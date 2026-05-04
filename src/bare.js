@@ -283,25 +283,39 @@ function onSwarmConnection (conn, info) {
   _store.replicate(conn)
 
   const remotePublicKey = b4a.toString(info.publicKey, 'hex')
-  const matchedCircleIds = []
-  for (const topicBuf of info.topics) {
-    const topicHex = b4a.toString(topicBuf, 'hex')
-    const circleId = _topicToCircle.get(topicHex)
-    if (circleId) matchedCircleIds.push(circleId)
-  }
-  for (const circleId of matchedCircleIds) {
-    const base = _circleBases.get(circleId)
-    if (base) {
-      setupPairChannel({
-        conn,
-        circleId,
-        base,
-        onWriterAdded: (writerKey) => {
-          send({ event: 'circle:writer:added', data: { circleId, writerKey } })
-        },
-      })
-    }
 
+  // info.topics is asymmetric on real-DHT connections: the lookup side may
+  // have it populated, the announce side often does not. Setting up the
+  // pair channel for every known circle is safe — protomux only matches
+  // when both sides open the same protocol+id, and unmatched channels
+  // don't affect corestore replication.
+  for (const [circleId, base] of _circleBases) {
+    setupPairChannel({
+      conn,
+      circleId,
+      base,
+      onWriterAdded: (writerKey) => {
+        send({ event: 'circle:writer:added', data: { circleId, writerKey } })
+      },
+    })
+  }
+
+  // Peer tracking: prefer info.topics, fall back to all circles we both
+  // could be on. The fallback over-counts when the remote isn't actually
+  // in our circle, but in v1 we only accept connections on circle topics
+  // we joined, so practically this matches.
+  const matchedCircleIds = []
+  if (info.topics && info.topics.length > 0) {
+    for (const topicBuf of info.topics) {
+      const topicHex = b4a.toString(topicBuf, 'hex')
+      const circleId = _topicToCircle.get(topicHex)
+      if (circleId) matchedCircleIds.push(circleId)
+    }
+  } else {
+    for (const circleId of _circleBases.keys()) matchedCircleIds.push(circleId)
+  }
+
+  for (const circleId of matchedCircleIds) {
     const peers = _circlePeers.get(circleId)
     if (peers) peers.add(remotePublicKey)
     send({ event: 'peer:connected', data: { circleId, remotePublicKey } })
