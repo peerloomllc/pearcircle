@@ -13,7 +13,7 @@
     "build:bare": "bare-pack --linked --defer fs --defer path src/bare.js -o assets/bare-universal.bundle",
     "build:bare:ios": "bare-pack --host ios-arm64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios.bundle",
     "build:bare:ios-sim": "bare-pack --host ios-x64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios-sim.bundle",
-    "build:ui": "esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic --loader:.js=jsx --define:process.env.NODE_ENV=\\\"production\\\" --outfile=assets/app-ui.bundle",
+    "build:ui": "esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic --loader:.js=jsx --loader:.css=text --define:process.env.NODE_ENV=\\\"production\\\" --outfile=assets/app-ui.bundle",
     "test": "jest",
     "postinstall": "patch-package"
   },
@@ -34,6 +34,7 @@
     "hypercore": "^11.26.0",
     "hyperdht": "^6.29.0",
     "hyperswarm": "^4.17.0",
+    "maplibre-gl": "^5.24.0",
     "qrcode": "^1.5.4",
     "react": "19.1.0",
     "react-dom": "19.1.0",

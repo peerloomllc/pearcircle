@@ -1,4 +1,6 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback, useRef } from 'react'
+import maplibregl from 'maplibre-gl'
+import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 
 // Lazy proxy: window.pear is installed by main.jsx but App.jsx is imported
 // before that assignment runs. Resolve through window at call time.
@@ -6,6 +8,23 @@ const pear = {
   call: (...args) => window.pear.call(...args),
   on: (...args) => window.pear.on(...args),
 }
+
+// Inject MapLibre's stylesheet exactly once per page. esbuild's
+// --loader:.css=text drops the CSS into the JS bundle as a string so we
+// can stamp it into a <style> tag at runtime - we have no separate CSS
+// pipeline.
+let _mapLibreCssInjected = false
+function ensureMapLibreCss () {
+  if (_mapLibreCssInjected) return
+  const styleEl = document.createElement('style')
+  styleEl.textContent = maplibreCss
+  document.head.appendChild(styleEl)
+  _mapLibreCssInjected = true
+}
+
+// OpenFreeMap is a free, key-less, OSM-based MapLibre style. Swap to
+// Protomaps in a follow-up slice once we have an API key (TODO.md).
+const TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
 
 export function App () {
   const [view, setView] = useState({ name: 'list' })
@@ -292,6 +311,8 @@ function DetailView ({ circleId, myPubkey, setView }) {
         <div style={s.row}><span style={s.muted}>Peers online</span><span>{peers.length}</span></div>
       </section>
 
+      <CircleMap data={data} />
+
       <h3 style={s.h3}>Members ({data.members.length})</h3>
       {data.members.length === 0 ? (
         <p style={s.muted}>No members visible yet. Waiting for sync...</p>
@@ -446,6 +467,136 @@ function AddPlaceForm ({ circleId, myLastSeen, onCancel, onAdded }) {
   )
 }
 
+// Approximate a geofence circle as a 64-vertex polygon in lat/lon space.
+// Earth-as-sphere math is fine for radii up to a few km; the polygon
+// would distort visibly at very high latitudes, but PearCircle places
+// are home/work/park sized, not continental.
+function circlePolygon (lat, lon, radiusMeters, steps = 64) {
+  const dLat = radiusMeters / 111320
+  const dLon = radiusMeters / (111320 * Math.cos(lat * Math.PI / 180))
+  const ring = []
+  for (let i = 0; i < steps; i++) {
+    const a = (i / steps) * 2 * Math.PI
+    ring.push([lon + dLon * Math.sin(a), lat + dLat * Math.cos(a)])
+  }
+  ring.push(ring[0])
+  return ring
+}
+
+function CircleMap ({ data }) {
+  const containerRef = useRef(null)
+  const mapRef = useRef(null)
+  const fittedRef = useRef(false)
+
+  // One-time map init. Sources/layers are added on the 'load' event so
+  // setData calls in the data-sync effect below always find them.
+  useEffect(() => {
+    ensureMapLibreCss()
+    if (!containerRef.current) return
+
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      style: TILE_STYLE_URL,
+      center: [0, 0],
+      zoom: 1.5,
+      attributionControl: false,
+    })
+    mapRef.current = map
+
+    map.on('load', () => {
+      map.addSource('places', { type: 'geojson', data: emptyFC() })
+      map.addSource('members', { type: 'geojson', data: emptyFC() })
+      map.addLayer({
+        id: 'places-fill', type: 'fill', source: 'places',
+        paint: { 'fill-color': '#7ec4cf', 'fill-opacity': 0.18 },
+      })
+      map.addLayer({
+        id: 'places-stroke', type: 'line', source: 'places',
+        paint: { 'line-color': '#7ec4cf', 'line-width': 2 },
+      })
+      map.addLayer({
+        id: 'members-pins', type: 'circle', source: 'members',
+        paint: {
+          'circle-radius': 8,
+          'circle-color': '#fc7',
+          'circle-stroke-color': '#1a1a1a',
+          'circle-stroke-width': 2,
+        },
+      })
+    })
+
+    return () => map.remove()
+  }, [])
+
+  // Sync features whenever data changes. Wait for the style to finish
+  // loading on the first call - on subsequent renders the listener is a
+  // no-op because the data on the source is just replaced.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !data) return
+    const apply = () => syncFeatures(map, data, fittedRef)
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [data])
+
+  return (
+    <div style={s.mapWrap}>
+      <div ref={containerRef} style={s.mapCanvas} />
+      <div style={s.mapAttribution}>© OpenStreetMap contributors</div>
+    </div>
+  )
+}
+
+function emptyFC () {
+  return { type: 'FeatureCollection', features: [] }
+}
+
+function syncFeatures (map, data, fittedRef) {
+  const memberFeatures = []
+  for (const m of data.members ?? []) {
+    const pubkey = m.value?.pubkey
+    const seen = pubkey ? data.lastSeen?.[pubkey] : null
+    if (!seen) continue
+    memberFeatures.push({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [seen.lon, seen.lat] },
+      properties: { name: m.value?.displayName ?? short(pubkey) },
+    })
+  }
+  const placeFeatures = (data.places ?? []).map(p => ({
+    type: 'Feature',
+    geometry: { type: 'Polygon', coordinates: [circlePolygon(p.lat, p.lon, p.radiusMeters)] },
+    properties: { name: p.name },
+  }))
+
+  map.getSource('members')?.setData({ type: 'FeatureCollection', features: memberFeatures })
+  map.getSource('places')?.setData({ type: 'FeatureCollection', features: placeFeatures })
+
+  if (fittedRef.current) return
+  if (memberFeatures.length === 0 && placeFeatures.length === 0) return
+  fittedRef.current = true
+  fitToFeatures(map, memberFeatures, data.places ?? [])
+}
+
+function fitToFeatures (map, memberFeatures, places) {
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity
+  for (const f of memberFeatures) {
+    const [lo, la] = f.geometry.coordinates
+    if (la < minLat) minLat = la; if (la > maxLat) maxLat = la
+    if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo
+  }
+  for (const p of places) {
+    if (p.lat < minLat) minLat = p.lat; if (p.lat > maxLat) maxLat = p.lat
+    if (p.lon < minLon) minLon = p.lon; if (p.lon > maxLon) maxLon = p.lon
+  }
+  if (!isFinite(minLat)) return
+  if (minLat === maxLat && minLon === maxLon) {
+    map.jumpTo({ center: [minLon, minLat], zoom: 14 })
+    return
+  }
+  map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 40, animate: false, maxZoom: 16 })
+}
+
 function ProfileView ({ profile, setView, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [saving, setSaving] = useState(false)
@@ -578,4 +729,7 @@ const s = {
   status: { fontSize: 13, color: '#cfc', marginTop: 4, fontWeight: 500 },
   transitionBtns: { display: 'flex', gap: 8, marginTop: 8 },
   smallBtn: { flex: 1, padding: '8px 10px', background: '#222', color: '#ccc', border: '1px solid #333', borderRadius: 6, fontSize: 12, cursor: 'pointer' },
+  mapWrap: { position: 'relative', height: 280, marginBottom: 12, borderRadius: 10, overflow: 'hidden', background: '#0a0a0a' },
+  mapCanvas: { height: '100%', width: '100%' },
+  mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: 4, pointerEvents: 'none' },
 }
