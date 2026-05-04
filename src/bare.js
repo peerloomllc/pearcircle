@@ -2,8 +2,8 @@
 // Wire protocol v1 (proposals/2026-05-03-wire-protocol.md).
 // Runs inside the Bare runtime launched by BareKit. No Node.js APIs.
 //
-// First slice: identity-only persistence. Hyperswarm, Autobase, and per-circle
-// state come in subsequent slices.
+// Slices landed: identity, local circle creation.
+// Still to come: Hyperswarm join, per-circle Autobase, pair flow.
 //
 // IPC envelope per CLAUDE.md:
 //   shell → worklet: { id, method, args }
@@ -11,11 +11,22 @@
 //   worklet → shell (events): { event, data }
 //
 // Shell MUST send `init` with a writable dataDir before any other method.
+//
+// Local-only Hyperbee namespaces (never replicated):
+//   identity                  — keypair (proposal §3)
+//   circles:joined:{id}       — index of circles this device participates in,
+//                               including the circleKey needed to rejoin the
+//                               swarm topic on next launch. Implementation
+//                               detail; the replicated `circle:{id}` row in
+//                               the per-circle Autobase is the canonical
+//                               cross-peer record.
 
 const Corestore = require('corestore')
 const Hyperbee = require('hyperbee')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
+const { generateCircleId, generateCircleKey } = require('./circle')
+const { buildInvite } = require('./invite')
 
 let _store = null
 let _localDb = null
@@ -32,6 +43,42 @@ const handlers = {
   'identity:get': async () => {
     if (!_identity) return { publicKey: null, ready: false }
     return { publicKey: b4a.toString(_identity.publicKey, 'hex'), ready: true }
+  },
+
+  'circle:create': async ({ name } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof name !== 'string' || name.length === 0 || name.length > 64) {
+      throw new Error('name must be a non-empty string of at most 64 chars')
+    }
+
+    const circleId = generateCircleId()
+    const circleKey = generateCircleKey()
+    const ownerPublicKey = b4a.toString(_identity.publicKey, 'hex')
+    const createdAt = Date.now()
+
+    await _localDb.put('circles:joined:' + circleId, {
+      circleId,
+      name,
+      circleKey,
+      role: 'owner',
+      createdAt,
+    })
+
+    const invite = buildInvite({ circleId, name, circleKey, inviterPublicKey: ownerPublicKey })
+
+    return { circleId, circleKey, name, ownerPublicKey, createdAt, invite }
+  },
+
+  'circles:list': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const circles = []
+    for await (const { value } of _localDb.createReadStream({
+      gt: 'circles:joined:',
+      lt: 'circles:joined:~',
+    })) {
+      if (value) circles.push(value)
+    }
+    return { circles }
   },
 }
 
