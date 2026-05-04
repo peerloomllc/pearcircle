@@ -26,7 +26,7 @@ const Hyperbee = require('hyperbee')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey } = require('./circle')
-const { buildInvite } = require('./invite')
+const { buildInvite, parseInvite } = require('./invite')
 
 let _store = null
 let _localDb = null
@@ -67,6 +67,35 @@ const handlers = {
     const invite = buildInvite({ circleId, name, circleKey, inviterPublicKey: ownerPublicKey })
 
     return { circleId, circleKey, name, ownerPublicKey, createdAt, invite }
+  },
+
+  'circle:join': async ({ invite } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof invite !== 'string') throw new Error('invite must be a string')
+
+    const parsed = parseInvite(invite)
+    if (!parsed.ok) throw new Error('invalid invite: ' + parsed.error)
+
+    const { circleId, name, circleKey, inviterPublicKey } = parsed
+
+    // Idempotent: if we already have a record (owner or member), return it
+    // unchanged. The owner re-scanning their own invite must not be demoted
+    // to 'member', and a member re-scanning the same invite is a no-op.
+    const existing = await _localDb.get('circles:joined:' + circleId)
+    if (existing) return { ...existing.value, alreadyJoined: true }
+
+    const joinedAt = Date.now()
+    const record = {
+      circleId,
+      name,
+      circleKey,
+      role: 'member',
+      inviterPublicKey,
+      joinedAt,
+    }
+    await _localDb.put('circles:joined:' + circleId, record)
+
+    return { ...record, alreadyJoined: false }
   },
 
   'circles:list': async () => {
