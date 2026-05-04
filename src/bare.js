@@ -2,8 +2,9 @@
 // Wire protocol v1 (proposals/2026-05-03-wire-protocol.md).
 // Runs inside the Bare runtime launched by BareKit. No Node.js APIs.
 //
-// Slices landed: identity, local circle creation, Hyperswarm topic join.
-// Still to come: per-circle Autobase, replication, addWriter pair flow.
+// Slices landed: identity, local circle creation, Hyperswarm topic join,
+// per-circle Autobase + replication (publish/read).
+// Still to come: addWriter pair flow (joiner becomes a writer).
 //
 // IPC envelope per CLAUDE.md:
 //   shell → worklet: { id, method, args }
@@ -24,6 +25,7 @@
 const Corestore = require('corestore')
 const Hyperbee = require('hyperbee')
 const Hyperswarm = require('hyperswarm')
+const Autobase = require('autobase')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey } = require('./circle')
@@ -38,6 +40,7 @@ let _initialized = false
 
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
+const _circleBases = new Map()    // circleId → Autobase instance
 
 const send = (msg) => BareKit.IPC.write(Buffer.from(JSON.stringify(msg) + '\n'))
 
@@ -62,13 +65,31 @@ const handlers = {
     const ownerPublicKey = b4a.toString(_identity.publicKey, 'hex')
     const createdAt = Date.now()
 
-    // Provision the per-circle Autobase bootstrap writer core. Its public
-    // key flows through the invite so joiners can open the same Autobase
-    // (proposal §2 amended 2026-05-04). Replication and apply branches
-    // wire up in the next slice.
-    const autobaseCore = _store.namespace(circleId).get({ name: 'autobase' })
-    await autobaseCore.ready()
-    const bootstrap = b4a.toString(autobaseCore.key, 'hex')
+    // Open the per-circle Autobase as the founding writer (bootstrap=null).
+    // Autobase auto-generates the writer keypair under our corestore
+    // namespace; base.local.key becomes the published bootstrap (proposal
+    // §2 amended 2026-05-04).
+    const ns = _store.namespace(circleId)
+    const base = new Autobase(ns, null, {
+      open: openCircleView,
+      apply: applyCircleNodes,
+      valueEncoding: 'json',
+    })
+    await base.ready()
+    _circleBases.set(circleId, base)
+    const bootstrap = b4a.toString(base.local.key, 'hex')
+
+    // Append initial replicated records per proposal §3 schema.
+    await base.append({
+      type: 'put',
+      key: 'circle',
+      value: { id: circleId, name, ownerKey: ownerPublicKey, createdAt, v: 1 },
+    })
+    await base.append({
+      type: 'put',
+      key: 'member:' + ownerPublicKey,
+      value: { pubkey: ownerPublicKey, displayName: ownerPublicKey.slice(0, 8), joinedAt: createdAt, v: 1 },
+    })
 
     await _localDb.put('circles:joined:' + circleId, {
       circleId,
@@ -101,6 +122,17 @@ const handlers = {
     const existing = await _localDb.get('circles:joined:' + circleId)
     if (existing) return { ...existing.value, alreadyJoined: true }
 
+    // Open the per-circle Autobase as a reader. Replication populates the
+    // view once a writer connects. addWriter (slice 6E) flips writable=true.
+    const ns = _store.namespace(circleId)
+    const base = new Autobase(ns, b4a.from(bootstrap, 'hex'), {
+      open: openCircleView,
+      apply: applyCircleNodes,
+      valueEncoding: 'json',
+    })
+    await base.ready()
+    _circleBases.set(circleId, base)
+
     const joinedAt = Date.now()
     const record = {
       circleId,
@@ -116,6 +148,26 @@ const handlers = {
     joinCircleTopic(circleId, circleKey)
 
     return { ...record, alreadyJoined: false }
+  },
+
+  'circle:get': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    await base.update()
+    const view = base.view
+    const circleRow = await view.get('circle')
+    const members = []
+    for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+      members.push({ key, value })
+    }
+    return {
+      circle: circleRow ? circleRow.value : null,
+      members,
+      writable: base.writable,
+      writers: base.writers ? base.writers.length : null,
+    }
   },
 
   'circles:list': async () => {
@@ -149,7 +201,65 @@ function joinCircleTopic (circleId, circleKey) {
   _swarm.join(topic, { server: true, client: true })
 }
 
+// Autobase hooks. The view is a Hyperbee on a sub-core named 'view'; apply
+// routes ops by record kind (proposal §4). For 6D scope, only `circle` and
+// `member:*` are handled; addWriter and other kinds land in subsequent slices.
+function openCircleView (store) {
+  return new Hyperbee(store.get('view'), {
+    keyEncoding: 'utf-8',
+    valueEncoding: 'json',
+  })
+}
+
+async function applyCircleNodes (nodes, view, base) {
+  const bootstrapHex = b4a.toString(base.key, 'hex')
+  for (const node of nodes) {
+    const op = node.value
+    if (!op || typeof op.type !== 'string') continue
+
+    if (op.type === 'addWriter' && typeof op.pubkey === 'string') {
+      await base.addWriter(b4a.from(op.pubkey, 'hex'))
+      continue
+    }
+
+    if (op.type === 'put' && typeof op.key === 'string') {
+      // `circle`: owner-write only — bootstrap writer authored or ignored
+      if (op.key === 'circle') {
+        const fromHex = b4a.toString(node.from.key, 'hex')
+        if (fromHex !== bootstrapHex) continue
+        await view.put('circle', op.value)
+        continue
+      }
+      // `member:*`: any current writer
+      if (op.key.startsWith('member:')) {
+        await view.put(op.key, op.value)
+        continue
+      }
+      // Other prefixes (place, lastSeen, transition, presence, removed)
+      // not yet wired — silently dropped.
+    }
+  }
+}
+
+async function mountCircleAutobase (circleId, bootstrapHex) {
+  if (_circleBases.has(circleId)) return _circleBases.get(circleId)
+  const ns = _store.namespace(circleId)
+  const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), {
+    open: openCircleView,
+    apply: applyCircleNodes,
+    valueEncoding: 'json',
+  })
+  await base.ready()
+  _circleBases.set(circleId, base)
+  return base
+}
+
 function onSwarmConnection (conn, info) {
+  // Pipe corestore replication first so cores can negotiate before we
+  // emit peer:connected — UI typically calls circle:get right after that
+  // event and we want the view to be fresh.
+  _store.replicate(conn)
+
   const remotePublicKey = b4a.toString(info.publicKey, 'hex')
   const matchedCircleIds = []
   for (const topicBuf of info.topics) {
@@ -217,15 +327,20 @@ async function init ({ dataDir } = {}, attempt = 0) {
   _swarm = new Hyperswarm({ keyPair: _identity })
   _swarm.on('connection', onSwarmConnection)
 
-  // Rejoin all known circle topics. Pre-existing local records (from prior
-  // launches) need their swarm topics re-announced on every boot.
+  // Rejoin all known circle topics and mount their Autobases. Pre-existing
+  // local records (from prior launches) need their swarm topics re-announced
+  // and their Autobases reopened on every boot.
   for await (const { value } of _localDb.createReadStream({
     gt: 'circles:joined:',
     lt: 'circles:joined:~',
   })) {
-    if (value && value.circleId && value.circleKey) {
-      joinCircleTopic(value.circleId, value.circleKey)
+    if (!value || !value.circleId) continue
+    if (value.bootstrap) {
+      try { await mountCircleAutobase(value.circleId, value.bootstrap) } catch (e) {
+        console.warn('[bare] failed to mount circle', value.circleId, e?.message)
+      }
     }
+    if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
   }
 
   _initialized = true
