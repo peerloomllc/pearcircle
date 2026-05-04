@@ -1,0 +1,30 @@
+node_modules/
+.expo/
+dist/
+web-build/
+
+# Native projects (regenerate with `npx expo prebuild`)
+android/
+ios/
+
+# Build artifacts
+assets/bare-universal.bundle
+assets/bare-ios.bundle
+assets/bare-ios-sim.bundle
+assets/app-ui.bundle
+*.apk
+*.aab
+*.ipa
+*.dmg
+*.exe
+
+# Local-only docs (per CLAUDE.md)
+TODO.md
+DONE.md
+
+# Logs / OS junk
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

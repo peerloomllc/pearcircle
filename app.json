@@ -1,0 +1,85 @@
+{
+  "expo": {
+    "name": "PearCircle",
+    "slug": "pearcircle",
+    "newArchEnabled": true,
+    "orientation": "portrait",
+    "scheme": "pear",
+    "icon": "./assets/images/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.pearcircle",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Used to scan circle invite QR codes and set your profile photo",
+        "NSPhotoLibraryUsageDescription": "Used to set your profile photo",
+        "NSMicrophoneUsageDescription": "Required by AVCaptureSession for QR scanning",
+        "NSLocationWhenInUseUsageDescription": "PearCircle shows your location to other members of your circle while the app is open.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "PearCircle shares your location with your circle and notifies them when you arrive at or leave the Places you have set, even when the app is closed.",
+        "NSLocalNetworkUsageDescription": "PearCircle connects directly to nearby devices on your Wi-Fi to sync circle data peer-to-peer.",
+        "NSBonjourServices": [
+          "_hyperswarm._udp"
+        ],
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "com.pearcircle.bgsync"
+        ],
+        "UIBackgroundModes": [
+          "fetch",
+          "processing",
+          "location"
+        ]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#111111"
+      },
+      "package": "com.pearcircle",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "POST_NOTIFICATIONS"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": false,
+          "data": [
+            {
+              "scheme": "pear",
+              "host": "pearcircle",
+              "pathPrefix": "/join"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ],
+      "versionCode": 1
+    },
+    "plugins": [
+      [
+        "expo-router"
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 29
+          }
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "assets": [
+      "./assets/bare-universal.bundle"
+    ],
+    "version": "0.1.0"
+  }
+}

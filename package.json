@@ -1,0 +1,58 @@
+{
+  "private": true,
+  "name": "pearcircle",
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "build:bare": "bare-pack --linked --defer fs --defer path src/bare.js -o assets/bare-universal.bundle",
+    "build:bare:ios": "bare-pack --host ios-arm64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios.bundle",
+    "build:bare:ios-sim": "bare-pack --host ios-x64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios-sim.bundle",
+    "build:ui": "esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic --loader:.js=jsx --define:process.env.NODE_ENV=\\\"production\\\" --outfile=assets/app-ui.bundle",
+    "test": "jest",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "autobase": "^7.25.1",
+    "b4a": "^1.8.0",
+    "corestore": "^7.8.0",
+    "expo": "^54.0.10",
+    "expo-build-properties": "^1.0.9",
+    "expo-camera": "~17.0.10",
+    "expo-constants": "^18.0.9",
+    "expo-file-system": "~19.0.21",
+    "expo-linking": "^8.0.8",
+    "expo-router": "^6.0.8",
+    "expo-secure-store": "~15.0.8",
+    "expo-system-ui": "^6.0.7",
+    "hyperbee": "^2.27.3",
+    "hypercore": "^11.26.0",
+    "hyperdht": "^6.29.0",
+    "hyperswarm": "^4.17.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.1.4",
+    "react-dom": "^19.1.4",
+    "react-native": "^0.81.4",
+    "react-native-b4a": "^0.0.4",
+    "react-native-bare-kit": "^0.12.2",
+    "react-native-safe-area-context": "^5.4.0",
+    "react-native-screens": "^4.23.0",
+    "react-native-webview": "13.15.0",
+    "sodium-universal": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.3",
+    "bare-bundle": "^1.10.0",
+    "bare-pack": "^2.0.0",
+    "esbuild": "^0.27.3",
+    "jest": "^29.0.0",
+    "patch-package": "^8.0.1",
+    "prettier": "^3.3.3",
+    "typescript": "^5.3.3"
+  }
+}
