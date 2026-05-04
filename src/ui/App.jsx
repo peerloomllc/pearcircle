@@ -11,14 +11,17 @@ export function App () {
   const [view, setView] = useState({ name: 'list' })
   const [identity, setIdentity] = useState(null)
   const [circles, setCircles] = useState([])
+  const [profile, setProfile] = useState(null)
 
   const refresh = useCallback(async () => {
-    const [id, cs] = await Promise.all([
+    const [id, cs, pr] = await Promise.all([
       pear.call('identity:get'),
       pear.call('circles:list'),
+      pear.call('profile:get'),
     ])
     setIdentity(id)
     setCircles(cs?.circles ?? [])
+    setProfile(pr ?? null)
   }, [])
 
   useEffect(() => {
@@ -31,7 +34,7 @@ export function App () {
   }, [refresh])
 
   if (view.name === 'list') {
-    return <ListView identity={identity} circles={circles} onRefresh={refresh} setView={setView} />
+    return <ListView identity={identity} profile={profile} circles={circles} onRefresh={refresh} setView={setView} />
   }
   if (view.name === 'create') {
     return <CreateView setView={setView} onCreated={refresh} />
@@ -42,10 +45,13 @@ export function App () {
   if (view.name === 'detail') {
     return <DetailView circleId={view.circleId} setView={setView} />
   }
+  if (view.name === 'profile') {
+    return <ProfileView profile={profile} setView={setView} onSaved={refresh} />
+  }
   return null
 }
 
-function ListView ({ identity, circles, onRefresh, setView }) {
+function ListView ({ identity, profile, circles, onRefresh, setView }) {
   return (
     <div style={s.screen}>
       <header style={s.header}>
@@ -53,7 +59,18 @@ function ListView ({ identity, circles, onRefresh, setView }) {
         <button style={s.iconBtn} onClick={onRefresh} aria-label='Refresh'>↻</button>
       </header>
       {identity?.publicKey && (
-        <p style={s.idLine}>You: {short(identity.publicKey)}</p>
+        <button
+          type='button'
+          style={s.profileBtn}
+          onClick={() => setView({ name: 'profile' })}
+        >
+          {profile?.displayName ? (
+            <span style={s.idName}>{profile.displayName}</span>
+          ) : (
+            <span style={s.idNeedName}>Set your name</span>
+          )}
+          <span style={s.idMuted}>{' · '}{short(identity.publicKey)}</span>
+        </button>
       )}
       <div style={s.actions}>
         <button style={s.primaryBtn} onClick={() => setView({ name: 'create' })}>
@@ -290,6 +307,52 @@ function DetailView ({ circleId, setView }) {
   )
 }
 
+function ProfileView ({ profile, setView, onSaved }) {
+  const [name, setName] = useState(profile?.displayName ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+  const [savedAt, setSavedAt] = useState(null)
+
+  const submit = async () => {
+    if (!name.trim()) return
+    setSaving(true)
+    setError(null)
+    try {
+      const r = await pear.call('profile:set', { displayName: name.trim() })
+      setSaving(false)
+      if (r?.ok) {
+        setSavedAt(Date.now())
+        onSaved()
+      } else {
+        setError('Could not save profile')
+      }
+    } catch (e) {
+      setSaving(false)
+      setError(String(e?.message ?? e))
+    }
+  }
+
+  return (
+    <div style={s.screen}>
+      <BackBar onBack={() => setView({ name: 'list' })} title='Profile' />
+      <label style={s.label}>Display name</label>
+      <input
+        style={s.input}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder='Your name'
+        autoFocus
+        maxLength={64}
+      />
+      <button style={s.primaryBtn} disabled={!name.trim() || saving} onClick={submit}>
+        {saving ? 'Saving...' : 'Save'}
+      </button>
+      {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new name shortly.</p>}
+      {error && <p style={s.error}>{error}</p>}
+    </div>
+  )
+}
+
 function BackBar ({ onBack, title }) {
   return (
     <header style={s.header}>
@@ -348,6 +411,10 @@ const s = {
   h2: { fontSize: 18, margin: '24px 0 8px 0', fontWeight: 600 },
   h3: { fontSize: 16, margin: '20px 0 8px 0', fontWeight: 600, color: '#bbb' },
   idLine: { color: '#888', margin: '4px 0 16px 0', fontSize: 13, fontFamily: 'monospace' },
+  profileBtn: { display: 'flex', alignItems: 'baseline', gap: 6, width: '100%', padding: '10px 12px', margin: '4px 0 16px 0', background: '#1c1c1c', border: '1px solid #2a2a2a', borderRadius: 8, color: '#eee', textAlign: 'left', cursor: 'pointer', fontSize: 13 },
+  idName: { color: '#eee', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', fontWeight: 600, fontSize: 14 },
+  idNeedName: { color: '#7ec4cf', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', fontWeight: 600, fontSize: 14 },
+  idMuted: { color: '#888', fontFamily: 'monospace' },
   actions: { display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 8 },
   primaryBtn: { width: '100%', padding: '14px 16px', background: '#7ec4cf', color: '#0a1f23', border: 'none', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
   secondaryBtn: { width: '100%', padding: '14px 16px', background: '#222', color: '#eee', border: '1px solid #333', borderRadius: 10, fontSize: 16, fontWeight: 500, cursor: 'pointer', marginTop: 8 },

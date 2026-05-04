@@ -54,6 +54,42 @@ const handlers = {
     return { publicKey: b4a.toString(_identity.publicKey, 'hex'), ready: true }
   },
 
+  'profile:get': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const row = await _localDb.get('profile')
+    return row ? row.value : null
+  },
+
+  'profile:set': async ({ displayName } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof displayName !== 'string') throw new Error('displayName must be a string')
+    const trimmed = displayName.trim().slice(0, 64)
+    if (trimmed.length === 0) throw new Error('displayName must be non-empty')
+    const updatedAt = Date.now()
+    const value = { displayName: trimmed, updatedAt, v: 1 }
+    await _localDb.put('profile', value)
+
+    // Re-broadcast member row to every writable circle so peers see the new name.
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    let republished = 0
+    for (const [, base] of _circleBases) {
+      if (!base.writable) continue
+      try {
+        const existing = await base.view.get('member:' + ourKey)
+        const joinedAt = existing?.value?.joinedAt ?? updatedAt
+        await base.append({
+          type: 'put',
+          key: 'member:' + ourKey,
+          value: { pubkey: ourKey, displayName: trimmed, joinedAt, v: 1 },
+        })
+        republished++
+      } catch {
+        // base closed mid-flight, etc.
+      }
+    }
+    return { ok: true, displayName: trimmed, updatedAt, republished }
+  },
+
   'circle:create': async ({ name } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof name !== 'string' || name.length === 0 || name.length > 64) {
@@ -64,6 +100,7 @@ const handlers = {
     const circleKey = generateCircleKey()
     const ownerPublicKey = b4a.toString(_identity.publicKey, 'hex')
     const createdAt = Date.now()
+    const profileDisplayName = await readProfileDisplayName(ownerPublicKey)
 
     // Open the per-circle Autobase as the founding writer (bootstrap=null).
     // Autobase auto-generates the writer keypair under our corestore
@@ -88,7 +125,7 @@ const handlers = {
     await base.append({
       type: 'put',
       key: 'member:' + ownerPublicKey,
-      value: { pubkey: ownerPublicKey, displayName: ownerPublicKey.slice(0, 8), joinedAt: createdAt, v: 1 },
+      value: { pubkey: ownerPublicKey, displayName: profileDisplayName, joinedAt: createdAt, v: 1 },
     })
 
     await _localDb.put('circles:joined:' + circleId, {
@@ -186,7 +223,7 @@ const handlers = {
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     const dn = (typeof displayName === 'string' && displayName.length > 0)
       ? displayName.slice(0, 64)
-      : ourKey.slice(0, 8)
+      : await readProfileDisplayName(ourKey)
     const joinedAt = Date.now()
 
     await base.append({
@@ -244,6 +281,13 @@ const handlers = {
     }
     return { ok: true, written, pubkey: ourKey }
   },
+}
+
+async function readProfileDisplayName (fallbackPubkey) {
+  const row = await _localDb.get('profile')
+  const dn = row?.value?.displayName
+  if (typeof dn === 'string' && dn.length > 0) return dn
+  return fallbackPubkey.slice(0, 8)
 }
 
 function joinCircleTopic (circleId, circleKey) {
