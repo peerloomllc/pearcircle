@@ -65,6 +65,12 @@ async function startWorklet() {
       }
     }
   })
+
+  // Bare runs a Corestore at <dataDir>/pearcircle/store. Strip the file://
+  // prefix so the path is a plain POSIX path Bare can open directly.
+  const docDir = FileSystem.documentDirectory!
+  const dataDir = docDir.replace(/^file:\/\//, '').replace(/\/$/, '')
+  await call('init', { dataDir })
 }
 
 export default function Index() {
