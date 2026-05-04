@@ -2,8 +2,8 @@
 // Wire protocol v1 (proposals/2026-05-03-wire-protocol.md).
 // Runs inside the Bare runtime launched by BareKit. No Node.js APIs.
 //
-// Slices landed: identity, local circle creation.
-// Still to come: Hyperswarm join, per-circle Autobase, pair flow.
+// Slices landed: identity, local circle creation, Hyperswarm topic join.
+// Still to come: per-circle Autobase, replication, addWriter pair flow.
 //
 // IPC envelope per CLAUDE.md:
 //   shell → worklet: { id, method, args }
@@ -23,15 +23,21 @@
 
 const Corestore = require('corestore')
 const Hyperbee = require('hyperbee')
+const Hyperswarm = require('hyperswarm')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey } = require('./circle')
 const { buildInvite, parseInvite } = require('./invite')
+const { topicForCircleKey } = require('./swarm')
 
 let _store = null
 let _localDb = null
 let _identity = null
+let _swarm = null
 let _initialized = false
+
+const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
+const _topicToCircle = new Map()  // topicHex → circleId
 
 const send = (msg) => BareKit.IPC.write(Buffer.from(JSON.stringify(msg) + '\n'))
 
@@ -66,6 +72,8 @@ const handlers = {
 
     const invite = buildInvite({ circleId, name, circleKey, inviterPublicKey: ownerPublicKey })
 
+    joinCircleTopic(circleId, circleKey)
+
     return { circleId, circleKey, name, ownerPublicKey, createdAt, invite }
   },
 
@@ -95,6 +103,8 @@ const handlers = {
     }
     await _localDb.put('circles:joined:' + circleId, record)
 
+    joinCircleTopic(circleId, circleKey)
+
     return { ...record, alreadyJoined: false }
   },
 
@@ -109,6 +119,47 @@ const handlers = {
     }
     return { circles }
   },
+
+  'circles:peers': async () => {
+    const out = {}
+    for (const [circleId, peers] of _circlePeers) {
+      out[circleId] = Array.from(peers)
+    }
+    return { peers: out }
+  },
+}
+
+function joinCircleTopic (circleId, circleKey) {
+  if (!_swarm) return
+  const topic = topicForCircleKey(circleKey)
+  const topicHex = b4a.toString(topic, 'hex')
+  if (_topicToCircle.has(topicHex)) return
+  _topicToCircle.set(topicHex, circleId)
+  if (!_circlePeers.has(circleId)) _circlePeers.set(circleId, new Set())
+  _swarm.join(topic, { server: true, client: true })
+}
+
+function onSwarmConnection (conn, info) {
+  const remotePublicKey = b4a.toString(info.publicKey, 'hex')
+  const matchedCircleIds = []
+  for (const topicBuf of info.topics) {
+    const topicHex = b4a.toString(topicBuf, 'hex')
+    const circleId = _topicToCircle.get(topicHex)
+    if (circleId) matchedCircleIds.push(circleId)
+  }
+  for (const circleId of matchedCircleIds) {
+    const peers = _circlePeers.get(circleId)
+    if (peers) peers.add(remotePublicKey)
+    send({ event: 'peer:connected', data: { circleId, remotePublicKey } })
+  }
+  conn.on('close', () => {
+    for (const circleId of matchedCircleIds) {
+      const peers = _circlePeers.get(circleId)
+      if (peers) peers.delete(remotePublicKey)
+      send({ event: 'peer:disconnected', data: { circleId, remotePublicKey } })
+    }
+  })
+  conn.on('error', () => { /* swallow; close fires too */ })
 }
 
 async function init ({ dataDir } = {}, attempt = 0) {
@@ -151,6 +202,20 @@ async function init ({ dataDir } = {}, attempt = 0) {
       secretKey: b4a.toString(_identity.secretKey, 'hex'),
       createdAt: Date.now(),
     })
+  }
+
+  _swarm = new Hyperswarm({ keyPair: _identity })
+  _swarm.on('connection', onSwarmConnection)
+
+  // Rejoin all known circle topics. Pre-existing local records (from prior
+  // launches) need their swarm topics re-announced on every boot.
+  for await (const { value } of _localDb.createReadStream({
+    gt: 'circles:joined:',
+    lt: 'circles:joined:~',
+  })) {
+    if (value && value.circleId && value.circleKey) {
+      joinCircleTopic(value.circleId, value.circleKey)
+    }
   }
 
   _initialized = true
