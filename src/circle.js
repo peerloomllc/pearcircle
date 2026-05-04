@@ -29,4 +29,13 @@ function generateCircleKey () {
   return b4a.toString(randomBytes32(), 'hex')
 }
 
-module.exports = { generateCircleId, generateCircleKey }
+// 16-byte hex (32 chars). Place ids are scoped within a circle's Autobase
+// view; 128 bits is more than enough to avoid collisions in any practical
+// circle while keeping keys short.
+function generatePlaceId () {
+  const buf = b4a.allocUnsafe(16)
+  sodium.randombytes_buf(buf)
+  return b4a.toString(buf, 'hex')
+}
+
+module.exports = { generateCircleId, generateCircleKey, generatePlaceId }

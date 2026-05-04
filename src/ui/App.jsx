@@ -43,7 +43,7 @@ export function App () {
     return <JoinView setView={setView} onJoined={refresh} initialInvite={view.invite} />
   }
   if (view.name === 'detail') {
-    return <DetailView circleId={view.circleId} setView={setView} />
+    return <DetailView circleId={view.circleId} myPubkey={identity?.publicKey} setView={setView} />
   }
   if (view.name === 'profile') {
     return <ProfileView profile={profile} setView={setView} onSaved={refresh} />
@@ -210,11 +210,12 @@ function JoinView ({ setView, onJoined, initialInvite }) {
   )
 }
 
-function DetailView ({ circleId, setView }) {
+function DetailView ({ circleId, myPubkey, setView }) {
   const [data, setData] = useState(null)
   const [peers, setPeers] = useState([])
   const [claiming, setClaiming] = useState(false)
   const [claimError, setClaimError] = useState(null)
+  const [showAddPlace, setShowAddPlace] = useState(false)
 
   const refresh = useCallback(async () => {
     const [d, p] = await Promise.all([
@@ -294,6 +295,36 @@ function DetailView ({ circleId, setView }) {
         </ul>
       )}
 
+      <h3 style={s.h3}>Places ({data.places?.length ?? 0})</h3>
+      {(!data.places || data.places.length === 0) ? (
+        <p style={s.muted}>No places yet.</p>
+      ) : (
+        <ul style={s.memberList}>
+          {data.places.map(p => (
+            <li key={p.id} style={s.memberItem}>
+              <div style={s.memberName}>{p.name}</div>
+              <div style={s.lastSeen}>
+                {p.lat.toFixed(5)}, {p.lon.toFixed(5)} · {p.radiusMeters}m
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {isWritable && !showAddPlace && (
+        <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
+          Add a place
+        </button>
+      )}
+      {isWritable && showAddPlace && (
+        <AddPlaceForm
+          circleId={circleId}
+          myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
+          onCancel={() => setShowAddPlace(false)}
+          onAdded={async () => { setShowAddPlace(false); await refresh() }}
+        />
+      )}
+
       {isWritable && (
         <button style={s.primaryBtn} disabled={claiming} onClick={claimMembership}>
           {claiming ? 'Posting...' : 'Post my membership'}
@@ -303,6 +334,70 @@ function DetailView ({ circleId, setView }) {
       {!isWritable && (
         <p style={s.muted}>Read-only until owner adds you as a writer.</p>
       )}
+    </div>
+  )
+}
+
+function AddPlaceForm ({ circleId, myLastSeen, onCancel, onAdded }) {
+  const [name, setName] = useState('')
+  const [lat, setLat] = useState('')
+  const [lon, setLon] = useState('')
+  const [radius, setRadius] = useState('100')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState(null)
+
+  const useCurrent = () => {
+    if (myLastSeen?.lat != null && myLastSeen?.lon != null) {
+      setLat(String(myLastSeen.lat))
+      setLon(String(myLastSeen.lon))
+    } else {
+      setError('No current location yet — wait for a location update or enter manually.')
+    }
+  }
+
+  const submit = async () => {
+    setError(null)
+    const latNum = parseFloat(lat)
+    const lonNum = parseFloat(lon)
+    const radNum = parseFloat(radius)
+    if (!name.trim()) { setError('Name is required'); return }
+    if (!Number.isFinite(latNum) || latNum < -90 || latNum > 90) { setError('Latitude must be between -90 and 90'); return }
+    if (!Number.isFinite(lonNum) || lonNum < -180 || lonNum > 180) { setError('Longitude must be between -180 and 180'); return }
+    if (!Number.isFinite(radNum) || radNum < 10 || radNum > 10000) { setError('Radius must be between 10 and 10000 metres'); return }
+    setSubmitting(true)
+    try {
+      const r = await pear.call('place:create', {
+        circleId,
+        name: name.trim(),
+        lat: latNum,
+        lon: lonNum,
+        radiusMeters: radNum,
+      })
+      setSubmitting(false)
+      if (r?.ok) onAdded()
+      else setError('Could not save place')
+    } catch (e) {
+      setSubmitting(false)
+      setError(String(e?.message ?? e))
+    }
+  }
+
+  return (
+    <div style={s.section}>
+      <label style={s.label}>Name</label>
+      <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} />
+      <label style={s.label}>Radius (metres)</label>
+      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
+      <label style={s.label}>Latitude</label>
+      <input style={s.input} value={lat} onChange={(e) => setLat(e.target.value)} inputMode='decimal' placeholder='37.42342' />
+      <label style={s.label}>Longitude</label>
+      <input style={s.input} value={lon} onChange={(e) => setLon(e.target.value)} inputMode='decimal' placeholder='-122.08453' />
+      <button style={s.secondaryBtn} onClick={useCurrent}>Use my current location</button>
+      <button style={s.primaryBtn} disabled={submitting} onClick={submit}>
+        {submitting ? 'Saving...' : 'Save place'}
+      </button>
+      <button style={s.secondaryBtn} onClick={onCancel}>Cancel</button>
+      {error && <p style={s.error}>{error}</p>}
     </div>
   )
 }
@@ -405,7 +500,7 @@ function short (s) {
 }
 
 const s = {
-  screen: { padding: 16, paddingBottom: 64, color: '#eee', background: '#111', minHeight: '100vh', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', boxSizing: 'border-box' },
+  screen: { paddingLeft: 16, paddingRight: 16, paddingTop: 'calc(env(safe-area-inset-top, 24px) + 16px)', paddingBottom: 64, color: '#eee', background: '#111', minHeight: '100vh', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', boxSizing: 'border-box' },
   header: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
   h1: { fontSize: 24, margin: 0, flex: 1, fontWeight: 600 },
   h2: { fontSize: 18, margin: '24px 0 8px 0', fontWeight: 600 },

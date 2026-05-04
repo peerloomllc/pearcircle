@@ -27,7 +27,7 @@ const Hyperswarm = require('hyperswarm')
 const Autobase = require('autobase')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
-const { generateCircleId, generateCircleKey } = require('./circle')
+const { generateCircleId, generateCircleKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel } = require('./pair')
@@ -204,10 +204,15 @@ const handlers = {
       const pubkey = key.slice('lastSeen:'.length)
       lastSeen[pubkey] = value
     }
+    const places = []
+    for await (const { value } of view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+      if (value) places.push(value)
+    }
     return {
       circle: circleRow ? circleRow.value : null,
       members,
       lastSeen,
+      places,
       writable: base.writable,
       writers: base.writers ? base.writers.length : null,
     }
@@ -233,6 +238,43 @@ const handlers = {
     })
 
     return { ok: true, pubkey: ourKey, displayName: dn, joinedAt }
+  },
+
+  'place:create': async ({ circleId, name, lat, lon, radiusMeters } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    if (typeof name !== 'string' || name.trim().length === 0 || name.length > 64) {
+      throw new Error('name must be a non-empty string of at most 64 chars')
+    }
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90) throw new Error('lat must be in [-90, 90]')
+    if (!Number.isFinite(lon) || lon < -180 || lon > 180) throw new Error('lon must be in [-180, 180]')
+    if (!Number.isFinite(radiusMeters) || radiusMeters < 10 || radiusMeters > 10000) {
+      throw new Error('radiusMeters must be in [10, 10000]')
+    }
+
+    const id = generatePlaceId()
+    const createdBy = b4a.toString(_identity.publicKey, 'hex')
+    const createdAt = Date.now()
+    const value = { id, name: name.trim(), lat, lon, radiusMeters, createdBy, createdAt, v: 1 }
+
+    await base.append({ type: 'put', key: 'place:' + id, value })
+    return { ok: true, place: value }
+  },
+
+  'place:list': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    await base.update()
+    const places = []
+    for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+      if (value) places.push(value)
+    }
+    return { places }
   },
 
   'circles:list': async () => {
@@ -339,8 +381,21 @@ async function applyCircleNodes (nodes, view, base) {
         await view.put(op.key, op.value)
         continue
       }
-      // Other prefixes (place, transition, presence, removed)
-      // not yet wired — silently dropped.
+      // `place:{id}`: any current writer; last-write-wins on createdAt
+      // collision (proposal §4). Older records dropped silently so a
+      // late-replicating node can't clobber a newer rename.
+      if (op.key.startsWith('place:')) {
+        const incoming = op.value
+        if (!incoming || typeof incoming.createdAt !== 'number') continue
+        const existing = await view.get(op.key)
+        if (existing && existing.value && typeof existing.value.createdAt === 'number') {
+          if (incoming.createdAt <= existing.value.createdAt) continue
+        }
+        await view.put(op.key, incoming)
+        continue
+      }
+      // Other prefixes (transition, presence, removed) not yet wired —
+      // silently dropped.
     }
   }
 }

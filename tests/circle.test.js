@@ -1,4 +1,4 @@
-const { generateCircleId, generateCircleKey } = require('../src/circle')
+const { generateCircleId, generateCircleKey, generatePlaceId } = require('../src/circle')
 const { buildInvite, parseInvite } = require('../src/invite')
 
 describe('generateCircleId', () => {
@@ -31,6 +31,21 @@ describe('generateCircleKey', () => {
   test('successive calls produce different values', () => {
     const a = generateCircleKey()
     const b = generateCircleKey()
+    expect(a).not.toBe(b)
+  })
+})
+
+describe('generatePlaceId', () => {
+  test('returns a 32-char hex string', () => {
+    const id = generatePlaceId()
+    expect(typeof id).toBe('string')
+    expect(id.length).toBe(32)
+    expect(id).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  test('successive calls produce different values', () => {
+    const a = generatePlaceId()
+    const b = generatePlaceId()
     expect(a).not.toBe(b)
   })
 })
