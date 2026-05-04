@@ -31,6 +31,11 @@ const { generateCircleId, generateCircleKey, generatePlaceId } = require('./circ
 const { buildInvite, parseInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel } = require('./pair')
+const { signValue, verifyValue } = require('./lib/sign')
+
+// Reject values stamped more than 5 minutes in the future against the local
+// clock (proposal §5). Catches replay/forgery and clock skew on the writer.
+const FUTURE_TS_TOLERANCE_MS = 5 * 60 * 1000
 
 let _store = null
 let _localDb = null
@@ -297,7 +302,13 @@ const handlers = {
 
     const pubkey = b4a.toString(_identity.publicKey, 'hex')
     const stamp = typeof ts === 'number' ? ts : Date.now()
-    const transition = { pubkey, placeId, kind, ts: stamp, v: 1 }
+    if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
+      throw new Error('ts is too far in the future')
+    }
+    const transition = signValue(
+      { pubkey, placeId, kind, ts: stamp, v: 1 },
+      _identity.secretKey,
+    )
 
     await base.append({ type: 'put', key: 'transition:' + stamp + ':' + pubkey, value: transition })
 
@@ -306,13 +317,14 @@ const handlers = {
     // because the native module may fire a transition without coords on
     // some platforms; in that case we leave lastSeen untouched.
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      const seen = {
+      const seen = signValue({
+        pubkey,
         lat,
         lon,
         accuracy: Number.isFinite(accuracy) ? accuracy : null,
         ts: stamp,
         v: 1,
-      }
+      }, _identity.secretKey)
       await base.append({ type: 'put', key: 'lastSeen:' + pubkey, value: seen })
     }
 
@@ -344,15 +356,21 @@ const handlers = {
     if (typeof lat !== 'number' || typeof lon !== 'number') {
       return { ok: false, reason: 'invalid_coords' }
     }
-    const value = {
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const stamp = typeof ts === 'number' ? ts : Date.now()
+    if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
+      return { ok: false, reason: 'future_ts' }
+    }
+    const value = signValue({
+      pubkey: ourKey,
       lat,
       lon,
       accuracy: typeof accuracy === 'number' ? accuracy : null,
-      ts: typeof ts === 'number' ? ts : Date.now(),
+      ts: stamp,
       speed: typeof speed === 'number' ? speed : null,
       v: 1,
-    }
-    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    }, _identity.secretKey)
+
     let written = 0
     for (const [, base] of _circleBases) {
       if (!base.writable) continue
@@ -418,9 +436,18 @@ async function applyCircleNodes (nodes, view, base) {
         await view.put(op.key, op.value)
         continue
       }
-      // `lastSeen:{pubkey}`: any current writer; last-write-wins
+      // `lastSeen:{pubkey}`: signed by the user-identity in `pubkey`
+      // (proposal §5). Reject unsigned, tampered, or future-stamped values.
+      // Key suffix must match the signed pubkey so a writer can't impersonate
+      // another member's row.
       if (op.key.startsWith('lastSeen:')) {
-        await view.put(op.key, op.value)
+        const incoming = op.value
+        if (!verifyValue(incoming)) continue
+        if (typeof incoming.ts !== 'number') continue
+        if (incoming.ts > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
+        const keyPubkey = op.key.slice('lastSeen:'.length)
+        if (keyPubkey !== incoming.pubkey) continue
+        await view.put(op.key, incoming)
         continue
       }
       // `place:{id}`: any current writer; last-write-wins on createdAt
@@ -436,15 +463,15 @@ async function applyCircleNodes (nodes, view, base) {
         await view.put(op.key, incoming)
         continue
       }
-      // `transition:{ts}:{pubkey}`: any current writer; key is unique per
-      // (ts, pubkey) so no merge needed. The writer self-attests pubkey;
-      // strict own-pubkey enforcement (proposal §4/§5) requires Ed25519
-      // signing on the value, which is a separate slice. lastSeen has the
-      // same gap today, so matching its loose behavior keeps the two
-      // record kinds consistent until signing lands.
+      // `transition:{ts}:{pubkey}`: signed by the user-identity in `pubkey`
+      // (proposal §5). Reject unsigned, tampered, or future-stamped values.
+      // Key suffix must match the signed pubkey for the same reason as
+      // lastSeen — the suffix is the index, the sig proves authorship.
       if (op.key.startsWith('transition:')) {
         const incoming = op.value
-        if (!incoming || typeof incoming.pubkey !== 'string') continue
+        if (!verifyValue(incoming)) continue
+        if (typeof incoming.ts !== 'number') continue
+        if (incoming.ts > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
         const tail = op.key.slice('transition:'.length)
         const colon = tail.indexOf(':')
         if (colon < 0) continue
