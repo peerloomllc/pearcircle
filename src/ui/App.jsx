@@ -1,6 +1,11 @@
 import React, { useEffect, useState, useCallback } from 'react'
 
-const pear = window.pear
+// Lazy proxy: window.pear is installed by main.jsx but App.jsx is imported
+// before that assignment runs. Resolve through window at call time.
+const pear = {
+  call: (...args) => window.pear.call(...args),
+  on: (...args) => window.pear.on(...args),
+}
 
 export function App () {
   const [view, setView] = useState({ name: 'list' })
