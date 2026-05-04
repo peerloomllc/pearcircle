@@ -176,13 +176,6 @@ export default function Index() {
     let msg: any
     try { msg = JSON.parse(e.nativeEvent.data) } catch { return }
     if (!msg?.method) return
-
-    if (msg.method === 'geofence:register') {
-      const result = await PearCircleLocation?.registerGeofence?.(msg.args)
-      respond(msg.id, result)
-      return
-    }
-
     const result = await call(msg.method, msg.args)
     respond(msg.id, result)
   }

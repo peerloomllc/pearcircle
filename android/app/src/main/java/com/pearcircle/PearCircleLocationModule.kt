@@ -1,18 +1,16 @@
 package com.pearcircle
 
 import android.Manifest
-import android.app.Activity
 import android.content.pm.PackageManager
 import android.location.Location
 import android.os.Looper
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.WritableMap
-import com.facebook.react.bridge.Arguments
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.facebook.react.modules.core.PermissionAwareActivity
 import com.facebook.react.modules.core.PermissionListener
@@ -52,12 +50,6 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     // Required by RN even when we deliver via DeviceEventManagerModule.
     @ReactMethod fun addListener(eventName: String) { /* no-op */ }
     @ReactMethod fun removeListeners(count: Int) { /* no-op */ }
-
-    @ReactMethod
-    fun registerGeofence(args: com.facebook.react.bridge.ReadableMap, promise: Promise) {
-        // Stub: geofencing lands in a later slice.
-        promise.resolve(false)
-    }
 
     private fun hasFineLocation(): Boolean =
         ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) ==

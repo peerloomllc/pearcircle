@@ -32,6 +32,7 @@ const { buildInvite, parseInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel } = require('./pair')
 const { signValue, verifyValue } = require('./lib/sign')
+const { haversineMeters, classify } = require('./lib/geofence')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -46,6 +47,28 @@ let _initialized = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+// In-process geofence state: every place across every circle, with the
+// most recent inside/outside classification. checkPlaceTransitions runs
+// on every location:update, computes haversine distances, and fires
+// transitions when classification flips. lastClassification === null is
+// the "haven't seen a location yet" state and lets the next observation
+// inside fire an initial-trigger enter (matching INITIAL_TRIGGER_ENTER).
+const _circlePlaces = new Map() // "{circleId}|{placeId}" → state
+
+function trackPlace (circleId, place) {
+  const key = circleId + '|' + place.id
+  const existing = _circlePlaces.get(key)
+  _circlePlaces.set(key, {
+    circleId,
+    placeId: place.id,
+    lat: place.lat,
+    lon: place.lon,
+    radiusMeters: place.radiusMeters,
+    // Preserve classification across rename/move so we don't fire a
+    // spurious enter just because the user relocated a Place.
+    lastClassification: existing?.lastClassification ?? null,
+  })
+}
 
 const send = (msg) => BareKit.IPC.write(Buffer.from(JSON.stringify(msg) + '\n'))
 
@@ -300,33 +323,18 @@ const handlers = {
     if (!base) throw new Error('unknown circle: ' + circleId)
     if (!base.writable) throw new Error('not yet a writer for this circle')
 
-    const pubkey = b4a.toString(_identity.publicKey, 'hex')
     const stamp = typeof ts === 'number' ? ts : Date.now()
     if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
       throw new Error('ts is too far in the future')
     }
-    const transition = signValue(
-      { pubkey, placeId, kind, ts: stamp, v: 1 },
-      _identity.secretKey,
-    )
-
-    await base.append({ type: 'put', key: 'transition:' + stamp + ':' + pubkey, value: transition })
-
-    // Per proposal §7, a transition also refreshes lastSeen so peers see
-    // a fresh location pin alongside the new status. lat/lon are optional
-    // because the native module may fire a transition without coords on
-    // some platforms; in that case we leave lastSeen untouched.
+    const transition = await appendTransition(base, placeId, kind, stamp)
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      const seen = signValue({
-        pubkey,
-        lat,
-        lon,
-        accuracy: Number.isFinite(accuracy) ? accuracy : null,
-        ts: stamp,
-        v: 1,
-      }, _identity.secretKey)
-      await base.append({ type: 'put', key: 'lastSeen:' + pubkey, value: seen })
+      await appendLastSeen(base, lat, lon, accuracy, stamp)
     }
+    // Sync the tracked classification so the JS check doesn't fight with
+    // the manual fire on the next location:update.
+    const tracked = _circlePlaces.get(circleId + '|' + placeId)
+    if (tracked) tracked.lastClassification = kind === 'enter' ? 'inside' : 'outside'
 
     return { ok: true, transition }
   },
@@ -381,8 +389,55 @@ const handlers = {
         // base closed mid-flight, etc.
       }
     }
+
+    // After lastSeen lands, run the JS-side geofence check. Any flips
+    // produce additional transition appends (and bump lastSeen again,
+    // but the second write is byte-identical so the view is unchanged).
+    await checkPlaceTransitions(lat, lon, accuracy, stamp)
+
     return { ok: true, written, pubkey: ourKey }
   },
+}
+
+async function appendTransition (base, placeId, kind, ts) {
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const value = signValue(
+    { pubkey: ourKey, placeId, kind, ts, v: 1 },
+    _identity.secretKey,
+  )
+  await base.append({ type: 'put', key: 'transition:' + ts + ':' + ourKey, value })
+  return value
+}
+
+async function appendLastSeen (base, lat, lon, accuracy, ts) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const value = signValue({
+    pubkey: ourKey,
+    lat,
+    lon,
+    accuracy: Number.isFinite(accuracy) ? accuracy : null,
+    ts,
+    v: 1,
+  }, _identity.secretKey)
+  await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
+}
+
+async function checkPlaceTransitions (lat, lon, accuracy, ts) {
+  for (const state of _circlePlaces.values()) {
+    const base = _circleBases.get(state.circleId)
+    if (!base || !base.writable) continue
+    const dist = haversineMeters(lat, lon, state.lat, state.lon)
+    const result = classify(dist, state.radiusMeters, state.lastClassification)
+    state.lastClassification = result.classification
+    if (!result.kind) continue
+    try {
+      await appendTransition(base, state.placeId, result.kind, ts)
+      await appendLastSeen(base, lat, lon, accuracy, ts)
+    } catch (e) {
+      console.warn('[bare] failed to append transition', e?.message)
+    }
+  }
 }
 
 async function readProfileDisplayName (fallbackPubkey) {
@@ -461,6 +516,11 @@ async function applyCircleNodes (nodes, view, base) {
           if (incoming.createdAt <= existing.value.createdAt) continue
         }
         await view.put(op.key, incoming)
+        // Track for in-process geofence checks. We don't have a base→circleId
+        // reverse map, so look up the circleId by walking _circleBases. Cheap.
+        for (const [cid, b] of _circleBases) {
+          if (b === base) { trackPlace(cid, incoming); break }
+        }
         continue
       }
       // `transition:{ts}:{pubkey}`: signed by the user-identity in `pubkey`
@@ -612,6 +672,21 @@ async function init ({ dataDir } = {}, attempt = 0) {
       }
     }
     if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
+  }
+
+  // Populate the in-process geofence tracker from each circle's current
+  // view. Places landing later via apply branch will be added there too.
+  // Initial classification is null so the first location:update fires an
+  // initial-trigger enter if the user is already inside the radius.
+  _circlePlaces.clear()
+  for (const [circleId, base] of _circleBases) {
+    try {
+      for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+        if (value) trackPlace(circleId, value)
+      }
+    } catch (e) {
+      console.warn('[bare] failed to enumerate places for', circleId, e?.message)
+    }
   }
 
   _initialized = true
