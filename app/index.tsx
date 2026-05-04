@@ -14,6 +14,21 @@ let _workletStarted = false
 let _nextId = 1
 const _pending = new Map<number, (msg: any) => void>()
 const _eventHandlers = new Map<string, ((data: any) => void)[]>()
+let _locationListenerSet = false
+
+function ensureLocationListener() {
+  if (_locationListenerSet) return
+  if (!PearCircleLocation) return
+  const emitter = new NativeEventEmitter(PearCircleLocation)
+  // No corresponding remove(): the listener intentionally survives
+  // activity destruction so the foreground service's location callbacks
+  // continue to reach the worklet while the app is in the background or
+  // its task has been swiped from recents.
+  emitter.addListener('PearCircleLocation:update', (data: any) => {
+    sendToWorklet({ method: 'location:update', args: data })
+  })
+  _locationListenerSet = true
+}
 
 function onEvent(event: string, fn: (data: any) => void) {
   const handlers = _eventHandlers.get(event) ?? []
@@ -157,19 +172,15 @@ export default function Index() {
     if (Platform.OS !== 'android' && Platform.OS !== 'ios') return
     if (!PearCircleLocation) return
 
-    const emitter = new NativeEventEmitter(PearCircleLocation)
-    const sub = emitter.addListener('PearCircleLocation:update', (data: any) => {
-      sendToWorklet({ method: 'location:update', args: data })
-    })
-
+    ensureLocationListener()
     PearCircleLocation.startUpdates?.().catch?.((e: any) =>
       console.warn('startUpdates failed', e),
     )
 
-    return () => {
-      sub.remove()
-      PearCircleLocation.stopUpdates?.()
-    }
+    // Deliberately no cleanup: the location listener survives activity
+    // destruction (set up at module scope), and the foreground service
+    // is meant to keep running too. Stopping is an explicit user action
+    // (future "Stop sharing" toggle slice).
   }, [])
 
   const onMessage = async (e: any) => {
