@@ -2,6 +2,13 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-05-03 — wire-protocol v1 approved; implementation unblocked
+Tier: T3
+Context: `proposals/2026-05-03-wire-protocol.md` defined the v1 invite link, Hyperbee schema, Autobase apply branches, signed location-update envelope, Hyperswarm topic derivation, and geofence transition format for PearCircle. The proposal carried six open questions; all six were resolved on 2026-05-03 in the entries below (tile host, transition retention, battery/isMoving, presence/mute, admin model, avatar storage).
+Choice: Approve the proposal as written, with the six resolved open questions baked in. Wire protocol v1 is now load-bearing for any P2P code. Subsequent changes to invite/schema/apply/envelope/topic/geofence shape follow the Constitution §3 proposal gate. New optional fields are free; new required fields or semantic shifts bump to v2 with translation logic per §4 of the proposal.
+Alternatives considered: (a) ship without locking - rejected because cross-peer interop diverges the moment two devices run different code, (b) split into per-record-kind sub-proposals - rejected because the apply branches and envelope are coupled by signature/identity rules and reviewing them in isolation hides those couplings.
+Consequences: Resolves the "Approve `proposals/2026-05-03-wire-protocol.md`" foundation TODO and the four "Wire protocol (T3, see proposal)" TODO sub-items. Unblocks `src/identity.js`, `src/invite.js`, `src/bare.js`, and the pair flow. REVIEW filed at `reviews/2026-05-03-wire-protocol.md` per Constitution §6. Wiki-synced per §7 so PearCal and PearGuard work can reference the same patterns.
+
 ## 2026-05-03 — avatars stored inline as base64 in `member:{pubkey}` records, ~30KB cap
 Tier: T2
 Context: Open question #6 in the wire-protocol proposal asked how to replicate per-member profile photos across a circle. Three options surfaced: (a) inline base64 inside `member:{pubkey}`, (b) Hyperdrive per circle with content-addressed hashes, (c) no avatars in v1, initials-only.

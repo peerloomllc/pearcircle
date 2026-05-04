@@ -1,5 +1,7 @@
 # Wire protocol — PearCircle v1
 
+**Status**: Approved 2026-05-03. All open questions resolved (see `DECISIONS.md`); approval record in `reviews/2026-05-03-wire-protocol.md`. Subsequent protocol changes follow the Constitution §3 proposal gate.
+
 **Goal**: Define the wire protocol for PearCircle v1 (invite link, Hyperbee schema, Autobase apply branches, location-update message envelope, geofence transition format) so cross-peer interop is stable from the first device build.
 
 **Tier**: T3. New protocol from scratch. Old peers do not exist yet, so the only "compat" obligation is forward-compat for the v1 series we choose to ship.

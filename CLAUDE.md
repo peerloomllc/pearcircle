@@ -17,7 +17,7 @@ A native location layer (CoreLocation on iOS, FusedLocationProvider + Geofencing
 
 ## Status
 
-Scaffold only. Wire protocol unspecified. See `proposals/2026-05-03-wire-protocol.md` (T3) for the open design before any P2P code lands.
+Wire protocol v1 locked 2026-05-03. See `proposals/2026-05-03-wire-protocol.md` (T3) for the spec and `reviews/2026-05-03-wire-protocol.md` for the approval record. Implementation work tracked in `TODO.md`.
 
 ## Build & Deploy
 
