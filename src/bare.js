@@ -208,11 +208,20 @@ const handlers = {
     for await (const { value } of view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
       if (value) places.push(value)
     }
+    // Most recent 50 transitions, newest first. Reverse-stream the
+    // ts-prefixed keys so we don't have to load the whole range.
+    const transitions = []
+    for await (const { value } of view.createReadStream({
+      gt: 'transition:', lt: 'transition:~', reverse: true, limit: 50,
+    })) {
+      if (value) transitions.push(value)
+    }
     return {
       circle: circleRow ? circleRow.value : null,
       members,
       lastSeen,
       places,
+      transitions,
       writable: base.writable,
       writers: base.writers ? base.writers.length : null,
     }
@@ -275,6 +284,39 @@ const handlers = {
       if (value) places.push(value)
     }
     return { places }
+  },
+
+  'geofence:transition': async ({ circleId, placeId, kind, lat, lon, accuracy, ts } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof placeId !== 'string') throw new Error('placeId must be a string')
+    if (kind !== 'enter' && kind !== 'exit') throw new Error("kind must be 'enter' or 'exit'")
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+
+    const pubkey = b4a.toString(_identity.publicKey, 'hex')
+    const stamp = typeof ts === 'number' ? ts : Date.now()
+    const transition = { pubkey, placeId, kind, ts: stamp, v: 1 }
+
+    await base.append({ type: 'put', key: 'transition:' + stamp + ':' + pubkey, value: transition })
+
+    // Per proposal §7, a transition also refreshes lastSeen so peers see
+    // a fresh location pin alongside the new status. lat/lon are optional
+    // because the native module may fire a transition without coords on
+    // some platforms; in that case we leave lastSeen untouched.
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      const seen = {
+        lat,
+        lon,
+        accuracy: Number.isFinite(accuracy) ? accuracy : null,
+        ts: stamp,
+        v: 1,
+      }
+      await base.append({ type: 'put', key: 'lastSeen:' + pubkey, value: seen })
+    }
+
+    return { ok: true, transition }
   },
 
   'circles:list': async () => {
@@ -394,8 +436,25 @@ async function applyCircleNodes (nodes, view, base) {
         await view.put(op.key, incoming)
         continue
       }
-      // Other prefixes (transition, presence, removed) not yet wired —
-      // silently dropped.
+      // `transition:{ts}:{pubkey}`: any current writer; key is unique per
+      // (ts, pubkey) so no merge needed. The writer self-attests pubkey;
+      // strict own-pubkey enforcement (proposal §4/§5) requires Ed25519
+      // signing on the value, which is a separate slice. lastSeen has the
+      // same gap today, so matching its loose behavior keeps the two
+      // record kinds consistent until signing lands.
+      if (op.key.startsWith('transition:')) {
+        const incoming = op.value
+        if (!incoming || typeof incoming.pubkey !== 'string') continue
+        const tail = op.key.slice('transition:'.length)
+        const colon = tail.indexOf(':')
+        if (colon < 0) continue
+        const keyPubkey = tail.slice(colon + 1)
+        if (keyPubkey !== incoming.pubkey) continue
+        await view.put(op.key, incoming)
+        continue
+      }
+      // Other prefixes (presence, removed) not yet wired — silently
+      // dropped.
     }
   }
 }

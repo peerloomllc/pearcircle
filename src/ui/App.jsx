@@ -216,6 +216,7 @@ function DetailView ({ circleId, myPubkey, setView }) {
   const [claiming, setClaiming] = useState(false)
   const [claimError, setClaimError] = useState(null)
   const [showAddPlace, setShowAddPlace] = useState(false)
+  const [transitionError, setTransitionError] = useState(null)
 
   const refresh = useCallback(async () => {
     const [d, p] = await Promise.all([
@@ -247,6 +248,23 @@ function DetailView ({ circleId, myPubkey, setView }) {
     setClaiming(false)
   }
 
+  const fireTransition = useCallback(async (place, kind) => {
+    setTransitionError(null)
+    try {
+      const seen = myPubkey ? data?.lastSeen?.[myPubkey] : null
+      await pear.call('geofence:transition', {
+        circleId,
+        placeId: place.id,
+        kind,
+        lat: seen?.lat ?? place.lat,
+        lon: seen?.lon ?? place.lon,
+      })
+      await refresh()
+    } catch (e) {
+      setTransitionError(String(e?.message ?? e))
+    }
+  }, [circleId, data, myPubkey, refresh])
+
   if (!data) {
     return (
       <div style={s.screen}>
@@ -255,9 +273,15 @@ function DetailView ({ circleId, myPubkey, setView }) {
     )
   }
 
-  const ownMember = data.members.find(m => m.value?.pubkey && data.circle?.ownerKey !== m.value.pubkey)
   const isWritable = data.writable
-  const myMember = data.members.find(m => m.key.endsWith(short(window.__myPubkey ?? '')))
+  // data.transitions is sorted desc by ts, so the first entry per pubkey
+  // is the most recent. Build a lookup once.
+  const latestTransition = {}
+  for (const t of data.transitions ?? []) {
+    if (t?.pubkey && !latestTransition[t.pubkey]) latestTransition[t.pubkey] = t
+  }
+  const placesById = {}
+  for (const p of data.places ?? []) placesById[p.id] = p
 
   return (
     <div style={s.screen}>
@@ -276,10 +300,19 @@ function DetailView ({ circleId, myPubkey, setView }) {
           {data.members.map(m => {
             const pubkey = m.value?.pubkey ?? ''
             const seen = data.lastSeen?.[pubkey]
+            const t = latestTransition?.[pubkey]
+            const tPlaceName = t ? placesById?.[t.placeId]?.name : null
             return (
               <li key={m.key} style={s.memberItem}>
                 <div style={s.memberName}>{m.value?.displayName ?? short(pubkey)}</div>
                 <div style={s.muted}>{short(pubkey)}</div>
+                {t && (
+                  <div style={s.status}>
+                    {t.kind === 'enter' ? 'at ' : 'left '}
+                    {tPlaceName ?? '(unknown place)'}
+                    {' · '}{ageLabel(t.ts)}
+                  </div>
+                )}
                 {seen ? (
                   <div style={s.lastSeen}>
                     {seen.lat.toFixed(5)}, {seen.lon.toFixed(5)}
@@ -306,10 +339,21 @@ function DetailView ({ circleId, myPubkey, setView }) {
               <div style={s.lastSeen}>
                 {p.lat.toFixed(5)}, {p.lon.toFixed(5)} · {p.radiusMeters}m
               </div>
+              {isWritable && (
+                <div style={s.transitionBtns}>
+                  <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
+                    Fire enter (debug)
+                  </button>
+                  <button style={s.smallBtn} onClick={() => fireTransition(p, 'exit')}>
+                    Fire exit (debug)
+                  </button>
+                </div>
+              )}
             </li>
           ))}
         </ul>
       )}
+      {transitionError && <p style={s.error}>{transitionError}</p>}
 
       {isWritable && !showAddPlace && (
         <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
@@ -531,4 +575,7 @@ const s = {
   memberName: { fontSize: 15, fontWeight: 500 },
   lastSeen: { fontSize: 12, color: '#9cf', marginTop: 4, fontFamily: 'monospace' },
   lastSeenMuted: { fontSize: 12, color: '#555', marginTop: 4, fontStyle: 'italic' },
+  status: { fontSize: 13, color: '#cfc', marginTop: 4, fontWeight: 500 },
+  transitionBtns: { display: 'flex', gap: 8, marginTop: 8 },
+  smallBtn: { flex: 1, padding: '8px 10px', background: '#222', color: '#ccc', border: '1px solid #333', borderRadius: 6, fontSize: 12, cursor: 'pointer' },
 }
