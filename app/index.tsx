@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { View, Text, StyleSheet, NativeModules, Platform, AppState } from 'react-native'
+import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState } from 'react-native'
 import { WebView } from 'react-native-webview'
 import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
@@ -154,8 +154,21 @@ export default function Index() {
   }
 
   useEffect(() => {
-    if (Platform.OS === 'ios' || Platform.OS === 'android') {
-      PearCircleLocation?.startUpdates?.()
+    if (Platform.OS !== 'android' && Platform.OS !== 'ios') return
+    if (!PearCircleLocation) return
+
+    const emitter = new NativeEventEmitter(PearCircleLocation)
+    const sub = emitter.addListener('PearCircleLocation:update', (data: any) => {
+      sendToWorklet({ method: 'location:update', args: data })
+    })
+
+    PearCircleLocation.startUpdates?.().catch?.((e: any) =>
+      console.warn('startUpdates failed', e),
+    )
+
+    return () => {
+      sub.remove()
+      PearCircleLocation.stopUpdates?.()
     }
   }, [])
 

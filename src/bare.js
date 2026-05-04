@@ -162,9 +162,15 @@ const handlers = {
     for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
       members.push({ key, value })
     }
+    const lastSeen = {}
+    for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
+      const pubkey = key.slice('lastSeen:'.length)
+      lastSeen[pubkey] = value
+    }
     return {
       circle: circleRow ? circleRow.value : null,
       members,
+      lastSeen,
       writable: base.writable,
       writers: base.writers ? base.writers.length : null,
     }
@@ -210,6 +216,33 @@ const handlers = {
       out[circleId] = Array.from(peers)
     }
     return { peers: out }
+  },
+
+  'location:update': async ({ lat, lon, accuracy, ts, speed } = {}) => {
+    if (!_initialized) return { ok: false, reason: 'not_initialized' }
+    if (typeof lat !== 'number' || typeof lon !== 'number') {
+      return { ok: false, reason: 'invalid_coords' }
+    }
+    const value = {
+      lat,
+      lon,
+      accuracy: typeof accuracy === 'number' ? accuracy : null,
+      ts: typeof ts === 'number' ? ts : Date.now(),
+      speed: typeof speed === 'number' ? speed : null,
+      v: 1,
+    }
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    let written = 0
+    for (const [, base] of _circleBases) {
+      if (!base.writable) continue
+      try {
+        await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
+        written++
+      } catch {
+        // base closed mid-flight, etc.
+      }
+    }
+    return { ok: true, written, pubkey: ourKey }
   },
 }
 
@@ -257,7 +290,12 @@ async function applyCircleNodes (nodes, view, base) {
         await view.put(op.key, op.value)
         continue
       }
-      // Other prefixes (place, lastSeen, transition, presence, removed)
+      // `lastSeen:{pubkey}`: any current writer; last-write-wins
+      if (op.key.startsWith('lastSeen:')) {
+        await view.put(op.key, op.value)
+        continue
+      }
+      // Other prefixes (place, transition, presence, removed)
       // not yet wired — silently dropped.
     }
   }

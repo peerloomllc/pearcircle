@@ -255,12 +255,25 @@ function DetailView ({ circleId, setView }) {
         <p style={s.muted}>No members visible yet. Waiting for sync...</p>
       ) : (
         <ul style={s.memberList}>
-          {data.members.map(m => (
-            <li key={m.key} style={s.memberItem}>
-              <div style={s.memberName}>{m.value?.displayName ?? short(m.value?.pubkey ?? '')}</div>
-              <div style={s.muted}>{short(m.value?.pubkey ?? '')}</div>
-            </li>
-          ))}
+          {data.members.map(m => {
+            const pubkey = m.value?.pubkey ?? ''
+            const seen = data.lastSeen?.[pubkey]
+            return (
+              <li key={m.key} style={s.memberItem}>
+                <div style={s.memberName}>{m.value?.displayName ?? short(pubkey)}</div>
+                <div style={s.muted}>{short(pubkey)}</div>
+                {seen ? (
+                  <div style={s.lastSeen}>
+                    {seen.lat.toFixed(5)}, {seen.lon.toFixed(5)}
+                    {' · '}{ageLabel(seen.ts)}
+                    {seen.accuracy != null && ` · ±${Math.round(seen.accuracy)}m`}
+                  </div>
+                ) : (
+                  <div style={s.lastSeenMuted}>no location yet</div>
+                )}
+              </li>
+            )
+          })}
         </ul>
       )}
 
@@ -312,6 +325,16 @@ function CopyButton ({ text }) {
   )
 }
 
+function ageLabel (ts) {
+  if (typeof ts !== 'number') return ''
+  const ms = Date.now() - ts
+  if (ms < 0) return 'just now'
+  if (ms < 60_000) return Math.max(1, Math.floor(ms / 1000)) + 's ago'
+  if (ms < 3_600_000) return Math.floor(ms / 60_000) + 'm ago'
+  if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + 'h ago'
+  return Math.floor(ms / 86_400_000) + 'd ago'
+}
+
 function short (s) {
   if (!s || typeof s !== 'string') return '...'
   if (s.length <= 12) return s
@@ -344,4 +367,6 @@ const s = {
   memberList: { listStyle: 'none', padding: 0, margin: 0 },
   memberItem: { padding: 12, background: '#1c1c1c', borderRadius: 10, marginBottom: 8 },
   memberName: { fontSize: 15, fontWeight: 500 },
+  lastSeen: { fontSize: 12, color: '#9cf', marginTop: 4, fontFamily: 'monospace' },
+  lastSeenMuted: { fontSize: 12, color: '#555', marginTop: 4, fontStyle: 'italic' },
 }
