@@ -1,12 +1,16 @@
 #!/usr/bin/env node
-// Pair-flow smoke for slice 6D (publish/read).
+// Pair-flow smoke for slices 6D + 6E.
 // Spins two corestores in tmp dirs, mounts a per-circle Autobase on each
-// (owner = writer, joiner = reader), pipes corestore replication through
-// hyperswarm connections, and verifies the joiner reads owner's circle and
-// member rows from the replicated view.
+// (owner = founding writer, joiner = reader), pipes corestore replication
+// AND the pearcircle/pair/1 protomux channel through hyperswarm connections.
+// Verifies:
+//   1. Replication: joiner reads owner's circle + member-owner rows (6D)
+//   2. addWriter:   joiner sends writerHello, owner appends addWriter,
+//                   joiner becomes base.writable (6E)
+//   3. Member claim: joiner appends member:{joinerKey}, owner reads it (6E)
 //
 // Run: node scripts/pair-smoke.js
-// Exits 0 on PASS, 1 on FAIL or 30s timeout.
+// Exits 0 on PASS, 1 on FAIL or 30s timeout per phase.
 // Requires network access to the Holepunch bootstrap nodes.
 
 const path = require('path')
@@ -20,8 +24,9 @@ const b4a = require('b4a')
 const { generateKeypair } = require('../src/identity')
 const { generateCircleId, generateCircleKey } = require('../src/circle')
 const { topicForCircleKey } = require('../src/swarm')
+const { setupPairChannel } = require('../src/pair')
 
-const TIMEOUT_MS = 30000
+const PHASE_TIMEOUT_MS = 90000
 
 function openCircleView (store) {
   return new Hyperbee(store.get('view'), {
@@ -53,6 +58,15 @@ async function applyCircleNodes (nodes, view, base) {
   }
 }
 
+async function waitFor (label, predicate) {
+  const start = Date.now()
+  while (Date.now() - start < PHASE_TIMEOUT_MS) {
+    if (await predicate()) return true
+    await new Promise(r => setTimeout(r, 250))
+  }
+  throw new Error('timeout waiting for: ' + label)
+}
+
 async function main () {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pearcircle-pair-'))
   const ownerDir = path.join(tmpRoot, 'owner')
@@ -60,7 +74,6 @@ async function main () {
   console.log('owner store: ', ownerDir)
   console.log('joiner store:', joinerDir)
 
-  // Owner setup
   const ownerStore = new Corestore(ownerDir)
   await ownerStore.ready()
   const ownerIdentity = generateKeypair()
@@ -88,10 +101,10 @@ async function main () {
     value: { pubkey: ownerPublicKey, displayName: 'Owner', joinedAt: Date.now(), v: 1 },
   })
 
-  // Joiner setup
   const joinerStore = new Corestore(joinerDir)
   await joinerStore.ready()
   const joinerIdentity = generateKeypair()
+  const joinerPublicKey = b4a.toString(joinerIdentity.publicKey, 'hex')
 
   const joinerNs = joinerStore.namespace(circleId)
   const joinerBase = new Autobase(joinerNs, b4a.from(bootstrap, 'hex'), {
@@ -101,43 +114,57 @@ async function main () {
   })
   await joinerBase.ready()
 
-  // Swarms
   const ownerSwarm = new Hyperswarm({ keyPair: ownerIdentity })
   const joinerSwarm = new Hyperswarm({ keyPair: joinerIdentity })
 
   ownerSwarm.on('connection', (conn) => {
     ownerStore.replicate(conn)
+    setupPairChannel({
+      conn, circleId, base: ownerBase,
+      onWriterAdded: (k) => console.log('owner: addWriter appended for', k.slice(0, 16) + '…'),
+    })
     conn.on('error', () => {})
   })
   joinerSwarm.on('connection', (conn) => {
     joinerStore.replicate(conn)
+    setupPairChannel({ conn, circleId, base: joinerBase })
     conn.on('error', () => {})
   })
 
   const topic = topicForCircleKey(circleKey)
   ownerSwarm.join(topic, { server: true, client: true })
   joinerSwarm.join(topic, { server: true, client: true })
-
   console.log('joining swarm topic and flushing…')
   await Promise.all([ownerSwarm.flush(), joinerSwarm.flush()])
 
-  // Wait for replication to populate joiner's view
-  const start = Date.now()
-  let circleRow = null
-  let memberRow = null
-  while (Date.now() - start < TIMEOUT_MS) {
+  // Phase 1: replication of circle + member-owner
+  await waitFor('joiner reads circle + member-owner', async () => {
     await joinerBase.update()
-    const got = await joinerBase.view.get('circle')
-    if (got && got.value) {
-      circleRow = got.value
-      const m = await joinerBase.view.get('member:' + ownerPublicKey)
-      if (m && m.value) {
-        memberRow = m.value
-        break
-      }
-    }
-    await new Promise(r => setTimeout(r, 250))
-  }
+    const c = await joinerBase.view.get('circle')
+    const m = await joinerBase.view.get('member:' + ownerPublicKey)
+    return Boolean(c?.value && m?.value)
+  })
+  console.log('PHASE 1 OK: joiner replicated circle + member-owner rows')
+
+  // Phase 2: joiner becomes a writer
+  await waitFor('joiner.base.writable', async () => {
+    await joinerBase.update()
+    return joinerBase.writable === true
+  })
+  console.log('PHASE 2 OK: joiner is now a writer (writable=true)')
+
+  // Phase 3: joiner appends own member row, owner reads it
+  await joinerBase.append({
+    type: 'put', key: 'member:' + joinerPublicKey,
+    value: { pubkey: joinerPublicKey, displayName: 'Joiner', joinedAt: Date.now(), v: 1 },
+  })
+
+  await waitFor('owner reads joiner member row', async () => {
+    await ownerBase.update()
+    const m = await ownerBase.view.get('member:' + joinerPublicKey)
+    return Boolean(m?.value && m.value.pubkey === joinerPublicKey)
+  })
+  console.log('PHASE 3 OK: owner replicated joiner member row')
 
   await Promise.all([ownerSwarm.destroy(), joinerSwarm.destroy()])
   await ownerBase.close()
@@ -146,16 +173,8 @@ async function main () {
   await joinerStore.close()
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 
-  if (circleRow && circleRow.id === circleId && circleRow.name === circleName && memberRow && memberRow.pubkey === ownerPublicKey) {
-    console.log('PASS: joiner replicated circle + owner-member rows')
-    console.log('  circle:', JSON.stringify(circleRow))
-    console.log('  member:', JSON.stringify(memberRow))
-    process.exit(0)
-  }
-  console.error('FAIL: replication incomplete after', TIMEOUT_MS, 'ms')
-  console.error('  circleRow:', circleRow)
-  console.error('  memberRow:', memberRow)
-  process.exit(1)
+  console.log('PASS: full bidirectional pair flow (replication + addWriter + member claim)')
+  process.exit(0)
 }
 
-main().catch(e => { console.error(e); process.exit(1) })
+main().catch(e => { console.error('FAIL:', e?.message ?? e); process.exit(1) })

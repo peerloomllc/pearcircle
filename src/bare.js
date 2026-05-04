@@ -3,8 +3,7 @@
 // Runs inside the Bare runtime launched by BareKit. No Node.js APIs.
 //
 // Slices landed: identity, local circle creation, Hyperswarm topic join,
-// per-circle Autobase + replication (publish/read).
-// Still to come: addWriter pair flow (joiner becomes a writer).
+// per-circle Autobase + replication, addWriter pair flow.
 //
 // IPC envelope per CLAUDE.md:
 //   shell → worklet: { id, method, args }
@@ -31,6 +30,7 @@ const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey } = require('./circle')
 const { buildInvite, parseInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
+const { setupPairChannel } = require('./pair')
 
 let _store = null
 let _localDb = null
@@ -170,6 +170,28 @@ const handlers = {
     }
   },
 
+  'circle:append:member': async ({ circleId, displayName } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const dn = (typeof displayName === 'string' && displayName.length > 0)
+      ? displayName.slice(0, 64)
+      : ourKey.slice(0, 8)
+    const joinedAt = Date.now()
+
+    await base.append({
+      type: 'put',
+      key: 'member:' + ourKey,
+      value: { pubkey: ourKey, displayName: dn, joinedAt, v: 1 },
+    })
+
+    return { ok: true, pubkey: ourKey, displayName: dn, joinedAt }
+  },
+
   'circles:list': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const circles = []
@@ -268,6 +290,18 @@ function onSwarmConnection (conn, info) {
     if (circleId) matchedCircleIds.push(circleId)
   }
   for (const circleId of matchedCircleIds) {
+    const base = _circleBases.get(circleId)
+    if (base) {
+      setupPairChannel({
+        conn,
+        circleId,
+        base,
+        onWriterAdded: (writerKey) => {
+          send({ event: 'circle:writer:added', data: { circleId, writerKey } })
+        },
+      })
+    }
+
     const peers = _circlePeers.get(circleId)
     if (peers) peers.add(remotePublicKey)
     send({ event: 'peer:connected', data: { circleId, remotePublicKey } })
