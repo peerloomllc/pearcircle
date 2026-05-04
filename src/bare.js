@@ -1,45 +1,107 @@
 // PearCircle — Bare worklet entry point.
+// Wire protocol v1 (proposals/2026-05-03-wire-protocol.md).
+// Runs inside the Bare runtime launched by BareKit. No Node.js APIs.
 //
-// Wire protocol is unspecified pending proposals/2026-05-03-wire-protocol.md.
-// This file currently only handles the IPC envelope and routes a small set of
-// stub methods so the shell can boot end-to-end before P2P code lands.
+// First slice: identity-only persistence. Hyperswarm, Autobase, and per-circle
+// state come in subsequent slices.
+//
+// IPC envelope per CLAUDE.md:
+//   shell → worklet: { id, method, args }
+//   worklet → shell: { id, result } or { id, error }
+//   worklet → shell (events): { event, data }
+//
+// Shell MUST send `init` with a writable dataDir before any other method.
 
-const ipc = BareKit.IPC
-const send = (msg) => ipc.write(Buffer.from(JSON.stringify(msg) + '\n'))
+const Corestore = require('corestore')
+const Hyperbee = require('hyperbee')
+const b4a = require('b4a')
+const { generateKeypair } = require('./identity')
+
+let _store = null
+let _localDb = null
+let _identity = null
+let _initialized = false
+
+const send = (msg) => BareKit.IPC.write(Buffer.from(JSON.stringify(msg) + '\n'))
 
 const handlers = {
   'ping': async () => ({ ok: true, ts: Date.now() }),
-  'app:state': async ({ state }) => {
-    // Worklet stays alive across RN background/foreground; nothing to do yet.
-    return { state }
-  },
+
+  'app:state': async ({ state }) => ({ state }),
+
   'identity:get': async () => {
-    // Stub. Real impl will read `identity` from local Hyperbee, generating
-    // a fresh sodium keypair on first launch.
-    return { publicKey: null, ready: false }
+    if (!_identity) return { publicKey: null, ready: false }
+    return { publicKey: b4a.toString(_identity.publicKey, 'hex'), ready: true }
   },
-  'circles:list': async () => ({ circles: [] }),
-  'members:list': async ({ circleId: _circleId }) => ({ members: [] }),
-  'places:list': async ({ circleId: _circleId }) => ({ places: [] }),
-  'lastSeen:list': async ({ circleId: _circleId }) => ({ entries: [] }),
-  'location:update': async ({ lat: _lat, lon: _lon, ts: _ts }) => {
-    // Native location module pushes here; stub accepts and ignores for now.
-    return { accepted: true }
-  },
-  'geofence:transition': async ({ placeId: _placeId, kind: _kind, ts: _ts }) => {
-    return { accepted: true }
+}
+
+async function init ({ dataDir } = {}, attempt = 0) {
+  if (_initialized) {
+    send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex') } })
+    return
   }
+  if (!dataDir || typeof dataDir !== 'string') {
+    throw new Error('init requires { dataDir: string }')
+  }
+
+  // Retry on lock errors: BareKit may restart the worklet before the prior
+  // instance has released the corestore lock file.
+  try {
+    _store = new Corestore(dataDir + '/pearcircle/store')
+    await _store.ready()
+  } catch (e) {
+    if (e?.message?.includes('lock') && attempt < 20) {
+      await new Promise(r => setTimeout(r, 1000))
+      return init({ dataDir }, attempt + 1)
+    }
+    throw e
+  }
+
+  const localCore = _store.get({ name: 'local' })
+  await localCore.ready()
+  _localDb = new Hyperbee(localCore, { keyEncoding: 'utf-8', valueEncoding: 'json' })
+  await _localDb.ready()
+
+  const stored = await _localDb.get('identity')
+  if (stored) {
+    _identity = {
+      publicKey: b4a.from(stored.value.publicKey, 'hex'),
+      secretKey: b4a.from(stored.value.secretKey, 'hex'),
+    }
+  } else {
+    _identity = generateKeypair()
+    await _localDb.put('identity', {
+      publicKey: b4a.toString(_identity.publicKey, 'hex'),
+      secretKey: b4a.toString(_identity.secretKey, 'hex'),
+      createdAt: Date.now(),
+    })
+  }
+
+  _initialized = true
+  send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex') } })
 }
 
 let buffer = ''
-ipc.on('data', async (chunk) => {
+BareKit.IPC.on('data', async (chunk) => {
   buffer += chunk.toString()
   let nl
   while ((nl = buffer.indexOf('\n')) !== -1) {
     const line = buffer.slice(0, nl)
     buffer = buffer.slice(nl + 1)
+    if (!line.trim()) continue
+
     let msg
     try { msg = JSON.parse(line) } catch { continue }
+
+    if (msg.method === 'init') {
+      try {
+        await init(msg.args ?? {})
+        send({ id: msg.id, result: { ok: true } })
+      } catch (err) {
+        send({ id: msg.id, error: err?.message ?? String(err) })
+      }
+      continue
+    }
 
     const handler = handlers[msg.method]
     if (!handler) {
@@ -54,5 +116,3 @@ ipc.on('data', async (chunk) => {
     }
   }
 })
-
-send({ event: 'ready' })
