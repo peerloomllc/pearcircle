@@ -1,56 +1,111 @@
-// PearCircle — Invite link build/parse.
+// Invite link builder and parser for PearCircle.
+// Wire format per proposals/2026-05-03-wire-protocol.md §2:
+//   https://peerloomllc.com/circle/join?circle={base64url(32)}&name={name}&key={hex(32)}&inviter={hex(32)}
+// Legacy custom scheme also accepted: pear://pearcircle/join?...
 //
-// Format (current):
-//   https://peerloomllc.com/circle/join?circle={base64(circleId)}&name={name}&key={hex}&inviter={hex}
-//
-// Legacy custom scheme also accepted:
-//   pear://pearcircle/join?circle=...&name=...&key=...&inviter=...
-//
-// Per-app `/circle/` path prefix avoids collision with PearCal's `/join` on
-// the same shared host.
+// Path prefix is /circle/ (not /join/) so the link never collides with
+// PearCal's invites on the shared peerloomllc.com host.
 
-const HOST_PATH = 'https://peerloomllc.com/circle/join'
-const LEGACY_SCHEME = 'pear://pearcircle/join'
+const HTTPS_HOST_PATH = 'https://peerloomllc.com/circle/join'
+const PEAR_HOST_PATH = 'pear://pearcircle/join'
 
-const MAX_NAME = 64
-const KEY_LEN = 64
+const HEX_64 = /^[0-9a-f]{64}$/i
+const BASE64URL_43 = /^[A-Za-z0-9_-]{43}$/
+const NAME_MAX = 64
 
-function buildInvite({ circleId, name, key, inviter }) {
-  if (!circleId || !key || !inviter) throw new Error('missing required field')
-  if (name && name.length > MAX_NAME) throw new Error('name too long')
-  if (key.length !== KEY_LEN) throw new Error('bad key length')
-  const params = new URLSearchParams({
-    circle: Buffer.from(circleId).toString('base64'),
-    name: name ?? '',
-    key,
-    inviter
-  })
-  return `${HOST_PATH}?${params}`
-}
-
-function parseInvite(url) {
-  const trimmed = String(url ?? '').trim()
-  let qIndex = trimmed.indexOf('?')
-  if (qIndex === -1) throw new Error('no query string')
-
-  const path = trimmed.slice(0, qIndex)
-  const isHttps = path === HOST_PATH
-  const isLegacy = path === LEGACY_SCHEME
-  if (!isHttps && !isLegacy) throw new Error('unrecognized invite host/path')
-
-  const params = new URLSearchParams(trimmed.slice(qIndex + 1))
-  const circleB64 = params.get('circle')
-  const key = params.get('key')
-  const inviter = params.get('inviter')
-  if (!circleB64 || !key || !inviter) throw new Error('missing required param')
-  if (key.length !== KEY_LEN) throw new Error('bad key length')
-
-  return {
-    circleId: Buffer.from(circleB64, 'base64').toString('utf8'),
-    name: params.get('name') ?? '',
-    key,
-    inviter
+/**
+ * Build an invite link.
+ * @param {object} args
+ * @param {string} args.circleId - 43-char base64url (32 bytes, no padding)
+ * @param {string} args.name - 1..64 char display name (raw, will be URL-encoded)
+ * @param {string} args.circleKey - 64-char hex (32 bytes)
+ * @param {string} args.inviterPublicKey - 64-char hex (32 bytes)
+ * @param {'https'|'pear'} [args.scheme='https']
+ * @returns {string}
+ */
+function buildInvite ({ circleId, name, circleKey, inviterPublicKey, scheme = 'https' }) {
+  if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
+    throw new Error('circleId must be a 43-char base64url string (32 bytes)')
   }
+  if (typeof name !== 'string' || name.length === 0 || name.length > NAME_MAX) {
+    throw new Error(`name must be a non-empty string of at most ${NAME_MAX} chars`)
+  }
+  if (typeof circleKey !== 'string' || !HEX_64.test(circleKey)) {
+    throw new Error('circleKey must be a 64-char hex string (32 bytes)')
+  }
+  if (typeof inviterPublicKey !== 'string' || !HEX_64.test(inviterPublicKey)) {
+    throw new Error('inviterPublicKey must be a 64-char hex string (32 bytes)')
+  }
+  if (scheme !== 'https' && scheme !== 'pear') {
+    throw new Error('scheme must be "https" or "pear"')
+  }
+
+  const base = scheme === 'pear' ? PEAR_HOST_PATH : HTTPS_HOST_PATH
+  const params = [
+    `circle=${circleId}`,
+    `name=${encodeURIComponent(name)}`,
+    `key=${circleKey}`,
+    `inviter=${inviterPublicKey}`,
+  ].join('&')
+  return `${base}?${params}`
 }
 
-module.exports = { buildInvite, parseInvite, HOST_PATH, LEGACY_SCHEME }
+/**
+ * Parse an invite link.
+ * @param {string} url
+ * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, inviterPublicKey?: string, error?: string }}
+ */
+function parseInvite (url) {
+  if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
+
+  let scheme, qs
+  if (url.startsWith(HTTPS_HOST_PATH + '?')) {
+    scheme = 'https'
+    qs = url.slice(HTTPS_HOST_PATH.length + 1)
+  } else if (url.startsWith(PEAR_HOST_PATH + '?')) {
+    scheme = 'pear'
+    qs = url.slice(PEAR_HOST_PATH.length + 1)
+  } else {
+    return { ok: false, error: 'not a PearCircle invite link' }
+  }
+
+  const params = parseQuery(qs)
+  const circleId = params.circle
+  const name = params.name
+  const circleKey = params.key
+  const inviterPublicKey = params.inviter
+
+  if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
+    return { ok: false, error: 'invalid or missing circleId' }
+  }
+  if (typeof name !== 'string' || name.length === 0 || name.length > NAME_MAX) {
+    return { ok: false, error: 'invalid or missing name' }
+  }
+  if (typeof circleKey !== 'string' || !HEX_64.test(circleKey)) {
+    return { ok: false, error: 'invalid or missing circleKey' }
+  }
+  if (typeof inviterPublicKey !== 'string' || !HEX_64.test(inviterPublicKey)) {
+    return { ok: false, error: 'invalid or missing inviterPublicKey' }
+  }
+
+  return { ok: true, scheme, circleId, name, circleKey, inviterPublicKey }
+}
+
+function parseQuery (qs) {
+  const params = {}
+  if (!qs) return params
+  for (const pair of qs.split('&')) {
+    const eq = pair.indexOf('=')
+    if (eq < 0) continue
+    try {
+      const k = decodeURIComponent(pair.slice(0, eq))
+      const v = decodeURIComponent(pair.slice(eq + 1))
+      params[k] = v
+    } catch {
+      // skip pairs with malformed percent-encoding
+    }
+  }
+  return params
+}
+
+module.exports = { buildInvite, parseInvite, NAME_MAX }
