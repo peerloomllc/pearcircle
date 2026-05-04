@@ -5,6 +5,7 @@ import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
 import { Asset } from 'expo-asset'
 import * as FileSystem from 'expo-file-system/legacy'
+import * as Linking from 'expo-linking'
 
 const { PearCircleLocation } = NativeModules
 
@@ -73,18 +74,84 @@ async function startWorklet() {
   await call('init', { dataDir })
 }
 
+function buildHtml(jsBundle: string) {
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <style>
+      html, body, #root { height: 100%; margin: 0; padding: 0; background: #111; }
+      body { -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>${jsBundle}</script>
+  </body>
+</html>`
+}
+
+async function loadUiHtml(): Promise<string> {
+  const asset = Asset.fromModule(require('../assets/app-ui.bundle'))
+  await asset.downloadAsync()
+  const js = await FileSystem.readAsStringAsync(asset.localUri!, {
+    encoding: FileSystem.EncodingType.UTF8,
+  })
+  return buildHtml(js)
+}
+
+function isInviteUrl(url: string) {
+  return url.startsWith('pear://pearcircle/join?') ||
+         url.startsWith('https://peerloomllc.com/circle/join?')
+}
+
 export default function Index() {
   const webViewRef = useRef<WebView>(null)
-  const [uiReady, setUiReady] = useState(false)
+  const [html, setHtml] = useState<string | null>(null)
+  const webViewLoaded = useRef(false)
+  const pendingDeeplink = useRef<string | null>(null)
 
   useEffect(() => {
     startWorklet().catch((e) => console.warn('worklet start failed', e))
+    loadUiHtml().then(setHtml).catch((e) => console.warn('UI bundle load failed', e))
 
     const sub = AppState.addEventListener('change', (s) => {
       sendToWorklet({ method: 'app:state', args: { state: s } })
     })
-    return () => sub.remove()
+
+    // Forward worklet events to the WebView so the UI can react.
+    onEvent('ready', (data) => emitEvent('ready', data))
+    onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
+    onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
+    onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
+
+    // Deep links: pear://pearcircle/join?... and https equivalent.
+    Linking.getInitialURL().then((url) => {
+      if (url && isInviteUrl(url)) deliverDeeplink(url)
+    })
+    const linkSub = Linking.addEventListener('url', ({ url }) => {
+      if (isInviteUrl(url)) deliverDeeplink(url)
+    })
+
+    return () => { sub.remove(); linkSub.remove() }
   }, [])
+
+  const deliverDeeplink = (url: string) => {
+    if (webViewLoaded.current) {
+      emitEvent('deeplink:invite', { url })
+    } else {
+      pendingDeeplink.current = url
+    }
+  }
+
+  const onLoad = () => {
+    webViewLoaded.current = true
+    if (pendingDeeplink.current) {
+      emitEvent('deeplink:invite', { url: pendingDeeplink.current })
+      pendingDeeplink.current = null
+    }
+  }
 
   useEffect(() => {
     if (Platform.OS === 'ios' || Platform.OS === 'android') {
@@ -92,13 +159,11 @@ export default function Index() {
     }
   }, [])
 
-  // Bridge WebView → worklet for most methods, with a few RN-side intercepts.
   const onMessage = async (e: any) => {
     let msg: any
     try { msg = JSON.parse(e.nativeEvent.data) } catch { return }
     if (!msg?.method) return
 
-    // RN-side intercepts go here (camera, QR, deep links, geofence registration).
     if (msg.method === 'geofence:register') {
       const result = await PearCircleLocation?.registerGeofence?.(msg.args)
       respond(msg.id, result)
@@ -115,8 +180,13 @@ export default function Index() {
     )
   }
 
-  if (!uiReady) {
-    // UI bundle loader will go here. For now, render a placeholder.
+  const emitEvent = (event: string, data: any) => {
+    webViewRef.current?.injectJavaScript(
+      `window.__pearEvent(${JSON.stringify(event)}, ${JSON.stringify(data ?? null)}); true;`
+    )
+  }
+
+  if (!html) {
     return (
       <View style={styles.splash}>
         <Text style={styles.splashText}>PearCircle</Text>
@@ -127,9 +197,13 @@ export default function Index() {
   return (
     <WebView
       ref={webViewRef}
-      source={{ html: '<html><body style="background:#111;color:#eee;font:16px sans-serif;padding:24px">UI bundle not yet built. Run <code>npm run build:ui</code>.</body></html>' }}
+      source={{ html, baseUrl: 'about:blank' }}
       onMessage={onMessage}
+      onLoad={onLoad}
       style={{ flex: 1, backgroundColor: '#111' }}
+      originWhitelist={['*']}
+      javaScriptEnabled
+      domStorageEnabled
     />
   )
 }
