@@ -4,6 +4,7 @@ const VALID = {
   circleId: 'A'.repeat(43),
   name: 'Smith Family',
   circleKey: 'a'.repeat(64),
+  bootstrap: 'c'.repeat(64),
   inviterPublicKey: 'b'.repeat(64),
 }
 
@@ -62,6 +63,18 @@ describe('buildInvite', () => {
     expect(() => buildInvite({ ...VALID, inviterPublicKey: 'z'.repeat(64) })).toThrow(/inviterPublicKey/)
   })
 
+  test('throws on missing bootstrap', () => {
+    expect(() => buildInvite({ ...VALID, bootstrap: undefined })).toThrow(/bootstrap/)
+  })
+
+  test('throws on bootstrap of wrong length', () => {
+    expect(() => buildInvite({ ...VALID, bootstrap: 'c'.repeat(63) })).toThrow(/bootstrap/)
+  })
+
+  test('throws on bootstrap with non-hex chars', () => {
+    expect(() => buildInvite({ ...VALID, bootstrap: 'z'.repeat(64) })).toThrow(/bootstrap/)
+  })
+
   test('throws on invalid scheme', () => {
     expect(() => buildInvite({ ...VALID, scheme: 'ftp' })).toThrow(/scheme/)
   })
@@ -76,6 +89,7 @@ describe('parseInvite', () => {
     expect(result.circleId).toBe(VALID.circleId)
     expect(result.name).toBe(VALID.name)
     expect(result.circleKey).toBe(VALID.circleKey)
+    expect(result.bootstrap).toBe(VALID.bootstrap)
     expect(result.inviterPublicKey).toBe(VALID.inviterPublicKey)
   })
 
@@ -136,60 +150,74 @@ describe('parseInvite', () => {
   })
 
   test('rejects missing circle param', () => {
-    const url = `https://peerloomllc.com/circle/join?name=Test&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?name=Test&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/circleId/)
   })
 
   test('rejects missing key param', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/circleKey/)
   })
 
+  test('rejects missing bootstrap param', () => {
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const result = parseInvite(url)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/bootstrap/)
+  })
+
   test('rejects missing inviter param', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/inviterPublicKey/)
   })
 
   test('rejects missing name param', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/name/)
   })
 
   test('rejects malformed circle (wrong length)', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=AAA&name=Test&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=AAA&name=Test&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
   })
 
   test('rejects malformed key (non-hex)', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${'z'.repeat(64)}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${'z'.repeat(64)}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
   })
 
+  test('rejects malformed bootstrap (non-hex)', () => {
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}&bootstrap=${'z'.repeat(64)}&inviter=${VALID.inviterPublicKey}`
+    const result = parseInvite(url)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/bootstrap/)
+  })
+
   test('rejects oversized name', () => {
     const longName = 'x'.repeat(NAME_MAX + 1)
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=${longName}&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=${longName}&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
   })
 
   test('rejects empty name', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
   })
 
   test('handles malformed percent-encoding gracefully', () => {
-    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=%ZZ&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=%ZZ&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
   })

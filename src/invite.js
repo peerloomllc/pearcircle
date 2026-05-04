@@ -1,10 +1,12 @@
 // Invite link builder and parser for PearCircle.
-// Wire format per proposals/2026-05-03-wire-protocol.md §2:
-//   https://peerloomllc.com/circle/join?circle={base64url(32)}&name={name}&key={hex(32)}&inviter={hex(32)}
+// Wire format per proposals/2026-05-03-wire-protocol.md §2 (amended 2026-05-04):
+//   https://peerloomllc.com/circle/join?circle={base64url(32)}&name={name}&key={hex(32)}&bootstrap={hex(32)}&inviter={hex(32)}
 // Legacy custom scheme also accepted: pear://pearcircle/join?...
 //
 // Path prefix is /circle/ (not /join/) so the link never collides with
 // PearCal's invites on the shared peerloomllc.com host.
+// `bootstrap` is the per-circle Autobase bootstrap writer core public key;
+// distinct from `inviter` because the inviter need not be the original owner.
 
 const HTTPS_HOST_PATH = 'https://peerloomllc.com/circle/join'
 const PEAR_HOST_PATH = 'pear://pearcircle/join'
@@ -19,11 +21,12 @@ const NAME_MAX = 64
  * @param {string} args.circleId - 43-char base64url (32 bytes, no padding)
  * @param {string} args.name - 1..64 char display name (raw, will be URL-encoded)
  * @param {string} args.circleKey - 64-char hex (32 bytes)
+ * @param {string} args.bootstrap - 64-char hex (32 bytes), Autobase bootstrap pubkey
  * @param {string} args.inviterPublicKey - 64-char hex (32 bytes)
  * @param {'https'|'pear'} [args.scheme='https']
  * @returns {string}
  */
-function buildInvite ({ circleId, name, circleKey, inviterPublicKey, scheme = 'https' }) {
+function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, scheme = 'https' }) {
   if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
     throw new Error('circleId must be a 43-char base64url string (32 bytes)')
   }
@@ -32,6 +35,9 @@ function buildInvite ({ circleId, name, circleKey, inviterPublicKey, scheme = 'h
   }
   if (typeof circleKey !== 'string' || !HEX_64.test(circleKey)) {
     throw new Error('circleKey must be a 64-char hex string (32 bytes)')
+  }
+  if (typeof bootstrap !== 'string' || !HEX_64.test(bootstrap)) {
+    throw new Error('bootstrap must be a 64-char hex string (32 bytes)')
   }
   if (typeof inviterPublicKey !== 'string' || !HEX_64.test(inviterPublicKey)) {
     throw new Error('inviterPublicKey must be a 64-char hex string (32 bytes)')
@@ -45,6 +51,7 @@ function buildInvite ({ circleId, name, circleKey, inviterPublicKey, scheme = 'h
     `circle=${circleId}`,
     `name=${encodeURIComponent(name)}`,
     `key=${circleKey}`,
+    `bootstrap=${bootstrap}`,
     `inviter=${inviterPublicKey}`,
   ].join('&')
   return `${base}?${params}`
@@ -53,7 +60,7 @@ function buildInvite ({ circleId, name, circleKey, inviterPublicKey, scheme = 'h
 /**
  * Parse an invite link.
  * @param {string} url
- * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, inviterPublicKey?: string, error?: string }}
+ * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, bootstrap?: string, inviterPublicKey?: string, error?: string }}
  */
 function parseInvite (url) {
   if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
@@ -73,6 +80,7 @@ function parseInvite (url) {
   const circleId = params.circle
   const name = params.name
   const circleKey = params.key
+  const bootstrap = params.bootstrap
   const inviterPublicKey = params.inviter
 
   if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
@@ -84,11 +92,14 @@ function parseInvite (url) {
   if (typeof circleKey !== 'string' || !HEX_64.test(circleKey)) {
     return { ok: false, error: 'invalid or missing circleKey' }
   }
+  if (typeof bootstrap !== 'string' || !HEX_64.test(bootstrap)) {
+    return { ok: false, error: 'invalid or missing bootstrap' }
+  }
   if (typeof inviterPublicKey !== 'string' || !HEX_64.test(inviterPublicKey)) {
     return { ok: false, error: 'invalid or missing inviterPublicKey' }
   }
 
-  return { ok: true, scheme, circleId, name, circleKey, inviterPublicKey }
+  return { ok: true, scheme, circleId, name, circleKey, bootstrap, inviterPublicKey }
 }
 
 function parseQuery (qs) {

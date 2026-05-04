@@ -62,19 +62,28 @@ const handlers = {
     const ownerPublicKey = b4a.toString(_identity.publicKey, 'hex')
     const createdAt = Date.now()
 
+    // Provision the per-circle Autobase bootstrap writer core. Its public
+    // key flows through the invite so joiners can open the same Autobase
+    // (proposal §2 amended 2026-05-04). Replication and apply branches
+    // wire up in the next slice.
+    const autobaseCore = _store.namespace(circleId).get({ name: 'autobase' })
+    await autobaseCore.ready()
+    const bootstrap = b4a.toString(autobaseCore.key, 'hex')
+
     await _localDb.put('circles:joined:' + circleId, {
       circleId,
       name,
       circleKey,
+      bootstrap,
       role: 'owner',
       createdAt,
     })
 
-    const invite = buildInvite({ circleId, name, circleKey, inviterPublicKey: ownerPublicKey })
+    const invite = buildInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey: ownerPublicKey })
 
     joinCircleTopic(circleId, circleKey)
 
-    return { circleId, circleKey, name, ownerPublicKey, createdAt, invite }
+    return { circleId, circleKey, bootstrap, name, ownerPublicKey, createdAt, invite }
   },
 
   'circle:join': async ({ invite } = {}) => {
@@ -84,7 +93,7 @@ const handlers = {
     const parsed = parseInvite(invite)
     if (!parsed.ok) throw new Error('invalid invite: ' + parsed.error)
 
-    const { circleId, name, circleKey, inviterPublicKey } = parsed
+    const { circleId, name, circleKey, bootstrap, inviterPublicKey } = parsed
 
     // Idempotent: if we already have a record (owner or member), return it
     // unchanged. The owner re-scanning their own invite must not be demoted
@@ -97,6 +106,7 @@ const handlers = {
       circleId,
       name,
       circleKey,
+      bootstrap,
       role: 'member',
       inviterPublicKey,
       joinedAt,

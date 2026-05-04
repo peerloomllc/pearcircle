@@ -2,6 +2,9 @@
 
 **Status**: Approved 2026-05-03. All open questions resolved (see `DECISIONS.md`); approval record in `reviews/2026-05-03-wire-protocol.md`. Subsequent protocol changes follow the Constitution §3 proposal gate.
 
+**Amendments**:
+- 2026-05-04 — invite link grammar (§2) gains a required `bootstrap=<hex(32)>` field carrying the per-circle Autobase bootstrap-writer-core public key. See `DECISIONS.md` 2026-05-04 and `reviews/2026-05-04-invite-bootstrap-amendment.md`. v1 remains the floor; no shipped peers existed at amendment time.
+
 **Goal**: Define the wire protocol for PearCircle v1 (invite link, Hyperbee schema, Autobase apply branches, location-update message envelope, geofence transition format) so cross-peer interop is stable from the first device build.
 
 **Tier**: T3. New protocol from scratch. Old peers do not exist yet, so the only "compat" obligation is forward-compat for the v1 series we choose to ship.
@@ -38,15 +41,16 @@ No prior peers exist. v1 is the floor. We MUST tag every replicated record with 
 ### 2. Invite link
 
 ```
-https://peerloomllc.com/circle/join?circle={base64url(circleId)}&name={name}&key={hex(circleKey)}&inviter={hex(pubkey)}
+https://peerloomllc.com/circle/join?circle={base64url(circleId)}&name={name}&key={hex(circleKey)}&bootstrap={hex(autobaseBootstrap)}&inviter={hex(pubkey)}
 ```
 
 - `circleId` is a 32-byte random value, stable for the life of the circle
 - `circleKey` is the Hyperswarm topic seed (32 bytes hex, 64 chars)
 - `name` is the display name of the circle, ≤ 64 chars, URL-encoded
+- `bootstrap` is the public key of the per-circle Autobase's bootstrap writer core (32 bytes hex, 64 chars). Joiners pass this to `new Autobase(store, bootstrap, ...)` to anchor the replicated view. Distinct from `inviter` because the inviter need not be the original owner (any-member-can-invite, DECISIONS 2026-05-03).
 - `inviter` is the issuing member's public key, ≤ 64 hex chars
 
-Legacy custom-scheme accepted: `pear://pearcircle/join?circle=...&name=...&key=...&inviter=...`
+Legacy custom-scheme accepted: `pear://pearcircle/join?circle=...&name=...&key=...&bootstrap=...&inviter=...`
 
 Per-app `/circle/` path prefix avoids host collision with PearCal's `/join` on `peerloomllc.com`.
 
