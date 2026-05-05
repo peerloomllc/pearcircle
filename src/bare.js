@@ -75,6 +75,18 @@ function trackPlace (circleId, place) {
   })
 }
 
+function untrackPlace (circleId, placeId) {
+  _circlePlaces.delete(circleId + '|' + placeId)
+}
+
+// Soft-delete tombstone (proposal amended 2026-05-05). A place row
+// with `deleted: true` is treated as non-existent by all consumers:
+// rendering, place:list, geofence checks. Older rows without the
+// field are deleted=false (additive amendment).
+function isDeleted (place) {
+  return place != null && place.deleted === true
+}
+
 const send = (msg) => BareKit.IPC.write(Buffer.from(JSON.stringify(msg) + '\n'))
 
 const handlers = {
@@ -354,6 +366,39 @@ const handlers = {
     return { ok: true, place: value }
   },
 
+  'place:delete': async ({ circleId, placeId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof placeId !== 'string') throw new Error('placeId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const existing = await base.view.get('place:' + placeId)
+    if (!existing || !existing.value) throw new Error('place not found')
+    if (isDeleted(existing.value)) return { ok: true, place: existing.value }
+    const prev = existing.value
+    // Soft-delete tombstone: same key, deleted: true, fresh
+    // createdAt + deletedAt. The apply branch's existing
+    // LWW-on-createdAt rule (proposal §4) keeps this winning over
+    // older replicas. Undelete is just a non-deleted write with a
+    // newer createdAt.
+    const now = Date.now()
+    const value = {
+      id: prev.id,
+      name: prev.name,
+      lat: prev.lat,
+      lon: prev.lon,
+      radiusMeters: prev.radiusMeters,
+      createdBy: prev.createdBy,
+      createdAt: now,
+      deleted: true,
+      deletedAt: now,
+      v: 1,
+    }
+    await base.append({ type: 'put', key: 'place:' + placeId, value })
+    return { ok: true, place: value }
+  },
+
   'place:list': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
@@ -362,7 +407,7 @@ const handlers = {
     await base.update()
     const places = []
     for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-      if (value) places.push(value)
+      if (value && !isDeleted(value)) places.push(value)
     }
     return { places }
   },
@@ -516,7 +561,7 @@ async function snapshotCircle (circleId, base) {
   }
   const places = []
   for await (const { value } of view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-    if (value) places.push(value)
+    if (value && !isDeleted(value)) places.push(value)
   }
   // Most recent 50 transitions, newest first. Reverse-stream the
   // ts-prefixed keys so we don't have to load the whole range.
@@ -631,8 +676,14 @@ async function applyCircleNodes (nodes, view, base) {
         await view.put(op.key, incoming)
         // Track for in-process geofence checks. We don't have a base→circleId
         // reverse map, so look up the circleId by walking _circleBases. Cheap.
+        // A delete tombstone (deleted: true) untracks instead, so the next
+        // location:update can't fire transitions against a deleted place.
         for (const [cid, b] of _circleBases) {
-          if (b === base) { trackPlace(cid, incoming); break }
+          if (b === base) {
+            if (isDeleted(incoming)) untrackPlace(cid, incoming.id)
+            else trackPlace(cid, incoming)
+            break
+          }
         }
         continue
       }
@@ -832,7 +883,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
   for (const [circleId, base] of _circleBases) {
     try {
       for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-        if (value) trackPlace(circleId, value)
+        if (value && !isDeleted(value)) trackPlace(circleId, value)
       }
     } catch (e) {
       console.warn('[bare] failed to enumerate places for', circleId, e?.message)

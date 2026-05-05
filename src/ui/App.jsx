@@ -227,6 +227,8 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
   const [sheetOpen, setSheetOpen] = useState(false)
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [editingPlace, setEditingPlace] = useState(null) // { circleId, id, name, radiusMeters } or null
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null) // place.id awaiting a second tap to delete
+  const [deleteError, setDeleteError] = useState(null)
   const [transitionError, setTransitionError] = useState(null)
   const [claiming, setClaiming] = useState(false)
   const [claimError, setClaimError] = useState(null)
@@ -373,6 +375,29 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     setSelectedPubkey(null)
     mapApiRef.current?.fitAll()
   }, [])
+
+  // Two-tap delete: first tap arms the confirm state for one place,
+  // second tap on the same place's button actually fires the delete.
+  // Auto-disarm after 4s so a stray earlier tap doesn't strand the
+  // user one click away from a destructive action.
+  useEffect(() => {
+    if (!confirmingDeleteId) return
+    const id = setTimeout(() => setConfirmingDeleteId(null), 4000)
+    return () => clearTimeout(id)
+  }, [confirmingDeleteId])
+
+  const deletePlace = useCallback(async (place) => {
+    setDeleteError(null)
+    try {
+      await pear.call('place:delete', { circleId: place.circleId, placeId: place.id })
+      setConfirmingDeleteId(null)
+      // Close any open edit form pointing at the just-deleted place.
+      setEditingPlace((cur) => (cur && cur.id === place.id ? null : cur))
+      await refresh()
+    } catch (e) {
+      setDeleteError(String(e?.message ?? e))
+    }
+  }, [refresh])
 
   // Resolve the focused member's display fields from whichever circle
   // carries the freshest row. Falls back to "you" when the user has
@@ -562,21 +587,41 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
                     <div style={s.placeRowHeader}>
                       <div style={s.memberName}>{p.name}</div>
                       {placeWritable && (
-                        <button
-                          style={{ ...s.smallBtn, flex: 'none', padding: '6px 12px' }}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setEditingPlace({
-                              circleId: p.circleId,
-                              id: p.id,
-                              name: p.name,
-                              radiusMeters: p.radiusMeters,
-                            })
-                            setShowAddPlace(false)
-                          }}
-                        >
-                          Edit
-                        </button>
+                        <div style={s.placeRowActions}>
+                          <button
+                            style={{ ...s.smallBtn, flex: 'none', padding: '6px 12px' }}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setEditingPlace({
+                                circleId: p.circleId,
+                                id: p.id,
+                                name: p.name,
+                                radiusMeters: p.radiusMeters,
+                              })
+                              setShowAddPlace(false)
+                              setConfirmingDeleteId(null)
+                            }}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            style={{
+                              ...s.smallBtn,
+                              flex: 'none',
+                              padding: '6px 12px',
+                              background: confirmingDeleteId === p.id ? '#5a1f1f' : '#222',
+                              color: confirmingDeleteId === p.id ? '#fcc' : '#ccc',
+                              borderColor: confirmingDeleteId === p.id ? '#7a2a2a' : '#333',
+                            }}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              if (confirmingDeleteId === p.id) deletePlace(p)
+                              else setConfirmingDeleteId(p.id)
+                            }}
+                          >
+                            {confirmingDeleteId === p.id ? 'Tap to confirm' : 'Delete'}
+                          </button>
+                        </div>
                       )}
                     </div>
                     <div style={s.placeRadiusLine}>{Math.round(p.radiusMeters)}m radius</div>
@@ -596,6 +641,7 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
             </ul>
           )}
           {transitionError && <p style={s.error}>{transitionError}</p>}
+          {deleteError && <p style={s.error}>{deleteError}</p>}
 
           {editingPlace && (
             <EditPlaceForm
@@ -1483,6 +1529,7 @@ const s = {
   memberRow: { display: 'flex', alignItems: 'flex-start', gap: 12 },
   memberName: { fontSize: 15, fontWeight: 500 },
   placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  placeRowActions: { display: 'flex', gap: 6, flexShrink: 0 },
   placeRadiusLine: { fontSize: 12, color: '#888', marginTop: 4, fontFamily: 'monospace' },
   avatarRow: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 },
   avatarPreview: { width: 96, height: 96, borderRadius: '50%', overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },

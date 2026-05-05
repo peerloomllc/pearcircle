@@ -5,6 +5,7 @@
 **Amendments**:
 - 2026-05-04 — invite link grammar (§2) gains a required `bootstrap=<hex(32)>` field carrying the per-circle Autobase bootstrap-writer-core public key. See `DECISIONS.md` 2026-05-04 and `reviews/2026-05-04-invite-bootstrap-amendment.md`. v1 remains the floor; no shipped peers existed at amendment time.
 - 2026-05-04 — transition key (§3) extended from `transition:{ts}:{pubkey}` to `transition:{ts}:{pubkey}:{placeId}`. Two transitions firing in the same location-update tick (e.g. exit-old-place + enter-new-place during a single FusedLocation result) collided on the old key shape and one silently overwrote the other in the apply branch's view. Field-observed during the geofence slice. ts-prefix preserves time-ordered reverse scans; placeId suffix disambiguates simultaneous transitions. v1 remains the floor; no shipped peers existed at amendment time. See `DECISIONS.md` 2026-05-04 and `reviews/2026-05-04-transition-key-amendment.md`.
+- 2026-05-05 — `place:{id}` value (§3) gains optional `deleted: boolean` and `deletedAt: number` fields for soft-delete. A delete is a fresh write to the existing key with `deleted: true` and `createdAt` bumped to `Date.now()` so the existing LWW-on-`createdAt` apply rule (§4) keeps the delete winning over older replicas without a new key kind or apply branch. Renderers, geofence checks, and place-list IPCs filter out `deleted: true` rows. Undelete is just a non-deleted write with a newer `createdAt`. Old records without the fields are treated as `deleted: false` (additive, backwards-compat with mid-flight v1 schemas). v1 remains the floor; no shipped peers existed at amendment time. See `DECISIONS.md` 2026-05-05 and `reviews/2026-05-05-place-delete-amendment.md`.
 
 **Goal**: Define the wire protocol for PearCircle v1 (invite link, Hyperbee schema, Autobase apply branches, location-update message envelope, geofence transition format) so cross-peer interop is stable from the first device build.
 
@@ -72,7 +73,7 @@ Per-app `/circle/` path prefix avoids host collision with PearCal's `/join` on `
 |-----|-------|
 | `circle` | `{ id, name, ownerKey, createdAt, v: 1 }` |
 | `member:{pubkey}` | `{ pubkey, displayName, avatar?: base64jpeg, joinedAt, v: 1 }` (avatar ≤ ~30KB encoded, client-side downscaled to ~96x96) |
-| `place:{id}` | `{ id, name, lat, lon, radiusMeters, createdBy, createdAt, v: 1 }` |
+| `place:{id}` | `{ id, name, lat, lon, radiusMeters, createdBy, createdAt, deleted?: boolean, deletedAt?: number, v: 1 }` (proposal amended 2026-05-05; `deleted: true` is the soft-delete tombstone, resolved by the existing LWW-on-`createdAt` rule) |
 | `lastSeen:{pubkey}` | `{ pubkey, lat, lon, accuracy, ts, battery?, isMoving?, v: 1 }` |
 | `transition:{ts}:{pubkey}:{placeId}` | `{ pubkey, placeId, kind: 'enter'|'exit', ts, v: 1 }` |
 | `removed:{pubkey}` | `{ pubkey, removedBy, ts, v: 1 }` (tombstone for kicked members) |
@@ -87,7 +88,7 @@ Per-app `/circle/` path prefix avoids host collision with PearCal's `/join` on `
 One apply branch per record kind. Each writes to the linearized view as above. Conflict policy:
 - `circle`: owner-write only; non-owner appends ignored
 - `member`: any current writer can append; new entries also drive Autobase `addWriter` for the new pubkey
-- `place`: any current member; last-write-wins on `id` collision by `createdAt`
+- `place`: any current member; last-write-wins on `id` collision by `createdAt`. A delete is a fresh write with `deleted: true` and `createdAt = Date.now()`; the same LWW rule keeps it winning over older replicas (proposal amended 2026-05-05). Renderers, geofence checks, and `place:list` filter out rows with `deleted: true`
 - `lastSeen`: any current member writing for their own pubkey ONLY; cross-member writes ignored
 - `transition`: any current member writing for their own pubkey ONLY
 - `removed`: owner-write only; sets a tombstone that suppresses future appends from `pubkey`
