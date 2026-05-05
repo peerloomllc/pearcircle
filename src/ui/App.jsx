@@ -239,6 +239,7 @@ function DetailView ({ circleId, myPubkey, setView }) {
   const [claimError, setClaimError] = useState(null)
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [transitionError, setTransitionError] = useState(null)
+  const [sheetOpen, setSheetOpen] = useState(false)
 
   const refresh = useCallback(async () => {
     const [d, p] = await Promise.all([
@@ -289,8 +290,11 @@ function DetailView ({ circleId, myPubkey, setView }) {
 
   if (!data) {
     return (
-      <div style={s.screen}>
-        <BackBar onBack={() => setView({ name: 'list' })} title='Loading...' />
+      <div style={s.mapFirstRoot}>
+        <header style={s.mapTopBar}>
+          <button style={s.iconBtn} onClick={() => setView({ name: 'list' })} aria-label='Back'>‹</button>
+          <h1 style={s.mapTitle}>Loading...</h1>
+        </header>
       </div>
     )
   }
@@ -304,109 +308,114 @@ function DetailView ({ circleId, myPubkey, setView }) {
   }
   const placesById = {}
   for (const p of data.places ?? []) placesById[p.id] = p
+  const memberCount = data.members.length
+  const placeCount = data.places?.length ?? 0
 
   return (
-    <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'list' })} title={data.circle?.name ?? '...'} />
-      <section style={s.section}>
-        <div style={s.row}><span style={s.muted}>Writable</span><span>{isWritable ? 'yes' : 'no'}</span></div>
-        <div style={s.row}><span style={s.muted}>Writers</span><span>{data.writers ?? '?'}</span></div>
-        <div style={s.row}><span style={s.muted}>Peers online</span><span>{peers.length}</span></div>
-      </section>
+    <div style={s.mapFirstRoot}>
+      <div style={s.mapFill}>
+        <CircleMap data={data} />
+      </div>
 
-      <CircleMap data={data} />
+      <header style={s.mapTopBar}>
+        <button style={s.iconBtn} onClick={() => setView({ name: 'list' })} aria-label='Back'>‹</button>
+        <h1 style={s.mapTitle}>{data.circle?.name ?? '...'}</h1>
+        <span style={s.peerBadge}>
+          <span style={{ ...s.peerDot, background: peers.length > 0 ? '#7ec77a' : '#555' }} />
+          {peers.length}
+        </span>
+      </header>
 
-      <h3 style={s.h3}>Members ({data.members.length})</h3>
-      {data.members.length === 0 ? (
-        <p style={s.muted}>No members visible yet. Waiting for sync...</p>
-      ) : (
-        <ul style={s.memberList}>
-          {data.members.map(m => {
-            const pubkey = m.value?.pubkey ?? ''
-            const displayName = m.value?.displayName ?? short(pubkey)
-            const seen = data.lastSeen?.[pubkey]
-            const t = latestTransition?.[pubkey]
-            const tPlaceName = t ? placesById?.[t.placeId]?.name : null
-            return (
-              <li key={m.key} style={s.memberItem}>
-                <div style={s.memberRow}>
-                  <Avatar base64={m.value?.avatar} label={displayName} size={36} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={s.memberName}>{displayName}</div>
-                    <div style={s.muted}>{short(pubkey)}</div>
-                    {t && (
-                      <div style={s.status}>
-                        {t.kind === 'enter' ? 'arrived at ' : 'left '}
-                        {tPlaceName ?? '(unknown place)'}
-                        {' · '}{ageLabel(t.ts)}
+      <button style={s.fab} onClick={() => setSheetOpen(true)}>
+        Members ({memberCount}) · Places ({placeCount})
+      </button>
+
+      {sheetOpen && (
+        <BottomSheet onClose={() => setSheetOpen(false)}>
+          <h3 style={s.h3}>Members ({memberCount})</h3>
+          {memberCount === 0 ? (
+            <p style={s.muted}>No members visible yet. Waiting for sync...</p>
+          ) : (
+            <ul style={s.memberList}>
+              {data.members.map(m => {
+                const pubkey = m.value?.pubkey ?? ''
+                const displayName = m.value?.displayName ?? short(pubkey)
+                const seen = data.lastSeen?.[pubkey]
+                const t = latestTransition?.[pubkey]
+                const tPlaceName = t ? placesById?.[t.placeId]?.name : null
+                return (
+                  <li key={m.key} style={s.memberItem}>
+                    <div style={s.memberRow}>
+                      <Avatar base64={m.value?.avatar} label={displayName} size={36} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={s.memberName}>{displayName}</div>
+                        {t ? (
+                          <div style={s.status}>
+                            {t.kind === 'enter' ? 'arrived at ' : 'left '}
+                            {tPlaceName ?? '(unknown place)'}
+                            {' · '}{ageLabel(t.ts)}
+                          </div>
+                        ) : seen ? (
+                          <div style={s.lastSeen}>updated {ageLabel(seen.ts)}</div>
+                        ) : (
+                          <div style={s.lastSeenMuted}>no location yet</div>
+                        )}
                       </div>
-                    )}
-                    {seen ? (
-                      <div style={s.lastSeen}>
-                        {seen.lat.toFixed(5)}, {seen.lon.toFixed(5)}
-                        {' · '}{ageLabel(seen.ts)}
-                        {seen.accuracy != null && ` · ±${Math.round(seen.accuracy)}m`}
-                      </div>
-                    ) : (
-                      <div style={s.lastSeenMuted}>no location yet</div>
-                    )}
-                  </div>
-                </div>
-              </li>
-            )
-          })}
-        </ul>
-      )}
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
 
-      <h3 style={s.h3}>Places ({data.places?.length ?? 0})</h3>
-      {(!data.places || data.places.length === 0) ? (
-        <p style={s.muted}>No places yet.</p>
-      ) : (
-        <ul style={s.memberList}>
-          {data.places.map(p => (
-            <li key={p.id} style={s.memberItem}>
-              <div style={s.memberName}>{p.name}</div>
-              <div style={s.lastSeen}>
-                {p.lat.toFixed(5)}, {p.lon.toFixed(5)} · {p.radiusMeters}m
-              </div>
-              {isWritable && (
-                <div style={s.transitionBtns}>
-                  <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
-                    Fire enter (debug)
-                  </button>
-                  <button style={s.smallBtn} onClick={() => fireTransition(p, 'exit')}>
-                    Fire exit (debug)
-                  </button>
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-      {transitionError && <p style={s.error}>{transitionError}</p>}
+          <h3 style={s.h3}>Places ({placeCount})</h3>
+          {placeCount === 0 ? (
+            <p style={s.muted}>No places yet.</p>
+          ) : (
+            <ul style={s.memberList}>
+              {data.places.map(p => (
+                <li key={p.id} style={s.memberItem}>
+                  <div style={s.memberName}>{p.name}</div>
+                  {isWritable && (
+                    <div style={s.transitionBtns}>
+                      <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
+                        Fire enter (debug)
+                      </button>
+                      <button style={s.smallBtn} onClick={() => fireTransition(p, 'exit')}>
+                        Fire exit (debug)
+                      </button>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {transitionError && <p style={s.error}>{transitionError}</p>}
 
-      {isWritable && !showAddPlace && (
-        <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
-          Add a place
-        </button>
-      )}
-      {isWritable && showAddPlace && (
-        <AddPlaceForm
-          circleId={circleId}
-          myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
-          onCancel={() => setShowAddPlace(false)}
-          onAdded={async () => { setShowAddPlace(false); await refresh() }}
-        />
-      )}
+          {isWritable && !showAddPlace && (
+            <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
+              Add a place
+            </button>
+          )}
+          {isWritable && showAddPlace && (
+            <AddPlaceForm
+              circleId={circleId}
+              myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
+              onCancel={() => setShowAddPlace(false)}
+              onAdded={async () => { setShowAddPlace(false); await refresh() }}
+            />
+          )}
 
-      {isWritable && (
-        <button style={s.primaryBtn} disabled={claiming} onClick={claimMembership}>
-          {claiming ? 'Posting...' : 'Post my membership'}
-        </button>
-      )}
-      {claimError && <p style={s.error}>{claimError}</p>}
-      {!isWritable && (
-        <p style={s.muted}>Read-only until owner adds you as a writer.</p>
+          {isWritable && (
+            <button style={s.primaryBtn} disabled={claiming} onClick={claimMembership}>
+              {claiming ? 'Posting...' : 'Post my membership'}
+            </button>
+          )}
+          {claimError && <p style={s.error}>{claimError}</p>}
+          {!isWritable && (
+            <p style={s.muted}>Read-only until owner adds you as a writer.</p>
+          )}
+        </BottomSheet>
       )}
     </div>
   )
@@ -582,28 +591,42 @@ function syncFeatures (map, data, fittedRef) {
   map.getSource('places')?.setData({ type: 'FeatureCollection', features: placeFeatures })
 
   if (fittedRef.current) return
-  if (memberFeatures.length === 0 && placeFeatures.length === 0) return
-  fittedRef.current = true
-  fitToFeatures(map, memberFeatures, data.places ?? [])
+  // Fit to where the people are. Including places in the bounds drags
+  // the view to anywhere a stale or far-away test place was set; the
+  // map should center on members so "where is everyone" is the default
+  // glance. Users can pan to see distant places. If no members have a
+  // location yet, fall back to places so we at least show something
+  // useful instead of a globe view.
+  if (memberFeatures.length > 0) {
+    fittedRef.current = true
+    fitTo(map, memberFeatures.map(f => f.geometry.coordinates))
+  } else if (data.places && data.places.length > 0) {
+    fittedRef.current = true
+    fitTo(map, data.places.map(p => [p.lon, p.lat]))
+  }
 }
 
-function fitToFeatures (map, memberFeatures, places) {
+function fitTo (map, lonLatPairs) {
   let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity
-  for (const f of memberFeatures) {
-    const [lo, la] = f.geometry.coordinates
+  for (const [lo, la] of lonLatPairs) {
     if (la < minLat) minLat = la; if (la > maxLat) maxLat = la
     if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo
   }
-  for (const p of places) {
-    if (p.lat < minLat) minLat = p.lat; if (p.lat > maxLat) maxLat = p.lat
-    if (p.lon < minLon) minLon = p.lon; if (p.lon > maxLon) maxLon = p.lon
-  }
   if (!isFinite(minLat)) return
+  // Use flyTo for a Life360-style cinematic descent: camera arcs up,
+  // glides over, and settles. cameraForBounds gives us the destination
+  // center/zoom; passing those to flyTo (rather than fitBounds with
+  // animate: true) lets us tune the curve for the arc effect.
+  const opts = { duration: 1400, curve: 1.42, essential: true }
   if (minLat === maxLat && minLon === maxLon) {
-    map.jumpTo({ center: [minLon, minLat], zoom: 14 })
+    map.flyTo({ center: [minLon, minLat], zoom: 14, ...opts })
     return
   }
-  map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 40, animate: false, maxZoom: 16 })
+  const cam = map.cameraForBounds(
+    [[minLon, minLat], [maxLon, maxLat]],
+    { padding: 60, maxZoom: 16 },
+  )
+  if (cam) map.flyTo({ center: cam.center, zoom: cam.zoom, ...opts })
 }
 
 function ProfileView ({ profile, setView, onSaved }) {
@@ -757,6 +780,76 @@ function initialsFor (label) {
   return parts.map(p => p[0].toUpperCase()).join('')
 }
 
+// Slide-up modal sheet, ported from pearcal-native/src/ui/App.jsx:5777.
+// Tap-to-dismiss on the scrim; drag the handle down >60px to close.
+// onClose runs after the slide-out finishes so the parent can unmount.
+function BottomSheet ({ onClose, children, zIndex = 200 }) {
+  const [visible, setVisible] = useState(false)
+  const [closing, setClosing] = useState(false)
+  const touchStartY = useRef(null)
+  const DURATION = 280
+
+  useEffect(() => {
+    const id = setTimeout(() => setVisible(true), 20)
+    return () => clearTimeout(id)
+  }, [])
+
+  const close = useCallback(() => {
+    setClosing((c) => {
+      if (c) return c
+      setTimeout(() => onClose(), DURATION)
+      return true
+    })
+  }, [onClose])
+
+  const onHandleTouchStart = (e) => { touchStartY.current = e.touches[0].clientY }
+  const onHandleTouchMove = (e) => {
+    if (touchStartY.current === null) return
+    const dy = e.touches[0].clientY - touchStartY.current
+    if (dy > 60) { touchStartY.current = null; close() }
+  }
+
+  const translateY = (!visible || closing) ? '100%' : '0%'
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex,
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+        background: visible && !closing ? 'rgba(0,0,0,0.55)' : 'rgba(0,0,0,0)',
+        transition: `background ${DURATION}ms ease`,
+      }}
+      onClick={close}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%', maxWidth: 600,
+          background: '#1a1a1a',
+          color: '#eee',
+          borderRadius: '20px 20px 0 0',
+          maxHeight: '85dvh', overflowY: 'auto', overflowX: 'hidden',
+          padding: '0 16px 32px',
+          transform: `translateY(${translateY})`,
+          transition: `transform ${DURATION}ms cubic-bezier(0.32,0.72,0,1)`,
+          WebkitOverflowScrolling: 'touch',
+          boxSizing: 'border-box',
+        }}
+      >
+        <div
+          onTouchStart={onHandleTouchStart}
+          onTouchMove={onHandleTouchMove}
+          onClick={close}
+          style={{ display: 'flex', justifyContent: 'center', padding: '12px 0 4px', cursor: 'pointer' }}
+        >
+          <div style={{ width: 36, height: 4, borderRadius: 2, background: '#444' }} />
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
 function Avatar ({ base64, label, size = 28 }) {
   const px = size + 'px'
   if (typeof base64 === 'string' && base64.length > 0) {
@@ -869,7 +962,29 @@ const s = {
   status: { fontSize: 13, color: '#cfc', marginTop: 4, fontWeight: 500 },
   transitionBtns: { display: 'flex', gap: 8, marginTop: 8 },
   smallBtn: { flex: 1, padding: '8px 10px', background: '#222', color: '#ccc', border: '1px solid #333', borderRadius: 6, fontSize: 12, cursor: 'pointer' },
-  mapWrap: { position: 'relative', height: 280, marginBottom: 12, borderRadius: 10, overflow: 'hidden', background: '#0a0a0a' },
+  mapWrap: { position: 'relative', height: '100%', width: '100%', background: '#0a0a0a' },
   mapCanvas: { height: '100%', width: '100%' },
   mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: 4, pointerEvents: 'none' },
+  mapFirstRoot: { position: 'fixed', inset: 0, color: '#eee', background: '#111', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', overflow: 'hidden' },
+  mapFill: { position: 'absolute', inset: 0 },
+  mapTopBar: {
+    position: 'absolute', top: 0, left: 0, right: 0, zIndex: 5,
+    display: 'flex', alignItems: 'center', gap: 8,
+    padding: '8px 12px',
+    paddingTop: 'calc(env(safe-area-inset-top, 24px) + 8px)',
+    background: '#1a1a1a',
+    borderBottom: '1px solid #2a2a2a',
+  },
+  mapTitle: { fontSize: 18, margin: 0, flex: 1, fontWeight: 600, color: '#eee' },
+  peerBadge: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 13, color: '#bbb', padding: '4px 8px' },
+  peerDot: { width: 8, height: 8, borderRadius: '50%' },
+  fab: {
+    position: 'absolute', bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)', right: 16,
+    padding: '12px 18px',
+    background: '#7ec4cf', color: '#0a1f23',
+    border: 'none', borderRadius: 999,
+    fontSize: 14, fontWeight: 600,
+    boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+    zIndex: 5, cursor: 'pointer',
+  },
 }
