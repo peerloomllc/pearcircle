@@ -318,6 +318,42 @@ const handlers = {
     return { ok: true, place: value }
   },
 
+  'place:update': async ({ circleId, placeId, name, radiusMeters } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof placeId !== 'string') throw new Error('placeId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    if (typeof name !== 'string' || name.trim().length === 0 || name.length > 64) {
+      throw new Error('name must be a non-empty string of at most 64 chars')
+    }
+    if (!Number.isFinite(radiusMeters) || radiusMeters < 10 || radiusMeters > 10000) {
+      throw new Error('radiusMeters must be in [10, 10000]')
+    }
+    const existing = await base.view.get('place:' + placeId)
+    if (!existing || !existing.value) throw new Error('place not found')
+    const prev = existing.value
+    // Preserve id, lat, lon, createdBy from the original. Bump
+    // createdAt to now — the apply branch (proposal §4) treats
+    // createdAt as the LWW timestamp, so a fresh value here wins
+    // over older replicas. Original creation time is sacrificed for
+    // simplicity; if we want to preserve it later, add a separate
+    // updatedAt field and amend the apply rule.
+    const value = {
+      id: prev.id,
+      name: name.trim(),
+      lat: prev.lat,
+      lon: prev.lon,
+      radiusMeters,
+      createdBy: prev.createdBy,
+      createdAt: Date.now(),
+      v: 1,
+    }
+    await base.append({ type: 'put', key: 'place:' + placeId, value })
+    return { ok: true, place: value }
+  },
+
   'place:list': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')

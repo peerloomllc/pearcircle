@@ -226,6 +226,7 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
   const [selectedPubkey, setSelectedPubkey] = useState(null) // null = auto-fit-everyone view
   const [sheetOpen, setSheetOpen] = useState(false)
   const [showAddPlace, setShowAddPlace] = useState(false)
+  const [editingPlace, setEditingPlace] = useState(null) // { circleId, id, name, radiusMeters } or null
   const [transitionError, setTransitionError] = useState(null)
   const [claiming, setClaiming] = useState(false)
   const [claimError, setClaimError] = useState(null)
@@ -558,7 +559,27 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
                 }
                 return (
                   <li key={p.circleId + ':' + p.id} style={{ ...s.memberItem, cursor: 'pointer' }} onClick={focusOn}>
-                    <div style={s.memberName}>{p.name}</div>
+                    <div style={s.placeRowHeader}>
+                      <div style={s.memberName}>{p.name}</div>
+                      {placeWritable && (
+                        <button
+                          style={{ ...s.smallBtn, flex: 'none', padding: '6px 12px' }}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setEditingPlace({
+                              circleId: p.circleId,
+                              id: p.id,
+                              name: p.name,
+                              radiusMeters: p.radiusMeters,
+                            })
+                            setShowAddPlace(false)
+                          }}
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </div>
+                    <div style={s.placeRadiusLine}>{Math.round(p.radiusMeters)}m radius</div>
                     {placeWritable && (
                       <div style={s.transitionBtns}>
                         <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
@@ -576,12 +597,20 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
           )}
           {transitionError && <p style={s.error}>{transitionError}</p>}
 
-          {actionTargetCircleId && actionTargetWritable && !showAddPlace && (
+          {editingPlace && (
+            <EditPlaceForm
+              key={editingPlace.circleId + ':' + editingPlace.id}
+              initial={editingPlace}
+              onCancel={() => setEditingPlace(null)}
+              onSaved={async () => { setEditingPlace(null); await refresh() }}
+            />
+          )}
+          {!editingPlace && actionTargetCircleId && actionTargetWritable && !showAddPlace && (
             <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
               Add a place
             </button>
           )}
-          {actionTargetCircleId && actionTargetWritable && showAddPlace && (
+          {!editingPlace && actionTargetCircleId && actionTargetWritable && showAddPlace && (
             <AddPlaceForm
               circleId={actionTargetCircleId}
               myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
@@ -604,6 +633,50 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
           )}
         </BottomSheet>
       )}
+    </div>
+  )
+}
+
+function EditPlaceForm ({ initial, onCancel, onSaved }) {
+  const [name, setName] = useState(initial?.name ?? '')
+  const [radius, setRadius] = useState(initial?.radiusMeters != null ? String(initial.radiusMeters) : '')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState(null)
+
+  const submit = async () => {
+    setError(null)
+    const radNum = parseFloat(radius)
+    if (!name.trim()) { setError('Name is required'); return }
+    if (!Number.isFinite(radNum) || radNum < 10 || radNum > 10000) { setError('Radius must be between 10 and 10000 metres'); return }
+    setSubmitting(true)
+    try {
+      const r = await pear.call('place:update', {
+        circleId: initial.circleId,
+        placeId: initial.id,
+        name: name.trim(),
+        radiusMeters: radNum,
+      })
+      setSubmitting(false)
+      if (r?.ok) onSaved()
+      else setError('Could not save place')
+    } catch (e) {
+      setSubmitting(false)
+      setError(String(e?.message ?? e))
+    }
+  }
+
+  return (
+    <div style={s.section}>
+      <h3 style={{ ...s.h3, margin: '0 0 8px 0' }}>Edit place</h3>
+      <label style={s.label}>Name</label>
+      <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
+      <label style={s.label}>Radius (metres)</label>
+      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
+      <button style={s.primaryBtn} disabled={submitting} onClick={submit}>
+        {submitting ? 'Saving...' : 'Save changes'}
+      </button>
+      <button style={s.secondaryBtn} onClick={onCancel}>Cancel</button>
+      {error && <p style={s.error}>{error}</p>}
     </div>
   )
 }
@@ -1409,6 +1482,8 @@ const s = {
   memberItem: { padding: 12, background: '#1c1c1c', borderRadius: 10, marginBottom: 8 },
   memberRow: { display: 'flex', alignItems: 'flex-start', gap: 12 },
   memberName: { fontSize: 15, fontWeight: 500 },
+  placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  placeRadiusLine: { fontSize: 12, color: '#888', marginTop: 4, fontFamily: 'monospace' },
   avatarRow: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 },
   avatarPreview: { width: 96, height: 96, borderRadius: '50%', overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   avatarImg: { width: '100%', height: '100%', objectFit: 'cover' },
