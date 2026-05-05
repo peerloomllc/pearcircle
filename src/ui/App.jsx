@@ -697,6 +697,7 @@ const CircleMap = React.forwardRef(function CircleMap (
   const fittedRef = useRef(false)
   const dataRef = useRef(data)
   const onMemberClickRef = useRef(onMemberClick)
+  const markersRef = useRef(new Map())
   const [mapReadyTick, setMapReadyTick] = useState(0)
 
   // Keep refs current so the layer click handler (registered once on
@@ -710,7 +711,12 @@ const CircleMap = React.forwardRef(function CircleMap (
     flyTo: (opts) => {
       const m = mapRef.current
       if (!m) return
-      try { m.flyTo(opts) } catch { try { m.jumpTo({ center: opts.center, zoom: opts.zoom }) } catch {} }
+      // Reset bearing/pitch on every auto-camera move so the user
+      // always lands north-up after focusing a member or place. The
+      // spread lets callers override if a future feature wants to
+      // preserve the current orientation.
+      const full = { bearing: 0, pitch: 0, ...opts }
+      try { m.flyTo(full) } catch { try { m.jumpTo({ center: full.center, zoom: full.zoom, bearing: 0, pitch: 0 }) } catch {} }
     },
     fitAll: () => {
       const m = mapRef.current
@@ -744,48 +750,50 @@ const CircleMap = React.forwardRef(function CircleMap (
 
     map.on('load', () => {
       map.addSource('places', { type: 'geojson', data: emptyFC() })
-      map.addSource('members', { type: 'geojson', data: emptyFC() })
+      // Place geofences only render at neighborhood-or-closer zoom.
+      // Below that, a fixed-size pin is much larger than the place's
+      // pixel radius, which made the pin look like it had drifted
+      // outside the place. Fading the geofence out keeps the pin (the
+      // persistent "where is X" indicator) the only thing the user
+      // sees at city/country zoom; the geofence reappears as you zoom
+      // back in to street level.
       map.addLayer({
         id: 'places-fill', type: 'fill', source: 'places',
-        paint: { 'fill-color': '#7ec4cf', 'fill-opacity': 0.18 },
+        paint: {
+          'fill-color': '#7ec4cf',
+          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 12, 0, 14, 0.18],
+        },
       })
       map.addLayer({
         id: 'places-stroke', type: 'line', source: 'places',
-        paint: { 'line-color': '#7ec4cf', 'line-width': 2 },
-      })
-      // Data-driven radius/stroke so the selected pin pops without
-      // running a second layer.
-      map.addLayer({
-        id: 'members-pins', type: 'circle', source: 'members',
         paint: {
-          'circle-radius': ['case', ['boolean', ['get', 'selected'], false], 13, 8],
-          'circle-color': '#fc7',
-          'circle-stroke-color': ['case', ['boolean', ['get', 'selected'], false], '#7ec4cf', '#1a1a1a'],
-          'circle-stroke-width': ['case', ['boolean', ['get', 'selected'], false], 4, 2],
+          'line-color': '#7ec4cf',
+          'line-width': 2,
+          'line-opacity': ['interpolate', ['linear'], ['zoom'], 12, 0, 14, 1],
         },
       })
-
-      map.on('click', 'members-pins', (e) => {
-        const f = e.features?.[0]
-        const pubkey = f?.properties?.pubkey
-        if (pubkey) onMemberClickRef.current?.(pubkey)
-      })
-      const canvas = map.getCanvas()
-      map.on('mouseenter', 'members-pins', () => { canvas.style.cursor = 'pointer' })
-      map.on('mouseleave', 'members-pins', () => { canvas.style.cursor = '' })
-
+      // Member pins are HTML markers (pear bubbles with avatar inside),
+      // managed in the data-sync effect below. Markers handle their own
+      // click events.
       setMapReadyTick(t => t + 1)
     })
 
-    return () => map.remove()
+    return () => {
+      for (const m of markersRef.current.values()) m.remove()
+      markersRef.current.clear()
+      map.remove()
+    }
   }, [])
 
-  // Sync features whenever data or selection changes. Wait for the
-  // style to finish loading on the first call.
+  // Sync features and member markers whenever data or selection
+  // changes. Wait for the style to finish loading on the first call.
   useEffect(() => {
     const map = mapRef.current
     if (!map || !data) return
-    const apply = () => syncFeatures(map, data, fittedRef, selectedPubkey)
+    const apply = () => {
+      syncFeatures(map, data, fittedRef)
+      syncMembers(map, data, selectedPubkey, markersRef.current, onMemberClickRef)
+    }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
   }, [data, selectedPubkey])
@@ -920,29 +928,12 @@ function emptyFC () {
   return { type: 'FeatureCollection', features: [] }
 }
 
-function syncFeatures (map, data, fittedRef, selectedPubkey) {
-  const memberFeatures = []
-  for (const m of data.members ?? []) {
-    const pubkey = m.value?.pubkey
-    const seen = pubkey ? data.lastSeen?.[pubkey] : null
-    if (!seen) continue
-    memberFeatures.push({
-      type: 'Feature',
-      geometry: { type: 'Point', coordinates: [seen.lon, seen.lat] },
-      properties: {
-        name: m.value?.displayName ?? short(pubkey),
-        pubkey,
-        selected: pubkey === selectedPubkey,
-      },
-    })
-  }
+function syncFeatures (map, data, fittedRef) {
   const placeFeatures = (data.places ?? []).map(p => ({
     type: 'Feature',
     geometry: { type: 'Polygon', coordinates: [circlePolygon(p.lat, p.lon, p.radiusMeters)] },
     properties: { name: p.name },
   }))
-
-  map.getSource('members')?.setData({ type: 'FeatureCollection', features: memberFeatures })
   map.getSource('places')?.setData({ type: 'FeatureCollection', features: placeFeatures })
 
   if (fittedRef.current) return
@@ -952,12 +943,112 @@ function syncFeatures (map, data, fittedRef, selectedPubkey) {
   // glance. Users can pan to see distant places. If no members have a
   // location yet, fall back to places so we at least show something
   // useful instead of a globe view.
-  if (memberFeatures.length > 0) {
+  const memberCoords = []
+  for (const m of data.members ?? []) {
+    const pubkey = m.value?.pubkey
+    const seen = pubkey ? data.lastSeen?.[pubkey] : null
+    if (seen) memberCoords.push([seen.lon, seen.lat])
+  }
+  if (memberCoords.length > 0) {
     fittedRef.current = true
-    fitTo(map, memberFeatures.map(f => f.geometry.coordinates))
+    fitTo(map, memberCoords)
   } else if (data.places && data.places.length > 0) {
     fittedRef.current = true
     fitTo(map, data.places.map(p => [p.lon, p.lat]))
+  }
+}
+
+function escapeHtml (s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ))
+}
+
+function buildBubbleElement (clickRef) {
+  const root = document.createElement('div')
+  // MapLibre owns the transform that places the marker at the
+  // projected lat/lon (set on every move/zoom event). The element
+  // must be position: absolute with top/left at the canvas-container
+  // origin so the transform offsets from (0, 0). MapLibre's
+  // .maplibregl-marker CSS class sets these, but explicit inline
+  // styles guard against CSS-load timing (and also override anything
+  // the WebView's user-agent sheet might inject for divs).
+  root.style.position = 'absolute'
+  root.style.top = '0'
+  root.style.left = '0'
+  root.style.cursor = 'pointer'
+  root.style.userSelect = 'none'
+  root.style.webkitUserSelect = 'none'
+  root.addEventListener('click', (e) => {
+    e.stopPropagation()
+    const pk = root.dataset.pubkey
+    if (pk) clickRef.current?.(pk)
+  })
+  return root
+}
+
+// Circular avatar badge anchored at the lat/lon. We tried a pear /
+// speech-bubble silhouette via inline SVG, an SVG positioned absolute
+// inside the marker, an SVG sitting in normal flow, and an SVG used
+// as a CSS background-image data URL. Every form caused a
+// zoom-dependent southward drift in MapLibre Marker positioning. A
+// plain div with the same dimensions and no SVG positions correctly
+// at every zoom, so we ship the bubble as a flat circular badge: the
+// avatar is the location indicator, with a colored ring for contrast
+// and a drop-shadow for depth. Selected state grows the badge and
+// swaps to a cyan ring with a glow halo.
+function renderBubble (root, member, selected) {
+  const pubkey = member.value?.pubkey ?? ''
+  const size = selected ? 48 : 40
+  const ring = selected ? 3 : 2
+  const ringColor = selected ? '#7ec4cf' : '#1a1a1a'
+
+  const avatar = member.value?.avatar
+  const label = member.value?.displayName ?? '?'
+  const inner = (typeof avatar === 'string' && avatar.length > 0)
+    ? `<img src="data:image/jpeg;base64,${avatar}" alt="" style="width:100%;height:100%;object-fit:cover;display:block;" />`
+    : `<div style="width:100%;height:100%;background:#2a3a3f;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:${Math.round(size * 0.42)}px;font-weight:600;font-family:system-ui;">${escapeHtml(initialsFor(label))}</div>`
+
+  root.dataset.pubkey = pubkey
+  root.style.width = size + 'px'
+  root.style.height = size + 'px'
+  root.style.borderRadius = '50%'
+  root.style.overflow = 'hidden'
+  root.style.boxSizing = 'border-box'
+  root.style.border = `${ring}px solid ${ringColor}`
+  root.style.background = '#fc7'
+  root.style.filter = selected
+    ? 'drop-shadow(0 0 10px rgba(126,196,207,0.7)) drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
+    : 'drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
+  root.innerHTML = inner
+}
+
+function syncMembers (map, data, selectedPubkey, markers, clickRef) {
+  const seen = new Set()
+  for (const m of data?.members ?? []) {
+    const pubkey = m.value?.pubkey
+    if (!pubkey) continue
+    const last = data.lastSeen?.[pubkey]
+    if (!last) continue
+    seen.add(pubkey)
+
+    let marker = markers.get(pubkey)
+    if (!marker) {
+      const el = buildBubbleElement(clickRef)
+      marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+      marker.setLngLat([last.lon, last.lat]).addTo(map)
+      markers.set(pubkey, marker)
+    } else {
+      marker.setLngLat([last.lon, last.lat])
+    }
+    renderBubble(marker.getElement(), m, pubkey === selectedPubkey)
+  }
+
+  for (const [pubkey, marker] of markers) {
+    if (!seen.has(pubkey)) {
+      marker.remove()
+      markers.delete(pubkey)
+    }
   }
 }
 
@@ -971,15 +1062,16 @@ function fitTo (map, lonLatPairs) {
   // Use flyTo for a Life360-style cinematic descent: camera arcs up,
   // glides over, and settles. cameraForBounds gives us the destination
   // center/zoom; passing those to flyTo (rather than fitBounds with
-  // animate: true) lets us tune the curve for the arc effect.
-  const opts = { duration: 1400, curve: 1.42, essential: true }
+  // animate: true) lets us tune the curve for the arc effect. Bearing
+  // and pitch are reset so the auto-fit always settles north-up.
+  const opts = { duration: 1400, curve: 1.42, essential: true, bearing: 0, pitch: 0 }
   if (minLat === maxLat && minLon === maxLon) {
     map.flyTo({ center: [minLon, minLat], zoom: 14, ...opts })
     return
   }
   const cam = map.cameraForBounds(
     [[minLon, minLat], [maxLon, maxLat]],
-    { padding: 60, maxZoom: 16 },
+    { padding: 60, maxZoom: 16, bearing: 0 },
   )
   if (cam) map.flyTo({ center: cam.center, zoom: cam.zoom, ...opts })
 }
