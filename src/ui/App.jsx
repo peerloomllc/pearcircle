@@ -221,6 +221,7 @@ function JoinView ({ setView, onJoined, initialInvite }) {
 function mergeCircleSnapshots (circles) {
   const memberMap = new Map()
   const lastSeen = {}
+  const presence = {}
   const places = []
   const transitions = []
   for (const c of circles ?? []) {
@@ -237,11 +238,15 @@ function mergeCircleSnapshots (circles) {
       const existing = lastSeen[pubkey]
       if (!existing || (seen?.ts ?? 0) > (existing?.ts ?? 0)) lastSeen[pubkey] = seen
     }
+    for (const [pubkey, pres] of Object.entries(c.presence ?? {})) {
+      const existing = presence[pubkey]
+      if (!existing || (pres?.setAt ?? 0) > (existing?.setAt ?? 0)) presence[pubkey] = pres
+    }
     for (const p of c.places ?? []) places.push({ ...p, circleId: c.circleId })
     for (const t of c.transitions ?? []) transitions.push({ ...t, circleId: c.circleId })
   }
   transitions.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
-  return { members: Array.from(memberMap.values()), lastSeen, places, transitions }
+  return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
 function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCircleId = null }) {
@@ -298,7 +303,9 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
 
   // If the focused member disappears from the active set (circle filter
   // changed, member left), drop focus so we don't strand a top bar
-  // pointing at no one.
+  // pointing at no one. Also drop focus if the focused member mutes
+  // their sharing — the top bar would otherwise show stale info while
+  // the pin disappears under it.
   useEffect(() => {
     if (!selectedPubkey) return
     const active = selectedCircleId
@@ -307,7 +314,10 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
     const present = active.some(c =>
       (c.members ?? []).some(m => m.value?.pubkey === selectedPubkey),
     ) || selectedPubkey === identity?.publicKey
-    if (!present) setSelectedPubkey(null)
+    if (!present) { setSelectedPubkey(null); return }
+    if (selectedPubkey === identity?.publicKey) return
+    const muted = active.some(c => c.presence?.[selectedPubkey]?.state === 'muted')
+    if (muted) setSelectedPubkey(null)
   }, [circles, selectedCircleId, selectedPubkey, identity])
 
   // Pick the active subset based on the current filter.
@@ -322,6 +332,14 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
   const myPubkey = identity?.publicKey
   const data = useMemo(() => {
     const out = { ...merged, lastSeen: { ...merged.lastSeen } }
+    // Hide muted members' pins by stripping their lastSeen. Other UI
+    // surfaces (member list) still see them via merged.presence so we
+    // can show "Sharing paused". Self is exempted — even when paused,
+    // I want to see my own pin at its frozen-last-known position.
+    for (const [pubkey, pres] of Object.entries(merged.presence ?? {})) {
+      if (pubkey === myPubkey) continue
+      if (pres?.state === 'muted') delete out.lastSeen[pubkey]
+    }
     if (myPubkey && selfSeen && !out.lastSeen[myPubkey]) {
       out.lastSeen[myPubkey] = selfSeen
     }
@@ -605,9 +623,11 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
                 const pubkey = m.value?.pubkey ?? ''
                 const displayName = m.value?.displayName ?? short(pubkey)
                 const seen = data.lastSeen?.[pubkey]
+                const pres = data.presence?.[pubkey]
+                const isPaused = pres?.state === 'muted' && pubkey !== myPubkey
                 const t = latestTransition?.[pubkey]
                 const tPlaceName = t ? placesById?.[t.placeId]?.name : null
-                const focusable = !!seen
+                const focusable = !!seen && !isPaused
                 return (
                   <li
                     key={m.key}
@@ -618,7 +638,9 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
                       <Avatar base64={m.value?.avatar} label={displayName} size={36} />
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={s.memberName}>{displayName}</div>
-                        {t ? (
+                        {isPaused ? (
+                          <div style={s.lastSeenMuted}>Sharing paused</div>
+                        ) : t ? (
                           <div style={s.status}>
                             {t.kind === 'enter' ? 'arrived at ' : 'left '}
                             {tPlaceName ?? '(unknown place)'}

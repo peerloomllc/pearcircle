@@ -470,6 +470,12 @@ const handlers = {
     if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
     await _localDb.put('sharing', { enabled, setAt: Date.now() })
     _sharingEnabled = enabled
+    // Replicate the presence transition (proposal §3 / §4): every
+    // current circle gets a signed `presence:{ourKey}` row so other
+    // members can distinguish "muted" from "stale lastSeen". Failures
+    // on individual circles are non-fatal — the local toggle still
+    // suppresses our writes either way.
+    await writePresenceToAllCircles(enabled ? 'visible' : 'muted')
     send({ event: 'sharing:changed', data: { enabled } })
     return { ok: true, enabled }
   },
@@ -519,6 +525,22 @@ const handlers = {
 
     return { ok: true, written, pubkey: ourKey }
   },
+}
+
+async function writePresenceToAllCircles (state) {
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const value = signValue(
+    { pubkey: ourKey, state, setAt: Date.now(), v: 1 },
+    _identity.secretKey,
+  )
+  for (const [, base] of _circleBases) {
+    if (!base.writable) continue
+    try {
+      await base.append({ type: 'put', key: 'presence:' + ourKey, value })
+    } catch {
+      // base closed mid-flight, etc.
+    }
+  }
 }
 
 async function appendTransition (base, placeId, kind, ts) {
@@ -582,6 +604,11 @@ async function snapshotCircle (circleId, base) {
     const pubkey = key.slice('lastSeen:'.length)
     lastSeen[pubkey] = value
   }
+  const presence = {}
+  for await (const { key, value } of view.createReadStream({ gt: 'presence:', lt: 'presence:~' })) {
+    const pubkey = key.slice('presence:'.length)
+    presence[pubkey] = value
+  }
   const places = []
   for await (const { value } of view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
     if (value && !isDeleted(value)) places.push(value)
@@ -598,6 +625,7 @@ async function snapshotCircle (circleId, base) {
     circle: circleRow ? circleRow.value : null,
     members,
     lastSeen,
+    presence,
     places,
     transitions,
     writable: base.writable,
@@ -683,6 +711,25 @@ async function applyCircleNodes (nodes, view, base) {
         if (incoming.ts > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
         const keyPubkey = op.key.slice('lastSeen:'.length)
         if (keyPubkey !== incoming.pubkey) continue
+        await view.put(op.key, incoming)
+        continue
+      }
+      // `presence:{pubkey}` (proposal §3 / §4): signed by the user-
+      // identity in `pubkey`. Same pubkey-match rule as lastSeen — a
+      // writer can't flip another member's presence. LWW on `setAt`
+      // so a late-replicating older write can't clobber a newer flip.
+      if (op.key.startsWith('presence:')) {
+        const incoming = op.value
+        if (!verifyValue(incoming)) continue
+        if (typeof incoming.setAt !== 'number') continue
+        if (incoming.setAt > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
+        if (incoming.state !== 'visible' && incoming.state !== 'muted') continue
+        const keyPubkey = op.key.slice('presence:'.length)
+        if (keyPubkey !== incoming.pubkey) continue
+        const existing = await view.get(op.key)
+        if (existing?.value && typeof existing.value.setAt === 'number') {
+          if (incoming.setAt <= existing.value.setAt) continue
+        }
         await view.put(op.key, incoming)
         continue
       }
