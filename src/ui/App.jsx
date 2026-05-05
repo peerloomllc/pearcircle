@@ -31,23 +31,31 @@ export function App () {
   const [view, setView] = useState({ name: 'home' })
   const [identity, setIdentity] = useState(null)
   const [profile, setProfile] = useState(null)
-  const [sharing, setSharing] = useState(true)
+  const [sharing, setSharing] = useState({ enabled: true, expiresAt: null })
 
   const refresh = useCallback(async () => {
     const [id, pr, sh] = await Promise.all([
       pear.call('identity:get'),
       pear.call('profile:get'),
-      pear.call('sharing:get').catch(() => ({ enabled: true })),
+      pear.call('sharing:get').catch(() => ({ enabled: true, expiresAt: null })),
     ])
     setIdentity(id)
     setProfile(pr ?? null)
-    setSharing(sh?.enabled !== false)
+    setSharing({
+      enabled: sh?.enabled !== false,
+      expiresAt: typeof sh?.expiresAt === 'number' ? sh.expiresAt : null,
+    })
   }, [])
 
   useEffect(() => {
     refresh()
     pear.on('ready', refresh)
-    pear.on('sharing:changed', ({ enabled }) => setSharing(enabled !== false))
+    pear.on('sharing:changed', ({ enabled, expiresAt }) => {
+      setSharing({
+        enabled: enabled !== false,
+        expiresAt: typeof expiresAt === 'number' ? expiresAt : null,
+      })
+    })
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setView({ name: 'join', invite: url })
     })
@@ -56,9 +64,10 @@ export function App () {
   // Single place that flips the sharing toggle: persist in worklet,
   // start/stop the native foreground service. UI subscribers see the
   // sharing:changed event and re-render. Errors surface to the caller
-  // so the ProfileView toggle can show them.
-  const setSharingEnabled = useCallback(async (enabled) => {
-    await pear.call('sharing:set', { enabled })
+  // so the ProfileView toggle can show them. expiresAt is a future ms
+  // timestamp for time-bounded mute; null/omitted = indefinite.
+  const setSharingEnabled = useCallback(async (enabled, expiresAt = null) => {
+    await pear.call('sharing:set', { enabled, expiresAt })
     if (enabled) {
       await pear.call('shell:location:start').catch(() => null)
     } else {
@@ -72,7 +81,7 @@ export function App () {
         key={view.selectCircle ?? 'all'}
         identity={identity}
         profile={profile}
-        sharing={sharing}
+        sharing={sharing.enabled}
         setView={setView}
         initialSelectedCircleId={view.selectCircle ?? null}
       />
@@ -316,7 +325,7 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
     ) || selectedPubkey === identity?.publicKey
     if (!present) { setSelectedPubkey(null); return }
     if (selectedPubkey === identity?.publicKey) return
-    const muted = active.some(c => c.presence?.[selectedPubkey]?.state === 'muted')
+    const muted = active.some(c => effectivePresenceMuted(c.presence?.[selectedPubkey]))
     if (muted) setSelectedPubkey(null)
   }, [circles, selectedCircleId, selectedPubkey, identity])
 
@@ -336,9 +345,12 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
     // surfaces (member list) still see them via merged.presence so we
     // can show "Sharing paused". Self is exempted — even when paused,
     // I want to see my own pin at its frozen-last-known position.
+    // Expired mutes (expiresAt < now) are NOT filtered — once the
+    // mute has expired the peer is implicitly visible again per
+    // proposal §4, even before they've written a fresh visible row.
     for (const [pubkey, pres] of Object.entries(merged.presence ?? {})) {
       if (pubkey === myPubkey) continue
-      if (pres?.state === 'muted') delete out.lastSeen[pubkey]
+      if (effectivePresenceMuted(pres)) delete out.lastSeen[pubkey]
     }
     if (myPubkey && selfSeen && !out.lastSeen[myPubkey]) {
       out.lastSeen[myPubkey] = selfSeen
@@ -624,7 +636,7 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
                 const displayName = m.value?.displayName ?? short(pubkey)
                 const seen = data.lastSeen?.[pubkey]
                 const pres = data.presence?.[pubkey]
-                const isPaused = pres?.state === 'muted' && pubkey !== myPubkey
+                const isPaused = effectivePresenceMuted(pres) && pubkey !== myPubkey
                 const t = latestTransition?.[pubkey]
                 const tPlaceName = t ? placesById?.[t.placeId]?.name : null
                 const focusable = !!seen && !isPaused
@@ -872,6 +884,18 @@ function AddPlaceForm ({ circleId, myLastSeen, initialCoords, onCancel, onAdded 
       {error && <p style={s.error}>{error}</p>}
     </div>
   )
+}
+
+// A presence row with state==='muted' is only effectively muted
+// while expiresAt is in the future (or absent — meaning indefinite).
+// An expired mute reads as visible: the writing peer's app may have
+// died before they could append the resume row themselves, so the
+// reader handles the rollover. Proposal §3 / §4: "until expiresAt
+// passes or the user toggles back to visible".
+function effectivePresenceMuted (pres, now = Date.now()) {
+  if (!pres || pres.state !== 'muted') return false
+  if (typeof pres.expiresAt !== 'number') return true
+  return pres.expiresAt > now
 }
 
 // Earth-distance haversine in metres. Used by the marker tween logic
@@ -1421,13 +1445,32 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
   const [savedAt, setSavedAt] = useState(null)
   const [sharingError, setSharingError] = useState(null)
   const [togglingSharing, setTogglingSharing] = useState(false)
+  // Re-render once a second while a mute has an active expiresAt so
+  // the countdown ticks. Stops once the expiry passes.
+  const [, setNowTick] = useState(0)
+  useEffect(() => {
+    if (sharing.enabled || !sharing.expiresAt) return
+    const id = setInterval(() => setNowTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [sharing.enabled, sharing.expiresAt])
   const fileRef = useRef(null)
 
-  const toggleSharing = async () => {
+  const stopSharing = async (durationMs) => {
     setSharingError(null)
     setTogglingSharing(true)
     try {
-      await setSharing(!sharing)
+      const expiresAt = typeof durationMs === 'number' ? Date.now() + durationMs : null
+      await setSharing(false, expiresAt)
+    } catch (e) {
+      setSharingError(String(e?.message ?? e))
+    }
+    setTogglingSharing(false)
+  }
+  const resumeSharing = async () => {
+    setSharingError(null)
+    setTogglingSharing(true)
+    try {
+      await setSharing(true, null)
     } catch (e) {
       setSharingError(String(e?.message ?? e))
     }
@@ -1521,23 +1564,47 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
       {error && <p style={s.error}>{error}</p>}
 
       <h2 style={s.h2}>Location sharing</h2>
-      <p style={s.muted}>
-        {sharing
-          ? 'Your location is being shared with the circles you\'re in.'
-          : 'Sharing is paused. Other members see your last known location until you resume.'}
-      </p>
-      <button
-        style={sharing ? s.dangerBtn : s.primaryBtn}
-        disabled={togglingSharing}
-        onClick={toggleSharing}
-      >
-        {togglingSharing
-          ? (sharing ? 'Stopping...' : 'Resuming...')
-          : (sharing ? 'Stop sharing' : 'Resume sharing')}
-      </button>
+      {sharing.enabled ? (
+        <>
+          <p style={s.muted}>
+            Your location is being shared with the circles you're in.
+          </p>
+          <button style={s.dangerBtn} disabled={togglingSharing} onClick={() => stopSharing(null)}>
+            {togglingSharing ? 'Stopping...' : 'Stop sharing'}
+          </button>
+          <p style={{ ...s.muted, marginTop: 16, marginBottom: 6 }}>Or pause briefly:</p>
+          <div style={s.durationRow}>
+            <button style={s.durationBtn} disabled={togglingSharing} onClick={() => stopSharing(15 * 60_000)}>15 min</button>
+            <button style={s.durationBtn} disabled={togglingSharing} onClick={() => stopSharing(60 * 60_000)}>1 hour</button>
+            <button style={s.durationBtn} disabled={togglingSharing} onClick={() => stopSharing(4 * 60 * 60_000)}>4 hours</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p style={s.muted}>
+            {sharing.expiresAt
+              ? `Sharing paused. Resumes in ${formatRemaining(sharing.expiresAt - Date.now())}.`
+              : 'Sharing is paused. Other members see your last known location until you resume.'}
+          </p>
+          <button style={s.primaryBtn} disabled={togglingSharing} onClick={resumeSharing}>
+            {togglingSharing ? 'Resuming...' : 'Resume sharing'}
+          </button>
+        </>
+      )}
       {sharingError && <p style={s.error}>{sharingError}</p>}
     </div>
   )
+}
+
+function formatRemaining (ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return 'a moment'
+  const totalSec = Math.round(ms / 1000)
+  if (totalSec < 60) return totalSec + 's'
+  const totalMin = Math.round(totalSec / 60)
+  if (totalMin < 60) return totalMin + ' min'
+  const hours = Math.floor(totalMin / 60)
+  const mins = totalMin % 60
+  return mins === 0 ? hours + 'h' : hours + 'h ' + mins + 'm'
 }
 
 // Roughly tracks bare's AVATAR_MAX_BASE64 so we surface the size error
@@ -1759,6 +1826,8 @@ const s = {
   primaryBtn: { width: '100%', padding: '14px 16px', background: '#7ec4cf', color: '#0a1f23', border: 'none', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
   secondaryBtn: { width: '100%', padding: '14px 16px', background: '#222', color: '#eee', border: '1px solid #333', borderRadius: 10, fontSize: 16, fontWeight: 500, cursor: 'pointer', marginTop: 8 },
   dangerBtn: { width: '100%', padding: '14px 16px', background: '#5a1f1f', color: '#fcc', border: '1px solid #7a2a2a', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
+  durationRow: { display: 'flex', gap: 8 },
+  durationBtn: { flex: 1, padding: '10px 8px', background: '#1c1c1c', color: '#ccc', border: '1px solid #333', borderRadius: 8, fontSize: 14, cursor: 'pointer' },
   sharingOffDot: { position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: '50%', background: '#e64545', border: '2px solid #1a1a1a', pointerEvents: 'none' },
   iconBtn: { width: 32, height: 32, padding: 0, background: 'none', color: '#ccc', border: 'none', fontSize: 22, cursor: 'pointer' },
   circleList: { listStyle: 'none', padding: 0, margin: 0 },

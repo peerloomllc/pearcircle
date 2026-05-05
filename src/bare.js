@@ -53,6 +53,8 @@ const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
 let _sharingEnabled = true        // local privacy/battery toggle; when false location:update is dropped. Persisted in _localDb under `sharing`. Loaded on init.
+let _sharingExpiresAt = null      // ms timestamp. While _sharingEnabled is false and expiresAt is in the future, mute is "until then"; once now > expiresAt, the worklet auto-resumes (writes a fresh visible presence row + restarts the local toggle). null means indefinite mute (manual resume only).
+let _sharingExpiryTimer = null    // setTimeout handle for the pending auto-resume, cleared whenever sharing:set is called again or auto-resume fires.
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
@@ -460,24 +462,31 @@ const handlers = {
 
   'sharing:get': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
-    const row = await _localDb.get('sharing')
-    const enabled = row?.value?.enabled !== false  // default: true
-    return { enabled }
+    return { enabled: _sharingEnabled, expiresAt: _sharingExpiresAt }
   },
 
-  'sharing:set': async ({ enabled } = {}) => {
+  'sharing:set': async ({ enabled, expiresAt = null } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
-    await _localDb.put('sharing', { enabled, setAt: Date.now() })
+    if (expiresAt != null && (typeof expiresAt !== 'number' || expiresAt <= Date.now())) {
+      throw new Error('expiresAt must be a future ms timestamp')
+    }
+    // Resume always clears any pending expiry; mute keeps the caller's
+    // expiresAt (null = indefinite) and arms the auto-resume timer.
+    const effectiveExpiresAt = enabled ? null : expiresAt
+    await _localDb.put('sharing', { enabled, expiresAt: effectiveExpiresAt, setAt: Date.now() })
     _sharingEnabled = enabled
+    _sharingExpiresAt = effectiveExpiresAt
+    armSharingExpiryTimer()
     // Replicate the presence transition (proposal §3 / §4): every
     // current circle gets a signed `presence:{ourKey}` row so other
-    // members can distinguish "muted" from "stale lastSeen". Failures
-    // on individual circles are non-fatal — the local toggle still
-    // suppresses our writes either way.
-    await writePresenceToAllCircles(enabled ? 'visible' : 'muted')
-    send({ event: 'sharing:changed', data: { enabled } })
-    return { ok: true, enabled }
+    // members can distinguish "muted" from "stale lastSeen". The
+    // expiresAt rides on the row so a peer whose app is running can
+    // surface a countdown, and an expired mute reads as visible even
+    // if the muting peer's app died before writing the resume.
+    await writePresenceToAllCircles(enabled ? 'visible' : 'muted', effectiveExpiresAt)
+    send({ event: 'sharing:changed', data: { enabled, expiresAt: effectiveExpiresAt } })
+    return { ok: true, enabled, expiresAt: effectiveExpiresAt }
   },
 
   'location:update': async ({ lat, lon, accuracy, ts, speed } = {}) => {
@@ -527,12 +536,11 @@ const handlers = {
   },
 }
 
-async function writePresenceToAllCircles (state) {
+async function writePresenceToAllCircles (state, expiresAt = null) {
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
-  const value = signValue(
-    { pubkey: ourKey, state, setAt: Date.now(), v: 1 },
-    _identity.secretKey,
-  )
+  const payload = { pubkey: ourKey, state, setAt: Date.now(), v: 1 }
+  if (typeof expiresAt === 'number') payload.expiresAt = expiresAt
+  const value = signValue(payload, _identity.secretKey)
   for (const [, base] of _circleBases) {
     if (!base.writable) continue
     try {
@@ -541,6 +549,36 @@ async function writePresenceToAllCircles (state) {
       // base closed mid-flight, etc.
     }
   }
+}
+
+// Schedule (or cancel) the auto-resume timer based on the current
+// _sharingExpiresAt. Called from sharing:set and on init. Idempotent:
+// always clears any pending timer first.
+function armSharingExpiryTimer () {
+  if (_sharingExpiryTimer) {
+    clearTimeout(_sharingExpiryTimer)
+    _sharingExpiryTimer = null
+  }
+  if (_sharingEnabled || !_sharingExpiresAt) return
+  const ms = _sharingExpiresAt - Date.now()
+  if (ms <= 0) {
+    // Already expired (clock jump or worklet sleep). Fire immediately.
+    autoResumeSharing().catch(() => {})
+    return
+  }
+  _sharingExpiryTimer = setTimeout(() => {
+    _sharingExpiryTimer = null
+    autoResumeSharing().catch(() => {})
+  }, ms)
+}
+
+async function autoResumeSharing () {
+  if (_sharingEnabled) return
+  await _localDb.put('sharing', { enabled: true, expiresAt: null, setAt: Date.now() })
+  _sharingEnabled = true
+  _sharingExpiresAt = null
+  await writePresenceToAllCircles('visible', null)
+  send({ event: 'sharing:changed', data: { enabled: true, expiresAt: null, auto: true } })
 }
 
 async function appendTransition (base, placeId, kind, ts) {
@@ -978,16 +1016,29 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
   }, 5000)
 
-  // Load the persisted sharing toggle. Default true so existing
-  // installs keep behaving as before; an explicit `enabled: false`
-  // record from a prior session restores the muted state.
+  // Load the persisted sharing state (default visible). If the user
+  // muted-with-expiry and the app was closed past the expiry, treat
+  // it as already-resumed. armSharingExpiryTimer schedules the
+  // auto-resume for any future expiresAt.
   try {
     const row = await _localDb.get('sharing')
-    if (row?.value?.enabled === false) _sharingEnabled = false
+    if (row?.value?.enabled === false) {
+      const exp = typeof row.value.expiresAt === 'number' ? row.value.expiresAt : null
+      _sharingEnabled = false
+      _sharingExpiresAt = exp
+    }
   } catch {}
+  armSharingExpiryTimer()
 
   _initialized = true
-  send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex'), sharingEnabled: _sharingEnabled } })
+  send({
+    event: 'ready',
+    data: {
+      publicKey: b4a.toString(_identity.publicKey, 'hex'),
+      sharingEnabled: _sharingEnabled,
+      sharingExpiresAt: _sharingExpiresAt,
+    },
+  })
 }
 
 let buffer = ''
