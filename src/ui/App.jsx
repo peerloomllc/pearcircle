@@ -226,12 +226,11 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
   const [selectedPubkey, setSelectedPubkey] = useState(null) // null = auto-fit-everyone view
   const [sheetOpen, setSheetOpen] = useState(false)
   const [showAddPlace, setShowAddPlace] = useState(false)
+  const [pendingPlaceCoords, setPendingPlaceCoords] = useState(null) // { lat, lon } from a map long-press, prefilled into AddPlaceForm
   const [editingPlace, setEditingPlace] = useState(null) // { circleId, id, name, radiusMeters } or null
   const [confirmingDeleteId, setConfirmingDeleteId] = useState(null) // place.id awaiting a second tap to delete
   const [deleteError, setDeleteError] = useState(null)
   const [transitionError, setTransitionError] = useState(null)
-  const [claiming, setClaiming] = useState(false)
-  const [claimError, setClaimError] = useState(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const mapApiRef = useRef(null)
   // Set by focusMember just before its flyTo. The auto-recenter
@@ -350,19 +349,6 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     }
   }, [data, myPubkey, refresh])
 
-  const claimMembership = async () => {
-    if (!actionTargetCircleId) return
-    setClaiming(true)
-    setClaimError(null)
-    try {
-      await pear.call('circle:append:member', { circleId: actionTargetCircleId })
-      await refresh()
-    } catch (e) {
-      setClaimError(String(e?.message ?? e))
-    }
-    setClaiming(false)
-  }
-
   const focusMember = useCallback((pubkey) => {
     if (!pubkey) return
     setSelectedPubkey(pubkey)
@@ -382,6 +368,19 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     mapApiRef.current?.fitAll()
   }, [])
 
+  // Long-press on the map opens the add-place form pre-filled with
+  // the touched coords. Requires a single writable circle as the
+  // target — in "All circles" mode (or read-only) we can't pick a
+  // single autobase to write to, so the gesture is a no-op there
+  // (matches the "Add a place" button being hidden in those states).
+  const onMapLongPress = useCallback(([lng, lat]) => {
+    if (!actionTargetCircleId || !actionTargetWritable) return
+    setEditingPlace(null)
+    setPendingPlaceCoords({ lat, lon: lng })
+    setShowAddPlace(true)
+    setSheetOpen(true)
+  }, [actionTargetCircleId, actionTargetWritable])
+
   // Two-tap delete: first tap arms the confirm state for one place,
   // second tap on the same place's button actually fires the delete.
   // Auto-disarm after 4s so a stray earlier tap doesn't strand the
@@ -391,6 +390,20 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     const id = setTimeout(() => setConfirmingDeleteId(null), 4000)
     return () => clearTimeout(id)
   }, [confirmingDeleteId])
+
+  // Dismissing the bottom sheet (scrim tap or drag-to-close) cancels
+  // any pending add/edit/delete-confirm flow, so reopening the sheet
+  // is a fresh state. Without this the user gets the surprise of
+  // returning to a half-filled edit form they thought they'd dismissed.
+  useEffect(() => {
+    if (sheetOpen) return
+    setEditingPlace(null)
+    setShowAddPlace(false)
+    setPendingPlaceCoords(null)
+    setConfirmingDeleteId(null)
+    setDeleteError(null)
+    setTransitionError(null)
+  }, [sheetOpen])
 
   const deletePlace = useCallback(async (place) => {
     setDeleteError(null)
@@ -451,6 +464,7 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
           data={data}
           selectedPubkey={selectedPubkey}
           onMemberClick={focusMember}
+          onLongPress={onMapLongPress}
         />
       </div>
 
@@ -675,29 +689,19 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
               onSaved={async () => { setEditingPlace(null); await refresh() }}
             />
           )}
-          {!editingPlace && actionTargetCircleId && actionTargetWritable && !showAddPlace && (
-            <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
-              Add a place
-            </button>
-          )}
           {!editingPlace && actionTargetCircleId && actionTargetWritable && showAddPlace && (
             <AddPlaceForm
+              key={pendingPlaceCoords ? `lp:${pendingPlaceCoords.lat}:${pendingPlaceCoords.lon}` : 'manual'}
               circleId={actionTargetCircleId}
               myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
-              onCancel={() => setShowAddPlace(false)}
-              onAdded={async () => { setShowAddPlace(false); await refresh() }}
+              initialCoords={pendingPlaceCoords}
+              onCancel={() => { setShowAddPlace(false); setPendingPlaceCoords(null) }}
+              onAdded={async () => { setShowAddPlace(false); setPendingPlaceCoords(null); await refresh() }}
             />
           )}
           {!actionTargetCircleId && circles.length > 1 && (
-            <p style={s.muted}>Pick a single circle from the menu above to add a place or post your membership.</p>
+            <p style={s.muted}>Pick a single circle from the menu above to add a place.</p>
           )}
-
-          {actionTargetCircleId && actionTargetWritable && (
-            <button style={s.primaryBtn} disabled={claiming} onClick={claimMembership}>
-              {claiming ? 'Posting...' : 'Post my membership'}
-            </button>
-          )}
-          {claimError && <p style={s.error}>{claimError}</p>}
           {actionTargetCircleId && !actionTargetWritable && (
             <p style={s.muted}>Read-only until owner adds you as a writer.</p>
           )}
@@ -751,39 +755,37 @@ function EditPlaceForm ({ initial, onCancel, onSaved }) {
   )
 }
 
-function AddPlaceForm ({ circleId, myLastSeen, onCancel, onAdded }) {
+function AddPlaceForm ({ circleId, myLastSeen, initialCoords, onCancel, onAdded }) {
+  // Coords are picked by the map: either explicit (long-press on a
+  // spot) or implicit (the user's current location when they tap
+  // "Add a place" from the sheet). Typing lat/lon is gone — the map
+  // is the canonical way to pick where a place lives.
+  const coords = initialCoords ?? (
+    myLastSeen?.lat != null && myLastSeen?.lon != null
+      ? { lat: myLastSeen.lat, lon: myLastSeen.lon, source: 'current' }
+      : null
+  )
   const [name, setName] = useState('')
-  const [lat, setLat] = useState('')
-  const [lon, setLon] = useState('')
   const [radius, setRadius] = useState('100')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
 
-  const useCurrent = () => {
-    if (myLastSeen?.lat != null && myLastSeen?.lon != null) {
-      setLat(String(myLastSeen.lat))
-      setLon(String(myLastSeen.lon))
-    } else {
-      setError('No current location yet — wait for a location update or enter manually.')
-    }
-  }
-
   const submit = async () => {
     setError(null)
-    const latNum = parseFloat(lat)
-    const lonNum = parseFloat(lon)
+    if (!coords) {
+      setError('No location picked. Long-press the map or wait for your current location.')
+      return
+    }
     const radNum = parseFloat(radius)
     if (!name.trim()) { setError('Name is required'); return }
-    if (!Number.isFinite(latNum) || latNum < -90 || latNum > 90) { setError('Latitude must be between -90 and 90'); return }
-    if (!Number.isFinite(lonNum) || lonNum < -180 || lonNum > 180) { setError('Longitude must be between -180 and 180'); return }
     if (!Number.isFinite(radNum) || radNum < 10 || radNum > 10000) { setError('Radius must be between 10 and 10000 metres'); return }
     setSubmitting(true)
     try {
       const r = await pear.call('place:create', {
         circleId,
         name: name.trim(),
-        lat: latNum,
-        lon: lonNum,
+        lat: coords.lat,
+        lon: coords.lon,
         radiusMeters: radNum,
       })
       setSubmitting(false)
@@ -797,16 +799,16 @@ function AddPlaceForm ({ circleId, myLastSeen, onCancel, onAdded }) {
 
   return (
     <div style={s.section}>
+      {!coords && (
+        <div style={s.coordsMissing}>
+          Long-press the map to pick a spot, or wait for your current location.
+        </div>
+      )}
       <label style={s.label}>Name</label>
-      <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} />
+      <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
       <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
-      <label style={s.label}>Latitude</label>
-      <input style={s.input} value={lat} onChange={(e) => setLat(e.target.value)} inputMode='decimal' placeholder='37.42342' />
-      <label style={s.label}>Longitude</label>
-      <input style={s.input} value={lon} onChange={(e) => setLon(e.target.value)} inputMode='decimal' placeholder='-122.08453' />
-      <button style={s.secondaryBtn} onClick={useCurrent}>Use my current location</button>
-      <button style={s.primaryBtn} disabled={submitting} onClick={submit}>
+      <button style={s.primaryBtn} disabled={submitting || !coords} onClick={submit}>
         {submitting ? 'Saving...' : 'Save place'}
       </button>
       <button style={s.secondaryBtn} onClick={onCancel}>Cancel</button>
@@ -853,7 +855,7 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
 }
 
 const CircleMap = React.forwardRef(function CircleMap (
-  { data, selectedPubkey, onMemberClick },
+  { data, selectedPubkey, onMemberClick, onLongPress },
   apiRef,
 ) {
   const containerRef = useRef(null)
@@ -861,6 +863,7 @@ const CircleMap = React.forwardRef(function CircleMap (
   const fittedRef = useRef(false)
   const dataRef = useRef(data)
   const onMemberClickRef = useRef(onMemberClick)
+  const onLongPressRef = useRef(onLongPress)
   // Per-pubkey marker state: { marker, lng, lat, anim? }. lng/lat is
   // the position the marker is currently displayed at (mid-tween or
   // settled). anim is { start, duration, fromLng, fromLat, toLng,
@@ -872,6 +875,7 @@ const CircleMap = React.forwardRef(function CircleMap (
   // Keep refs current so the layer click handler (registered once on
   // load) and the imperative fitAll always see the latest props.
   useEffect(() => { onMemberClickRef.current = onMemberClick }, [onMemberClick])
+  useEffect(() => { onLongPressRef.current = onLongPress }, [onLongPress])
   useEffect(() => { dataRef.current = data }, [data])
 
   // Expose imperative flyTo/panTo/fitAll to the parent. Direct camera
@@ -974,6 +978,55 @@ const CircleMap = React.forwardRef(function CircleMap (
       // Member pins are HTML markers (pear bubbles with avatar inside),
       // managed in the data-sync effect below. Markers handle their own
       // click events.
+      //
+      // Long-press detection: maplibre's `contextmenu` event isn't
+      // reliable in Android/iOS WebView (the OS-level long-press menu
+      // for text selection often preempts it, fires haptic feedback,
+      // and swallows the contextmenu event). We track touchstart +
+      // touchmove + touchend ourselves with a 500ms timer that
+      // cancels on movement > 10px or release. unproject() converts
+      // the touch point to lng/lat at the moment the timer fires.
+      const canvas = map.getCanvas()
+      // -webkit-touch-callout: none suppresses the iOS/Android
+      // long-press callout on the canvas so the WebView doesn't fight
+      // for the gesture.
+      canvas.style.webkitTouchCallout = 'none'
+      let pressState = null
+      const clearPress = () => {
+        if (pressState?.timer) clearTimeout(pressState.timer)
+        pressState = null
+      }
+      const onTouchStart = (e) => {
+        if (e.touches.length !== 1) { clearPress(); return }
+        const t = e.touches[0]
+        const rect = canvas.getBoundingClientRect()
+        const x = t.clientX - rect.left
+        const y = t.clientY - rect.top
+        pressState = {
+          x, y,
+          timer: setTimeout(() => {
+            try {
+              const ll = map.unproject([x, y])
+              onLongPressRef.current?.([ll.lng, ll.lat])
+            } catch {}
+            pressState = null
+          }, 500),
+        }
+      }
+      const onTouchMove = (e) => {
+        if (!pressState) return
+        if (e.touches.length !== 1) { clearPress(); return }
+        const t = e.touches[0]
+        const rect = canvas.getBoundingClientRect()
+        const dx = (t.clientX - rect.left) - pressState.x
+        const dy = (t.clientY - rect.top) - pressState.y
+        if (Math.hypot(dx, dy) > 10) clearPress()
+      }
+      canvas.addEventListener('touchstart', onTouchStart, { passive: true })
+      canvas.addEventListener('touchmove', onTouchMove, { passive: true })
+      canvas.addEventListener('touchend', clearPress, { passive: true })
+      canvas.addEventListener('touchcancel', clearPress, { passive: true })
+
       setMapReadyTick(t => t + 1)
     })
 
@@ -1638,6 +1691,7 @@ const s = {
   placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
   placeRowActions: { display: 'flex', gap: 6, flexShrink: 0 },
   placeRadiusLine: { fontSize: 12, color: '#888', marginTop: 4, fontFamily: 'monospace' },
+  coordsMissing: { fontSize: 13, color: '#fa9', padding: '8px 12px', background: '#2a1f0f', border: '1px solid #4a3520', borderRadius: 8, marginBottom: 12, lineHeight: 1.4 },
   avatarRow: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 },
   avatarPreview: { width: 96, height: 96, borderRadius: '50%', overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   avatarImg: { width: '100%', height: '100%', objectFit: 'cover' },
