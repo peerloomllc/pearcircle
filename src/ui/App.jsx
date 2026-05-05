@@ -223,6 +223,7 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
   const [selectedCircleId, setSelectedCircleId] = useState(initialSelectedCircleId) // null = All
+  const [selectedPubkey, setSelectedPubkey] = useState(null) // null = auto-fit-everyone view
   const [sheetOpen, setSheetOpen] = useState(false)
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [transitionError, setTransitionError] = useState(null)
@@ -261,6 +262,20 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     if (!selectedCircleId) return
     if (!circles.some(c => c.circleId === selectedCircleId)) setSelectedCircleId(null)
   }, [circles, selectedCircleId])
+
+  // If the focused member disappears from the active set (circle filter
+  // changed, member left), drop focus so we don't strand a top bar
+  // pointing at no one.
+  useEffect(() => {
+    if (!selectedPubkey) return
+    const active = selectedCircleId
+      ? circles.filter(c => c.circleId === selectedCircleId)
+      : circles
+    const present = active.some(c =>
+      (c.members ?? []).some(m => m.value?.pubkey === selectedPubkey),
+    ) || selectedPubkey === identity?.publicKey
+    if (!present) setSelectedPubkey(null)
+  }, [circles, selectedCircleId, selectedPubkey, identity])
 
   // Pick the active subset based on the current filter.
   const activeCircles = selectedCircleId
@@ -340,6 +355,39 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     setClaiming(false)
   }
 
+  const focusMember = useCallback((pubkey) => {
+    if (!pubkey) return
+    setSelectedPubkey(pubkey)
+    setMenuOpen(false)
+    setSheetOpen(false)
+    const seen = data.lastSeen?.[pubkey]
+    if (seen) {
+      mapApiRef.current?.flyTo({
+        center: [seen.lon, seen.lat], zoom: 16, duration: 1100,
+      })
+    }
+  }, [data])
+
+  const clearFocus = useCallback(() => {
+    setSelectedPubkey(null)
+    mapApiRef.current?.fitAll()
+  }, [])
+
+  // Resolve the focused member's display fields from whichever circle
+  // carries the freshest row. Falls back to "you" when the user has
+  // focused themselves but no circle row exists yet.
+  const selectedMember = (() => {
+    if (!selectedPubkey) return null
+    const m = data.members.find(x => x.value?.pubkey === selectedPubkey)
+    const seen = data.lastSeen?.[selectedPubkey]
+    return {
+      pubkey: selectedPubkey,
+      displayName: m?.value?.displayName ?? (selectedPubkey === myPubkey ? 'You' : short(selectedPubkey)),
+      avatar: m?.value?.avatar,
+      seen,
+    }
+  })()
+
   // Title is the current filter label.
   const filterLabel = selectedCircleId
     ? (activeCircles[0]?.circle?.name ?? '...')
@@ -348,18 +396,43 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
   return (
     <div style={s.mapFirstRoot}>
       <div style={s.mapFill}>
-        <CircleMap ref={mapApiRef} data={data} />
+        <CircleMap
+          ref={mapApiRef}
+          data={data}
+          selectedPubkey={selectedPubkey}
+          onMemberClick={focusMember}
+        />
       </div>
 
       <header style={s.mapTopBar}>
-        <button
-          type='button'
-          style={s.dropdownBtn}
-          onClick={() => setMenuOpen((m) => !m)}
-        >
-          <span style={s.dropdownLabel}>{filterLabel}</span>
-          <span style={s.dropdownChevron}>{menuOpen ? '▴' : '▾'}</span>
-        </button>
+        {selectedMember ? (
+          <>
+            <button
+              type='button'
+              style={s.iconBtn}
+              onClick={clearFocus}
+              aria-label='Back to all'
+            >‹</button>
+            <Avatar base64={selectedMember.avatar} label={selectedMember.displayName} size={32} />
+            <div style={s.focusTextCol}>
+              <div style={s.focusName}>{selectedMember.displayName}</div>
+              <div style={s.focusSub}>
+                {selectedMember.seen
+                  ? 'updated ' + ageLabel(selectedMember.seen.ts)
+                  : 'no location yet'}
+              </div>
+            </div>
+          </>
+        ) : (
+          <button
+            type='button'
+            style={s.dropdownBtn}
+            onClick={() => setMenuOpen((m) => !m)}
+          >
+            <span style={s.dropdownLabel}>{filterLabel}</span>
+            <span style={s.dropdownChevron}>{menuOpen ? '▴' : '▾'}</span>
+          </button>
+        )}
         <span style={s.peerBadge}>
           <span style={{ ...s.peerDot, background: peerCount > 0 ? '#7ec77a' : '#555' }} />
           {peerCount}
@@ -374,7 +447,7 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
         </button>
       </header>
 
-      {menuOpen && (
+      {menuOpen && !selectedMember && (
         <>
           <div style={s.menuScrim} onClick={() => setMenuOpen(false)} />
           <div style={s.menu}>
@@ -435,8 +508,13 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
                 const seen = data.lastSeen?.[pubkey]
                 const t = latestTransition?.[pubkey]
                 const tPlaceName = t ? placesById?.[t.placeId]?.name : null
+                const focusable = !!seen
                 return (
-                  <li key={m.key} style={s.memberItem}>
+                  <li
+                    key={m.key}
+                    style={{ ...s.memberItem, cursor: focusable ? 'pointer' : 'default' }}
+                    onClick={focusable ? () => focusMember(pubkey) : undefined}
+                  >
                     <div style={s.memberRow}>
                       <Avatar base64={m.value?.avatar} label={displayName} size={36} />
                       <div style={{ flex: 1, minWidth: 0 }}>
@@ -610,19 +688,42 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
   return ring
 }
 
-const CircleMap = React.forwardRef(function CircleMap ({ data }, apiRef) {
+const CircleMap = React.forwardRef(function CircleMap (
+  { data, selectedPubkey, onMemberClick },
+  apiRef,
+) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const fittedRef = useRef(false)
+  const dataRef = useRef(data)
+  const onMemberClickRef = useRef(onMemberClick)
+  const [mapReadyTick, setMapReadyTick] = useState(0)
 
-  // Expose imperative flyTo/jumpTo to the parent so click handlers can
-  // drive the camera directly without going through state + effect
-  // round-trips that could be batched or dropped in unexpected ways.
+  // Keep refs current so the layer click handler (registered once on
+  // load) and the imperative fitAll always see the latest props.
+  useEffect(() => { onMemberClickRef.current = onMemberClick }, [onMemberClick])
+  useEffect(() => { dataRef.current = data }, [data])
+
+  // Expose imperative flyTo/fitAll to the parent. Direct camera moves
+  // avoid state/effect round-trips that could be batched or dropped.
   React.useImperativeHandle(apiRef, () => ({
     flyTo: (opts) => {
       const m = mapRef.current
       if (!m) return
       try { m.flyTo(opts) } catch { try { m.jumpTo({ center: opts.center, zoom: opts.zoom }) } catch {} }
+    },
+    fitAll: () => {
+      const m = mapRef.current
+      const d = dataRef.current
+      if (!m || !d) return
+      const coords = []
+      for (const mem of d.members ?? []) {
+        const pubkey = mem.value?.pubkey
+        const seen = pubkey ? d.lastSeen?.[pubkey] : null
+        if (seen) coords.push([seen.lon, seen.lat])
+      }
+      if (coords.length > 0) fitTo(m, coords)
+      else if (d.places?.length > 0) fitTo(m, d.places.map(p => [p.lon, p.lat]))
     },
   }), [])
 
@@ -652,44 +753,174 @@ const CircleMap = React.forwardRef(function CircleMap ({ data }, apiRef) {
         id: 'places-stroke', type: 'line', source: 'places',
         paint: { 'line-color': '#7ec4cf', 'line-width': 2 },
       })
+      // Data-driven radius/stroke so the selected pin pops without
+      // running a second layer.
       map.addLayer({
         id: 'members-pins', type: 'circle', source: 'members',
         paint: {
-          'circle-radius': 8,
+          'circle-radius': ['case', ['boolean', ['get', 'selected'], false], 13, 8],
           'circle-color': '#fc7',
-          'circle-stroke-color': '#1a1a1a',
-          'circle-stroke-width': 2,
+          'circle-stroke-color': ['case', ['boolean', ['get', 'selected'], false], '#7ec4cf', '#1a1a1a'],
+          'circle-stroke-width': ['case', ['boolean', ['get', 'selected'], false], 4, 2],
         },
       })
+
+      map.on('click', 'members-pins', (e) => {
+        const f = e.features?.[0]
+        const pubkey = f?.properties?.pubkey
+        if (pubkey) onMemberClickRef.current?.(pubkey)
+      })
+      const canvas = map.getCanvas()
+      map.on('mouseenter', 'members-pins', () => { canvas.style.cursor = 'pointer' })
+      map.on('mouseleave', 'members-pins', () => { canvas.style.cursor = '' })
+
+      setMapReadyTick(t => t + 1)
     })
 
     return () => map.remove()
   }, [])
 
-  // Sync features whenever data changes. Wait for the style to finish
-  // loading on the first call - on subsequent renders the listener is a
-  // no-op because the data on the source is just replaced.
+  // Sync features whenever data or selection changes. Wait for the
+  // style to finish loading on the first call.
   useEffect(() => {
     const map = mapRef.current
     if (!map || !data) return
-    const apply = () => syncFeatures(map, data, fittedRef)
+    const apply = () => syncFeatures(map, data, fittedRef, selectedPubkey)
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [data])
+  }, [data, selectedPubkey])
 
   return (
     <div style={s.mapWrap}>
       <div ref={containerRef} style={s.mapCanvas} />
+      <EdgeIndicators
+        map={mapRef.current}
+        ready={mapReadyTick > 0}
+        members={data?.members ?? []}
+        lastSeen={data?.lastSeen ?? {}}
+        selectedPubkey={selectedPubkey}
+        onSelect={onMemberClick}
+      />
       <div style={s.mapAttribution}>© OpenStreetMap contributors</div>
     </div>
   )
 })
 
+// Off-screen members get a clamped avatar pinned to the viewport edge
+// with a small arrow pointing outward in their direction. Subscribes to
+// the map's move/zoom/resize events so positions track the camera.
+// Top inset clears the floating top bar; bottom inset clears the FAB.
+function EdgeIndicators ({ map, ready, members, lastSeen, selectedPubkey, onSelect }) {
+  const [, setTick] = useState(0)
+
+  useEffect(() => {
+    if (!map || !ready) return
+    const rerender = () => setTick(t => (t + 1) % 1_000_000)
+    map.on('move', rerender)
+    map.on('zoom', rerender)
+    map.on('resize', rerender)
+    rerender()
+    return () => {
+      map.off('move', rerender)
+      map.off('zoom', rerender)
+      map.off('resize', rerender)
+    }
+  }, [map, ready])
+
+  if (!map || !ready) return null
+  const canvas = map.getCanvas()
+  const w = canvas.clientWidth
+  const h = canvas.clientHeight
+  if (w === 0 || h === 0) return null
+
+  const TOP = 80
+  const BOTTOM = 96
+  const SIDE = 32
+  const cx = w / 2
+  const cy = (TOP + (h - BOTTOM)) / 2
+  const halfW = w / 2 - SIDE
+  const halfH = (h - TOP - BOTTOM) / 2
+  if (halfW <= 0 || halfH <= 0) return null
+
+  const indicators = []
+  for (const m of members) {
+    const pubkey = m.value?.pubkey
+    if (!pubkey) continue
+    const seen = lastSeen?.[pubkey]
+    if (!seen) continue
+    let p
+    try { p = map.project([seen.lon, seen.lat]) } catch { continue }
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue
+    const onScreen = p.x >= SIDE && p.x <= w - SIDE && p.y >= TOP && p.y <= h - BOTTOM
+    if (onScreen) continue
+
+    const dx = p.x - cx
+    const dy = p.y - cy
+    if (dx === 0 && dy === 0) continue
+    const t = Math.min(halfW / Math.max(Math.abs(dx), 1e-6), halfH / Math.max(Math.abs(dy), 1e-6))
+    const ex = cx + dx * t
+    const ey = cy + dy * t
+    const angle = Math.atan2(dy, dx) * 180 / Math.PI
+    indicators.push({
+      pubkey,
+      name: m.value?.displayName ?? short(pubkey),
+      avatar: m.value?.avatar,
+      x: ex, y: ey, angle,
+      selected: pubkey === selectedPubkey,
+    })
+  }
+
+  return (
+    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 4 }}>
+      {indicators.map(i => (
+        <button
+          key={i.pubkey}
+          onClick={() => onSelect?.(i.pubkey)}
+          style={{
+            position: 'absolute',
+            left: i.x - 22, top: i.y - 22,
+            width: 44, height: 44,
+            border: 'none', padding: 0, background: 'transparent',
+            pointerEvents: 'auto', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+          aria-label={'Focus ' + i.name}
+        >
+          <div style={{
+            width: 32, height: 32, borderRadius: '50%',
+            border: '2px solid ' + (i.selected ? '#7ec4cf' : '#fc7'),
+            boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+            background: '#1a1a1a',
+            overflow: 'hidden',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <Avatar base64={i.avatar} label={i.name} size={28} />
+          </div>
+          <div style={{
+            position: 'absolute',
+            // Place the arrow's base (its transform-origin at local 0,5)
+            // 18px from button center in the angle direction, so the
+            // notch sits just outside the 32px avatar ring.
+            left: 22 + Math.cos(i.angle * Math.PI / 180) * 18,
+            top: 17 + Math.sin(i.angle * Math.PI / 180) * 18,
+            width: 0, height: 0,
+            borderLeft: '7px solid ' + (i.selected ? '#7ec4cf' : '#fc7'),
+            borderTop: '5px solid transparent',
+            borderBottom: '5px solid transparent',
+            transform: `rotate(${i.angle}deg)`,
+            transformOrigin: '0 5px',
+          }} />
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function emptyFC () {
   return { type: 'FeatureCollection', features: [] }
 }
 
-function syncFeatures (map, data, fittedRef) {
+function syncFeatures (map, data, fittedRef, selectedPubkey) {
   const memberFeatures = []
   for (const m of data.members ?? []) {
     const pubkey = m.value?.pubkey
@@ -698,7 +929,11 @@ function syncFeatures (map, data, fittedRef) {
     memberFeatures.push({
       type: 'Feature',
       geometry: { type: 'Point', coordinates: [seen.lon, seen.lat] },
-      properties: { name: m.value?.displayName ?? short(pubkey) },
+      properties: {
+        name: m.value?.displayName ?? short(pubkey),
+        pubkey,
+        selected: pubkey === selectedPubkey,
+      },
     })
   }
   const placeFeatures = (data.places ?? []).map(p => ({
@@ -1127,6 +1362,9 @@ const s = {
   },
   dropdownLabel: { flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   dropdownChevron: { fontSize: 12, color: '#888' },
+  focusTextCol: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center' },
+  focusName: { fontSize: 15, fontWeight: 600, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  focusSub: { fontSize: 12, color: '#9cf', fontFamily: 'monospace' },
   avatarBtn: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
