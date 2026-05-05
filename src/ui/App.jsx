@@ -83,12 +83,15 @@ function ListView ({ identity, profile, circles, onRefresh, setView }) {
           style={s.profileBtn}
           onClick={() => setView({ name: 'profile' })}
         >
-          {profile?.displayName ? (
-            <span style={s.idName}>{profile.displayName}</span>
-          ) : (
-            <span style={s.idNeedName}>Set your name</span>
-          )}
-          <span style={s.idMuted}>{' · '}{short(identity.publicKey)}</span>
+          <Avatar base64={profile?.avatar} label={profile?.displayName ?? ''} size={32} />
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', flex: 1 }}>
+            {profile?.displayName ? (
+              <span style={s.idName}>{profile.displayName}</span>
+            ) : (
+              <span style={s.idNeedName}>Set your name</span>
+            )}
+            <span style={s.idMuted}>{short(identity.publicKey)}</span>
+          </div>
         </button>
       )}
       <div style={s.actions}>
@@ -320,29 +323,35 @@ function DetailView ({ circleId, myPubkey, setView }) {
         <ul style={s.memberList}>
           {data.members.map(m => {
             const pubkey = m.value?.pubkey ?? ''
+            const displayName = m.value?.displayName ?? short(pubkey)
             const seen = data.lastSeen?.[pubkey]
             const t = latestTransition?.[pubkey]
             const tPlaceName = t ? placesById?.[t.placeId]?.name : null
             return (
               <li key={m.key} style={s.memberItem}>
-                <div style={s.memberName}>{m.value?.displayName ?? short(pubkey)}</div>
-                <div style={s.muted}>{short(pubkey)}</div>
-                {t && (
-                  <div style={s.status}>
-                    {t.kind === 'enter' ? 'arrived at ' : 'left '}
-                    {tPlaceName ?? '(unknown place)'}
-                    {' · '}{ageLabel(t.ts)}
+                <div style={s.memberRow}>
+                  <Avatar base64={m.value?.avatar} label={displayName} size={36} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={s.memberName}>{displayName}</div>
+                    <div style={s.muted}>{short(pubkey)}</div>
+                    {t && (
+                      <div style={s.status}>
+                        {t.kind === 'enter' ? 'arrived at ' : 'left '}
+                        {tPlaceName ?? '(unknown place)'}
+                        {' · '}{ageLabel(t.ts)}
+                      </div>
+                    )}
+                    {seen ? (
+                      <div style={s.lastSeen}>
+                        {seen.lat.toFixed(5)}, {seen.lon.toFixed(5)}
+                        {' · '}{ageLabel(seen.ts)}
+                        {seen.accuracy != null && ` · ±${Math.round(seen.accuracy)}m`}
+                      </div>
+                    ) : (
+                      <div style={s.lastSeenMuted}>no location yet</div>
+                    )}
                   </div>
-                )}
-                {seen ? (
-                  <div style={s.lastSeen}>
-                    {seen.lat.toFixed(5)}, {seen.lon.toFixed(5)}
-                    {' · '}{ageLabel(seen.ts)}
-                    {seen.accuracy != null && ` · ±${Math.round(seen.accuracy)}m`}
-                  </div>
-                ) : (
-                  <div style={s.lastSeenMuted}>no location yet</div>
-                )}
+                </div>
               </li>
             )
           })}
@@ -599,16 +608,42 @@ function fitToFeatures (map, memberFeatures, places) {
 
 function ProfileView ({ profile, setView, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
+  // null = unchanged from server; '' = explicitly cleared; string = new value
+  const [avatar, setAvatar] = useState(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [savedAt, setSavedAt] = useState(null)
+  const fileRef = useRef(null)
+
+  const onPickFile = async (e) => {
+    setError(null)
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow re-picking the same file
+    if (!file) return
+    try {
+      const dataUrl = await readFileDataUrl(file)
+      const compressed = await compressToAvatar(dataUrl)
+      // compressed is "data:image/jpeg;base64,..." — strip the prefix
+      const comma = compressed.indexOf(',')
+      const base64 = compressed.slice(comma + 1)
+      if (base64.length > AVATAR_MAX_BASE64) {
+        setError('Image is still too large after compression. Try a different photo.')
+        return
+      }
+      setAvatar(base64)
+    } catch (err) {
+      setError('Could not load that image: ' + (err?.message ?? err))
+    }
+  }
 
   const submit = async () => {
     if (!name.trim()) return
     setSaving(true)
     setError(null)
     try {
-      const r = await pear.call('profile:set', { displayName: name.trim() })
+      const args = { displayName: name.trim() }
+      if (avatar !== null) args.avatar = avatar === '' ? null : avatar
+      const r = await pear.call('profile:set', args)
       setSaving(false)
       if (r?.ok) {
         setSavedAt(Date.now())
@@ -622,24 +657,124 @@ function ProfileView ({ profile, setView, onSaved }) {
     }
   }
 
+  const previewBase64 = avatar !== null ? avatar : profile?.avatar
+  const hasAvatar = typeof previewBase64 === 'string' && previewBase64.length > 0
+
   return (
     <div style={s.screen}>
       <BackBar onBack={() => setView({ name: 'list' })} title='Profile' />
+      <div style={s.avatarRow}>
+        <div style={s.avatarPreview}>
+          {hasAvatar ? (
+            <img src={'data:image/jpeg;base64,' + previewBase64} style={s.avatarImg} alt='Your avatar' />
+          ) : (
+            <span style={s.avatarFallback}>{initialsFor(name || profile?.displayName || '?')}</span>
+          )}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
+          <button style={s.secondaryBtn} onClick={() => fileRef.current?.click()}>
+            {hasAvatar ? 'Change photo' : 'Choose photo'}
+          </button>
+          {hasAvatar && (
+            <button style={s.secondaryBtn} onClick={() => setAvatar('')}>Remove photo</button>
+          )}
+          <input
+            ref={fileRef}
+            type='file'
+            accept='image/*'
+            style={{ display: 'none' }}
+            onChange={onPickFile}
+          />
+        </div>
+      </div>
       <label style={s.label}>Display name</label>
       <input
         style={s.input}
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder='Your name'
-        autoFocus
         maxLength={64}
       />
       <button style={s.primaryBtn} disabled={!name.trim() || saving} onClick={submit}>
         {saving ? 'Saving...' : 'Save'}
       </button>
-      {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new name shortly.</p>}
+      {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
     </div>
+  )
+}
+
+// Roughly tracks bare's AVATAR_MAX_BASE64 so we surface the size error
+// in the UI before the IPC call. Bare is the source of truth.
+const AVATAR_MAX_BASE64 = 42000
+
+function readFileDataUrl (file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = () => reject(reader.error || new Error('read failed'))
+    reader.readAsDataURL(file)
+  })
+}
+
+// Center-square-cover crop to 96x96 then JPEG-compress. Reduces quality
+// in steps if the encoded result is over the byte budget; gives up at
+// quality 0.4 and lets the caller surface a friendly error.
+function compressToAvatar (dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const size = 96
+      const canvas = document.createElement('canvas')
+      canvas.width = size
+      canvas.height = size
+      const ctx = canvas.getContext('2d')
+      const sw = img.naturalWidth
+      const sh = img.naturalHeight
+      const cropSize = Math.min(sw, sh)
+      const sx = (sw - cropSize) / 2
+      const sy = (sh - cropSize) / 2
+      ctx.drawImage(img, sx, sy, cropSize, cropSize, 0, 0, size, size)
+      const qualities = [0.85, 0.75, 0.65, 0.55, 0.45]
+      for (const q of qualities) {
+        const url = canvas.toDataURL('image/jpeg', q)
+        const b64Len = url.length - (url.indexOf(',') + 1)
+        if (b64Len <= AVATAR_MAX_BASE64) { resolve(url); return }
+      }
+      // Fall through: return the lowest-quality version even if oversized;
+      // bare will reject and the UI will message the user.
+      resolve(canvas.toDataURL('image/jpeg', 0.45))
+    }
+    img.onerror = () => reject(new Error('decode failed'))
+    img.src = dataUrl
+  })
+}
+
+function initialsFor (label) {
+  const trimmed = (label || '').trim()
+  if (!trimmed) return '?'
+  const parts = trimmed.split(/\s+/).slice(0, 2)
+  return parts.map(p => p[0].toUpperCase()).join('')
+}
+
+function Avatar ({ base64, label, size = 28 }) {
+  const px = size + 'px'
+  if (typeof base64 === 'string' && base64.length > 0) {
+    return (
+      <img
+        src={'data:image/jpeg;base64,' + base64}
+        alt=''
+        style={{ width: px, height: px, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }}
+      />
+    )
+  }
+  return (
+    <div style={{
+      width: px, height: px, borderRadius: '50%', flexShrink: 0,
+      background: '#2a3a3f', color: '#cfe', display: 'flex',
+      alignItems: 'center', justifyContent: 'center',
+      fontSize: Math.round(size * 0.42), fontWeight: 600, fontFamily: 'system-ui',
+    }}>{initialsFor(label)}</div>
   )
 }
 
@@ -701,7 +836,7 @@ const s = {
   h2: { fontSize: 18, margin: '24px 0 8px 0', fontWeight: 600 },
   h3: { fontSize: 16, margin: '20px 0 8px 0', fontWeight: 600, color: '#bbb' },
   idLine: { color: '#888', margin: '4px 0 16px 0', fontSize: 13, fontFamily: 'monospace' },
-  profileBtn: { display: 'flex', alignItems: 'baseline', gap: 6, width: '100%', padding: '10px 12px', margin: '4px 0 16px 0', background: '#1c1c1c', border: '1px solid #2a2a2a', borderRadius: 8, color: '#eee', textAlign: 'left', cursor: 'pointer', fontSize: 13 },
+  profileBtn: { display: 'flex', alignItems: 'center', gap: 12, width: '100%', padding: '10px 12px', margin: '4px 0 16px 0', background: '#1c1c1c', border: '1px solid #2a2a2a', borderRadius: 8, color: '#eee', textAlign: 'left', cursor: 'pointer', fontSize: 13 },
   idName: { color: '#eee', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', fontWeight: 600, fontSize: 14 },
   idNeedName: { color: '#7ec4cf', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', fontWeight: 600, fontSize: 14 },
   idMuted: { color: '#888', fontFamily: 'monospace' },
@@ -723,7 +858,12 @@ const s = {
   row: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: 14 },
   memberList: { listStyle: 'none', padding: 0, margin: 0 },
   memberItem: { padding: 12, background: '#1c1c1c', borderRadius: 10, marginBottom: 8 },
+  memberRow: { display: 'flex', alignItems: 'flex-start', gap: 12 },
   memberName: { fontSize: 15, fontWeight: 500 },
+  avatarRow: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 },
+  avatarPreview: { width: 96, height: 96, borderRadius: '50%', overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  avatarImg: { width: '100%', height: '100%', objectFit: 'cover' },
+  avatarFallback: { color: '#cfe', fontSize: 36, fontWeight: 600, fontFamily: 'system-ui' },
   lastSeen: { fontSize: 12, color: '#9cf', marginTop: 4, fontFamily: 'monospace' },
   lastSeenMuted: { fontSize: 12, color: '#555', marginTop: 4, fontStyle: 'italic' },
   status: { fontSize: 13, color: '#cfc', marginTop: 4, fontWeight: 500 },

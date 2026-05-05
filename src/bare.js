@@ -38,6 +38,10 @@ const { haversineMeters, classify } = require('./lib/geofence')
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
 const FUTURE_TS_TOLERANCE_MS = 5 * 60 * 1000
 
+// Avatar base64 cap. Per DECISIONS 2026-05-03 the byte-budget is ~30KB,
+// which is ~40KB after base64 inflation. We leave a small headroom.
+const AVATAR_MAX_BASE64 = 42000
+
 let _store = null
 let _localDb = null
 let _identity = null
@@ -88,16 +92,32 @@ const handlers = {
     return row ? row.value : null
   },
 
-  'profile:set': async ({ displayName } = {}) => {
+  'profile:set': async ({ displayName, avatar } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof displayName !== 'string') throw new Error('displayName must be a string')
     const trimmed = displayName.trim().slice(0, 64)
     if (trimmed.length === 0) throw new Error('displayName must be non-empty')
-    const updatedAt = Date.now()
-    const value = { displayName: trimmed, updatedAt, v: 1 }
-    await _localDb.put('profile', value)
+    // avatar: base64 JPEG string, ~30KB encoded ceiling per DECISIONS
+    // 2026-05-03 (~40KB after base64 inflation). null/undefined clears
+    // the avatar; anything else is silently dropped at apply time on
+    // peers but we reject up-front to surface the error to the user.
+    let avatarValue
+    if (avatar === null || avatar === undefined) {
+      avatarValue = null
+    } else if (typeof avatar !== 'string') {
+      throw new Error('avatar must be a base64 string or null')
+    } else if (avatar.length > AVATAR_MAX_BASE64) {
+      throw new Error('avatar too large after compression; pick a smaller photo')
+    } else {
+      avatarValue = avatar
+    }
 
-    // Re-broadcast member row to every writable circle so peers see the new name.
+    const updatedAt = Date.now()
+    const profile = { displayName: trimmed, updatedAt, v: 1 }
+    if (avatarValue) profile.avatar = avatarValue
+    await _localDb.put('profile', profile)
+
+    // Re-broadcast member row to every writable circle so peers see the new name + avatar.
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     let republished = 0
     for (const [, base] of _circleBases) {
@@ -105,10 +125,12 @@ const handlers = {
       try {
         const existing = await base.view.get('member:' + ourKey)
         const joinedAt = existing?.value?.joinedAt ?? updatedAt
+        const memberValue = { pubkey: ourKey, displayName: trimmed, joinedAt, v: 1 }
+        if (avatarValue) memberValue.avatar = avatarValue
         await base.append({
           type: 'put',
           key: 'member:' + ourKey,
-          value: { pubkey: ourKey, displayName: trimmed, joinedAt, v: 1 },
+          value: memberValue,
         })
         republished++
       } catch {
@@ -128,7 +150,7 @@ const handlers = {
     const circleKey = generateCircleKey()
     const ownerPublicKey = b4a.toString(_identity.publicKey, 'hex')
     const createdAt = Date.now()
-    const profileDisplayName = await readProfileDisplayName(ownerPublicKey)
+    const profile = await readProfileForMemberRow(ownerPublicKey)
 
     // Open the per-circle Autobase as the founding writer (bootstrap=null).
     // Autobase auto-generates the writer keypair under our corestore
@@ -150,10 +172,12 @@ const handlers = {
       key: 'circle',
       value: { id: circleId, name, ownerKey: ownerPublicKey, createdAt, v: 1 },
     })
+    const ownerMember = { pubkey: ownerPublicKey, displayName: profile.displayName, joinedAt: createdAt, v: 1 }
+    if (profile.avatar) ownerMember.avatar = profile.avatar
     await base.append({
       type: 'put',
       key: 'member:' + ownerPublicKey,
-      value: { pubkey: ownerPublicKey, displayName: profileDisplayName, joinedAt: createdAt, v: 1 },
+      value: ownerMember,
     })
 
     await _localDb.put('circles:joined:' + circleId, {
@@ -263,15 +287,18 @@ const handlers = {
     if (!base.writable) throw new Error('not yet a writer for this circle')
 
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const profile = await readProfileForMemberRow(ourKey)
     const dn = (typeof displayName === 'string' && displayName.length > 0)
       ? displayName.slice(0, 64)
-      : await readProfileDisplayName(ourKey)
+      : profile.displayName
     const joinedAt = Date.now()
 
+    const memberValue = { pubkey: ourKey, displayName: dn, joinedAt, v: 1 }
+    if (profile.avatar) memberValue.avatar = profile.avatar
     await base.append({
       type: 'put',
       key: 'member:' + ourKey,
-      value: { pubkey: ourKey, displayName: dn, joinedAt, v: 1 },
+      value: memberValue,
     })
 
     return { ok: true, pubkey: ourKey, displayName: dn, joinedAt }
@@ -452,6 +479,16 @@ async function readProfileDisplayName (fallbackPubkey) {
   const dn = row?.value?.displayName
   if (typeof dn === 'string' && dn.length > 0) return dn
   return fallbackPubkey.slice(0, 8)
+}
+
+async function readProfileForMemberRow (fallbackPubkey) {
+  const row = await _localDb.get('profile')
+  const dn = row?.value?.displayName
+  const av = row?.value?.avatar
+  return {
+    displayName: (typeof dn === 'string' && dn.length > 0) ? dn : fallbackPubkey.slice(0, 8),
+    avatar: (typeof av === 'string' && av.length > 0) ? av : null,
+  }
 }
 
 function joinCircleTopic (circleId, circleKey) {
