@@ -4,6 +4,7 @@
 
 **Amendments**:
 - 2026-05-04 — invite link grammar (§2) gains a required `bootstrap=<hex(32)>` field carrying the per-circle Autobase bootstrap-writer-core public key. See `DECISIONS.md` 2026-05-04 and `reviews/2026-05-04-invite-bootstrap-amendment.md`. v1 remains the floor; no shipped peers existed at amendment time.
+- 2026-05-04 — transition key (§3) extended from `transition:{ts}:{pubkey}` to `transition:{ts}:{pubkey}:{placeId}`. Two transitions firing in the same location-update tick (e.g. exit-old-place + enter-new-place during a single FusedLocation result) collided on the old key shape and one silently overwrote the other in the apply branch's view. Field-observed during the geofence slice. ts-prefix preserves time-ordered reverse scans; placeId suffix disambiguates simultaneous transitions. v1 remains the floor; no shipped peers existed at amendment time. See `DECISIONS.md` 2026-05-04 and `reviews/2026-05-04-transition-key-amendment.md`.
 
 **Goal**: Define the wire protocol for PearCircle v1 (invite link, Hyperbee schema, Autobase apply branches, location-update message envelope, geofence transition format) so cross-peer interop is stable from the first device build.
 
@@ -73,13 +74,13 @@ Per-app `/circle/` path prefix avoids host collision with PearCal's `/join` on `
 | `member:{pubkey}` | `{ pubkey, displayName, avatar?: base64jpeg, joinedAt, v: 1 }` (avatar ≤ ~30KB encoded, client-side downscaled to ~96x96) |
 | `place:{id}` | `{ id, name, lat, lon, radiusMeters, createdBy, createdAt, v: 1 }` |
 | `lastSeen:{pubkey}` | `{ pubkey, lat, lon, accuracy, ts, battery?, isMoving?, v: 1 }` |
-| `transition:{ts}:{pubkey}` | `{ pubkey, placeId, kind: 'enter'|'exit', ts, v: 1 }` |
+| `transition:{ts}:{pubkey}:{placeId}` | `{ pubkey, placeId, kind: 'enter'|'exit', ts, v: 1 }` |
 | `removed:{pubkey}` | `{ pubkey, removedBy, ts, v: 1 }` (tombstone for kicked members) |
 | `presence:{pubkey}` | `{ pubkey, state: 'visible' | 'muted', setAt, expiresAt?, v: 1 }` |
 
 `lastSeen:{pubkey}` is single-row-per-member. Apply branch overwrites if incoming `ts > existing.ts`. Older records dropped silently.
 
-`transition:{ts}:{pubkey}` is append-only. Pruned by client after a configurable retention window (default 30 days) using a local sweep, NOT a replicated `del` op.
+`transition:{ts}:{pubkey}:{placeId}` is append-only. Per-place suffix prevents same-tick collisions when one location update produces multiple transitions (proposal amended 2026-05-04). Pruned by client after a configurable retention window (default 30 days) using a local sweep, NOT a replicated `del` op.
 
 ### 4. Autobase apply branches
 

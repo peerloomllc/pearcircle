@@ -405,7 +405,14 @@ async function appendTransition (base, placeId, kind, ts) {
     { pubkey: ourKey, placeId, kind, ts, v: 1 },
     _identity.secretKey,
   )
-  await base.append({ type: 'put', key: 'transition:' + ts + ':' + ourKey, value })
+  // Key shape per proposal §3 amended 2026-05-04: ts:pubkey:placeId.
+  // The placeId suffix prevents same-tick collisions when one
+  // location:update produces multiple transitions.
+  await base.append({
+    type: 'put',
+    key: 'transition:' + ts + ':' + ourKey + ':' + placeId,
+    value,
+  })
   return value
 }
 
@@ -523,20 +530,28 @@ async function applyCircleNodes (nodes, view, base) {
         }
         continue
       }
-      // `transition:{ts}:{pubkey}`: signed by the user-identity in `pubkey`
-      // (proposal §5). Reject unsigned, tampered, or future-stamped values.
-      // Key suffix must match the signed pubkey for the same reason as
-      // lastSeen — the suffix is the index, the sig proves authorship.
+      // `transition:{ts}:{pubkey}:{placeId}` (proposal §3 amended 2026-05-04):
+      // signed by the user-identity in `pubkey` (proposal §5). Reject unsigned,
+      // tampered, or future-stamped values. Each key segment is checked against
+      // the corresponding value field so a writer can't impersonate another
+      // member or claim a different place than the one they're writing about.
+      // Old two-segment keys are silently dropped here; they remain in the
+      // view from prior applies but no new ones land.
       if (op.key.startsWith('transition:')) {
         const incoming = op.value
         if (!verifyValue(incoming)) continue
         if (typeof incoming.ts !== 'number') continue
+        if (typeof incoming.placeId !== 'string') continue
         if (incoming.ts > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
         const tail = op.key.slice('transition:'.length)
-        const colon = tail.indexOf(':')
-        if (colon < 0) continue
-        const keyPubkey = tail.slice(colon + 1)
+        const firstColon = tail.indexOf(':')
+        if (firstColon < 0) continue
+        const secondColon = tail.indexOf(':', firstColon + 1)
+        if (secondColon < 0) continue // old two-segment key
+        const keyPubkey = tail.slice(firstColon + 1, secondColon)
+        const keyPlaceId = tail.slice(secondColon + 1)
         if (keyPubkey !== incoming.pubkey) continue
+        if (keyPlaceId !== incoming.placeId) continue
         await view.put(op.key, incoming)
         continue
       }

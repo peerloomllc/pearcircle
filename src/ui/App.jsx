@@ -329,7 +329,7 @@ function DetailView ({ circleId, myPubkey, setView }) {
                 <div style={s.muted}>{short(pubkey)}</div>
                 {t && (
                   <div style={s.status}>
-                    {t.kind === 'enter' ? 'at ' : 'left '}
+                    {t.kind === 'enter' ? 'arrived at ' : 'left '}
                     {tPlaceName ?? '(unknown place)'}
                     {' · '}{ageLabel(t.ts)}
                   </div>
