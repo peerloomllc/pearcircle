@@ -51,6 +51,7 @@ let _initialized = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
@@ -244,39 +245,28 @@ const handlers = {
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const base = _circleBases.get(circleId)
     if (!base) throw new Error('unknown circle: ' + circleId)
-    await base.update()
-    const view = base.view
-    const circleRow = await view.get('circle')
-    const members = []
-    for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
-      members.push({ key, value })
+    return await snapshotCircle(circleId, base)
+  },
+
+  'circles:getAll': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const out = []
+    for (const [circleId, base] of _circleBases) {
+      try {
+        const snap = await snapshotCircle(circleId, base)
+        out.push({ circleId, ...snap })
+        // Maintenance: every refresh, ensure our member row exists in
+        // every writable circle. Idempotent: skips if a row already
+        // exists. This is the reliable path that catches cases the
+        // apply-branch hook misses (timing, missed restart, etc).
+        autoAppendMemberRow(circleId).catch(() => {})
+      } catch (e) {
+        // Surface the failure but keep going so one bad base doesn't
+        // black out the whole home view.
+        out.push({ circleId, error: String(e?.message ?? e) })
+      }
     }
-    const lastSeen = {}
-    for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
-      const pubkey = key.slice('lastSeen:'.length)
-      lastSeen[pubkey] = value
-    }
-    const places = []
-    for await (const { value } of view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-      if (value) places.push(value)
-    }
-    // Most recent 50 transitions, newest first. Reverse-stream the
-    // ts-prefixed keys so we don't have to load the whole range.
-    const transitions = []
-    for await (const { value } of view.createReadStream({
-      gt: 'transition:', lt: 'transition:~', reverse: true, limit: 50,
-    })) {
-      if (value) transitions.push(value)
-    }
-    return {
-      circle: circleRow ? circleRow.value : null,
-      members,
-      lastSeen,
-      places,
-      transitions,
-      writable: base.writable,
-      writers: base.writers ? base.writers.length : null,
-    }
+    return { circles: out, selfLastSeen: _selfLastSeen }
   },
 
   'circle:append:member': async ({ circleId, displayName } = {}) => {
@@ -405,6 +395,7 @@ const handlers = {
       speed: typeof speed === 'number' ? speed : null,
       v: 1,
     }, _identity.secretKey)
+    _selfLastSeen = value
 
     let written = 0
     for (const [, base] of _circleBases) {
@@ -474,6 +465,42 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts) {
   }
 }
 
+async function snapshotCircle (circleId, base) {
+  await base.update()
+  const view = base.view
+  const circleRow = await view.get('circle')
+  const members = []
+  for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+    members.push({ key, value })
+  }
+  const lastSeen = {}
+  for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
+    const pubkey = key.slice('lastSeen:'.length)
+    lastSeen[pubkey] = value
+  }
+  const places = []
+  for await (const { value } of view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+    if (value) places.push(value)
+  }
+  // Most recent 50 transitions, newest first. Reverse-stream the
+  // ts-prefixed keys so we don't have to load the whole range.
+  const transitions = []
+  for await (const { value } of view.createReadStream({
+    gt: 'transition:', lt: 'transition:~', reverse: true, limit: 50,
+  })) {
+    if (value) transitions.push(value)
+  }
+  return {
+    circle: circleRow ? circleRow.value : null,
+    members,
+    lastSeen,
+    places,
+    transitions,
+    writable: base.writable,
+    writers: base.writers ? base.writers.length : null,
+  }
+}
+
 async function readProfileDisplayName (fallbackPubkey) {
   const row = await _localDb.get('profile')
   const dn = row?.value?.displayName
@@ -513,12 +540,18 @@ function openCircleView (store) {
 
 async function applyCircleNodes (nodes, view, base) {
   const bootstrapHex = b4a.toString(base.key, 'hex')
+  let weJustBecameWritable = false
   for (const node of nodes) {
     const op = node.value
     if (!op || typeof op.type !== 'string') continue
 
     if (op.type === 'addWriter' && typeof op.pubkey === 'string') {
       await base.addWriter(b4a.from(op.pubkey, 'hex'))
+      // Detect "we just became a writer" so we can auto-append our
+      // member row outside the apply pass. base.local.key is our local
+      // writer-core key on this autobase.
+      const ourLocalKey = base.local && b4a.toString(base.local.key, 'hex')
+      if (ourLocalKey === op.pubkey) weJustBecameWritable = true
       continue
     }
 
@@ -595,6 +628,35 @@ async function applyCircleNodes (nodes, view, base) {
       // Other prefixes (presence, removed) not yet wired — silently
       // dropped.
     }
+  }
+  if (weJustBecameWritable) {
+    // Schedule the member-row append for after this apply pass returns.
+    // We can't append from inside apply (would deadlock the autobase
+    // pipeline) and we don't have circleId in this scope, so look it up.
+    let myCircleId = null
+    for (const [cid, b] of _circleBases) {
+      if (b === base) { myCircleId = cid; break }
+    }
+    if (myCircleId) {
+      setTimeout(() => autoAppendMemberRow(myCircleId).catch(() => {}), 0)
+    }
+  }
+}
+
+async function autoAppendMemberRow (circleId) {
+  const base = _circleBases.get(circleId)
+  if (!base || !base.writable) return
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const existing = await base.view.get('member:' + ourKey)
+  if (existing && existing.value) return
+  const profile = await readProfileForMemberRow(ourKey)
+  const memberValue = { pubkey: ourKey, displayName: profile.displayName, joinedAt: Date.now(), v: 1 }
+  if (profile.avatar) memberValue.avatar = profile.avatar
+  try {
+    await base.append({ type: 'put', key: 'member:' + ourKey, value: memberValue })
+    send({ event: 'circle:writer:added', data: { circleId, writerKey: ourKey } })
+  } catch {
+    // base closed / already appended via race; harmless
   }
 }
 
@@ -740,6 +802,24 @@ async function init ({ dataDir } = {}, attempt = 0) {
       console.warn('[bare] failed to enumerate places for', circleId, e?.message)
     }
   }
+
+  // Sweep: for every circle where we're a writer, make sure our member
+  // row exists. Catches the case where we became writable while the app
+  // was offline (or in an earlier session before the auto-append was
+  // wired) and never got around to publishing our row.
+  for (const [circleId] of _circleBases) {
+    autoAppendMemberRow(circleId).catch(() => {})
+  }
+
+  // Worklet-level membership sweep. Runs even when the UI isn't open
+  // (the foreground service keeps the bare process alive in the
+  // background) so a fresh-joined circle gets our member row appended
+  // promptly regardless of HomeMapView's polling cadence.
+  setInterval(() => {
+    for (const [circleId] of _circleBases) {
+      autoAppendMemberRow(circleId).catch(() => {})
+    }
+  }, 5000)
 
   _initialized = true
   send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex') } })

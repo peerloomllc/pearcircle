@@ -1,6 +1,7 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react'
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
+import QRCode from 'qrcode'
 
 // Lazy proxy: window.pear is installed by main.jsx but App.jsx is imported
 // before that assignment runs. Resolve through window at call time.
@@ -27,33 +28,37 @@ function ensureMapLibreCss () {
 const TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
 
 export function App () {
-  const [view, setView] = useState({ name: 'list' })
+  const [view, setView] = useState({ name: 'home' })
   const [identity, setIdentity] = useState(null)
-  const [circles, setCircles] = useState([])
   const [profile, setProfile] = useState(null)
 
   const refresh = useCallback(async () => {
-    const [id, cs, pr] = await Promise.all([
+    const [id, pr] = await Promise.all([
       pear.call('identity:get'),
-      pear.call('circles:list'),
       pear.call('profile:get'),
     ])
     setIdentity(id)
-    setCircles(cs?.circles ?? [])
     setProfile(pr ?? null)
   }, [])
 
   useEffect(() => {
     refresh()
     pear.on('ready', refresh)
-    pear.on('circle:writer:added', refresh)
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setView({ name: 'join', invite: url })
     })
   }, [refresh])
 
-  if (view.name === 'list') {
-    return <ListView identity={identity} profile={profile} circles={circles} onRefresh={refresh} setView={setView} />
+  if (view.name === 'home') {
+    return (
+      <HomeMapView
+        key={view.selectCircle ?? 'all'}
+        identity={identity}
+        profile={profile}
+        setView={setView}
+        initialSelectedCircleId={view.selectCircle ?? null}
+      />
+    )
   }
   if (view.name === 'create') {
     return <CreateView setView={setView} onCreated={refresh} />
@@ -61,63 +66,10 @@ export function App () {
   if (view.name === 'join') {
     return <JoinView setView={setView} onJoined={refresh} initialInvite={view.invite} />
   }
-  if (view.name === 'detail') {
-    return <DetailView circleId={view.circleId} myPubkey={identity?.publicKey} setView={setView} />
-  }
   if (view.name === 'profile') {
     return <ProfileView profile={profile} setView={setView} onSaved={refresh} />
   }
   return null
-}
-
-function ListView ({ identity, profile, circles, onRefresh, setView }) {
-  return (
-    <div style={s.screen}>
-      <header style={s.header}>
-        <h1 style={s.h1}>PearCircle</h1>
-        <button style={s.iconBtn} onClick={onRefresh} aria-label='Refresh'>↻</button>
-      </header>
-      {identity?.publicKey && (
-        <button
-          type='button'
-          style={s.profileBtn}
-          onClick={() => setView({ name: 'profile' })}
-        >
-          <Avatar base64={profile?.avatar} label={profile?.displayName ?? ''} size={32} />
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', flex: 1 }}>
-            {profile?.displayName ? (
-              <span style={s.idName}>{profile.displayName}</span>
-            ) : (
-              <span style={s.idNeedName}>Set your name</span>
-            )}
-            <span style={s.idMuted}>{short(identity.publicKey)}</span>
-          </div>
-        </button>
-      )}
-      <div style={s.actions}>
-        <button style={s.primaryBtn} onClick={() => setView({ name: 'create' })}>
-          Create circle
-        </button>
-        <button style={s.secondaryBtn} onClick={() => setView({ name: 'join' })}>
-          Join via link
-        </button>
-      </div>
-      <h2 style={s.h2}>Your circles</h2>
-      {circles.length === 0 ? (
-        <p style={s.muted}>No circles yet. Create one or paste an invite.</p>
-      ) : (
-        <ul style={s.circleList}>
-          {circles.map((c) => (
-            <li key={c.circleId} style={s.circleItem}
-                onClick={() => setView({ name: 'detail', circleId: c.circleId })}>
-              <div style={s.circleName}>{c.name}</div>
-              <div style={s.circleMeta}>{c.role} · {short(c.circleId)}</div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  )
 }
 
 function CreateView ({ setView, onCreated }) {
@@ -143,18 +95,19 @@ function CreateView ({ setView, onCreated }) {
   if (result) {
     return (
       <div style={s.screen}>
-        <BackBar onBack={() => setView({ name: 'list' })} title={result.name} />
-        <p style={s.muted}>Circle created. Share this invite link:</p>
+        <BackBar onBack={() => setView({ name: 'home', selectCircle: result.circleId })} title={result.name} />
+        <p style={s.muted}>Circle created. Share the QR code or paste the link:</p>
+        <QrImage text={result.invite} />
         <textarea style={s.inviteBox} readOnly value={result.invite} onFocus={(e) => e.target.select()} />
-        <CopyButton text={result.invite} />
-        <button style={s.primaryBtn} onClick={() => setView({ name: 'list' })}>Done</button>
+        <ShareButton text={result.invite} />
+        <button style={s.primaryBtn} onClick={() => setView({ name: 'home', selectCircle: result.circleId })}>Done</button>
       </div>
     )
   }
 
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'list' })} title='New circle' />
+      <BackBar onBack={() => setView({ name: 'home' })} title='New circle' />
       <label style={s.label}>Circle name</label>
       <input
         style={s.input}
@@ -175,8 +128,17 @@ function CreateView ({ setView, onCreated }) {
 function JoinView ({ setView, onJoined, initialInvite }) {
   const [invite, setInvite] = useState(initialInvite ?? '')
   const [joining, setJoining] = useState(false)
-  const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+
+  const onScan = async () => {
+    setError(null)
+    try {
+      const text = await pear.call('shell:scanQr')
+      if (typeof text === 'string' && text.length > 0) setInvite(text)
+    } catch (err) {
+      setError('Scan failed: ' + (err?.message ?? err))
+    }
+  }
 
   const submit = async () => {
     if (!invite.trim()) return
@@ -186,8 +148,13 @@ function JoinView ({ setView, onJoined, initialInvite }) {
       const r = await pear.call('circle:join', { invite: invite.trim() })
       setJoining(false)
       if (r?.circleId) {
-        setResult(r)
+        // Route straight back to the map with the newly joined circle
+        // pre-selected as the dropdown filter so the title bar and map
+        // immediately reflect the join. onJoined refreshes App-level
+        // state; HomeMapView's own circles:getAll picks up the new
+        // circle on mount.
         onJoined()
+        setView({ name: 'home', selectCircle: r.circleId })
       } else {
         setError('Invalid invite')
       }
@@ -197,33 +164,20 @@ function JoinView ({ setView, onJoined, initialInvite }) {
     }
   }
 
-  if (result) {
-    return (
-      <div style={s.screen}>
-        <BackBar onBack={() => setView({ name: 'list' })} title={result.name} />
-        <p style={s.muted}>
-          {result.alreadyJoined ? 'You were already in this circle.' : 'Joined! Waiting for sync...'}
-        </p>
-        <button style={s.primaryBtn} onClick={() => setView({ name: 'detail', circleId: result.circleId })}>
-          Open
-        </button>
-        <button style={s.secondaryBtn} onClick={() => setView({ name: 'list' })}>Done</button>
-      </div>
-    )
-  }
-
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'list' })} title='Join a circle' />
+      <BackBar onBack={() => setView({ name: 'home' })} title='Join a circle' />
       <label style={s.label}>Paste invite link</label>
       <textarea
         style={s.textarea}
         value={invite}
         onChange={(e) => setInvite(e.target.value)}
         placeholder='https://peerloomllc.com/circle/join?...'
-        autoFocus
         rows={4}
       />
+      <button style={s.secondaryBtn} onClick={onScan}>
+        Scan QR code
+      </button>
       <button style={s.primaryBtn} disabled={!invite.trim() || joining} onClick={submit}>
         {joining ? 'Joining...' : 'Join'}
       </button>
@@ -232,23 +186,65 @@ function JoinView ({ setView, onJoined, initialInvite }) {
   )
 }
 
-function DetailView ({ circleId, myPubkey, setView }) {
-  const [data, setData] = useState(null)
-  const [peers, setPeers] = useState([])
-  const [claiming, setClaiming] = useState(false)
-  const [claimError, setClaimError] = useState(null)
+// Merge per-circle snapshots into one view-model. Members are deduped by
+// pubkey (keep the row with the latest joinedAt); lastSeen by pubkey too
+// (newest ts wins). Places carry their circleId so per-place actions
+// (fire transition, future delete) know where to write. Transitions are
+// flattened across circles and sorted desc by ts for the latest-per-
+// pubkey lookup.
+function mergeCircleSnapshots (circles) {
+  const memberMap = new Map()
+  const lastSeen = {}
+  const places = []
+  const transitions = []
+  for (const c of circles ?? []) {
+    if (!c || c.error) continue
+    for (const m of c.members ?? []) {
+      const pubkey = m.value?.pubkey
+      if (!pubkey) continue
+      const existing = memberMap.get(pubkey)
+      const incomingJoinedAt = m.value?.joinedAt ?? 0
+      const existingJoinedAt = existing?.value?.joinedAt ?? 0
+      if (!existing || incomingJoinedAt > existingJoinedAt) memberMap.set(pubkey, m)
+    }
+    for (const [pubkey, seen] of Object.entries(c.lastSeen ?? {})) {
+      const existing = lastSeen[pubkey]
+      if (!existing || (seen?.ts ?? 0) > (existing?.ts ?? 0)) lastSeen[pubkey] = seen
+    }
+    for (const p of c.places ?? []) places.push({ ...p, circleId: c.circleId })
+    for (const t of c.transitions ?? []) transitions.push({ ...t, circleId: c.circleId })
+  }
+  transitions.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
+  return { members: Array.from(memberMap.values()), lastSeen, places, transitions }
+}
+
+function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = null }) {
+  const [circles, setCircles] = useState([])
+  const [selfSeen, setSelfSeen] = useState(null)
+  const [peerCount, setPeerCount] = useState(0)
+  const [selectedCircleId, setSelectedCircleId] = useState(initialSelectedCircleId) // null = All
+  const [sheetOpen, setSheetOpen] = useState(false)
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [transitionError, setTransitionError] = useState(null)
-  const [sheetOpen, setSheetOpen] = useState(false)
+  const [claiming, setClaiming] = useState(false)
+  const [claimError, setClaimError] = useState(null)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const mapApiRef = useRef(null)
 
   const refresh = useCallback(async () => {
-    const [d, p] = await Promise.all([
-      pear.call('circle:get', { circleId }),
-      pear.call('circles:peers'),
-    ])
-    setData(d)
-    setPeers(p?.peers?.[circleId] ?? [])
-  }, [circleId])
+    try {
+      const [all, peersResp] = await Promise.all([
+        pear.call('circles:getAll'),
+        pear.call('circles:peers'),
+      ])
+      setCircles(all?.circles ?? [])
+      setSelfSeen(all?.selfLastSeen ?? null)
+      const sets = peersResp?.peers ?? {}
+      let total = 0
+      for (const k of Object.keys(sets)) total += sets[k]?.length ?? 0
+      setPeerCount(total)
+    } catch {}
+  }, [])
 
   useEffect(() => {
     refresh()
@@ -256,27 +252,70 @@ function DetailView ({ circleId, myPubkey, setView }) {
     pear.on('peer:connected', refresh)
     pear.on('peer:disconnected', refresh)
     pear.on('circle:writer:added', refresh)
+    pear.on('ready', refresh)
     return () => clearInterval(id)
   }, [refresh])
 
-  const claimMembership = async () => {
-    setClaiming(true)
-    setClaimError(null)
-    try {
-      await pear.call('circle:append:member', { circleId })
-      await refresh()
-    } catch (e) {
-      setClaimError(String(e?.message ?? e))
+  // If a circle the user filtered to gets removed (left), drop the filter.
+  useEffect(() => {
+    if (!selectedCircleId) return
+    if (!circles.some(c => c.circleId === selectedCircleId)) setSelectedCircleId(null)
+  }, [circles, selectedCircleId])
+
+  // Pick the active subset based on the current filter.
+  const activeCircles = selectedCircleId
+    ? circles.filter(c => c.circleId === selectedCircleId)
+    : circles
+  const merged = mergeCircleSnapshots(activeCircles)
+
+  // Inject self into the map even when the user has no circles yet
+  // (zero-circle empty state) or hasn't appeared in any circle's lastSeen
+  // yet, so the map is never blank.
+  const myPubkey = identity?.publicKey
+  const data = useMemo(() => {
+    const out = { ...merged, lastSeen: { ...merged.lastSeen } }
+    if (myPubkey && selfSeen && !out.lastSeen[myPubkey]) {
+      out.lastSeen[myPubkey] = selfSeen
     }
-    setClaiming(false)
+    if (myPubkey && !out.members.some(m => m.value?.pubkey === myPubkey)) {
+      out.members.push({
+        key: 'member:' + myPubkey,
+        value: {
+          pubkey: myPubkey,
+          displayName: profile?.displayName ?? 'You',
+          avatar: profile?.avatar ?? null,
+          joinedAt: 0,
+        },
+      })
+    }
+    return out
+  }, [merged, myPubkey, selfSeen, profile])
+
+  const placesById = {}
+  for (const p of data.places ?? []) placesById[p.id] = p
+
+  const latestTransition = {}
+  for (const t of data.transitions ?? []) {
+    if (t?.pubkey && !latestTransition[t.pubkey]) latestTransition[t.pubkey] = t
   }
+
+  const memberCount = data.members.length
+  const placeCount = data.places.length
+  const isSingleCircle = activeCircles.length === 1
+  // Where to write per-place / per-circle actions. With "All" selected
+  // and multiple circles we don't have a single target, so write
+  // actions are hidden until the user filters down.
+  const actionTargetCircleId = isSingleCircle ? activeCircles[0]?.circleId : null
+  const actionTargetWritable = isSingleCircle ? !!activeCircles[0]?.writable : false
 
   const fireTransition = useCallback(async (place, kind) => {
     setTransitionError(null)
     try {
       const seen = myPubkey ? data?.lastSeen?.[myPubkey] : null
+      // Each place carries its own circleId from the merge step, so
+      // transitions land on the right autobase even in "All" mode.
       await pear.call('geofence:transition', {
-        circleId,
+        circleId: place.circleId,
         placeId: place.id,
         kind,
         lat: seen?.lat ?? place.lat,
@@ -286,49 +325,102 @@ function DetailView ({ circleId, myPubkey, setView }) {
     } catch (e) {
       setTransitionError(String(e?.message ?? e))
     }
-  }, [circleId, data, myPubkey, refresh])
+  }, [data, myPubkey, refresh])
 
-  if (!data) {
-    return (
-      <div style={s.mapFirstRoot}>
-        <header style={s.mapTopBar}>
-          <button style={s.iconBtn} onClick={() => setView({ name: 'list' })} aria-label='Back'>‹</button>
-          <h1 style={s.mapTitle}>Loading...</h1>
-        </header>
-      </div>
-    )
+  const claimMembership = async () => {
+    if (!actionTargetCircleId) return
+    setClaiming(true)
+    setClaimError(null)
+    try {
+      await pear.call('circle:append:member', { circleId: actionTargetCircleId })
+      await refresh()
+    } catch (e) {
+      setClaimError(String(e?.message ?? e))
+    }
+    setClaiming(false)
   }
 
-  const isWritable = data.writable
-  // data.transitions is sorted desc by ts, so the first entry per pubkey
-  // is the most recent. Build a lookup once.
-  const latestTransition = {}
-  for (const t of data.transitions ?? []) {
-    if (t?.pubkey && !latestTransition[t.pubkey]) latestTransition[t.pubkey] = t
-  }
-  const placesById = {}
-  for (const p of data.places ?? []) placesById[p.id] = p
-  const memberCount = data.members.length
-  const placeCount = data.places?.length ?? 0
+  // Title is the current filter label.
+  const filterLabel = selectedCircleId
+    ? (activeCircles[0]?.circle?.name ?? '...')
+    : (circles.length === 0 ? 'PearCircle' : circles.length === 1 ? (circles[0]?.circle?.name ?? '...') : 'All circles')
 
   return (
     <div style={s.mapFirstRoot}>
       <div style={s.mapFill}>
-        <CircleMap data={data} />
+        <CircleMap ref={mapApiRef} data={data} />
       </div>
 
       <header style={s.mapTopBar}>
-        <button style={s.iconBtn} onClick={() => setView({ name: 'list' })} aria-label='Back'>‹</button>
-        <h1 style={s.mapTitle}>{data.circle?.name ?? '...'}</h1>
+        <button
+          type='button'
+          style={s.dropdownBtn}
+          onClick={() => setMenuOpen((m) => !m)}
+        >
+          <span style={s.dropdownLabel}>{filterLabel}</span>
+          <span style={s.dropdownChevron}>{menuOpen ? '▴' : '▾'}</span>
+        </button>
         <span style={s.peerBadge}>
-          <span style={{ ...s.peerDot, background: peers.length > 0 ? '#7ec77a' : '#555' }} />
-          {peers.length}
+          <span style={{ ...s.peerDot, background: peerCount > 0 ? '#7ec77a' : '#555' }} />
+          {peerCount}
         </span>
+        <button
+          type='button'
+          style={s.avatarBtn}
+          onClick={() => setView({ name: 'profile' })}
+          aria-label='Profile'
+        >
+          <Avatar base64={profile?.avatar} label={profile?.displayName ?? '?'} size={32} />
+        </button>
       </header>
 
-      <button style={s.fab} onClick={() => setSheetOpen(true)}>
-        Members ({memberCount}) · Places ({placeCount})
-      </button>
+      {menuOpen && (
+        <>
+          <div style={s.menuScrim} onClick={() => setMenuOpen(false)} />
+          <div style={s.menu}>
+            {circles.length > 1 && (
+              <button
+                style={{ ...s.menuItem, ...(selectedCircleId === null ? s.menuItemActive : null) }}
+                onClick={() => { setSelectedCircleId(null); setMenuOpen(false) }}
+              >
+                All circles
+              </button>
+            )}
+            {circles.map((c) => (
+              <button
+                key={c.circleId}
+                style={{ ...s.menuItem, ...(selectedCircleId === c.circleId ? s.menuItemActive : null) }}
+                onClick={() => { setSelectedCircleId(c.circleId); setMenuOpen(false) }}
+              >
+                {c.circle?.name ?? '...'}
+              </button>
+            ))}
+            {circles.length > 0 && <div style={s.menuDivider} />}
+            <button
+              style={s.menuItem}
+              onClick={() => { setMenuOpen(false); setView({ name: 'create' }) }}
+            >
+              + Create circle
+            </button>
+            <button
+              style={s.menuItem}
+              onClick={() => { setMenuOpen(false); setView({ name: 'join' }) }}
+            >
+              + Join via link
+            </button>
+          </div>
+        </>
+      )}
+
+      {circles.length === 0 ? (
+        <div style={s.emptyHint}>
+          You're not in any circles yet. Use the menu above to create one or join via an invite link.
+        </div>
+      ) : (
+        <button style={s.fab} onClick={() => setSheetOpen(true)}>
+          Members ({memberCount}) · Places ({placeCount})
+        </button>
+      )}
 
       {sheetOpen && (
         <BottomSheet onClose={() => setSheetOpen(false)}>
@@ -373,46 +465,63 @@ function DetailView ({ circleId, myPubkey, setView }) {
             <p style={s.muted}>No places yet.</p>
           ) : (
             <ul style={s.memberList}>
-              {data.places.map(p => (
-                <li key={p.id} style={s.memberItem}>
-                  <div style={s.memberName}>{p.name}</div>
-                  {isWritable && (
-                    <div style={s.transitionBtns}>
-                      <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
-                        Fire enter (debug)
-                      </button>
-                      <button style={s.smallBtn} onClick={() => fireTransition(p, 'exit')}>
-                        Fire exit (debug)
-                      </button>
-                    </div>
-                  )}
-                </li>
-              ))}
+              {data.places.map(p => {
+                const placeCircle = circles.find(c => c.circleId === p.circleId)
+                const placeWritable = !!placeCircle?.writable
+                const focusOn = (e) => {
+                  // Don't trigger if a debug button inside the row was tapped.
+                  if (e.target.closest('button')) return
+                  // Imperative call: avoids any state-batching weirdness
+                  // around the same-render BottomSheet unmount.
+                  mapApiRef.current?.flyTo({
+                    center: [p.lon, p.lat], zoom: 16, duration: 1100,
+                  })
+                  setSheetOpen(false)
+                }
+                return (
+                  <li key={p.circleId + ':' + p.id} style={{ ...s.memberItem, cursor: 'pointer' }} onClick={focusOn}>
+                    <div style={s.memberName}>{p.name}</div>
+                    {placeWritable && (
+                      <div style={s.transitionBtns}>
+                        <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
+                          Fire enter (debug)
+                        </button>
+                        <button style={s.smallBtn} onClick={() => fireTransition(p, 'exit')}>
+                          Fire exit (debug)
+                        </button>
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
             </ul>
           )}
           {transitionError && <p style={s.error}>{transitionError}</p>}
 
-          {isWritable && !showAddPlace && (
+          {actionTargetCircleId && actionTargetWritable && !showAddPlace && (
             <button style={s.secondaryBtn} onClick={() => setShowAddPlace(true)}>
               Add a place
             </button>
           )}
-          {isWritable && showAddPlace && (
+          {actionTargetCircleId && actionTargetWritable && showAddPlace && (
             <AddPlaceForm
-              circleId={circleId}
+              circleId={actionTargetCircleId}
               myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
               onCancel={() => setShowAddPlace(false)}
               onAdded={async () => { setShowAddPlace(false); await refresh() }}
             />
           )}
+          {!actionTargetCircleId && circles.length > 1 && (
+            <p style={s.muted}>Pick a single circle from the menu above to add a place or post your membership.</p>
+          )}
 
-          {isWritable && (
+          {actionTargetCircleId && actionTargetWritable && (
             <button style={s.primaryBtn} disabled={claiming} onClick={claimMembership}>
               {claiming ? 'Posting...' : 'Post my membership'}
             </button>
           )}
           {claimError && <p style={s.error}>{claimError}</p>}
-          {!isWritable && (
+          {actionTargetCircleId && !actionTargetWritable && (
             <p style={s.muted}>Read-only until owner adds you as a writer.</p>
           )}
         </BottomSheet>
@@ -501,10 +610,21 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
   return ring
 }
 
-function CircleMap ({ data }) {
+const CircleMap = React.forwardRef(function CircleMap ({ data }, apiRef) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const fittedRef = useRef(false)
+
+  // Expose imperative flyTo/jumpTo to the parent so click handlers can
+  // drive the camera directly without going through state + effect
+  // round-trips that could be batched or dropped in unexpected ways.
+  React.useImperativeHandle(apiRef, () => ({
+    flyTo: (opts) => {
+      const m = mapRef.current
+      if (!m) return
+      try { m.flyTo(opts) } catch { try { m.jumpTo({ center: opts.center, zoom: opts.zoom }) } catch {} }
+    },
+  }), [])
 
   // One-time map init. Sources/layers are added on the 'load' event so
   // setData calls in the data-sync effect below always find them.
@@ -563,7 +683,7 @@ function CircleMap ({ data }) {
       <div style={s.mapAttribution}>© OpenStreetMap contributors</div>
     </div>
   )
-}
+})
 
 function emptyFC () {
   return { type: 'FeatureCollection', features: [] }
@@ -685,7 +805,7 @@ function ProfileView ({ profile, setView, onSaved }) {
 
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'list' })} title='Profile' />
+      <BackBar onBack={() => setView({ name: 'home' })} title='Profile' />
       <div style={s.avatarRow}>
         <div style={s.avatarPreview}>
           {hasAvatar ? (
@@ -881,27 +1001,36 @@ function BackBar ({ onBack, title }) {
   )
 }
 
-function CopyButton ({ text }) {
-  const [copied, setCopied] = useState(false)
+function QrImage ({ text, size = 240 }) {
+  const [dataUrl, setDataUrl] = useState(null)
+  useEffect(() => {
+    let cancelled = false
+    QRCode.toDataURL(text, { width: size * 2, margin: 1, errorCorrectionLevel: 'M' })
+      .then((url) => { if (!cancelled) setDataUrl(url) })
+      .catch(() => { if (!cancelled) setDataUrl(null) })
+    return () => { cancelled = true }
+  }, [text, size])
+  return (
+    <div style={s.qrWrap}>
+      {dataUrl
+        ? <img src={dataUrl} style={{ width: size, height: size, display: 'block' }} alt='Invite QR code' />
+        : <div style={{ width: size, height: size, background: '#222' }} />}
+    </div>
+  )
+}
+
+function ShareButton ({ text, title = 'Join my PearCircle' }) {
   const click = async () => {
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text)
-      } else {
-        const ta = document.createElement('textarea')
-        ta.value = text
-        document.body.appendChild(ta)
-        ta.select()
-        document.execCommand('copy')
-        document.body.removeChild(ta)
-      }
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {}
+    // Route through the shell rather than the WebView's Web Share API.
+    // The WebView runs with about:blank as the base URL and that isn't
+    // reliably treated as a secure context, so navigator.share tends to
+    // fail silently. The shell uses React Native's Share, which always
+    // opens the OS share sheet.
+    try { await pear.call('shell:share', { text, title }) } catch {}
   }
   return (
     <button style={s.secondaryBtn} onClick={click}>
-      {copied ? 'Copied' : 'Copy invite link'}
+      Share join link
     </button>
   )
 }
@@ -979,12 +1108,51 @@ const s = {
   peerBadge: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 13, color: '#bbb', padding: '4px 8px' },
   peerDot: { width: 8, height: 8, borderRadius: '50%' },
   fab: {
-    position: 'absolute', bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)', right: 16,
+    position: 'absolute',
+    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
+    left: '50%', transform: 'translateX(-50%)',
     padding: '12px 18px',
     background: '#7ec4cf', color: '#0a1f23',
     border: 'none', borderRadius: 999,
     fontSize: 14, fontWeight: 600,
     boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
     zIndex: 5, cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  },
+  dropdownBtn: {
+    display: 'flex', alignItems: 'center', gap: 6, flex: 1,
+    padding: '6px 10px', background: 'transparent', color: '#eee',
+    border: 'none', borderRadius: 8, fontSize: 16, fontWeight: 600,
+    cursor: 'pointer', textAlign: 'left',
+  },
+  dropdownLabel: { flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  dropdownChevron: { fontSize: 12, color: '#888' },
+  avatarBtn: {
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
+  },
+  menuScrim: {
+    position: 'fixed', inset: 0, zIndex: 9, background: 'transparent',
+  },
+  menu: {
+    position: 'absolute', top: 'calc(env(safe-area-inset-top, 24px) + 56px)', left: 12,
+    background: '#1a1a1a', border: '1px solid #2a2a2a', borderRadius: 10,
+    padding: 6, minWidth: 220, maxWidth: 'calc(100% - 24px)',
+    boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 10,
+  },
+  menuItem: {
+    display: 'block', width: '100%', padding: '10px 12px',
+    background: 'transparent', color: '#eee', border: 'none', borderRadius: 6,
+    fontSize: 14, textAlign: 'left', cursor: 'pointer',
+  },
+  menuItemActive: { background: '#243237', color: '#7ec4cf', fontWeight: 600 },
+  menuDivider: { height: 1, background: '#2a2a2a', margin: '6px 4px' },
+  qrWrap: { display: 'flex', justifyContent: 'center', padding: 12, background: '#fff', borderRadius: 12, marginBottom: 12 },
+  emptyHint: {
+    position: 'absolute', left: 16, right: 16,
+    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
+    padding: 14, background: 'rgba(26,26,26,0.92)',
+    borderRadius: 10, color: '#ccc', fontSize: 14, lineHeight: 1.4,
+    zIndex: 5,
   },
 }

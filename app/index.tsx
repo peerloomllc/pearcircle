@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState } from 'react-native'
+import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, Modal, TouchableOpacity } from 'react-native'
 import { WebView } from 'react-native-webview'
 import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
 import { Asset } from 'expo-asset'
 import * as FileSystem from 'expo-file-system/legacy'
 import * as Linking from 'expo-linking'
+import { CameraView, useCameraPermissions } from 'expo-camera'
 
 const { PearCircleLocation } = NativeModules
 
@@ -126,6 +127,10 @@ export default function Index() {
   const [html, setHtml] = useState<string | null>(null)
   const webViewLoaded = useRef(false)
   const pendingDeeplink = useRef<string | null>(null)
+  // QR scanner is a JS-driven modal that resolves a pending shell:scanQr
+  // IPC call when the camera reads a code (or the user cancels).
+  const [scannerVisible, setScannerVisible] = useState(false)
+  const scanResolveRef = useRef<((value: string | null) => void) | null>(null)
 
   useEffect(() => {
     startWorklet().catch((e) => console.warn('worklet start failed', e))
@@ -187,6 +192,32 @@ export default function Index() {
     let msg: any
     try { msg = JSON.parse(e.nativeEvent.data) } catch { return }
     if (!msg?.method) return
+    if (msg.method === 'shell:scanQr') {
+      // Open the native CameraView modal and resolve when a QR is read
+      // (or when the user cancels).
+      const text = await new Promise<string | null>((resolve) => {
+        scanResolveRef.current = resolve
+        setScannerVisible(true)
+      })
+      respond(msg.id, text)
+      return
+    }
+    if (msg.method === 'shell:share') {
+      // Native share sheet via React Native's Share API. The Web Share
+      // API in the WebView is unreliable with the about:blank base URL
+      // (not always considered a secure context), so we route through
+      // the shell instead.
+      try {
+        const result = await Share.share({
+          message: msg.args?.text ?? '',
+          title: msg.args?.title ?? '',
+        })
+        respond(msg.id, { ok: result.action !== Share.dismissedAction })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
     const result = await call(msg.method, msg.args)
     respond(msg.id, result)
   }
@@ -211,21 +242,96 @@ export default function Index() {
     )
   }
 
+  const onScannerResult = (text: string | null) => {
+    setScannerVisible(false)
+    const fn = scanResolveRef.current
+    scanResolveRef.current = null
+    if (fn) fn(text)
+  }
+
   return (
-    <WebView
-      ref={webViewRef}
-      source={{ html, baseUrl: 'about:blank' }}
-      onMessage={onMessage}
-      onLoad={onLoad}
-      style={{ flex: 1, backgroundColor: '#111' }}
-      originWhitelist={['*']}
-      javaScriptEnabled
-      domStorageEnabled
-    />
+    <>
+      <WebView
+        ref={webViewRef}
+        source={{ html, baseUrl: 'about:blank' }}
+        onMessage={onMessage}
+        onLoad={onLoad}
+        style={{ flex: 1, backgroundColor: '#111' }}
+        originWhitelist={['*']}
+        javaScriptEnabled
+        domStorageEnabled
+      />
+      <QrScannerModal
+        visible={scannerVisible}
+        onScanned={(t) => onScannerResult(t)}
+        onCancel={() => onScannerResult(null)}
+      />
+    </>
+  )
+}
+
+function QrScannerModal({
+  visible,
+  onScanned,
+  onCancel,
+}: {
+  visible: boolean
+  onScanned: (text: string) => void
+  onCancel: () => void
+}) {
+  const [permission, requestPermission] = useCameraPermissions()
+  const scanned = useRef(false)
+
+  useEffect(() => {
+    if (!visible) { scanned.current = false; return }
+    if (!permission?.granted) {
+      requestPermission().then((res) => {
+        if (!res.granted) onCancel()
+      })
+    }
+  }, [visible, permission, requestPermission, onCancel])
+
+  const handleBarcode = (result: any) => {
+    if (scanned.current) return
+    scanned.current = true
+    onScanned(result.data)
+  }
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onCancel}>
+      {permission?.granted ? (
+        <View style={{ flex: 1, backgroundColor: '#000' }}>
+          <CameraView
+            style={StyleSheet.absoluteFillObject}
+            facing="back"
+            onBarcodeScanned={handleBarcode}
+            barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+          />
+          <View style={styles.scannerOverlay} pointerEvents="box-none">
+            <View style={styles.scannerHint}>
+              <Text style={styles.scannerHintText}>Point at the invite QR</Text>
+            </View>
+            <TouchableOpacity style={styles.scannerCancel} onPress={onCancel}>
+              <Text style={styles.scannerCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
+        <View style={styles.scannerWaiting}>
+          <Text style={{ color: '#fff' }}>Requesting camera permission…</Text>
+        </View>
+      )}
+    </Modal>
   )
 }
 
 const styles = StyleSheet.create({
   splash: { flex: 1, backgroundColor: '#111', alignItems: 'center', justifyContent: 'center' },
-  splashText: { color: '#eee', fontSize: 28, fontWeight: '600' }
+  splashText: { color: '#eee', fontSize: 28, fontWeight: '600' },
+  scannerOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'space-between', padding: 32 },
+  scannerHint: { alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 8, marginTop: 60 },
+  scannerHintText: { color: '#fff', fontSize: 14, fontWeight: '500' },
+  scannerCancel: { backgroundColor: 'rgba(0,0,0,0.7)', padding: 16, borderRadius: 8, alignItems: 'center' },
+  scannerCancelText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  scannerWaiting: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#111' },
 })
