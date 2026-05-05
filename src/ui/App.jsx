@@ -234,6 +234,11 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
   const [claimError, setClaimError] = useState(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const mapApiRef = useRef(null)
+  // Set by focusMember just before its flyTo. The auto-recenter
+  // effect skips its first run after a focus so we don't override
+  // the cinematic flyTo with an immediate panTo. Subsequent lastSeen
+  // updates re-pan as expected.
+  const justFocusedRef = useRef(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -365,6 +370,7 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
     setSheetOpen(false)
     const seen = data.lastSeen?.[pubkey]
     if (seen) {
+      justFocusedRef.current = true
       mapApiRef.current?.flyTo({
         center: [seen.lon, seen.lat], zoom: 16, duration: 1100,
       })
@@ -398,6 +404,24 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
       setDeleteError(String(e?.message ?? e))
     }
   }, [refresh])
+
+  // Auto-recenter on the focused member's location updates. Tracks
+  // their lastSeen.ts so the effect fires only when a genuinely new
+  // update arrives (data refreshes every 3s but ts only bumps when
+  // the worklet writes a new lastSeen). Skips the first run after
+  // focusMember so the initial cinematic flyTo isn't immediately
+  // overridden by a panTo.
+  const focusedSeenTs = selectedPubkey ? (data.lastSeen?.[selectedPubkey]?.ts ?? null) : null
+  useEffect(() => {
+    if (!selectedPubkey) return
+    if (justFocusedRef.current) {
+      justFocusedRef.current = false
+      return
+    }
+    const seen = data.lastSeen?.[selectedPubkey]
+    if (!seen) return
+    mapApiRef.current?.panTo([seen.lon, seen.lat], { duration: 600 })
+  }, [selectedPubkey, focusedSeenTs])
 
   // Resolve the focused member's display fields from whichever circle
   // carries the freshest row. Falls back to "you" when the user has
@@ -791,6 +815,27 @@ function AddPlaceForm ({ circleId, myLastSeen, onCancel, onAdded }) {
   )
 }
 
+// Earth-distance haversine in metres. Used by the marker tween logic
+// to decide animate-vs-snap on each lastSeen update.
+function haversineMeters (lat1, lon1, lat2, lon2) {
+  const R = 6371000
+  const toRad = (d) => d * Math.PI / 180
+  const dLat = toRad(lat2 - lat1)
+  const dLon = toRad(lon2 - lon1)
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)))
+}
+
+// Tween parameters for marker movement between consecutive lastSeen
+// updates. TWEEN_MS is the animation duration; TWEEN_MAX_METERS is the
+// distance threshold above which we snap rather than animate (a multi-
+// kilometre teleport at 700ms looks worse than the snap, and almost
+// always means GPS resync after a tunnel or a debug-button warp, not a
+// real movement worth visualizing).
+const TWEEN_MS = 700
+const TWEEN_MAX_METERS = 500
+
 // Approximate a geofence circle as a 64-vertex polygon in lat/lon space.
 // Earth-as-sphere math is fine for radii up to a few km; the polygon
 // would distort visibly at very high latitudes, but PearCircle places
@@ -816,7 +861,12 @@ const CircleMap = React.forwardRef(function CircleMap (
   const fittedRef = useRef(false)
   const dataRef = useRef(data)
   const onMemberClickRef = useRef(onMemberClick)
-  const markersRef = useRef(new Map())
+  // Per-pubkey marker state: { marker, lng, lat, anim? }. lng/lat is
+  // the position the marker is currently displayed at (mid-tween or
+  // settled). anim is { start, duration, fromLng, fromLat, toLng,
+  // toLat } while a tween is running, null when settled.
+  const markerStatesRef = useRef(new Map())
+  const rafRef = useRef(null)
   const [mapReadyTick, setMapReadyTick] = useState(0)
 
   // Keep refs current so the layer click handler (registered once on
@@ -824,8 +874,9 @@ const CircleMap = React.forwardRef(function CircleMap (
   useEffect(() => { onMemberClickRef.current = onMemberClick }, [onMemberClick])
   useEffect(() => { dataRef.current = data }, [data])
 
-  // Expose imperative flyTo/fitAll to the parent. Direct camera moves
-  // avoid state/effect round-trips that could be batched or dropped.
+  // Expose imperative flyTo/panTo/fitAll to the parent. Direct camera
+  // moves avoid state/effect round-trips that could be batched or
+  // dropped.
   React.useImperativeHandle(apiRef, () => ({
     flyTo: (opts) => {
       const m = mapRef.current
@@ -836,6 +887,11 @@ const CircleMap = React.forwardRef(function CircleMap (
       // preserve the current orientation.
       const full = { bearing: 0, pitch: 0, ...opts }
       try { m.flyTo(full) } catch { try { m.jumpTo({ center: full.center, zoom: full.zoom, bearing: 0, pitch: 0 }) } catch {} }
+    },
+    panTo: (coords, opts) => {
+      const m = mapRef.current
+      if (!m) return
+      try { m.panTo(coords, { duration: 600, ...opts }) } catch {}
     },
     fitAll: () => {
       const m = mapRef.current
@@ -851,6 +907,30 @@ const CircleMap = React.forwardRef(function CircleMap (
       else if (d.places?.length > 0) fitTo(m, d.places.map(p => [p.lon, p.lat]))
     },
   }), [])
+
+  // Single rAF loop driving all in-flight marker tweens. Started
+  // lazily by ensureRaf when a new tween is scheduled; stops itself
+  // when no animations remain so we don't burn frames at idle.
+  const ensureRaf = useCallback(() => {
+    if (rafRef.current != null) return
+    const tick = () => {
+      const now = performance.now()
+      let stillAnimating = false
+      for (const state of markerStatesRef.current.values()) {
+        if (!state.anim) continue
+        const t = Math.min(1, (now - state.anim.start) / state.anim.duration)
+        const lng = state.anim.fromLng + (state.anim.toLng - state.anim.fromLng) * t
+        const lat = state.anim.fromLat + (state.anim.toLat - state.anim.fromLat) * t
+        state.marker.setLngLat([lng, lat])
+        state.lng = lng
+        state.lat = lat
+        if (t >= 1) state.anim = null
+        else stillAnimating = true
+      }
+      rafRef.current = stillAnimating ? requestAnimationFrame(tick) : null
+    }
+    rafRef.current = requestAnimationFrame(tick)
+  }, [])
 
   // One-time map init. Sources/layers are added on the 'load' event so
   // setData calls in the data-sync effect below always find them.
@@ -898,8 +978,12 @@ const CircleMap = React.forwardRef(function CircleMap (
     })
 
     return () => {
-      for (const m of markersRef.current.values()) m.remove()
-      markersRef.current.clear()
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current)
+        rafRef.current = null
+      }
+      for (const state of markerStatesRef.current.values()) state.marker.remove()
+      markerStatesRef.current.clear()
       map.remove()
     }
   }, [])
@@ -911,11 +995,11 @@ const CircleMap = React.forwardRef(function CircleMap (
     if (!map || !data) return
     const apply = () => {
       syncFeatures(map, data, fittedRef)
-      syncMembers(map, data, selectedPubkey, markersRef.current, onMemberClickRef)
+      syncMembers(map, data, selectedPubkey, markerStatesRef.current, onMemberClickRef, ensureRaf)
     }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [data, selectedPubkey])
+  }, [data, selectedPubkey, ensureRaf])
 
   return (
     <div style={s.mapWrap}>
@@ -1142,7 +1226,7 @@ function renderBubble (root, member, selected) {
   root.innerHTML = inner
 }
 
-function syncMembers (map, data, selectedPubkey, markers, clickRef) {
+function syncMembers (map, data, selectedPubkey, states, clickRef, ensureRaf) {
   const seen = new Set()
   for (const m of data?.members ?? []) {
     const pubkey = m.value?.pubkey
@@ -1151,22 +1235,45 @@ function syncMembers (map, data, selectedPubkey, markers, clickRef) {
     if (!last) continue
     seen.add(pubkey)
 
-    let marker = markers.get(pubkey)
-    if (!marker) {
+    let state = states.get(pubkey)
+    if (!state) {
       const el = buildBubbleElement(clickRef)
-      marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
       marker.setLngLat([last.lon, last.lat]).addTo(map)
-      markers.set(pubkey, marker)
+      state = { marker, lng: last.lon, lat: last.lat, anim: null }
+      states.set(pubkey, state)
     } else {
-      marker.setLngLat([last.lon, last.lat])
+      // Tween from where the marker currently sits (mid-animation
+      // values are honored) to the new lastSeen. Distance-cap to
+      // avoid weird teleport animations: a multi-kilometre jump is
+      // almost always GPS resync after a tunnel or a debug warp, and
+      // animating it across the map looks worse than the snap.
+      const dist = haversineMeters(state.lat, state.lng, last.lat, last.lon)
+      if (dist > TWEEN_MAX_METERS) {
+        state.marker.setLngLat([last.lon, last.lat])
+        state.lng = last.lon
+        state.lat = last.lat
+        state.anim = null
+      } else if (dist > 0.5) {
+        state.anim = {
+          start: performance.now(),
+          duration: TWEEN_MS,
+          fromLng: state.lng,
+          fromLat: state.lat,
+          toLng: last.lon,
+          toLat: last.lat,
+        }
+        ensureRaf()
+      }
+      // else: position unchanged within ~0.5m, skip the tween.
     }
-    renderBubble(marker.getElement(), m, pubkey === selectedPubkey)
+    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey)
   }
 
-  for (const [pubkey, marker] of markers) {
+  for (const [pubkey, state] of states) {
     if (!seen.has(pubkey)) {
-      marker.remove()
-      markers.delete(pubkey)
+      state.marker.remove()
+      states.delete(pubkey)
     }
   }
 }
