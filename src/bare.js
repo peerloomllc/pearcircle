@@ -52,6 +52,7 @@ const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
+let _sharingEnabled = true        // local privacy/battery toggle; when false location:update is dropped. Persisted in _localDb under `sharing`. Loaded on init.
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
@@ -457,8 +458,30 @@ const handlers = {
     return { peers: out }
   },
 
+  'sharing:get': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const row = await _localDb.get('sharing')
+    const enabled = row?.value?.enabled !== false  // default: true
+    return { enabled }
+  },
+
+  'sharing:set': async ({ enabled } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
+    await _localDb.put('sharing', { enabled, setAt: Date.now() })
+    _sharingEnabled = enabled
+    send({ event: 'sharing:changed', data: { enabled } })
+    return { ok: true, enabled }
+  },
+
   'location:update': async ({ lat, lon, accuracy, ts, speed } = {}) => {
     if (!_initialized) return { ok: false, reason: 'not_initialized' }
+    // Sharing toggle gate: when off, drop location updates entirely.
+    // The native foreground service is also stopped by the shell, so
+    // typically nothing reaches this path while disabled — but the
+    // service can take a moment to wind down, and the worklet may
+    // still receive a queued event during that window.
+    if (!_sharingEnabled) return { ok: false, reason: 'sharing_disabled' }
     if (typeof lat !== 'number' || typeof lon !== 'number') {
       return { ok: false, reason: 'invalid_coords' }
     }
@@ -908,8 +931,16 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
   }, 5000)
 
+  // Load the persisted sharing toggle. Default true so existing
+  // installs keep behaving as before; an explicit `enabled: false`
+  // record from a prior session restores the muted state.
+  try {
+    const row = await _localDb.get('sharing')
+    if (row?.value?.enabled === false) _sharingEnabled = false
+  } catch {}
+
   _initialized = true
-  send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex') } })
+  send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex'), sharingEnabled: _sharingEnabled } })
 }
 
 let buffer = ''

@@ -31,23 +31,40 @@ export function App () {
   const [view, setView] = useState({ name: 'home' })
   const [identity, setIdentity] = useState(null)
   const [profile, setProfile] = useState(null)
+  const [sharing, setSharing] = useState(true)
 
   const refresh = useCallback(async () => {
-    const [id, pr] = await Promise.all([
+    const [id, pr, sh] = await Promise.all([
       pear.call('identity:get'),
       pear.call('profile:get'),
+      pear.call('sharing:get').catch(() => ({ enabled: true })),
     ])
     setIdentity(id)
     setProfile(pr ?? null)
+    setSharing(sh?.enabled !== false)
   }, [])
 
   useEffect(() => {
     refresh()
     pear.on('ready', refresh)
+    pear.on('sharing:changed', ({ enabled }) => setSharing(enabled !== false))
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setView({ name: 'join', invite: url })
     })
   }, [refresh])
+
+  // Single place that flips the sharing toggle: persist in worklet,
+  // start/stop the native foreground service. UI subscribers see the
+  // sharing:changed event and re-render. Errors surface to the caller
+  // so the ProfileView toggle can show them.
+  const setSharingEnabled = useCallback(async (enabled) => {
+    await pear.call('sharing:set', { enabled })
+    if (enabled) {
+      await pear.call('shell:location:start').catch(() => null)
+    } else {
+      await pear.call('shell:location:stop').catch(() => null)
+    }
+  }, [])
 
   if (view.name === 'home') {
     return (
@@ -55,6 +72,7 @@ export function App () {
         key={view.selectCircle ?? 'all'}
         identity={identity}
         profile={profile}
+        sharing={sharing}
         setView={setView}
         initialSelectedCircleId={view.selectCircle ?? null}
       />
@@ -67,7 +85,15 @@ export function App () {
     return <JoinView setView={setView} onJoined={refresh} initialInvite={view.invite} />
   }
   if (view.name === 'profile') {
-    return <ProfileView profile={profile} setView={setView} onSaved={refresh} />
+    return (
+      <ProfileView
+        profile={profile}
+        sharing={sharing}
+        setSharing={setSharingEnabled}
+        setView={setView}
+        onSaved={refresh}
+      />
+    )
   }
   return null
 }
@@ -218,7 +244,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = null }) {
+function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCircleId = null }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
@@ -507,7 +533,16 @@ function HomeMapView ({ identity, profile, setView, initialSelectedCircleId = nu
           onClick={() => setView({ name: 'profile' })}
           aria-label='Profile'
         >
-          <Avatar base64={profile?.avatar} label={profile?.displayName ?? '?'} size={32} />
+          <span style={{ position: 'relative', display: 'inline-flex' }}>
+            <Avatar base64={profile?.avatar} label={profile?.displayName ?? '?'} size={32} />
+            {!sharing && (
+              <span
+                style={s.sharingOffDot}
+                title='Sharing paused'
+                aria-label='Sharing paused'
+              />
+            )}
+          </span>
         </button>
       </header>
 
@@ -1355,14 +1390,27 @@ function fitTo (map, lonLatPairs) {
   if (cam) map.flyTo({ center: cam.center, zoom: cam.zoom, ...opts })
 }
 
-function ProfileView ({ profile, setView, onSaved }) {
+function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   // null = unchanged from server; '' = explicitly cleared; string = new value
   const [avatar, setAvatar] = useState(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [savedAt, setSavedAt] = useState(null)
+  const [sharingError, setSharingError] = useState(null)
+  const [togglingSharing, setTogglingSharing] = useState(false)
   const fileRef = useRef(null)
+
+  const toggleSharing = async () => {
+    setSharingError(null)
+    setTogglingSharing(true)
+    try {
+      await setSharing(!sharing)
+    } catch (e) {
+      setSharingError(String(e?.message ?? e))
+    }
+    setTogglingSharing(false)
+  }
 
   const onPickFile = async (e) => {
     setError(null)
@@ -1449,6 +1497,23 @@ function ProfileView ({ profile, setView, onSaved }) {
       </button>
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
+
+      <h2 style={s.h2}>Location sharing</h2>
+      <p style={s.muted}>
+        {sharing
+          ? 'Your location is being shared with the circles you\'re in.'
+          : 'Sharing is paused. Other members see your last known location until you resume.'}
+      </p>
+      <button
+        style={sharing ? s.dangerBtn : s.primaryBtn}
+        disabled={togglingSharing}
+        onClick={toggleSharing}
+      >
+        {togglingSharing
+          ? (sharing ? 'Stopping...' : 'Resuming...')
+          : (sharing ? 'Stop sharing' : 'Resume sharing')}
+      </button>
+      {sharingError && <p style={s.error}>{sharingError}</p>}
     </div>
   )
 }
@@ -1671,6 +1736,8 @@ const s = {
   actions: { display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 8 },
   primaryBtn: { width: '100%', padding: '14px 16px', background: '#7ec4cf', color: '#0a1f23', border: 'none', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
   secondaryBtn: { width: '100%', padding: '14px 16px', background: '#222', color: '#eee', border: '1px solid #333', borderRadius: 10, fontSize: 16, fontWeight: 500, cursor: 'pointer', marginTop: 8 },
+  dangerBtn: { width: '100%', padding: '14px 16px', background: '#5a1f1f', color: '#fcc', border: '1px solid #7a2a2a', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
+  sharingOffDot: { position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: '50%', background: '#e64545', border: '2px solid #1a1a1a', pointerEvents: 'none' },
   iconBtn: { width: 32, height: 32, padding: 0, background: 'none', color: '#ccc', border: 'none', fontSize: 22, cursor: 'pointer' },
   circleList: { listStyle: 'none', padding: 0, margin: 0 },
   circleItem: { padding: 14, background: '#1c1c1c', borderRadius: 10, marginBottom: 8, cursor: 'pointer' },

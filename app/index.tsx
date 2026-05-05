@@ -145,6 +145,7 @@ export default function Index() {
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
+    onEvent('sharing:changed', (data) => emitEvent('sharing:changed', data))
 
     // Deep links: pear://pearcircle/join?... and https equivalent.
     Linking.getInitialURL().then((url) => {
@@ -178,14 +179,23 @@ export default function Index() {
     if (!PearCircleLocation) return
 
     ensureLocationListener()
-    PearCircleLocation.startUpdates?.().catch?.((e: any) =>
-      console.warn('startUpdates failed', e),
-    )
+
+    // Auto-start the foreground service unless the worklet's persisted
+    // sharing toggle says otherwise. The worklet emits its current
+    // `sharingEnabled` on the `ready` event, before any user
+    // interaction. We listen once and start (or skip) accordingly.
+    const onReadyOnce = (data: any) => {
+      if (data?.sharingEnabled === false) return
+      PearCircleLocation.startUpdates?.().catch?.((e: any) =>
+        console.warn('startUpdates failed', e),
+      )
+    }
+    onEvent('ready', onReadyOnce)
 
     // Deliberately no cleanup: the location listener survives activity
     // destruction (set up at module scope), and the foreground service
-    // is meant to keep running too. Stopping is an explicit user action
-    // (future "Stop sharing" toggle slice).
+    // is meant to keep running too. Stopping is an explicit user
+    // action (the sharing toggle).
   }, [])
 
   const onMessage = async (e: any) => {
@@ -213,6 +223,30 @@ export default function Index() {
           title: msg.args?.title ?? '',
         })
         respond(msg.id, { ok: result.action !== Share.dismissedAction })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:location:start') {
+      // Start the native foreground location service. Used by the
+      // sharing toggle to resume location updates after a stop.
+      try {
+        await PearCircleLocation?.startUpdates?.()
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:location:stop') {
+      // Stop the native foreground location service. The service's
+      // persistent notification disappears and no further callbacks
+      // reach the worklet. Worklet-side `_sharingEnabled` is the
+      // belt-and-suspenders gate for any in-flight events.
+      try {
+        await PearCircleLocation?.stopUpdates?.()
+        respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
       }
