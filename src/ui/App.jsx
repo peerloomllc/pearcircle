@@ -572,10 +572,13 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
             >‹</button>
             <Avatar base64={selectedMember.avatar} label={selectedMember.displayName} size={32} />
             <div style={s.focusTextCol}>
-              <div style={s.focusName}>{selectedMember.displayName}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={s.focusName}>{selectedMember.displayName}</div>
+                <BatteryBadge level={selectedMember.seen?.battery} />
+              </div>
               <div style={s.focusSub}>
                 {selectedMember.seen
-                  ? 'updated ' + ageLabel(selectedMember.seen.ts)
+                  ? <LiveOrAge ts={selectedMember.seen.ts} />
                   : 'no location yet'}
               </div>
             </div>
@@ -1497,7 +1500,7 @@ function buildBubbleElement (clickRef) {
 // avatar is the location indicator, with a colored ring for contrast
 // and a drop-shadow for depth. Selected state grows the badge and
 // swaps to a cyan ring with a glow halo.
-function renderBubble (root, member, selected) {
+function renderBubble (root, member, selected, last) {
   const pubkey = member.value?.pubkey ?? ''
   const size = selected ? 48 : 40
   const ring = selected ? 3 : 2
@@ -1510,18 +1513,38 @@ function renderBubble (root, member, selected) {
     ? `<img src="${escapeHtml(src)}" alt="" style="width:100%;height:100%;object-fit:cover;display:block;" />`
     : `<div style="width:100%;height:100%;background:#2a3a3f;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:${Math.round(size * 0.42)}px;font-weight:600;font-family:system-ui;">${escapeHtml(initialsFor(label))}</div>`
 
+  // Battery overlay: small horizontal rectangle hanging just below the
+  // bottom edge of the avatar circle. Pure DOM (no SVG) per the
+  // renderBubble saga — SVG inside markers caused zoom-dependent drift.
+  // Position is absolute so it doesn't affect the root's bounding box,
+  // which is what MapLibre transforms; pointer-events: none keeps the
+  // whole marker click-target the avatar.
+  const batt = (typeof last?.battery === 'number' && last.battery >= 0 && last.battery <= 100)
+    ? Math.round(last.battery) : null
+  const battColor = batt == null ? null : (batt < 20 ? '#e57373' : batt < 50 ? '#ffb74d' : '#81c784')
+  const battHtml = batt == null ? '' : (
+    `<div style="position:absolute;bottom:-3px;left:50%;transform:translateX(-50%);width:20px;height:9px;background:#1a1a1a;border:1px solid #888;border-radius:2px;box-sizing:border-box;overflow:hidden;pointer-events:none;">` +
+    `<div style="width:${batt}%;height:100%;background:${battColor};"></div>` +
+    `</div>`
+  )
+
+  // Root carries positioning and the drop-shadow; the inner div carries
+  // the circular clip + ring border. This restructure lets the battery
+  // badge overflow below without being clipped by the avatar's circle.
   root.dataset.pubkey = pubkey
   root.style.width = size + 'px'
   root.style.height = size + 'px'
-  root.style.borderRadius = '50%'
-  root.style.overflow = 'hidden'
+  root.style.borderRadius = '0'
+  root.style.overflow = 'visible'
   root.style.boxSizing = 'border-box'
-  root.style.border = `${ring}px solid ${ringColor}`
-  root.style.background = '#fc7'
+  root.style.border = 'none'
+  root.style.background = 'transparent'
   root.style.filter = selected
     ? 'drop-shadow(0 0 10px rgba(126,196,207,0.7)) drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
     : 'drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
-  root.innerHTML = inner
+  root.innerHTML =
+    `<div style="width:100%;height:100%;border-radius:50%;overflow:hidden;border:${ring}px solid ${ringColor};background:#fc7;box-sizing:border-box;">${inner}</div>` +
+    battHtml
 }
 
 function syncMembers (map, data, selectedPubkey, states, clickRef, ensureRaf) {
@@ -1565,7 +1588,7 @@ function syncMembers (map, data, selectedPubkey, states, clickRef, ensureRaf) {
       }
       // else: position unchanged within ~0.5m, skip the tween.
     }
-    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey)
+    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey, last)
   }
 
   for (const [pubkey, state] of states) {
@@ -2023,7 +2046,10 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
       <div style={s.memberRow}>
         <Avatar base64={member.value?.avatar} label={displayName} size={36} />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={s.memberName}>{displayName}</div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <div style={{ ...s.memberName, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
+            {!isPaused && <BatteryBadge level={seen?.battery} />}
+          </div>
           {isPaused ? (
             <div style={s.lastSeenMuted}>Sharing paused</div>
           ) : transition ? (
@@ -2035,7 +2061,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
           ) : seen ? (
             <div style={s.lastSeen}>
               {geoLabel ? 'near ' + geoLabel + ' · ' : ''}
-              updated {ageLabel(seen.ts)}
+              <LiveOrAge ts={seen.ts} />
             </div>
           ) : (
             <div style={s.lastSeenMuted}>no location yet</div>
@@ -2043,6 +2069,27 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
         </div>
       </div>
     </li>
+  )
+}
+
+// Inline-SVG battery indicator with a fill that scales with the level
+// and a color band: green > 50, amber 20-50, red < 20. Sits on the
+// member row's title line so it stays visible regardless of subtitle
+// state (paused / transition / lastSeen / no-loc-yet).
+function BatteryBadge ({ level }) {
+  if (typeof level !== 'number' || !Number.isFinite(level)) return null
+  const pct = Math.max(0, Math.min(100, Math.round(level)))
+  const color = pct < 20 ? '#e57373' : pct < 50 ? '#ffb74d' : '#81c784'
+  const fillW = (pct / 100) * 12  // inner area width is 12 (between x=2 and x=14)
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 8, flexShrink: 0 }}>
+      <svg width="20" height="10" viewBox="0 0 20 10" aria-hidden="true">
+        <rect x="0.5" y="0.5" width="15" height="9" rx="1.5" fill="none" stroke="#888" strokeWidth="1"/>
+        <rect x="16" y="3" width="2" height="4" rx="0.5" fill="#888"/>
+        <rect x="2" y="2" width={fillW} height="6" fill={color}/>
+      </svg>
+      <span style={{ fontSize: 12, color: pct < 20 ? '#e57373' : '#aaa', fontVariantNumeric: 'tabular-nums', minWidth: 30, textAlign: 'right', display: 'inline-block' }}>{pct}%</span>
+    </span>
   )
 }
 
@@ -2112,14 +2159,36 @@ function ShareButton ({ text, title = 'Join my PearCircle' }) {
   )
 }
 
+// Sub-minute precision is noise — every refresh poll otherwise flips
+// "5s ago" → "8s ago" → "2s ago" without conveying anything new. Bucket
+// anything under a minute as "just now" and coarsen everything else
+// to whole minutes / hours / days.
 function ageLabel (ts) {
   if (typeof ts !== 'number') return ''
   const ms = Date.now() - ts
-  if (ms < 0) return 'just now'
-  if (ms < 60_000) return Math.max(1, Math.floor(ms / 1000)) + 's ago'
+  if (ms < 60_000) return 'just now'
   if (ms < 3_600_000) return Math.floor(ms / 60_000) + 'm ago'
   if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + 'h ago'
   return Math.floor(ms / 86_400_000) + 'd ago'
+}
+
+// Replaces sub-minute "updated Xs ago" churn with a stable green-dot
+// "Live" pill while ts is fresh, then falls back to coarser "Xm ago".
+// Used for lastSeen freshness; transitions keep ageLabel since they're
+// past events and "Live" wouldn't be the right framing.
+const LIVE_THRESHOLD_MS = 60_000
+function LiveOrAge ({ ts, prefix = 'updated ' }) {
+  if (typeof ts !== 'number') return null
+  const fresh = (Date.now() - ts) < LIVE_THRESHOLD_MS
+  if (fresh) {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+        <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#7ec77a', display: 'inline-block' }} />
+        Live
+      </span>
+    )
+  }
+  return <>{prefix}{ageLabel(ts)}</>
 }
 
 function short (s) {

@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.location.Location
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
@@ -84,12 +85,20 @@ class PearCircleLocationService : Service() {
     }
 
     private fun emitToJs(loc: Location) {
+        // Battery percentage piggybacks on every location event. Reading
+        // BATTERY_PROPERTY_CAPACITY is a near-zero-cost system call (no
+        // broadcast subscription needed). Returns Int.MIN_VALUE on
+        // unsupported devices; we treat anything outside 0..100 as null.
+        val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        val cap = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        val battery: Double? = if (cap in 0..100) cap.toDouble() else null
         PearCircleLocationModule.instance?.emitLocation(
             loc.latitude,
             loc.longitude,
             loc.accuracy.toDouble(),
             loc.time.toDouble(),
             loc.speed.toDouble(),
+            battery,
         )
     }
 

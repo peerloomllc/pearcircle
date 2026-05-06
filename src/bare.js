@@ -500,7 +500,7 @@ const handlers = {
     return { ok: true, enabled, expiresAt: effectiveExpiresAt }
   },
 
-  'location:update': async ({ lat, lon, accuracy, ts, speed } = {}) => {
+  'location:update': async ({ lat, lon, accuracy, ts, speed, battery } = {}) => {
     if (!_initialized) return { ok: false, reason: 'not_initialized' }
     // Sharing toggle gate: when off, drop location updates entirely.
     // The native foreground service is also stopped by the shell, so
@@ -516,6 +516,7 @@ const handlers = {
     if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
       return { ok: false, reason: 'future_ts' }
     }
+    const batt = (typeof battery === 'number' && battery >= 0 && battery <= 100) ? battery : null
     const value = signValue({
       pubkey: ourKey,
       lat,
@@ -523,6 +524,7 @@ const handlers = {
       accuracy: typeof accuracy === 'number' ? accuracy : null,
       ts: stamp,
       speed: typeof speed === 'number' ? speed : null,
+      battery: batt,
       v: 1,
     }, _identity.secretKey)
     _selfLastSeen = value
@@ -541,7 +543,7 @@ const handlers = {
     // After lastSeen lands, run the JS-side geofence check. Any flips
     // produce additional transition appends (and bump lastSeen again,
     // but the second write is byte-identical so the view is unchanged).
-    await checkPlaceTransitions(lat, lon, accuracy, stamp)
+    await checkPlaceTransitions(lat, lon, accuracy, stamp, batt)
 
     return { ok: true, written, pubkey: ourKey }
   },
@@ -609,21 +611,23 @@ async function appendTransition (base, placeId, kind, ts) {
   return value
 }
 
-async function appendLastSeen (base, lat, lon, accuracy, ts) {
+async function appendLastSeen (base, lat, lon, accuracy, ts, battery = null) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const batt = (typeof battery === 'number' && battery >= 0 && battery <= 100) ? battery : null
   const value = signValue({
     pubkey: ourKey,
     lat,
     lon,
     accuracy: Number.isFinite(accuracy) ? accuracy : null,
     ts,
+    battery: batt,
     v: 1,
   }, _identity.secretKey)
   await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
 }
 
-async function checkPlaceTransitions (lat, lon, accuracy, ts) {
+async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null) {
   for (const state of _circlePlaces.values()) {
     const base = _circleBases.get(state.circleId)
     if (!base || !base.writable) continue
@@ -633,7 +637,9 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts) {
     if (!result.kind) continue
     try {
       await appendTransition(base, state.placeId, result.kind, ts)
-      await appendLastSeen(base, lat, lon, accuracy, ts)
+      // Pass battery so the post-transition lastSeen write stays byte-
+      // identical to the location:update one (autobase apply dedupes).
+      await appendLastSeen(base, lat, lon, accuracy, ts, battery)
     } catch (e) {
       console.warn('[bare] failed to append transition', e?.message)
     }
