@@ -272,6 +272,9 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
   const [deleteError, setDeleteError] = useState(null)
   const [transitionError, setTransitionError] = useState(null)
   const [menuOpen, setMenuOpen] = useState(false)
+  // Per-device mute set ('{circleId}:{placeId}'). Source of truth is the
+  // RN shell; this is a local cache loaded on mount and updated on toggle.
+  const [mutedPlaces, setMutedPlaces] = useState(() => new Set())
   const mapApiRef = useRef(null)
   // Set by focusMember just before its flyTo. The auto-recenter
   // effect skips its first run after a focus so we don't override
@@ -301,8 +304,36 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
     pear.on('peer:disconnected', refresh)
     pear.on('circle:writer:added', refresh)
     pear.on('ready', refresh)
+    // Load mute set from the shell once on mount; toggleMute keeps state
+    // in sync after that without re-fetching.
+    pear.call('shell:notif:mute:list').then((r) => {
+      const arr = r?.mutes
+      if (Array.isArray(arr)) setMutedPlaces(new Set(arr))
+    }).catch(() => {})
     return () => clearInterval(id)
   }, [refresh])
+
+  const toggleMute = useCallback(async (place) => {
+    const key = place.circleId + ':' + place.id
+    const next = !mutedPlaces.has(key)
+    setMutedPlaces((prev) => {
+      const s = new Set(prev)
+      if (next) s.add(key)
+      else s.delete(key)
+      return s
+    })
+    try {
+      await pear.call('shell:notif:mute:set', { circleId: place.circleId, placeId: place.id, muted: next })
+    } catch {
+      // Roll back on failure so the UI doesn't lie.
+      setMutedPlaces((prev) => {
+        const s = new Set(prev)
+        if (next) s.delete(key)
+        else s.add(key)
+        return s
+      })
+    }
+  }, [mutedPlaces])
 
   // If a circle the user filtered to gets removed (left), drop the filter.
   useEffect(() => {
@@ -681,43 +712,58 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
                   <li key={p.circleId + ':' + p.id} style={{ ...s.memberItem, cursor: 'pointer' }} onClick={focusOn}>
                     <div style={s.placeRowHeader}>
                       <div style={s.memberName}>{p.name}</div>
-                      {placeWritable && (
-                        <div style={s.placeRowActions}>
-                          <button
-                            style={{ ...s.smallBtn, flex: 'none', padding: '6px 12px' }}
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              setEditingPlace({
-                                circleId: p.circleId,
-                                id: p.id,
-                                name: p.name,
-                                radiusMeters: p.radiusMeters,
-                              })
-                              setShowAddPlace(false)
-                              setConfirmingDeleteId(null)
-                            }}
-                          >
-                            Edit
-                          </button>
-                          <button
-                            style={{
-                              ...s.smallBtn,
-                              flex: 'none',
-                              padding: '6px 12px',
-                              background: confirmingDeleteId === p.id ? '#5a1f1f' : '#222',
-                              color: confirmingDeleteId === p.id ? '#fcc' : '#ccc',
-                              borderColor: confirmingDeleteId === p.id ? '#7a2a2a' : '#333',
-                            }}
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              if (confirmingDeleteId === p.id) deletePlace(p)
-                              else setConfirmingDeleteId(p.id)
-                            }}
-                          >
-                            {confirmingDeleteId === p.id ? 'Tap to confirm' : 'Delete'}
-                          </button>
-                        </div>
-                      )}
+                      <div style={s.placeRowActions}>
+                        <button
+                          style={{
+                            ...s.smallBtn,
+                            flex: 'none',
+                            padding: '6px 12px',
+                            background: mutedPlaces.has(p.circleId + ':' + p.id) ? '#3a2a14' : '#222',
+                            color: mutedPlaces.has(p.circleId + ':' + p.id) ? '#fc9' : '#ccc',
+                            borderColor: mutedPlaces.has(p.circleId + ':' + p.id) ? '#5a3f1f' : '#333',
+                          }}
+                          onClick={(e) => { e.stopPropagation(); toggleMute(p) }}
+                        >
+                          {mutedPlaces.has(p.circleId + ':' + p.id) ? 'Muted' : 'Mute'}
+                        </button>
+                        {placeWritable && (
+                          <>
+                            <button
+                              style={{ ...s.smallBtn, flex: 'none', padding: '6px 12px' }}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setEditingPlace({
+                                  circleId: p.circleId,
+                                  id: p.id,
+                                  name: p.name,
+                                  radiusMeters: p.radiusMeters,
+                                })
+                                setShowAddPlace(false)
+                                setConfirmingDeleteId(null)
+                              }}
+                            >
+                              Edit
+                            </button>
+                            <button
+                              style={{
+                                ...s.smallBtn,
+                                flex: 'none',
+                                padding: '6px 12px',
+                                background: confirmingDeleteId === p.id ? '#5a1f1f' : '#222',
+                                color: confirmingDeleteId === p.id ? '#fcc' : '#ccc',
+                                borderColor: confirmingDeleteId === p.id ? '#7a2a2a' : '#333',
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                if (confirmingDeleteId === p.id) deletePlace(p)
+                                else setConfirmingDeleteId(p.id)
+                              }}
+                            >
+                              {confirmingDeleteId === p.id ? 'Tap to confirm' : 'Delete'}
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
                     <div style={s.placeRadiusLine}>{Math.round(p.radiusMeters)}m radius</div>
                     {placeWritable && (

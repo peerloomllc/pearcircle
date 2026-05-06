@@ -7,8 +7,91 @@ import { Asset } from 'expo-asset'
 import * as FileSystem from 'expo-file-system/legacy'
 import * as Linking from 'expo-linking'
 import { CameraView, useCameraPermissions } from 'expo-camera'
+import * as Notifications from 'expo-notifications'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 
 const { PearCircleLocation } = NativeModules
+
+// Foreground-display behavior for geofence notifications. Default
+// expo-notifications suppresses alerts when the app is foregrounded;
+// transitions are timely so we override.
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+})
+
+// Per-device mute state for place transitions. Loaded once from AsyncStorage
+// at startup; written through on every change so reloads see latest. The
+// WebView is the editor; RN holds the source of truth for fast lookup when
+// transition:applied events arrive.
+const MUTES_KEY = 'pc:notif:mutes'
+const _mutes = new Set<string>()
+let _ourPubkey: string | null = null
+
+const muteKey = (circleId: string, placeId: string) => circleId + ':' + placeId
+
+async function loadMutes() {
+  try {
+    const raw = await AsyncStorage.getItem(MUTES_KEY)
+    if (!raw) return
+    const arr = JSON.parse(raw)
+    if (Array.isArray(arr)) for (const k of arr) if (typeof k === 'string') _mutes.add(k)
+  } catch {}
+}
+
+async function persistMutes() {
+  try { await AsyncStorage.setItem(MUTES_KEY, JSON.stringify([..._mutes])) } catch {}
+}
+
+async function setMute(circleId: string, placeId: string, muted: boolean) {
+  if (typeof circleId !== 'string' || typeof placeId !== 'string') return
+  const k = muteKey(circleId, placeId)
+  if (muted) _mutes.add(k)
+  else _mutes.delete(k)
+  await persistMutes()
+}
+
+async function ensureNotifications() {
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('geofence', {
+      name: 'Place transitions',
+      importance: Notifications.AndroidImportance.HIGH,
+      description: 'Notifications when circle members arrive at or leave Places',
+      lightColor: '#0E413A',
+    })
+  }
+  const settings = await Notifications.getPermissionsAsync()
+  if (settings.status !== 'granted') {
+    await Notifications.requestPermissionsAsync()
+  }
+}
+
+async function fireTransitionNotification(payload: any) {
+  if (!payload || !payload.transition) return
+  const { circleId, transition, displayName, placeName } = payload
+  if (typeof transition.pubkey !== 'string') return
+  // Self-transitions: peers get notified about you, you don't need to be
+  // told you arrived where you went.
+  if (_ourPubkey && transition.pubkey === _ourPubkey) return
+  if (_mutes.has(muteKey(circleId, transition.placeId))) return
+  const verb = transition.kind === 'enter' ? 'arrived at' : 'left'
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'PearCircle',
+        body: `${displayName} ${verb} ${placeName}`,
+        ...(Platform.OS === 'android' ? { channelId: 'geofence' } : {}),
+      },
+      trigger: null,
+    })
+  } catch (e: any) {
+    console.warn('fire transition notification failed: ' + e?.message)
+  }
+}
 
 let _worklet: any = null
 let _workletStarted = false
@@ -145,11 +228,23 @@ export default function Index() {
     })
 
     // Forward worklet events to the WebView so the UI can react.
-    onEvent('ready', (data) => emitEvent('ready', data))
+    onEvent('ready', (data) => {
+      // Capture our pubkey so transition:applied can suppress self-notifications.
+      if (data?.publicKey && typeof data.publicKey === 'string') _ourPubkey = data.publicKey
+      emitEvent('ready', data)
+    })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
     onEvent('sharing:changed', (data) => emitEvent('sharing:changed', data))
+    // Geofence transitions land here; fire OS notification if it's a peer
+    // (not us) and the place isn't muted on this device.
+    onEvent('transition:applied', (data) => { fireTransitionNotification(data) })
+
+    // Notification setup runs in parallel with worklet startup; it's
+    // independent and either order is fine.
+    loadMutes().catch(() => {})
+    ensureNotifications().catch((e) => console.warn('notif setup failed', e))
 
     // Deep links: pear://pearcircle/join?... and https equivalent.
     Linking.getInitialURL().then((url) => {
@@ -271,6 +366,18 @@ export default function Index() {
       } catch (err: any) {
         respond(msg.id, { supported: true, exempt: false, error: err?.message ?? String(err) })
       }
+      return
+    }
+    if (msg.method === 'shell:notif:mute:list') {
+      // Return the current mute set as an array of '{circleId}:{placeId}'
+      // keys. Cheap; called once on UI init and after sets to refresh state.
+      respond(msg.id, { mutes: [..._mutes] })
+      return
+    }
+    if (msg.method === 'shell:notif:mute:set') {
+      const { circleId, placeId, muted } = msg.args ?? {}
+      await setMute(circleId, placeId, !!muted)
+      respond(msg.id, { ok: true })
       return
     }
     if (msg.method === 'shell:battery:requestExempt') {

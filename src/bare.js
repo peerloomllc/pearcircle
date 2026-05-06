@@ -186,7 +186,7 @@ const handlers = {
     const ns = _store.namespace(circleId)
     const base = new Autobase(ns, null, {
       open: openCircleView,
-      apply: applyCircleNodes,
+      apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
       valueEncoding: 'json',
     })
     await base.ready()
@@ -243,7 +243,7 @@ const handlers = {
     const ns = _store.namespace(circleId)
     const base = new Autobase(ns, b4a.from(bootstrap, 'hex'), {
       open: openCircleView,
-      apply: applyCircleNodes,
+      apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
       valueEncoding: 'json',
     })
     await base.ready()
@@ -719,7 +719,7 @@ function openCircleView (store) {
   })
 }
 
-async function applyCircleNodes (nodes, view, base) {
+async function applyCircleNodes (nodes, view, base, circleId) {
   const bootstrapHex = b4a.toString(base.key, 'hex')
   let weJustBecameWritable = false
   for (const node of nodes) {
@@ -793,16 +793,13 @@ async function applyCircleNodes (nodes, view, base) {
           if (incoming.createdAt <= existing.value.createdAt) continue
         }
         await view.put(op.key, incoming)
-        // Track for in-process geofence checks. We don't have a base→circleId
-        // reverse map, so look up the circleId by walking _circleBases. Cheap.
-        // A delete tombstone (deleted: true) untracks instead, so the next
-        // location:update can't fire transitions against a deleted place.
-        for (const [cid, b] of _circleBases) {
-          if (b === base) {
-            if (isDeleted(incoming)) untrackPlace(cid, incoming.id)
-            else trackPlace(cid, incoming)
-            break
-          }
+        // Track for in-process geofence checks. circleId comes from the
+        // closure captured at autobase creation. A delete tombstone
+        // (deleted: true) untracks instead, so the next location:update
+        // can't fire transitions against a deleted place.
+        if (circleId) {
+          if (isDeleted(incoming)) untrackPlace(circleId, incoming.id)
+          else trackPlace(circleId, incoming)
         }
         continue
       }
@@ -829,6 +826,24 @@ async function applyCircleNodes (nodes, view, base) {
         if (keyPubkey !== incoming.pubkey) continue
         if (keyPlaceId !== incoming.placeId) continue
         await view.put(op.key, incoming)
+        // Emit transition:applied so the RN shell can fire an OS notification.
+        // Resolved displayName + placeName piggyback on the event so the
+        // receiver doesn't need to round-trip back to the worklet.
+        try {
+          if (circleId) {
+            const memberRow = await view.get('member:' + incoming.pubkey)
+            const placeRow = await view.get('place:' + incoming.placeId)
+            const placeDeleted = !!(placeRow?.value && isDeleted(placeRow.value))
+            if (!placeDeleted) {
+              send({ event: 'transition:applied', data: {
+                circleId,
+                transition: incoming,
+                displayName: memberRow?.value?.displayName || incoming.pubkey.slice(0, 8),
+                placeName: placeRow?.value?.name || 'a place',
+              }})
+            }
+          }
+        } catch (e) { console.warn('[bare] transition:applied emit failed', e?.message) }
         continue
       }
       // Other prefixes (presence, removed) not yet wired — silently
@@ -871,7 +886,7 @@ async function mountCircleAutobase (circleId, bootstrapHex) {
   const ns = _store.namespace(circleId)
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), {
     open: openCircleView,
-    apply: applyCircleNodes,
+    apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
     valueEncoding: 'json',
   })
   await base.ready()
