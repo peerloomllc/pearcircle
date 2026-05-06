@@ -381,10 +381,15 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
   const placeCount = data.places.length
   const isSingleCircle = activeCircles.length === 1
   // Where to write per-place / per-circle actions. With "All" selected
-  // and multiple circles we don't have a single target, so write
-  // actions are hidden until the user filters down.
+  // and multiple circles we don't have a single target for membership-
+  // post / read-only-warning lines. Place creation handles the
+  // multi-circle case via writableCircles below.
   const actionTargetCircleId = isSingleCircle ? activeCircles[0]?.circleId : null
   const actionTargetWritable = isSingleCircle ? !!activeCircles[0]?.writable : false
+  // Circles the user can write a new place to in the current scope.
+  // Filtered view = at most one; All view = every writable circle.
+  // The AddPlaceForm shows a picker when this list has more than one.
+  const writableCircles = activeCircles.filter(c => c.writable)
 
   const fireTransition = useCallback(async (place, kind) => {
     setTransitionError(null)
@@ -425,17 +430,18 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
   }, [])
 
   // Long-press on the map opens the add-place form pre-filled with
-  // the touched coords. Requires a single writable circle as the
-  // target — in "All circles" mode (or read-only) we can't pick a
-  // single autobase to write to, so the gesture is a no-op there
-  // (matches the "Add a place" button being hidden in those states).
+  // the touched coords. The form picks (or asks for) the target
+  // circle from `writableCircles`, so this works in both filtered
+  // and "All circles" modes as long as the user is a writer
+  // somewhere. No-op when the user has no writable circle (read-only
+  // joiner, pending writer-add, etc).
   const onMapLongPress = useCallback(([lng, lat]) => {
-    if (!actionTargetCircleId || !actionTargetWritable) return
+    if (writableCircles.length === 0) return
     setEditingPlace(null)
     setPendingPlaceCoords({ lat, lon: lng })
     setShowAddPlace(true)
     setSheetOpen(true)
-  }, [actionTargetCircleId, actionTargetWritable])
+  }, [writableCircles])
 
   // Two-tap delete: first tap arms the confirm state for one place,
   // second tap on the same place's button actually fires the delete.
@@ -758,18 +764,15 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
               onSaved={async () => { setEditingPlace(null); await refresh() }}
             />
           )}
-          {!editingPlace && actionTargetCircleId && actionTargetWritable && showAddPlace && (
+          {!editingPlace && writableCircles.length > 0 && showAddPlace && (
             <AddPlaceForm
               key={pendingPlaceCoords ? `lp:${pendingPlaceCoords.lat}:${pendingPlaceCoords.lon}` : 'manual'}
-              circleId={actionTargetCircleId}
+              circles={writableCircles}
               myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
               initialCoords={pendingPlaceCoords}
               onCancel={() => { setShowAddPlace(false); setPendingPlaceCoords(null) }}
               onAdded={async () => { setShowAddPlace(false); setPendingPlaceCoords(null); await refresh() }}
             />
-          )}
-          {!actionTargetCircleId && circles.length > 1 && (
-            <p style={s.muted}>Pick a single circle from the menu above to add a place.</p>
           )}
           {actionTargetCircleId && !actionTargetWritable && (
             <p style={s.muted}>Read-only until owner adds you as a writer.</p>
@@ -824,15 +827,21 @@ function EditPlaceForm ({ initial, onCancel, onSaved }) {
   )
 }
 
-function AddPlaceForm ({ circleId, myLastSeen, initialCoords, onCancel, onAdded }) {
+function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }) {
   // Coords are picked by the map: either explicit (long-press on a
-  // spot) or implicit (the user's current location when they tap
-  // "Add a place" from the sheet). Typing lat/lon is gone — the map
-  // is the canonical way to pick where a place lives.
+  // spot) or implicit (the user's current location). Typing lat/lon
+  // is gone — the map is the canonical way to pick where a place
+  // lives.
   const coords = initialCoords ?? (
     myLastSeen?.lat != null && myLastSeen?.lon != null
       ? { lat: myLastSeen.lat, lon: myLastSeen.lon, source: 'current' }
       : null
+  )
+  // Target circle: when the user has exactly one writable circle in
+  // scope we auto-pick it; otherwise they choose from the list.
+  // `circles` is non-empty when this form is shown (gated upstream).
+  const [targetCircleId, setTargetCircleId] = useState(
+    circles.length === 1 ? circles[0].circleId : null,
   )
   const [name, setName] = useState('')
   const [radius, setRadius] = useState('100')
@@ -841,6 +850,10 @@ function AddPlaceForm ({ circleId, myLastSeen, initialCoords, onCancel, onAdded 
 
   const submit = async () => {
     setError(null)
+    if (!targetCircleId) {
+      setError('Pick which circle the place belongs to.')
+      return
+    }
     if (!coords) {
       setError('No location picked. Long-press the map or wait for your current location.')
       return
@@ -851,7 +864,7 @@ function AddPlaceForm ({ circleId, myLastSeen, initialCoords, onCancel, onAdded 
     setSubmitting(true)
     try {
       const r = await pear.call('place:create', {
-        circleId,
+        circleId: targetCircleId,
         name: name.trim(),
         lat: coords.lat,
         lon: coords.lon,
@@ -873,11 +886,32 @@ function AddPlaceForm ({ circleId, myLastSeen, initialCoords, onCancel, onAdded 
           Long-press the map to pick a spot, or wait for your current location.
         </div>
       )}
+      {circles.length > 1 && (
+        <>
+          <label style={s.label}>Add to circle</label>
+          <div style={s.durationRow}>
+            {circles.map(c => (
+              <button
+                key={c.circleId}
+                style={{
+                  ...s.durationBtn,
+                  ...(targetCircleId === c.circleId
+                    ? { background: '#243237', color: '#7ec4cf', borderColor: '#7ec4cf' }
+                    : null),
+                }}
+                onClick={() => setTargetCircleId(c.circleId)}
+              >
+                {c.circle?.name ?? '...'}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
       <label style={s.label}>Name</label>
       <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
       <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
-      <button style={s.primaryBtn} disabled={submitting || !coords} onClick={submit}>
+      <button style={s.primaryBtn} disabled={submitting || !coords || !targetCircleId} onClick={submit}>
         {submitting ? 'Saving...' : 'Save place'}
       </button>
       <button style={s.secondaryBtn} onClick={onCancel}>Cancel</button>
