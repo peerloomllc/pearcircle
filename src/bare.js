@@ -40,7 +40,12 @@ const FUTURE_TS_TOLERANCE_MS = 5 * 60 * 1000
 
 // Avatar base64 cap. Per DECISIONS 2026-05-03 the byte-budget is ~30KB,
 // which is ~40KB after base64 inflation. We leave a small headroom.
-const AVATAR_MAX_BASE64 = 42000
+// Upper bound for any avatar payload (base64 portion only — the
+// data URL prefix is free). UI enforces stricter per-format caps:
+// ~42KB for static formats (compressed JPEG) and up to this 500KB
+// ceiling for animated GIF/WebP that we store raw to preserve
+// animation. Pattern matches PearGuard's MAX_ANIMATED_BASE64.
+const AVATAR_MAX_BASE64 = 500_000
 
 let _store = null
 let _localDb = null
@@ -113,18 +118,24 @@ const handlers = {
     if (typeof displayName !== 'string') throw new Error('displayName must be a string')
     const trimmed = displayName.trim().slice(0, 64)
     if (trimmed.length === 0) throw new Error('displayName must be non-empty')
-    // avatar: base64 JPEG string, ~30KB encoded ceiling per DECISIONS
-    // 2026-05-03 (~40KB after base64 inflation). null/undefined clears
-    // the avatar; anything else is silently dropped at apply time on
-    // peers but we reject up-front to surface the error to the user.
+    // avatar: a data URL like `data:image/<mime>;base64,...` (current
+    // format, supports any image mime including animated GIF/WebP/APNG)
+    // OR a raw base64 string (legacy v1 format, treated as JPEG by the
+    // renderer). Cap is on the BASE64 PORTION only — the prefix is
+    // free. null/undefined clears the avatar.
     let avatarValue
     if (avatar === null || avatar === undefined) {
       avatarValue = null
     } else if (typeof avatar !== 'string') {
-      throw new Error('avatar must be a base64 string or null')
-    } else if (avatar.length > AVATAR_MAX_BASE64) {
-      throw new Error('avatar too large after compression; pick a smaller photo')
+      throw new Error('avatar must be a string or null')
     } else {
+      const comma = avatar.indexOf(',')
+      const b64Len = (avatar.startsWith('data:') && comma > 0)
+        ? avatar.length - comma - 1
+        : avatar.length
+      if (b64Len > AVATAR_MAX_BASE64) {
+        throw new Error('avatar too large; pick a smaller photo')
+      }
       avatarValue = avatar
     }
 

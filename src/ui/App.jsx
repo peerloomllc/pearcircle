@@ -1459,8 +1459,9 @@ function renderBubble (root, member, selected) {
 
   const avatar = member.value?.avatar
   const label = member.value?.displayName ?? '?'
-  const inner = (typeof avatar === 'string' && avatar.length > 0)
-    ? `<img src="data:image/jpeg;base64,${avatar}" alt="" style="width:100%;height:100%;object-fit:cover;display:block;" />`
+  const src = avatarSrc(avatar)
+  const inner = src
+    ? `<img src="${escapeHtml(src)}" alt="" style="width:100%;height:100%;object-fit:cover;display:block;" />`
     : `<div style="width:100%;height:100%;background:#2a3a3f;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:${Math.round(size * 0.42)}px;font-weight:600;font-family:system-ui;">${escapeHtml(initialsFor(label))}</div>`
 
   root.dataset.pubkey = pubkey
@@ -1635,15 +1636,32 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
     if (!file) return
     try {
       const dataUrl = await readFileDataUrl(file)
+      const mime = file.type || ''
+      const isAnimated = ANIMATED_MIMES.includes(mime)
+      const cap = isAnimated ? AVATAR_ANIMATED_MAX_B64 : AVATAR_STATIC_MAX_B64
+      const b64Len = dataUrlBase64Length(dataUrl)
+      // For animated formats: store raw up to the larger budget so
+      // GIF/WebP keep their frames. Canvas would flatten to a single
+      // frame, so there's no useful fallback when oversized.
+      if (isAnimated) {
+        if (b64Len > cap) {
+          setError('Animated avatar is too large. Try one under ~375KB.')
+          return
+        }
+        setAvatar(dataUrl)
+        return
+      }
+      // Static format: raw if it fits, else canvas-compress to JPEG.
+      if (b64Len <= cap) {
+        setAvatar(dataUrl)
+        return
+      }
       const compressed = await compressToAvatar(dataUrl)
-      // compressed is "data:image/jpeg;base64,..." — strip the prefix
-      const comma = compressed.indexOf(',')
-      const base64 = compressed.slice(comma + 1)
-      if (base64.length > AVATAR_MAX_BASE64) {
+      if (dataUrlBase64Length(compressed) > AVATAR_STATIC_MAX_B64) {
         setError('Image is still too large after compression. Try a different photo.')
         return
       }
-      setAvatar(base64)
+      setAvatar(compressed)
     } catch (err) {
       setError('Could not load that image: ' + (err?.message ?? err))
     }
@@ -1679,7 +1697,7 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
       <div style={s.avatarRow}>
         <div style={s.avatarPreview}>
           {hasAvatar ? (
-            <img src={'data:image/jpeg;base64,' + previewBase64} style={s.avatarImg} alt='Your avatar' />
+            <img src={avatarSrc(previewBase64)} style={s.avatarImg} alt='Your avatar' />
           ) : (
             <span style={s.avatarFallback}>{initialsFor(name || profile?.displayName || '?')}</span>
           )}
@@ -1784,9 +1802,36 @@ function formatRemaining (ms) {
   return mins === 0 ? hours + 'h' : hours + 'h ' + mins + 'm'
 }
 
-// Roughly tracks bare's AVATAR_MAX_BASE64 so we surface the size error
-// in the UI before the IPC call. Bare is the source of truth.
-const AVATAR_MAX_BASE64 = 42000
+// Two caps mirror PearGuard's pattern:
+// - Static formats (JPEG/PNG that's not APNG): ~42KB after compression
+//   to a 96x96 JPEG. Replication-cheap.
+// - Animated formats (GIF, WebP that may be animated): up to ~500KB
+//   stored raw to preserve animation, since canvas re-encoding would
+//   flatten to a single frame.
+// Bare's cap is the larger 500KB ceiling; the UI enforces the
+// stricter per-format budget below.
+const AVATAR_STATIC_MAX_B64 = 42000
+const AVATAR_ANIMATED_MAX_B64 = 500_000
+const ANIMATED_MIMES = ['image/gif', 'image/webp']
+// Legacy name retained for the canvas compression helper that still
+// targets the static cap.
+const AVATAR_MAX_BASE64 = AVATAR_STATIC_MAX_B64
+
+// The avatar field on member rows can be either:
+// - A full data URL (`data:image/<mime>;base64,...`) — current format,
+//   covers JPEG/PNG/GIF/WebP including animated GIF.
+// - A raw base64 string — legacy v1 format, treated as JPEG.
+// avatarSrc returns whatever can go into an <img src=>.
+function avatarSrc (avatar) {
+  if (typeof avatar !== 'string' || avatar.length === 0) return null
+  return avatar.startsWith('data:') ? avatar : 'data:image/jpeg;base64,' + avatar
+}
+
+function dataUrlBase64Length (dataUrl) {
+  if (typeof dataUrl !== 'string') return 0
+  const i = dataUrl.indexOf(',')
+  return i < 0 ? 0 : dataUrl.length - i - 1
+}
 
 function readFileDataUrl (file) {
   return new Promise((resolve, reject) => {
@@ -1957,10 +2002,11 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
 
 function Avatar ({ base64, label, size = 28 }) {
   const px = size + 'px'
-  if (typeof base64 === 'string' && base64.length > 0) {
+  const src = avatarSrc(base64)
+  if (src) {
     return (
       <img
-        src={'data:image/jpeg;base64,' + base64}
+        src={src}
         alt=''
         style={{ width: px, height: px, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }}
       />
