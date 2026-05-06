@@ -1,6 +1,17 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
+import { colors, typography, spacing, radius } from './theme.js'
+import { FONT_CSS } from './fonts.js'
+
+// Inject the Manrope @font-face once per WebView load. Mirrors PearCal's
+// pattern so the family resolves before any styled element renders.
+if (typeof document !== 'undefined' && !document.getElementById('pearcircle-font-styles')) {
+  const styleEl = document.createElement('style')
+  styleEl.id = 'pearcircle-font-styles'
+  styleEl.textContent = FONT_CSS
+  document.head.appendChild(styleEl)
+}
 import QRCode from 'qrcode'
 
 // Lazy proxy: window.pear is installed by main.jsx but App.jsx is imported
@@ -112,6 +123,9 @@ export function App () {
         onSaved={refresh}
       />
     )
+  }
+  if (view.name === 'about') {
+    return <AboutView setView={setView} />
   }
   return null
 }
@@ -1535,7 +1549,7 @@ function renderBubble (root, member, selected, last) {
   const src = avatarSrc(avatar)
   const inner = src
     ? `<img src="${escapeHtml(src)}" alt="" style="width:100%;height:100%;object-fit:cover;display:block;" />`
-    : `<div style="width:100%;height:100%;background:#2a3a3f;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:${Math.round(size * 0.42)}px;font-weight:600;font-family:system-ui;">${escapeHtml(initialsFor(label))}</div>`
+    : `<div style="width:100%;height:100%;background:#2a3a3f;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:${Math.round(size * 0.42)}px;font-weight:400;font-family:${typography.fontFamily};">${escapeHtml(initialsFor(label))}</div>`
 
   // Battery overlay: small horizontal rectangle hanging just below the
   // bottom edge of the avatar circle. Pure DOM (no SVG) per the
@@ -1880,6 +1894,98 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
           {batteryError && <p style={s.error}>{batteryError}</p>}
         </>
       )}
+
+      <h2 style={s.h2}>About</h2>
+      <button style={s.secondaryBtn} onClick={() => setView({ name: 'about' })}>
+        About PearCircle
+      </button>
+    </div>
+  )
+}
+
+// AboutView mirrors PearGuard's AboutTab pattern: brand header, plain
+// prose sections explaining the model, a couple of action buttons. No
+// donation flow yet (PearCircle hasn't shipped to stores; can layer in
+// later with the same iOS guideline 3.1.1 gating PearGuard uses).
+function AboutView ({ setView }) {
+  const share = async () => {
+    try {
+      await pear.call('shell:share', {
+        title: 'PearCircle',
+        text: 'PearCircle - private peer-to-peer location sharing. No accounts, no servers, no subscriptions.\n\nhttps://peerloomllc.com/pearcircle/',
+      })
+    } catch {}
+  }
+  const sectionTitle = { ...typography.subheading, color: colors.text.primary, margin: `${spacing.lg}px 0 ${spacing.sm}px 0` }
+  const body = { ...typography.body, color: colors.text.secondary, lineHeight: 1.6, margin: `0 0 ${spacing.md}px 0` }
+  const card = {
+    background: colors.surface.card,
+    border: `1px solid ${colors.border}`,
+    borderRadius: radius.lg,
+    padding: spacing.base,
+    marginBottom: spacing.md,
+  }
+  return (
+    <div style={s.screen}>
+      <div style={s.header}>
+        <button type='button' style={s.iconBtn} onClick={() => setView({ name: 'profile' })} aria-label='Back'>‹</button>
+        <h1 style={s.h1}>About</h1>
+      </div>
+
+      <div style={{ ...card, textAlign: 'center', padding: spacing.xl }}>
+        <div style={{ ...typography.display, color: colors.primary, fontWeight: 400, marginBottom: spacing.xs }}>PearCircle</div>
+        <div style={{ ...typography.caption, color: colors.text.muted }}>Private. Peer-to-Peer. No Servers.</div>
+      </div>
+
+      <div style={card}>
+        <h3 style={sectionTitle}>What this is</h3>
+        <p style={body}>
+          PearCircle is a peer-to-peer location-sharing app. You form
+          private circles with people you trust, share live location, and
+          get notified when someone arrives at or leaves a Place.
+        </p>
+        <p style={body}>
+          There are no accounts, no servers, no subscriptions. Your circle's
+          data lives on the devices in the circle and syncs directly between
+          them over the internet or your local network.
+        </p>
+      </div>
+
+      <div style={card}>
+        <h3 style={sectionTitle}>How it works</h3>
+        <p style={body}>
+          PearCircle is built on the Holepunch P2P stack: each circle is an
+          append-only log shared between members, replicated peer-to-peer
+          via Hyperswarm. Membership is gated by signed invites; new members
+          join by scanning a QR code or tapping a deep link.
+        </p>
+        <p style={body}>
+          Location updates are signed by your device's key and replicated
+          to other circle members. Geofence transitions ("arrived at Home",
+          "left Work") are computed locally on each device.
+        </p>
+      </div>
+
+      <div style={card}>
+        <h3 style={sectionTitle}>Privacy</h3>
+        <p style={body}>
+          Because there are no servers, no third party sees your location
+          or who's in your circles. Members of a circle see each other's
+          shared location while sharing is on; toggle Stop sharing to pause
+          broadcasting at any time. Place names are local to the circle.
+        </p>
+        <p style={body}>
+          The "near X" labels in member rows use OpenStreetMap's Nominatim
+          service to translate coordinates into place names. The coordinates
+          you share with peers do not pass through any third party.
+        </p>
+      </div>
+
+      <button style={s.secondaryBtn} onClick={share}>Share PearCircle</button>
+
+      <p style={{ ...typography.micro, color: colors.text.muted, textAlign: 'center', marginTop: spacing.xl }}>
+        Part of PeerLoom &middot; v0.1.0
+      </p>
     </div>
   )
 }
@@ -2134,7 +2240,7 @@ function Avatar ({ base64, label, size = 28 }) {
       width: px, height: px, borderRadius: '50%', flexShrink: 0,
       background: '#2a3a3f', color: '#cfe', display: 'flex',
       alignItems: 'center', justifyContent: 'center',
-      fontSize: Math.round(size * 0.42), fontWeight: 600, fontFamily: 'system-ui',
+      fontSize: Math.round(size * 0.42), fontWeight: 400, fontFamily: typography.fontFamily,
     }}>{initialsFor(label)}</div>
   )
 }
@@ -2222,56 +2328,56 @@ function short (s) {
 }
 
 const s = {
-  screen: { paddingLeft: 16, paddingRight: 16, paddingTop: 'calc(env(safe-area-inset-top, 24px) + 16px)', paddingBottom: 64, color: '#eee', background: '#111', minHeight: '100vh', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', boxSizing: 'border-box' },
-  header: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
-  h1: { fontSize: 24, margin: 0, flex: 1, fontWeight: 600 },
-  h2: { fontSize: 18, margin: '24px 0 8px 0', fontWeight: 600 },
-  h3: { fontSize: 16, margin: '20px 0 8px 0', fontWeight: 600, color: '#bbb' },
-  idLine: { color: '#888', margin: '4px 0 16px 0', fontSize: 13, fontFamily: 'monospace' },
-  profileBtn: { display: 'flex', alignItems: 'center', gap: 12, width: '100%', padding: '10px 12px', margin: '4px 0 16px 0', background: '#1c1c1c', border: '1px solid #2a2a2a', borderRadius: 8, color: '#eee', textAlign: 'left', cursor: 'pointer', fontSize: 13 },
-  idName: { color: '#eee', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', fontWeight: 600, fontSize: 14 },
-  idNeedName: { color: '#7ec4cf', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', fontWeight: 600, fontSize: 14 },
-  idMuted: { color: '#888', fontFamily: 'monospace' },
-  actions: { display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 8 },
-  primaryBtn: { width: '100%', padding: '14px 16px', background: '#7ec4cf', color: '#0a1f23', border: 'none', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
-  secondaryBtn: { width: '100%', padding: '14px 16px', background: '#222', color: '#eee', border: '1px solid #333', borderRadius: 10, fontSize: 16, fontWeight: 500, cursor: 'pointer', marginTop: 8 },
-  dangerBtn: { width: '100%', padding: '14px 16px', background: '#5a1f1f', color: '#fcc', border: '1px solid #7a2a2a', borderRadius: 10, fontSize: 16, fontWeight: 600, cursor: 'pointer' },
-  durationRow: { display: 'flex', gap: 8 },
-  durationBtn: { flex: 1, padding: '10px 8px', background: '#1c1c1c', color: '#ccc', border: '1px solid #333', borderRadius: 8, fontSize: 14, cursor: 'pointer' },
-  sharingOffDot: { position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: '50%', background: '#e64545', border: '2px solid #1a1a1a', pointerEvents: 'none' },
-  iconBtn: { width: 32, height: 32, padding: 0, background: 'none', color: '#ccc', border: 'none', fontSize: 22, cursor: 'pointer' },
+  screen: { paddingLeft: spacing.base, paddingRight: spacing.base, paddingTop: `calc(env(safe-area-inset-top, 24px) + ${spacing.base}px)`, paddingBottom: spacing.xxxl + spacing.base, color: colors.text.primary, background: colors.surface.base, minHeight: '100vh', fontFamily: typography.fontFamily, boxSizing: 'border-box' },
+  header: { display: 'flex', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.md },
+  h1: { fontSize: typography.display.fontSize, margin: 0, flex: 1, fontWeight: typography.display.fontWeight },
+  h2: { fontSize: 18, margin: `${spacing.xl}px 0 ${spacing.sm}px 0`, fontWeight: 400 },
+  h3: { fontSize: typography.subheading.fontSize, margin: `${spacing.lg}px 0 ${spacing.sm}px 0`, fontWeight: typography.subheading.fontWeight, color: colors.text.secondary },
+  idLine: { color: colors.text.muted, margin: `${spacing.xs}px 0 ${spacing.base}px 0`, fontSize: typography.caption.fontSize, fontFamily: typography.monoFamily },
+  profileBtn: { display: 'flex', alignItems: 'center', gap: spacing.md, width: '100%', padding: `${spacing.sm + 2}px ${spacing.md}px`, margin: `${spacing.xs}px 0 ${spacing.base}px 0`, background: colors.surface.input, border: `1px solid ${colors.border}`, borderRadius: radius.md, color: colors.text.primary, textAlign: 'left', cursor: 'pointer', fontSize: typography.caption.fontSize },
+  idName: { color: colors.text.primary, fontFamily: typography.fontFamily, fontWeight: 400, fontSize: typography.body.fontSize },
+  idNeedName: { color: colors.accent, fontFamily: typography.fontFamily, fontWeight: 400, fontSize: typography.body.fontSize },
+  idMuted: { color: colors.text.muted, fontFamily: typography.monoFamily },
+  actions: { display: 'flex', flexDirection: 'column', gap: spacing.sm, marginBottom: spacing.sm },
+  primaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.primary, color: colors.text.onPrimary, border: 'none', borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, cursor: 'pointer' },
+  secondaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.surface.elevated, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer', marginTop: spacing.sm },
+  dangerBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: '#5a1f1f', color: '#fcc', border: '1px solid #7a2a2a', borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, cursor: 'pointer' },
+  durationRow: { display: 'flex', gap: spacing.sm },
+  durationBtn: { flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`, background: colors.surface.input, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.body.fontSize, cursor: 'pointer' },
+  sharingOffDot: { position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: radius.full, background: colors.error, border: `2px solid ${colors.surface.card}`, pointerEvents: 'none' },
+  iconBtn: { width: 32, height: 32, padding: 0, background: 'none', color: colors.text.secondary, border: 'none', fontSize: 22, cursor: 'pointer' },
   circleList: { listStyle: 'none', padding: 0, margin: 0 },
-  circleItem: { padding: 14, background: '#1c1c1c', borderRadius: 10, marginBottom: 8, cursor: 'pointer' },
-  circleName: { fontSize: 16, fontWeight: 600 },
-  circleMeta: { fontSize: 12, color: '#888', marginTop: 2, fontFamily: 'monospace' },
-  label: { fontSize: 13, color: '#aaa', display: 'block', marginBottom: 6, marginTop: 8 },
-  input: { width: '100%', padding: 12, background: '#1c1c1c', color: '#eee', border: '1px solid #333', borderRadius: 8, fontSize: 16, marginBottom: 16, boxSizing: 'border-box' },
-  textarea: { width: '100%', padding: 12, background: '#1c1c1c', color: '#eee', border: '1px solid #333', borderRadius: 8, fontSize: 14, fontFamily: 'monospace', resize: 'vertical', marginBottom: 16, boxSizing: 'border-box' },
-  inviteBox: { width: '100%', padding: 12, background: '#1c1c1c', color: '#9cf', border: '1px solid #333', borderRadius: 8, fontSize: 12, fontFamily: 'monospace', resize: 'vertical', marginBottom: 12, minHeight: 80, boxSizing: 'border-box' },
-  muted: { color: '#888', fontSize: 14 },
-  error: { color: '#f77', marginTop: 8, fontSize: 14 },
-  section: { background: '#1c1c1c', padding: 12, borderRadius: 10, marginBottom: 12 },
-  row: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: 14 },
+  circleItem: { padding: spacing.base - 2, background: colors.surface.card, borderRadius: radius.lg, marginBottom: spacing.sm, cursor: 'pointer' },
+  circleName: { fontSize: typography.subheading.fontSize, fontWeight: 400 },
+  circleMeta: { fontSize: typography.micro.fontSize, color: colors.text.muted, marginTop: 2, fontFamily: typography.monoFamily },
+  label: { fontSize: typography.caption.fontSize, color: colors.text.secondary, display: 'block', marginBottom: 6, marginTop: spacing.sm },
+  input: { width: '100%', padding: spacing.md, background: colors.surface.card, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.subheading.fontSize, marginBottom: spacing.base, boxSizing: 'border-box' },
+  textarea: { width: '100%', padding: spacing.md, background: colors.surface.card, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.body.fontSize, fontFamily: typography.monoFamily, resize: 'vertical', marginBottom: spacing.base, boxSizing: 'border-box' },
+  inviteBox: { width: '100%', padding: spacing.md, background: colors.surface.card, color: '#9cf', border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.micro.fontSize, fontFamily: typography.monoFamily, resize: 'vertical', marginBottom: spacing.md, minHeight: 80, boxSizing: 'border-box' },
+  muted: { color: colors.text.muted, fontSize: typography.body.fontSize },
+  error: { color: '#f77', marginTop: spacing.sm, fontSize: typography.body.fontSize },
+  section: { background: colors.surface.card, padding: spacing.md, borderRadius: radius.lg, marginBottom: spacing.md },
+  row: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: typography.body.fontSize },
   memberList: { listStyle: 'none', padding: 0, margin: 0 },
-  memberItem: { padding: 12, background: '#1c1c1c', borderRadius: 10, marginBottom: 8 },
-  memberRow: { display: 'flex', alignItems: 'flex-start', gap: 12 },
-  memberName: { fontSize: 15, fontWeight: 500 },
-  placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  memberItem: { padding: spacing.md, background: colors.surface.card, borderRadius: radius.lg, marginBottom: spacing.sm },
+  memberRow: { display: 'flex', alignItems: 'flex-start', gap: spacing.md },
+  memberName: { fontSize: 15, fontWeight: 400 },
+  placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.sm },
   placeRowActions: { display: 'flex', gap: 6, flexShrink: 0 },
-  placeRadiusLine: { fontSize: 12, color: '#888', marginTop: 4, fontFamily: 'monospace' },
-  coordsMissing: { fontSize: 13, color: '#fa9', padding: '8px 12px', background: '#2a1f0f', border: '1px solid #4a3520', borderRadius: 8, marginBottom: 12, lineHeight: 1.4 },
-  avatarRow: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 },
-  avatarPreview: { width: 96, height: 96, borderRadius: '50%', overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  placeRadiusLine: { fontSize: typography.micro.fontSize, color: colors.text.muted, marginTop: spacing.xs, fontFamily: typography.monoFamily },
+  coordsMissing: { fontSize: typography.caption.fontSize, color: '#fa9', padding: `${spacing.sm}px ${spacing.md}px`, background: '#2a1f0f', border: '1px solid #4a3520', borderRadius: radius.md, marginBottom: spacing.md, lineHeight: 1.4 },
+  avatarRow: { display: 'flex', alignItems: 'center', gap: spacing.base, marginBottom: spacing.base },
+  avatarPreview: { width: 96, height: 96, borderRadius: radius.full, overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   avatarImg: { width: '100%', height: '100%', objectFit: 'cover' },
-  avatarFallback: { color: '#cfe', fontSize: 36, fontWeight: 600, fontFamily: 'system-ui' },
-  lastSeen: { fontSize: 12, color: '#9cf', marginTop: 4, fontFamily: 'monospace' },
-  lastSeenMuted: { fontSize: 12, color: '#555', marginTop: 4, fontStyle: 'italic' },
-  status: { fontSize: 13, color: '#cfc', marginTop: 4, fontWeight: 500 },
-  transitionBtns: { display: 'flex', gap: 8, marginTop: 8 },
-  smallBtn: { flex: 1, padding: '8px 10px', background: '#222', color: '#ccc', border: '1px solid #333', borderRadius: 6, fontSize: 12, cursor: 'pointer' },
+  avatarFallback: { color: '#cfe', fontSize: 36, fontWeight: 400, fontFamily: typography.fontFamily },
+  lastSeen: { fontSize: typography.micro.fontSize, color: '#9cf', marginTop: spacing.xs, fontFamily: typography.monoFamily },
+  lastSeenMuted: { fontSize: typography.micro.fontSize, color: '#555', marginTop: spacing.xs, fontStyle: 'italic' },
+  status: { fontSize: typography.caption.fontSize, color: '#cfc', marginTop: spacing.xs, fontWeight: 400 },
+  transitionBtns: { display: 'flex', gap: spacing.sm, marginTop: spacing.sm },
+  smallBtn: { flex: 1, padding: `${spacing.sm}px ${spacing.sm + 2}px`, background: colors.surface.elevated, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.sm + 2, fontSize: typography.micro.fontSize, cursor: 'pointer' },
   mapWrap: { position: 'relative', height: '100%', width: '100%', background: '#0a0a0a' },
   mapCanvas: { height: '100%', width: '100%' },
-  mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: 4, pointerEvents: 'none' },
+  mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: radius.sm, pointerEvents: 'none' },
   mapFirstRoot: { position: 'fixed', inset: 0, color: '#eee', background: '#111', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', overflow: 'hidden' },
   mapFill: { position: 'absolute', inset: 0 },
   mapTopBar: {
@@ -2282,7 +2388,7 @@ const s = {
     background: '#1a1a1a',
     borderBottom: '1px solid #2a2a2a',
   },
-  mapTitle: { fontSize: 18, margin: 0, flex: 1, fontWeight: 600, color: '#eee' },
+  mapTitle: { fontSize: 18, margin: 0, flex: 1, fontWeight: 400, color: '#eee' },
   peerBadge: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 13, color: '#bbb', padding: '4px 8px' },
   peerDot: { width: 8, height: 8, borderRadius: '50%' },
   fab: {
@@ -2292,7 +2398,7 @@ const s = {
     padding: '12px 18px',
     background: '#7ec4cf', color: '#0a1f23',
     border: 'none', borderRadius: 999,
-    fontSize: 14, fontWeight: 600,
+    fontSize: 14, fontWeight: 400,
     boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
     zIndex: 5, cursor: 'pointer',
     whiteSpace: 'nowrap',
@@ -2300,13 +2406,13 @@ const s = {
   dropdownBtn: {
     display: 'flex', alignItems: 'center', gap: 6, flex: 1,
     padding: '6px 10px', background: 'transparent', color: '#eee',
-    border: 'none', borderRadius: 8, fontSize: 16, fontWeight: 600,
+    border: 'none', borderRadius: 8, fontSize: 16, fontWeight: 400,
     cursor: 'pointer', textAlign: 'left',
   },
   dropdownLabel: { flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   dropdownChevron: { fontSize: 12, color: '#888' },
   focusTextCol: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center' },
-  focusName: { fontSize: 15, fontWeight: 600, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  focusName: { fontSize: 15, fontWeight: 400, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   focusSub: { fontSize: 12, color: '#9cf', fontFamily: 'monospace' },
   avatarBtn: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2326,7 +2432,7 @@ const s = {
     background: 'transparent', color: '#eee', border: 'none', borderRadius: 6,
     fontSize: 14, textAlign: 'left', cursor: 'pointer',
   },
-  menuItemActive: { background: '#243237', color: '#7ec4cf', fontWeight: 600 },
+  menuItemActive: { background: '#243237', color: '#7ec4cf', fontWeight: 400 },
   menuDivider: { height: 1, background: '#2a2a2a', margin: '6px 4px' },
   qrWrap: { display: 'flex', justifyContent: 'center', padding: 12, background: '#fff', borderRadius: 12, marginBottom: 12 },
   emptyHint: {
