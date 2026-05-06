@@ -3,6 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
+import { Image as ImageIcon } from '@phosphor-icons/react'
 
 // Inject the Manrope @font-face once per WebView load. Mirrors PearCal's
 // pattern so the family resolves before any styled element renders.
@@ -1663,9 +1664,11 @@ function fitTo (map, lonLatPairs) {
 
 function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
+  const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
   const [avatar, setAvatar] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [photoSaving, setPhotoSaving] = useState(false)
   const [error, setError] = useState(null)
   const [savedAt, setSavedAt] = useState(null)
   const [sharingError, setSharingError] = useState(null)
@@ -1736,6 +1739,30 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
     setTogglingSharing(false)
   }
 
+  // Avatar saves immediately on pick or remove (PearCal flow). Local
+  // `avatar` state holds the in-flight optimistic value until profile
+  // refreshes; on success we clear it so the next render reads from
+  // the server-side profile prop.
+  const commitAvatar = async (value) => {
+    setError(null)
+    setPhotoSaving(true)
+    setAvatar(value === null ? '' : value) // optimistic preview
+    try {
+      const r = await pear.call('profile:set', { displayName: profile?.displayName ?? name, avatar: value })
+      if (r?.ok) {
+        onSaved()
+        setAvatar(null) // hand back to server-side profile prop
+      } else {
+        setError('Could not save photo')
+        setAvatar(null)
+      }
+    } catch (e) {
+      setError(String(e?.message ?? e))
+      setAvatar(null)
+    }
+    setPhotoSaving(false)
+  }
+
   const onPickFile = async (e) => {
     setError(null)
     const file = e.target.files?.[0]
@@ -1755,12 +1782,12 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
           setError('Animated avatar is too large. Try one under ~375KB.')
           return
         }
-        setAvatar(dataUrl)
+        await commitAvatar(dataUrl)
         return
       }
       // Static format: raw if it fits, else canvas-compress to JPEG.
       if (b64Len <= cap) {
-        setAvatar(dataUrl)
+        await commitAvatar(dataUrl)
         return
       }
       const compressed = await compressToAvatar(dataUrl)
@@ -1768,26 +1795,29 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
         setError('Image is still too large after compression. Try a different photo.')
         return
       }
-      setAvatar(compressed)
+      await commitAvatar(compressed)
     } catch (err) {
       setError('Could not load that image: ' + (err?.message ?? err))
     }
   }
 
-  const submit = async () => {
-    if (!name.trim()) return
+  const removePhoto = () => commitAvatar(null)
+
+  const saveName = async () => {
+    const trimmed = name.trim()
+    if (!trimmed) return
     setSaving(true)
     setError(null)
     try {
-      const args = { displayName: name.trim() }
-      if (avatar !== null) args.avatar = avatar === '' ? null : avatar
-      const r = await pear.call('profile:set', args)
+      // Bare-side preserves existing avatar when the key is omitted.
+      const r = await pear.call('profile:set', { displayName: trimmed })
       setSaving(false)
       if (r?.ok) {
         setSavedAt(Date.now())
+        setEditingName(false)
         onSaved()
       } else {
-        setError('Could not save profile')
+        setError('Could not save name')
       }
     } catch (e) {
       setSaving(false)
@@ -1795,47 +1825,92 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
     }
   }
 
-  const previewBase64 = avatar !== null ? avatar : profile?.avatar
+  const previewBase64 = avatar !== null && avatar !== '' ? avatar : profile?.avatar
   const hasAvatar = typeof previewBase64 === 'string' && previewBase64.length > 0
+  const displayName = profile?.displayName ?? '?'
 
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'home' })} title='Profile' />
-      <div style={s.avatarRow}>
-        <div style={s.avatarPreview}>
+      <BackBar onBack={() => setView({ name: 'home' })} title='Settings' />
+
+      {/* Avatar header — centered, PearCal pattern. */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.md, marginBottom: spacing.xl }}>
+        <div style={{
+          width: 88, height: 88, borderRadius: radius.full,
+          background: '#2a3a3f', overflow: 'hidden',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          opacity: photoSaving ? 0.5 : 1, transition: 'opacity 0.2s',
+        }}>
           {hasAvatar ? (
-            <img src={avatarSrc(previewBase64)} style={s.avatarImg} alt='Your avatar' />
+            <img src={avatarSrc(previewBase64)} alt='avatar' style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
           ) : (
-            <span style={s.avatarFallback}>{initialsFor(name || profile?.displayName || '?')}</span>
+            <span style={{ ...s.avatarFallback, fontSize: 36 }}>{initialsFor(displayName)}</span>
           )}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
-          <button style={s.secondaryBtn} onClick={() => fileRef.current?.click()}>
-            {hasAvatar ? 'Change photo' : 'Choose photo'}
+        <div style={{ display: 'flex', gap: spacing.sm }}>
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={photoSaving}
+            style={{
+              flex: 1, minWidth: 96,
+              fontSize: 12, padding: `${spacing.xs + 1}px ${spacing.md + 2}px`,
+              borderRadius: radius.md, border: `1px solid ${colors.border}`,
+              background: 'transparent', color: colors.text.primary,
+              cursor: 'pointer', fontWeight: 300, fontFamily: typography.fontFamily,
+              opacity: photoSaving ? 0.5 : 1,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.xs + 1,
+            }}>
+            <ImageIcon size={14} weight='thin' /> Photo
           </button>
           {hasAvatar && (
-            <button style={s.secondaryBtn} onClick={() => setAvatar('')}>Remove photo</button>
+            <button
+              onClick={removePhoto}
+              disabled={photoSaving}
+              style={{
+                flex: 1, minWidth: 96,
+                fontSize: 12, padding: `${spacing.xs + 1}px ${spacing.md + 2}px`,
+                borderRadius: radius.md, border: '1px solid #d45f7a',
+                background: 'transparent', color: '#d45f7a',
+                cursor: 'pointer', fontWeight: 300, fontFamily: typography.fontFamily,
+                opacity: photoSaving ? 0.5 : 1,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+              Remove
+            </button>
           )}
-          <input
-            ref={fileRef}
-            type='file'
-            accept='image/*'
-            style={{ display: 'none' }}
-            onChange={onPickFile}
-          />
         </div>
+        <input ref={fileRef} type='file' accept='image/*' style={{ display: 'none' }} onChange={onPickFile} />
+
+        {editingName ? (
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={64}
+            style={{
+              fontSize: 18, fontWeight: 300, textAlign: 'center', background: 'transparent',
+              fontFamily: typography.fontFamily, border: `1px solid ${colors.border}`,
+              borderRadius: radius.md, padding: `${spacing.xs + 2}px ${spacing.md}px`,
+              color: colors.text.primary, outline: 'none',
+            }}
+          />
+        ) : (
+          <span style={{ fontSize: 20, fontWeight: 300, color: colors.text.primary }}>{displayName}</span>
+        )}
+        <button
+          onClick={editingName ? saveName : () => { setName(profile?.displayName ?? ''); setEditingName(true) }}
+          disabled={saving || (editingName && !name.trim())}
+          style={{
+            fontSize: 13, padding: `${spacing.xs + 1}px ${spacing.base}px`,
+            borderRadius: radius.md, border: `1px solid ${colors.border}`,
+            background: 'transparent', color: colors.text.primary,
+            cursor: 'pointer', fontWeight: 300, fontFamily: typography.fontFamily,
+            opacity: saving ? 0.6 : 1,
+          }}>
+          {saving ? 'Saving...' : editingName ? 'Save Name' : 'Edit Name'}
+        </button>
       </div>
-      <label style={s.label}>Display name</label>
-      <input
-        style={s.input}
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder='Your name'
-        maxLength={64}
-      />
-      <button style={s.primaryBtn} disabled={!name.trim() || saving} onClick={submit}>
-        {saving ? 'Saving...' : 'Save'}
-      </button>
+
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
 
@@ -1894,11 +1969,6 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
           {batteryError && <p style={s.error}>{batteryError}</p>}
         </>
       )}
-
-      <h2 style={s.h2}>About</h2>
-      <button style={s.secondaryBtn} onClick={() => setView({ name: 'about' })}>
-        About PearCircle
-      </button>
     </div>
   )
 }

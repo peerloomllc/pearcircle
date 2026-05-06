@@ -113,22 +113,31 @@ const handlers = {
     return row ? row.value : null
   },
 
-  'profile:set': async ({ displayName, avatar } = {}) => {
+  'profile:set': async (args = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
+    const { displayName } = args
     if (typeof displayName !== 'string') throw new Error('displayName must be a string')
     const trimmed = displayName.trim().slice(0, 64)
     if (trimmed.length === 0) throw new Error('displayName must be non-empty')
-    // avatar: a data URL like `data:image/<mime>;base64,...` (current
-    // format, supports any image mime including animated GIF/WebP/APNG)
-    // OR a raw base64 string (legacy v1 format, treated as JPEG by the
-    // renderer). Cap is on the BASE64 PORTION only — the prefix is
-    // free. null/undefined clears the avatar.
+    // avatar handling distinguishes three states:
+    //   - key absent          → preserve existing avatar (PATCH-like)
+    //   - key present, null   → explicit clear
+    //   - key present, string → validate + set
+    // The previous implementation conflated absent and null, so any name
+    // update wiped the photo.
+    const avatarSpecified = Object.prototype.hasOwnProperty.call(args, 'avatar')
+    const avatar = args.avatar
     let avatarValue
-    if (avatar === null || avatar === undefined) {
+    if (!avatarSpecified) {
+      const existing = await _localDb.get('profile')
+      avatarValue = existing?.value?.avatar ?? null
+    } else if (avatar === null || avatar === undefined) {
       avatarValue = null
     } else if (typeof avatar !== 'string') {
       throw new Error('avatar must be a string or null')
     } else {
+      // avatar: a data URL (current) or raw base64 (legacy v1 = JPEG).
+      // Cap is on the BASE64 PORTION only; the prefix is free.
       const comma = avatar.indexOf(',')
       const b64Len = (avatar.startsWith('data:') && comma > 0)
         ? avatar.length - comma - 1
