@@ -1562,6 +1562,12 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
   const [savedAt, setSavedAt] = useState(null)
   const [sharingError, setSharingError] = useState(null)
   const [togglingSharing, setTogglingSharing] = useState(false)
+  // Battery-optimization state. supported=null means we haven't
+  // queried yet; supported=false means iOS / pre-Doze and the row
+  // hides. exempt=true means the OS won't pause our foreground
+  // service during idle.
+  const [battery, setBattery] = useState({ supported: null, exempt: false })
+  const [batteryError, setBatteryError] = useState(null)
   // Re-render once a second while a mute has an active expiresAt so
   // the countdown ticks. Stops once the expiry passes.
   const [, setNowTick] = useState(0)
@@ -1571,6 +1577,34 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
     return () => clearInterval(id)
   }, [sharing.enabled, sharing.expiresAt])
   const fileRef = useRef(null)
+
+  // Query battery exemption on mount and on app:state=active so the
+  // row updates after the user dismisses the system dialog without
+  // the activity being torn down.
+  useEffect(() => {
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const r = await pear.call('shell:battery:isExempt')
+        if (!cancelled) setBattery({ supported: !!r?.supported, exempt: !!r?.exempt })
+      } catch {
+        if (!cancelled) setBattery({ supported: false, exempt: false })
+      }
+    }
+    refresh()
+    pear.on('app:state', ({ state }) => { if (state === 'active') refresh() })
+    return () => { cancelled = true }
+  }, [])
+
+  const requestBatteryExempt = async () => {
+    setBatteryError(null)
+    try {
+      const r = await pear.call('shell:battery:requestExempt')
+      if (!r?.ok) setBatteryError(r?.error ?? 'Could not open battery settings.')
+    } catch (e) {
+      setBatteryError(String(e?.message ?? e))
+    }
+  }
 
   const stopSharing = async (durationMs) => {
     setSharingError(null)
@@ -1709,6 +1743,32 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
         </>
       )}
       {sharingError && <p style={s.error}>{sharingError}</p>}
+
+      {battery.supported && (
+        <>
+          <h2 style={s.h2}>Battery optimization</h2>
+          {battery.exempt ? (
+            <p style={s.muted}>
+              Battery optimization is off for PearCircle. Location sharing
+              should keep working through extended idle.
+            </p>
+          ) : (
+            <>
+              <p style={s.muted}>
+                Battery optimization is on. Android may pause location sharing
+                during long idle periods (overnight, in a meeting), so peers
+                won't see your updates until your phone wakes. Disabling this
+                for PearCircle keeps sharing reliable but uses slightly more
+                battery.
+              </p>
+              <button style={s.secondaryBtn} onClick={requestBatteryExempt}>
+                Disable battery optimization
+              </button>
+            </>
+          )}
+          {batteryError && <p style={s.error}>{batteryError}</p>}
+        </>
+      )}
     </div>
   )
 }

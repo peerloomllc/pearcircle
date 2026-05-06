@@ -138,6 +138,10 @@ export default function Index() {
 
     const sub = AppState.addEventListener('change', (s) => {
       sendToWorklet({ method: 'app:state', args: { state: s } })
+      // Also forward to the WebView so the UI can refresh things
+      // that change outside the app (e.g. the battery-optimization
+      // toggle reflects after the user dismisses the system dialog).
+      emitEvent('app:state', { state: s })
     })
 
     // Forward worklet events to the WebView so the UI can react.
@@ -246,6 +250,41 @@ export default function Index() {
       // belt-and-suspenders gate for any in-flight events.
       try {
         await PearCircleLocation?.stopUpdates?.()
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:battery:isExempt') {
+      // Doze / OEM battery optimizations gate the foreground service
+      // after extended idle. The UI uses this to decide whether to
+      // show the "Disable battery optimization" onboarding card in
+      // ProfileView. iOS / pre-Doze Android resolve as supported=false.
+      if (Platform.OS !== 'android' || !PearCircleLocation?.isIgnoringBatteryOptimizations) {
+        respond(msg.id, { supported: false, exempt: false })
+        return
+      }
+      try {
+        const exempt = await PearCircleLocation.isIgnoringBatteryOptimizations()
+        respond(msg.id, { supported: true, exempt: !!exempt })
+      } catch (err: any) {
+        respond(msg.id, { supported: true, exempt: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:battery:requestExempt') {
+      // Opens the system "Allow PearCircle to ignore battery
+      // optimizations?" dialog. The user has to tap Allow themselves
+      // — there's no programmatic bypass. After the dialog closes,
+      // the activity resumes and the WebView's app:state=active
+      // listener triggers a re-check.
+      if (Platform.OS !== 'android' || !PearCircleLocation?.requestIgnoreBatteryOptimizations) {
+        respond(msg.id, { ok: false, supported: false })
+        return
+      }
+      try {
+        await PearCircleLocation.requestIgnoreBatteryOptimizations()
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })

@@ -1,8 +1,13 @@
 package com.pearcircle
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -37,6 +42,39 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     fun stopUpdates(promise: Promise) {
         PearCircleLocationService.stop(ctx)
         promise.resolve(true)
+    }
+
+    // Battery optimization is the OEM/Doze gate that pauses the
+    // foreground location service after extended idle. Asking the
+    // user to exempt the app keeps sharing reliable but is opt-in
+    // because exemption is a real privacy/battery posture change.
+    @ReactMethod
+    fun isIgnoringBatteryOptimizations(promise: Promise) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            // Pre-Doze; the concept doesn't apply.
+            promise.resolve(true)
+            return
+        }
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+        promise.resolve(pm.isIgnoringBatteryOptimizations(ctx.packageName))
+    }
+
+    @ReactMethod
+    fun requestIgnoreBatteryOptimizations(promise: Promise) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            promise.resolve(true)
+            return
+        }
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:" + ctx.packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            ctx.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Throwable) {
+            promise.reject("ACTIVITY_NOT_FOUND", e.message ?: "Unable to open battery optimization dialog")
+        }
     }
 
     // Required by RN even when we deliver via DeviceEventManagerModule.
