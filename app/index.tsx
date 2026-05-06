@@ -70,6 +70,15 @@ async function ensureNotifications() {
   }
 }
 
+// Multi-circle dedup: when a Place exists in two circles a member is
+// in (e.g., "Home" in both a family and friends circle), each circle's
+// apply emits its own transition:applied event. The transition records
+// stay distinct per circle (correct, replication semantics demand it),
+// but firing the OS notification once per circle is just noise. Dedup
+// on pubkey + kind + placeName within a short TTL collapses the burst.
+const NOTIF_DEDUP_TTL_MS = 10_000
+const _recentNotifications = new Map<string, number>()
+
 async function fireTransitionNotification(payload: any) {
   if (!payload || !payload.transition) return
   const { circleId, transition, displayName, placeName } = payload
@@ -78,12 +87,27 @@ async function fireTransitionNotification(payload: any) {
   // told you arrived where you went.
   if (_ourPubkey && transition.pubkey === _ourPubkey) return
   if (_mutes.has(muteKey(circleId, transition.placeId))) return
+  const dedupKey = transition.pubkey + ':' + transition.kind + ':' + placeName
+  const lastTs = _recentNotifications.get(dedupKey)
+  const now = Date.now()
+  if (lastTs != null && now - lastTs < NOTIF_DEDUP_TTL_MS) return
+  _recentNotifications.set(dedupKey, now)
+  // Opportunistic cleanup so the Map is bounded across long sessions.
+  // Cheap; only runs when we're already on the firing path.
+  const cutoff = now - NOTIF_DEDUP_TTL_MS
+  for (const [k, ts] of _recentNotifications) {
+    if (ts < cutoff) _recentNotifications.delete(k)
+  }
   const verb = transition.kind === 'enter' ? 'arrived at' : 'left'
   try {
     await Notifications.scheduleNotificationAsync({
       content: {
         title: 'PearCircle',
         body: `${displayName} ${verb} ${placeName}`,
+        // Stashed for tap-routing: the response listener pulls these
+        // fields and delivers a notification:focus event to the WebView,
+        // which sets the circle filter + focuses the member.
+        data: { kind: 'transition', circleId, pubkey: transition.pubkey },
         ...(Platform.OS === 'android' ? { channelId: 'geofence' } : {}),
       },
       trigger: null,
@@ -210,6 +234,7 @@ export default function Index() {
   const [html, setHtml] = useState<string | null>(null)
   const webViewLoaded = useRef(false)
   const pendingDeeplink = useRef<string | null>(null)
+  const pendingNotificationFocus = useRef<{ circleId: string; pubkey: string } | null>(null)
   // QR scanner is a JS-driven modal that resolves a pending shell:scanQr
   // IPC call when the camera reads a code (or the user cancels).
   const [scannerVisible, setScannerVisible] = useState(false)
@@ -254,7 +279,25 @@ export default function Index() {
       if (isInviteUrl(url)) deliverDeeplink(url)
     })
 
-    return () => { sub.remove(); linkSub.remove() }
+    // Notification taps: route to focus-member in the WebView. Cold-start
+    // taps come through getLastNotificationResponseAsync; live taps come
+    // through addNotificationResponseReceivedListener. Both deliver via
+    // deliverNotificationFocus, which mirrors the deeplink pending-flush
+    // pattern so a tap that lands before the WebView is ready isn't lost.
+    Notifications.getLastNotificationResponseAsync().then((resp) => {
+      const data = resp?.notification?.request?.content?.data as any
+      if (data?.kind === 'transition' && typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
+        deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
+      }
+    }).catch(() => {})
+    const notifSub = Notifications.addNotificationResponseReceivedListener((resp) => {
+      const data = resp?.notification?.request?.content?.data as any
+      if (data?.kind === 'transition' && typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
+        deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
+      }
+    })
+
+    return () => { sub.remove(); linkSub.remove(); notifSub.remove() }
   }, [])
 
   const deliverDeeplink = (url: string) => {
@@ -265,11 +308,23 @@ export default function Index() {
     }
   }
 
+  const deliverNotificationFocus = (payload: { circleId: string; pubkey: string }) => {
+    if (webViewLoaded.current) {
+      emitEvent('notification:focus', payload)
+    } else {
+      pendingNotificationFocus.current = payload
+    }
+  }
+
   const onLoad = () => {
     webViewLoaded.current = true
     if (pendingDeeplink.current) {
       emitEvent('deeplink:invite', { url: pendingDeeplink.current })
       pendingDeeplink.current = null
+    }
+    if (pendingNotificationFocus.current) {
+      emitEvent('notification:focus', pendingNotificationFocus.current)
+      pendingNotificationFocus.current = null
     }
   }
 

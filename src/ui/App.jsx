@@ -59,6 +59,14 @@ export function App () {
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setView({ name: 'join', invite: url })
     })
+    // Notification taps from the shell route here so any current view
+    // (Profile, Join, etc.) gets superseded by home with focus state.
+    // seq forces a new prop reference even on repeat-taps of the same
+    // member so HomeMapView's effect re-fires.
+    pear.on('notification:focus', ({ circleId, pubkey }) => {
+      if (typeof circleId !== 'string' || typeof pubkey !== 'string') return
+      setView({ name: 'home', selectCircle: circleId, focus: { circleId, pubkey, seq: Date.now() } })
+    })
   }, [refresh])
 
   // Single place that flips the sharing toggle: persist in worklet,
@@ -84,6 +92,7 @@ export function App () {
         sharing={sharing.enabled}
         setView={setView}
         initialSelectedCircleId={view.selectCircle ?? null}
+        initialFocus={view.focus ?? null}
       />
     )
   }
@@ -258,7 +267,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCircleId = null }) {
+function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCircleId = null, initialFocus = null }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
@@ -459,6 +468,21 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
     setSelectedPubkey(null)
     mapApiRef.current?.fitAll()
   }, [])
+
+  // Notification-tap focus delivered via prop from App. Each tap arrives
+  // with a fresh seq so we can detect new taps even on repeat-tap of the
+  // same member. focusMember changes whenever `data` updates (its
+  // useCallback deps) which would re-fire this effect spuriously; the
+  // seq ref guards against that. Placed after focusMember's declaration
+  // to avoid a TDZ ReferenceError on the deps array at render time.
+  const lastAppliedFocusSeq = useRef(null)
+  useEffect(() => {
+    if (!initialFocus?.pubkey) return
+    if (initialFocus.seq === lastAppliedFocusSeq.current) return
+    lastAppliedFocusSeq.current = initialFocus.seq ?? null
+    if (initialFocus.circleId) setSelectedCircleId(initialFocus.circleId)
+    focusMember(initialFocus.pubkey)
+  }, [initialFocus, focusMember])
 
   // Long-press on the map opens the add-place form pre-filled with
   // the touched coords. The form picks (or asks for) the target
