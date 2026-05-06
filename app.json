@@ -33,7 +33,7 @@
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#111111"
+        "backgroundColor": "#0E413A"
       },
       "package": "com.pearcircle",
       "permissions": [
