@@ -639,39 +639,21 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
             <ul style={s.memberList}>
               {data.members.map(m => {
                 const pubkey = m.value?.pubkey ?? ''
-                const displayName = m.value?.displayName ?? short(pubkey)
                 const seen = data.lastSeen?.[pubkey]
                 const pres = data.presence?.[pubkey]
                 const isPaused = effectivePresenceMuted(pres) && pubkey !== myPubkey
                 const t = latestTransition?.[pubkey]
                 const tPlaceName = t ? placesById?.[t.placeId]?.name : null
-                const focusable = !!seen && !isPaused
                 return (
-                  <li
+                  <MemberRow
                     key={m.key}
-                    style={{ ...s.memberItem, cursor: focusable ? 'pointer' : 'default' }}
-                    onClick={focusable ? () => focusMember(pubkey) : undefined}
-                  >
-                    <div style={s.memberRow}>
-                      <Avatar base64={m.value?.avatar} label={displayName} size={36} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={s.memberName}>{displayName}</div>
-                        {isPaused ? (
-                          <div style={s.lastSeenMuted}>Sharing paused</div>
-                        ) : t ? (
-                          <div style={s.status}>
-                            {t.kind === 'enter' ? 'arrived at ' : 'left '}
-                            {tPlaceName ?? '(unknown place)'}
-                            {' · '}{ageLabel(t.ts)}
-                          </div>
-                        ) : seen ? (
-                          <div style={s.lastSeen}>updated {ageLabel(seen.ts)}</div>
-                        ) : (
-                          <div style={s.lastSeenMuted}>no location yet</div>
-                        )}
-                      </div>
-                    </div>
-                  </li>
+                    member={m}
+                    seen={seen}
+                    isPaused={isPaused}
+                    transition={t}
+                    transitionPlaceName={tPlaceName}
+                    onFocus={focusMember}
+                  />
                 )
               })}
             </ul>
@@ -918,6 +900,107 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
       {error && <p style={s.error}>{error}</p>}
     </div>
   )
+}
+
+// Reverse-geocode a lat/lon to a "road, locality" label via the
+// public Nominatim (OpenStreetMap) endpoint. Used to add a "near X"
+// hint to member rows when there's no recent Place transition to show.
+//
+// Privacy note: each unique 4-decimal-place coordinate (~11m grid) is
+// queried once per session via plain HTTPS to nominatim.openstreetmap.org.
+// That host learns the rough position of any visible member when the
+// user opens the bottom sheet. The map tile host already learns the
+// user's viewport; this is a strictly smaller leak (specific points
+// vs. tile tiles around them). No coordinates are persisted or logged
+// beyond the in-memory cache that lives for the lifetime of the
+// process. If we want stricter privacy later, swap this to a
+// self-hosted Nominatim, run it through the bare worklet, or drop the
+// feature.
+//
+// Usage policy: Nominatim allows ~1 req/sec for shared use. We
+// serialize lookups through a single global queue and pace them at
+// 1.1s. Repeat lookups for the same grid cell short-circuit on cache.
+const _geocodeCache = new Map()    // key → label (string|null) once resolved
+const _geocodeWaiters = new Map()  // key → array of (label) callbacks
+let _geocodeBusy = false
+
+function geocodeKey (lat, lon) {
+  return Math.round(lat * 10000) / 10000 + ':' + Math.round(lon * 10000) / 10000
+}
+
+async function processGeocodeQueue () {
+  if (_geocodeBusy) return
+  let nextKey = null
+  for (const k of _geocodeWaiters.keys()) {
+    if (!_geocodeCache.has(k)) { nextKey = k; break }
+  }
+  if (nextKey == null) return
+  _geocodeBusy = true
+  const [lat, lon] = nextKey.split(':').map(parseFloat)
+  let label = null
+  try {
+    const url = 'https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=16&lat=' + lat + '&lon=' + lon
+    const r = await fetch(url, { headers: { 'Accept': 'application/json' } })
+    if (r.ok) {
+      const data = await r.json()
+      const a = data?.address ?? {}
+      const road = a.road || a.pedestrian || a.footway
+      const where = a.suburb || a.neighbourhood || a.city || a.town || a.village || a.hamlet
+      label = [road, where].filter(Boolean).join(', ') || null
+    }
+  } catch {}
+  _geocodeCache.set(nextKey, label)
+  const waiters = _geocodeWaiters.get(nextKey) || []
+  _geocodeWaiters.delete(nextKey)
+  for (const cb of waiters) {
+    try { cb(label) } catch {}
+  }
+  setTimeout(() => { _geocodeBusy = false; processGeocodeQueue() }, 1100)
+}
+
+// Per-member memo of (last lat/lon we fetched for this member, the
+// label we got back). Hysteresis: as long as the member's current
+// position is within HYSTERESIS_M of the memoized point, we keep
+// showing the memoized label even when fresh lastSeen rows arrive
+// with slightly different coords. Without this, GPS jitter at the
+// 5-30s update cadence flips the displayed label between nearby
+// suburbs/streets that Nominatim resolves differently.
+const _memberGeocodeMemo = new Map() // pubkey → { lat, lon, label }
+const HYSTERESIS_M = 100
+
+function useReverseGeocodeForMember (pubkey, lat, lon, enabled) {
+  const [label, setLabel] = useState(() => _memberGeocodeMemo.get(pubkey)?.label ?? null)
+  useEffect(() => {
+    if (!enabled) return
+    if (!pubkey || typeof lat !== 'number' || typeof lon !== 'number') return
+    const memo = _memberGeocodeMemo.get(pubkey)
+    if (memo && haversineMeters(memo.lat, memo.lon, lat, lon) < HYSTERESIS_M) {
+      // Stay with the memoized label — they haven't actually moved.
+      setLabel(memo.label)
+      return
+    }
+    const key = geocodeKey(lat, lon)
+    const onResult = (newLabel) => {
+      _memberGeocodeMemo.set(pubkey, { lat, lon, label: newLabel })
+      setLabel(newLabel)
+    }
+    if (_geocodeCache.has(key)) {
+      onResult(_geocodeCache.get(key))
+      return
+    }
+    const list = _geocodeWaiters.get(key) || []
+    list.push(onResult)
+    _geocodeWaiters.set(key, list)
+    processGeocodeQueue()
+    return () => {
+      const cur = _geocodeWaiters.get(key)
+      if (!cur) return
+      const idx = cur.indexOf(onResult)
+      if (idx >= 0) cur.splice(idx, 1)
+      if (cur.length === 0) _geocodeWaiters.delete(key)
+    }
+  }, [pubkey, lat, lon, enabled])
+  return enabled ? label : null
 }
 
 // A presence row with state==='muted' is only effectively muted
@@ -1761,6 +1844,54 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
         {children}
       </div>
     </div>
+  )
+}
+
+// Single member row in the bottom sheet's roster. Pulled out as its
+// own component so the useReverseGeocode hook has a stable call site
+// per row (otherwise hook ordering would shift with the members list).
+function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, onFocus }) {
+  const pubkey = member.value?.pubkey ?? ''
+  const displayName = member.value?.displayName ?? short(pubkey)
+  const focusable = !!seen && !isPaused
+  // Only fetch a "near X" label when there's no recent transition
+  // explaining where they are (and they're not paused). Saves
+  // requests and keeps the row stable when transitions are fresh.
+  // Per-member hysteresis prevents GPS-jitter-driven flicker.
+  const geoLabel = useReverseGeocodeForMember(
+    pubkey,
+    seen?.lat,
+    seen?.lon,
+    !!seen && !transition && !isPaused,
+  )
+  return (
+    <li
+      style={{ ...s.memberItem, cursor: focusable ? 'pointer' : 'default' }}
+      onClick={focusable ? () => onFocus(pubkey) : undefined}
+    >
+      <div style={s.memberRow}>
+        <Avatar base64={member.value?.avatar} label={displayName} size={36} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={s.memberName}>{displayName}</div>
+          {isPaused ? (
+            <div style={s.lastSeenMuted}>Sharing paused</div>
+          ) : transition ? (
+            <div style={s.status}>
+              {transition.kind === 'enter' ? 'arrived at ' : 'left '}
+              {transitionPlaceName ?? '(unknown place)'}
+              {' · '}{ageLabel(transition.ts)}
+            </div>
+          ) : seen ? (
+            <div style={s.lastSeen}>
+              {geoLabel ? 'near ' + geoLabel + ' · ' : ''}
+              updated {ageLabel(seen.ts)}
+            </div>
+          ) : (
+            <div style={s.lastSeenMuted}>no location yet</div>
+          )}
+        </div>
+      </div>
+    </li>
   )
 }
 

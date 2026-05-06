@@ -2,6 +2,14 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-05-05 — reverse-geocoding "near X" via public Nominatim
+Tier: T1 (no wire change), but worth recording for the privacy posture shift it introduces.
+Context: Member rows in the bottom sheet showed `updated Xs ago` when there was no recent Place transition to anchor the row to a known location. The TODO §Maps UX entry called for a "near X" fallback (street/locality) for that case. Three options for the geocoding source: (a) public Nominatim (OpenStreetMap), (b) self-hosted Nominatim, (c) skip the feature.
+Choice: Option (a). Public Nominatim at `https://nominatim.openstreetmap.org/reverse` queried directly from the WebView, results cached in-memory by lat/lon rounded to 4 decimals (~11m grid), per-member hysteresis at 100m so GPS jitter doesn't flip the label between adjacent suburbs/streets, throttled to ~1 request per 1.1 seconds globally per the Nominatim usage policy.
+Alternatives considered: (b) Self-hosted Nominatim — eliminates the third-party server but adds significant ops burden (Nominatim is a heavy service to run) for a feature that's nice-to-have. Defer until we self-host other infra. (c) Skip — leaves member rows showing only timestamps for non-Place locations, losing the "where are they roughly" affordance that was the original motivation.
+Privacy implication: each unique 4-decimal-place coordinate becomes a query to `nominatim.openstreetmap.org` once per session. That host learns the rough position of any member visible in the sheet. Trade-off summary: smaller leak than the existing tile-host (which already learns the user's viewport area), and only triggered when the user opens the sheet (not constantly in the background). Not stored or logged beyond the in-memory cache that lives for the process lifetime. Documented in the helper's comment block in `src/ui/App.jsx`. Future onboarding hint slice should mention this; future settings slice could add a toggle.
+Consequences: New `useReverseGeocodeForMember` hook in `src/ui/App.jsx`, MemberRow extracted from inline `data.members.map` so hook ordering is stable per row. No bare worklet changes — all UI-side. No DECISIONS-level wire impact.
+
 ## 2026-05-05 — `place:{id}` gets soft-delete via optional `deleted`/`deletedAt` fields
 Tier: T3
 Context: Users need to delete places once created — TODO.md called it out as the next governance-gated slice after the place edit feature shipped. The wire-protocol proposal §2 schema for `place:{id}` had no delete semantics; §4 noted the apply rule was last-write-wins on `createdAt` and the "Place delete" TODO line specifically flagged it as needing a proposal amendment for del/tombstone semantics. Field testing on the two test devices was done in the same session as the schema change so any apply-branch regression would surface immediately.
