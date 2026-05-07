@@ -29,10 +29,12 @@ To be filled in once a first device build runs. Will mirror PearCal/PearGuard:
 
 ## Verify gate
 
-Per Constitution §5, this app needs a single canonical `npm run verify`. Initial definition once tests exist:
-- `npm test` (jest: invite encode/decode, geofence math, message signing)
-- `npm run build:bare` and `npm run build:ui` must complete clean
-- Manual smoke: pair two devices, share location, trigger a geofence enter/exit
+Per Constitution §5, the canonical gate is `npm run verify`, which chains:
+- `npm test` (jest projects: `node` for `tests/**/*.test.js`, `jsdom` for `src/ui/**/*.test.jsx`)
+- `npm run build:bare` (bare worklet bundle)
+- `npm run build:ui` (esbuild UI bundle)
+
+Run before committing protocol or worklet changes; first failure halts the chain. Manual smoke is a separate step on top of the green gate: pair two devices, share location, trigger a geofence enter / exit, confirm the OS notification fires on the receiving device.
 
 ## Architecture
 

@@ -15,6 +15,7 @@
     "build:bare:ios-sim": "bare-pack --host ios-x64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios-sim.bundle",
     "build:ui": "esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic --loader:.js=jsx --loader:.css=text --loader:.png=dataurl --define:process.env.NODE_ENV=\\\"production\\\" --outfile=assets/app-ui.bundle",
     "test": "jest",
+    "verify": "npm test && npm run build:bare && npm run build:ui",
     "postinstall": "patch-package"
   },
   "dependencies": {
