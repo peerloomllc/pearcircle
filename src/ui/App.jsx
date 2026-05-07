@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork } from '@phosphor-icons/react'
 
 // Inject the Manrope @font-face once per WebView load. Mirrors PearCal's
 // pattern so the family resolves before any styled element renders.
@@ -44,6 +44,11 @@ export function App () {
   const [identity, setIdentity] = useState(null)
   const [profile, setProfile] = useState(null)
   const [sharing, setSharing] = useState({ enabled: true, expiresAt: null })
+  // Sheet stack overlays the home view rather than navigating to a
+  // full-page route. Shape: null | { name, ...data }. Names so far:
+  //   settings | about | create | join | invite
+  const [sheet, setSheet] = useState(null)
+  const closeSheet = useCallback(() => setSheet(null), [])
 
   const refresh = useCallback(async () => {
     const [id, pr, sh] = await Promise.all([
@@ -69,7 +74,7 @@ export function App () {
       })
     })
     pear.on('deeplink:invite', ({ url }) => {
-      if (typeof url === 'string') setView({ name: 'join', invite: url })
+      if (typeof url === 'string') setSheet({ name: 'join', invite: url })
     })
     // Notification taps from the shell route here so any current view
     // (Profile, Join, etc.) gets superseded by home with focus state.
@@ -95,43 +100,81 @@ export function App () {
     }
   }, [])
 
-  if (view.name === 'home') {
-    return (
+  // All non-home views live as sheets now. The home (map) view is the
+  // base; everything else slides up over it.
+  const onCircleCreated = useCallback((circleId) => {
+    refresh()
+    if (circleId) setView({ name: 'home', selectCircle: circleId })
+  }, [refresh])
+  const onCircleJoined = useCallback((circleId) => {
+    refresh()
+    if (circleId) setView({ name: 'home', selectCircle: circleId })
+    setSheet(null)
+  }, [refresh])
+
+  return (
+    <>
       <HomeMapView
         key={view.selectCircle ?? 'all'}
         identity={identity}
         profile={profile}
         sharing={sharing.enabled}
         setView={setView}
+        setSheet={setSheet}
         initialSelectedCircleId={view.selectCircle ?? null}
         initialFocus={view.focus ?? null}
       />
-    )
-  }
-  if (view.name === 'create') {
-    return <CreateView setView={setView} onCreated={refresh} />
-  }
-  if (view.name === 'join') {
-    return <JoinView setView={setView} onJoined={refresh} initialInvite={view.invite} />
-  }
-  if (view.name === 'profile') {
-    return (
-      <ProfileView
-        profile={profile}
-        sharing={sharing}
-        setSharing={setSharingEnabled}
-        setView={setView}
-        onSaved={refresh}
-      />
-    )
-  }
-  if (view.name === 'about') {
-    return <AboutView setView={setView} />
-  }
-  return null
+      <SheetContainer open={sheet?.name === 'settings'}>
+        <ProfileView
+          profile={profile}
+          sharing={sharing}
+          setSharing={setSharingEnabled}
+          onClose={closeSheet}
+          onSaved={refresh}
+        />
+      </SheetContainer>
+      <SheetContainer open={sheet?.name === 'about'}>
+        <AboutView onClose={closeSheet} />
+      </SheetContainer>
+      <SheetContainer open={sheet?.name === 'create'}>
+        <CreateView onClose={closeSheet} onCreated={onCircleCreated} setSheet={setSheet} />
+      </SheetContainer>
+      <SheetContainer open={sheet?.name === 'join'}>
+        <JoinView onClose={closeSheet} onJoined={onCircleJoined} initialInvite={sheet?.name === 'join' ? sheet.invite : undefined} />
+      </SheetContainer>
+      <SheetContainer open={sheet?.name === 'invite'}>
+        {sheet?.name === 'invite' && (
+          <InviteShareView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
+        )}
+      </SheetContainer>
+    </>
+  )
 }
 
-function CreateView ({ setView, onCreated }) {
+// Slide-up overlay container. Always mounted so the closing animation
+// has content to slide; pointer-events gate interaction. Children stay
+// in DOM when closed (a touch wasteful for ProfileView's effects, but
+// avoids a remount-and-relayout per open).
+function SheetContainer ({ open, children }) {
+  return (
+    <div
+      aria-hidden={!open}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 100,
+        background: colors.surface.base,
+        transform: open ? 'translateY(0)' : 'translateY(100%)',
+        transition: 'transform 280ms cubic-bezier(0.32, 0.72, 0, 1)',
+        pointerEvents: open ? 'auto' : 'none',
+        overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch',
+      }}
+    >
+      {children}
+    </div>
+  )
+}
+
+function CreateView ({ onClose, onCreated }) {
   const [name, setName] = useState('')
   const [creating, setCreating] = useState(false)
   const [result, setResult] = useState(null)
@@ -145,28 +188,35 @@ function CreateView ({ setView, onCreated }) {
     setCreating(false)
     if (r?.invite) {
       setResult(r)
-      onCreated()
+      onCreated(r.circleId)
     } else {
       setError('Could not create circle')
     }
   }
 
+  const finish = () => {
+    setName('')
+    setResult(null)
+    setError(null)
+    onClose()
+  }
+
   if (result) {
     return (
       <div style={s.screen}>
-        <BackBar onBack={() => setView({ name: 'home', selectCircle: result.circleId })} title={result.name} />
+        <BackBar onBack={finish} title={result.name} />
         <p style={s.muted}>Circle created. Share the QR code or paste the link:</p>
         <QrImage text={result.invite} />
         <textarea style={s.inviteBox} readOnly value={result.invite} onFocus={(e) => e.target.select()} />
         <ShareButton text={result.invite} />
-        <button style={s.primaryBtn} onClick={() => setView({ name: 'home', selectCircle: result.circleId })}>Done</button>
+        <button style={s.primaryBtn} onClick={finish}>Done</button>
       </div>
     )
   }
 
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'home' })} title='New circle' />
+      <BackBar onBack={onClose} title='New Circle' />
       <label style={s.label}>Circle name</label>
       <input
         style={s.input}
@@ -184,8 +234,46 @@ function CreateView ({ setView, onCreated }) {
   )
 }
 
-function JoinView ({ setView, onJoined, initialInvite }) {
+// Sheet for sharing an invite to an existing circle. Fetches the invite
+// link on open via circle:invite (which rebuilds it deterministically
+// from the local joined-record) and renders the same QR/copy/share UI
+// CreateView's result state uses.
+function InviteShareView ({ circleId, circleName, onClose }) {
+  const [invite, setInvite] = useState(null)
+  const [error, setError] = useState(null)
+  useEffect(() => {
+    if (!circleId) return
+    let cancelled = false
+    pear.call('circle:invite', { circleId })
+      .then((r) => { if (!cancelled) setInvite(r?.invite ?? null) })
+      .catch((e) => { if (!cancelled) setError(String(e?.message ?? e)) })
+    return () => { cancelled = true }
+  }, [circleId])
+  return (
+    <div style={s.screen}>
+      <BackBar onBack={onClose} title={circleName ?? 'Invite'} />
+      {error && <p style={s.error}>{error}</p>}
+      {!error && !invite && <p style={s.muted}>Building invite...</p>}
+      {invite && (
+        <>
+          <p style={s.muted}>Share the QR code or paste the link to invite someone to this circle.</p>
+          <QrImage text={invite} />
+          <textarea style={s.inviteBox} readOnly value={invite} onFocus={(e) => e.target.select()} />
+          <ShareButton text={invite} />
+        </>
+      )}
+    </div>
+  )
+}
+
+function JoinView ({ onClose, onJoined, initialInvite }) {
   const [invite, setInvite] = useState(initialInvite ?? '')
+  // Reseed the invite field when the parent re-opens the sheet with a
+  // fresh deep-link URL. Without this the textarea sticks to whatever
+  // the user last typed.
+  useEffect(() => {
+    if (typeof initialInvite === 'string') setInvite(initialInvite)
+  }, [initialInvite])
   const [joining, setJoining] = useState(false)
   const [error, setError] = useState(null)
 
@@ -207,13 +295,7 @@ function JoinView ({ setView, onJoined, initialInvite }) {
       const r = await pear.call('circle:join', { invite: invite.trim() })
       setJoining(false)
       if (r?.circleId) {
-        // Route straight back to the map with the newly joined circle
-        // pre-selected as the dropdown filter so the title bar and map
-        // immediately reflect the join. onJoined refreshes App-level
-        // state; HomeMapView's own circles:getAll picks up the new
-        // circle on mount.
-        onJoined()
-        setView({ name: 'home', selectCircle: r.circleId })
+        onJoined(r.circleId)
       } else {
         setError('Invalid invite')
       }
@@ -225,7 +307,7 @@ function JoinView ({ setView, onJoined, initialInvite }) {
 
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'home' })} title='Join a circle' />
+      <BackBar onBack={onClose} title='Join Circle' />
       <label style={s.label}>Paste invite link</label>
       <textarea
         style={s.textarea}
@@ -237,7 +319,7 @@ function JoinView ({ setView, onJoined, initialInvite }) {
       <button style={s.secondaryBtn} onClick={onScan}>
         Scan QR code
       </button>
-      <button style={s.primaryBtn} disabled={!invite.trim() || joining} onClick={submit}>
+      <button style={{ ...s.primaryBtn, marginTop: spacing.md }} disabled={!invite.trim() || joining} onClick={submit}>
         {joining ? 'Joining...' : 'Join'}
       </button>
       {error && <p style={s.error}>{error}</p>}
@@ -282,7 +364,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCircleId = null, initialFocus = null }) {
+function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSelectedCircleId = null, initialFocus = null }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
@@ -600,15 +682,29 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
         />
       </div>
 
-      <header style={s.mapTopBar}>
-        {selectedMember ? (
+      {/* Slide-down member-focus top bar. Always mounted so the slide
+          animation has content; hidden above the viewport when no member
+          is focused. */}
+      <div
+        aria-hidden={!selectedMember}
+        style={{
+          position: 'absolute', top: 0, left: 0, right: 0,
+          paddingTop: `calc(env(safe-area-inset-top, 24px) + 8px)`,
+          paddingLeft: 12, paddingRight: 12, paddingBottom: 8,
+          background: 'rgba(26,26,26,0.92)',
+          backdropFilter: 'blur(8px)',
+          WebkitBackdropFilter: 'blur(8px)',
+          borderBottom: `1px solid ${colors.border}`,
+          display: 'flex', alignItems: 'center', gap: 8,
+          transform: selectedMember ? 'translateY(0)' : 'translateY(-100%)',
+          transition: 'transform 250ms cubic-bezier(0.32, 0.72, 0, 1)',
+          zIndex: 6,
+          pointerEvents: selectedMember ? 'auto' : 'none',
+        }}
+      >
+        {selectedMember && (
           <>
-            <button
-              type='button'
-              style={s.iconBtn}
-              onClick={clearFocus}
-              aria-label='Back to all'
-            >‹</button>
+            <button type='button' style={s.iconBtn} onClick={clearFocus} aria-label='Back to all'>‹</button>
             <Avatar base64={selectedMember.avatar} label={selectedMember.displayName} size={32} />
             <div style={s.focusTextCol}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -616,82 +712,189 @@ function HomeMapView ({ identity, profile, sharing, setView, initialSelectedCirc
                 <BatteryBadge level={selectedMember.seen?.battery} />
               </div>
               <div style={s.focusSub}>
-                {selectedMember.seen
-                  ? <LiveOrAge ts={selectedMember.seen.ts} />
-                  : 'no location yet'}
+                {selectedMember.seen ? <LiveOrAge ts={selectedMember.seen.ts} /> : 'no location yet'}
               </div>
             </div>
           </>
-        ) : (
-          <button
-            type='button'
-            style={s.dropdownBtn}
-            onClick={() => setMenuOpen((m) => !m)}
-          >
-            <span style={s.dropdownLabel}>{filterLabel}</span>
-            <span style={s.dropdownChevron}>{menuOpen ? '▴' : '▾'}</span>
-          </button>
         )}
-        <span style={s.peerBadge}>
-          <span style={{ ...s.peerDot, background: peerCount > 0 ? '#7ec77a' : '#555' }} />
-          {peerCount}
-        </span>
+      </div>
+
+      {/* Tap-outside scrim for the pill menu, separate from member-sheet
+          dismissal so closing the menu doesn't disturb other UI state. */}
+      {menuOpen && !selectedMember && <div style={s.menuScrim} onClick={() => setMenuOpen(false)} />}
+
+      {/* Floating circle pill + menu live in one positioned container so
+          they share the slide-down transform when a member is focused.
+          Pill stays visible alongside the focus bar (offset to clear it),
+          rather than fading out. */}
+      <div
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + 12px)`,
+          left: '50%',
+          transform: selectedMember ? 'translate(-50%, 56px)' : 'translate(-50%, 0)',
+          transition: 'transform 250ms cubic-bezier(0.32, 0.72, 0, 1)',
+          width: 240, maxWidth: 'calc(100vw - 32px)',
+          // Above the scrim (z 9) so dropdown items are clickable; the
+          // scrim only catches taps outside the pill+menu container.
+          zIndex: 20,
+        }}
+      >
         <button
           type='button'
-          style={s.avatarBtn}
-          onClick={() => setView({ name: 'profile' })}
-          aria-label='Profile'
+          onClick={() => setMenuOpen((m) => !m)}
+          style={{
+            width: '100%',
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '8px 14px',
+            background: 'rgba(26,26,26,0.92)',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.full,
+            color: colors.text.primary,
+            fontFamily: typography.fontFamily,
+            fontSize: 14, fontWeight: 300,
+            cursor: 'pointer',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+          }}
         >
-          <span style={{ position: 'relative', display: 'inline-flex' }}>
-            <Avatar base64={profile?.avatar} label={profile?.displayName ?? '?'} size={32} />
-            {!sharing && (
-              <span
-                style={s.sharingOffDot}
-                title='Sharing paused'
-                aria-label='Sharing paused'
-              />
-            )}
+          <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', textAlign: 'left' }}>{filterLabel}</span>
+          <span style={{ display: 'inline-flex', alignItems: 'center', color: colors.text.secondary, transform: menuOpen ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 200ms' }}>
+            <CaretDown size={11} weight='thin' />
+          </span>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, marginLeft: 4, color: colors.text.secondary }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: peerCount > 0 ? '#7ec77a' : '#555' }} />
+            <span style={{ fontSize: 12 }}>{peerCount}</span>
           </span>
         </button>
-      </header>
 
-      {menuOpen && !selectedMember && (
-        <>
-          <div style={s.menuScrim} onClick={() => setMenuOpen(false)} />
-          <div style={s.menu}>
-            {circles.length > 1 && (
+        {/* Always-mounted menu, animates open/close. Keeps width matched
+            to the pill since they share the parent container. */}
+        <div
+          aria-hidden={!menuOpen || !!selectedMember}
+          style={{
+            position: 'absolute', top: 44, left: 0, right: 0,
+            background: colors.surface.card,
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.lg,
+            padding: 6,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+            transform: menuOpen && !selectedMember ? 'translateY(0)' : 'translateY(-6px)',
+            opacity: menuOpen && !selectedMember ? 1 : 0,
+            pointerEvents: menuOpen && !selectedMember ? 'auto' : 'none',
+            transition: 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1), opacity 180ms',
+            zIndex: 10,
+          }}
+        >
+          {circles.length > 1 && (
+            <button
+              style={{ ...s.menuItem, ...(selectedCircleId === null ? s.menuItemActive : null) }}
+              onClick={() => { setSelectedCircleId(null); setMenuOpen(false) }}
+            >
+              All circles
+            </button>
+          )}
+          {circles.map((c) => (
+            <div key={c.circleId} style={{ display: 'flex', alignItems: 'stretch', gap: 4 }}>
               <button
-                style={{ ...s.menuItem, ...(selectedCircleId === null ? s.menuItemActive : null) }}
-                onClick={() => { setSelectedCircleId(null); setMenuOpen(false) }}
-              >
-                All circles
-              </button>
-            )}
-            {circles.map((c) => (
-              <button
-                key={c.circleId}
-                style={{ ...s.menuItem, ...(selectedCircleId === c.circleId ? s.menuItemActive : null) }}
+                style={{ ...s.menuItem, ...(selectedCircleId === c.circleId ? s.menuItemActive : null), flex: 1 }}
                 onClick={() => { setSelectedCircleId(c.circleId); setMenuOpen(false) }}
               >
                 {c.circle?.name ?? '...'}
               </button>
-            ))}
-            {circles.length > 0 && <div style={s.menuDivider} />}
-            <button
-              style={s.menuItem}
-              onClick={() => { setMenuOpen(false); setView({ name: 'create' }) }}
-            >
-              + Create circle
-            </button>
-            <button
-              style={s.menuItem}
-              onClick={() => { setMenuOpen(false); setView({ name: 'join' }) }}
-            >
-              + Join via link
-            </button>
-          </div>
-        </>
-      )}
+              <button
+                onClick={() => {
+                  setMenuOpen(false)
+                  setSheet({ name: 'invite', circleId: c.circleId, circleName: c.circle?.name ?? 'Circle' })
+                }}
+                aria-label='Share invite'
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  width: 36, padding: 0,
+                  background: 'transparent', color: colors.text.secondary,
+                  border: 'none', borderRadius: 6, cursor: 'pointer',
+                }}>
+                <ShareNetwork size={16} weight='thin' />
+              </button>
+            </div>
+          ))}
+          {circles.length > 0 && <div style={s.menuDivider} />}
+          <button
+            style={s.menuItem}
+            onClick={() => { setMenuOpen(false); setSheet({ name: 'create' }) }}
+          >
+            + Create Circle
+          </button>
+          <button
+            style={s.menuItem}
+            onClick={() => { setMenuOpen(false); setSheet({ name: 'join' }) }}
+          >
+            + Join Circle
+          </button>
+        </div>
+      </div>
+
+      {/* Floating gear (Settings) bottom-left, info (About) bottom-right.
+          Same circular FAB style; sit above the bottom sheet handle and
+          below the sheet itself. Sharing-paused indicator overlays the
+          gear so the user notices when they're not broadcasting. */}
+      <button
+        type='button'
+        onClick={() => setSheet({ name: 'settings' })}
+        aria-label='Settings'
+        style={{
+          position: 'absolute',
+          left: 16,
+          bottom: `calc(env(safe-area-inset-bottom, 0px) + 16px)`,
+          width: 44, height: 44, borderRadius: '50%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(26,26,26,0.92)',
+          backdropFilter: 'blur(8px)',
+          WebkitBackdropFilter: 'blur(8px)',
+          border: `1px solid ${colors.border}`,
+          color: colors.text.primary,
+          cursor: 'pointer',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+          zIndex: 5,
+        }}
+      >
+        <GearSix size={22} weight='thin' />
+        {!sharing && (
+          <span
+            style={{
+              position: 'absolute', top: -2, right: -2,
+              width: 12, height: 12, borderRadius: '50%',
+              background: colors.error, border: `2px solid ${colors.surface.card}`,
+              pointerEvents: 'none',
+            }}
+            title='Sharing paused'
+            aria-label='Sharing paused'
+          />
+        )}
+      </button>
+      <button
+        type='button'
+        onClick={() => setSheet({ name: 'about' })}
+        aria-label='About'
+        style={{
+          position: 'absolute',
+          right: 16,
+          bottom: `calc(env(safe-area-inset-bottom, 0px) + 16px)`,
+          width: 44, height: 44, borderRadius: '50%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(26,26,26,0.92)',
+          backdropFilter: 'blur(8px)',
+          WebkitBackdropFilter: 'blur(8px)',
+          border: `1px solid ${colors.border}`,
+          color: colors.text.primary,
+          cursor: 'pointer',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+          zIndex: 5,
+        }}
+      >
+        <InfoIcon size={22} weight='thin' />
+      </button>
 
       {circles.length === 0 ? (
         <div style={s.emptyHint}>
@@ -1662,7 +1865,7 @@ function fitTo (map, lonLatPairs) {
   if (cam) map.flyTo({ center: cam.center, zoom: cam.zoom, ...opts })
 }
 
-function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
+function ProfileView ({ profile, sharing, setSharing, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -1831,7 +2034,7 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
 
   return (
     <div style={s.screen}>
-      <BackBar onBack={() => setView({ name: 'home' })} title='Settings' />
+      <BackBar onBack={onClose} title='Settings' />
 
       {/* Avatar header — centered, PearCal pattern. */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.md, marginBottom: spacing.xl }}>
@@ -1977,7 +2180,7 @@ function ProfileView ({ profile, sharing, setSharing, setView, onSaved }) {
 // prose sections explaining the model, a couple of action buttons. No
 // donation flow yet (PearCircle hasn't shipped to stores; can layer in
 // later with the same iOS guideline 3.1.1 gating PearGuard uses).
-function AboutView ({ setView }) {
+function AboutView ({ onClose }) {
   const share = async () => {
     try {
       await pear.call('shell:share', {
@@ -1997,10 +2200,7 @@ function AboutView ({ setView }) {
   }
   return (
     <div style={s.screen}>
-      <div style={s.header}>
-        <button type='button' style={s.iconBtn} onClick={() => setView({ name: 'profile' })} aria-label='Back'>‹</button>
-        <h1 style={s.h1}>About</h1>
-      </div>
+      <BackBar onBack={onClose} title='About' />
 
       <div style={{ ...card, textAlign: 'center', padding: spacing.xl }}>
         <div style={{ ...typography.display, color: colors.primary, fontWeight: 400, marginBottom: spacing.xs }}>PearCircle</div>
@@ -2319,7 +2519,7 @@ function BackBar ({ onBack, title }) {
   return (
     <header style={s.header}>
       <button style={s.iconBtn} onClick={onBack} aria-label='Back'>‹</button>
-      <h1 style={s.h1}>{title}</h1>
+      <h1 style={{ ...s.h1, textAlign: 'center' }}>{title}</h1>
       <span style={{ width: 32 }} />
     </header>
   )
@@ -2465,13 +2665,16 @@ const s = {
     position: 'absolute',
     bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
     left: '50%', transform: 'translateX(-50%)',
-    padding: '12px 18px',
-    background: '#7ec4cf', color: '#0a1f23',
-    border: 'none', borderRadius: 999,
-    fontSize: 14, fontWeight: 400,
-    boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+    padding: '10px 18px',
+    background: 'rgba(26,26,26,0.92)', color: colors.text.primary,
+    border: `1px solid ${colors.border}`, borderRadius: 999,
+    fontSize: 14, fontWeight: 300,
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
     zIndex: 5, cursor: 'pointer',
     whiteSpace: 'nowrap',
+    fontFamily: typography.fontFamily,
   },
   dropdownBtn: {
     display: 'flex', alignItems: 'center', gap: 6, flex: 1,

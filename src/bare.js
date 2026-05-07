@@ -460,6 +460,22 @@ const handlers = {
     return { ok: true, transition }
   },
 
+  // Rebuild a shareable invite for a circle the local device is already
+  // a member of. The persisted joined-record holds everything buildInvite
+  // needs (circleId, name, circleKey, bootstrap); the inviter pubkey is
+  // ours so peers know who shared it. Used by the existing-circle share
+  // flow — no new state, no Hyperbee writes, just a deterministic build.
+  'circle:invite': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const record = await _localDb.get('circles:joined:' + circleId)
+    if (!record?.value) throw new Error('not a member of that circle')
+    const { name, circleKey, bootstrap } = record.value
+    const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
+    const invite = buildInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
+    return { invite, name }
+  },
+
   'circles:list': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const circles = []
