@@ -435,6 +435,25 @@ export default function Index() {
       respond(msg.id, { ok: true })
       return
     }
+    if (msg.method === 'shell:openUrl') {
+      // Hand a URL off to the OS for resolution. Used by the member
+      // detail sheet's "Get directions" action with a geo: URI; could
+      // host any external link in the future. The shell does the work
+      // because the WebView's about:blank base URL prevents reliable
+      // window.open / location.href navigation.
+      const url = msg.args?.url
+      if (typeof url !== 'string' || url.length === 0) {
+        respond(msg.id, { ok: false, error: 'url must be a non-empty string' })
+        return
+      }
+      try {
+        await Linking.openURL(url)
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
     if (msg.method === 'shell:battery:requestExempt') {
       // Opens the system "Allow PearCircle to ignore battery
       // optimizations?" dialog. The user has to tap Allow themselves

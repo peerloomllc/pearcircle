@@ -249,12 +249,18 @@ function CreateView ({ onClose, onCreated }) {
     <div style={s.screen}>
       <BackBar onBack={onClose} title='New Circle' />
       <label style={s.label}>Circle name</label>
+      {/* No autoFocus here on purpose: CreateView lives in an always-
+          mounted SheetContainer (translated off-screen when closed), and
+          Android WebView defers autoFocus on hidden inputs until the
+          first user gesture, then fires it on whatever the user tapped
+          first - which surfaced as the keyboard opening on the first
+          pin tap after cold start. Tapping the input is one extra step
+          when the sheet does open, which is fine. */}
       <input
         style={s.input}
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder='Smith Family'
-        autoFocus
         maxLength={64}
       />
       <button style={s.primaryBtn} disabled={!name.trim() || creating} onClick={submit}>
@@ -401,6 +407,10 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
   const [peerCount, setPeerCount] = useState(0)
   const [selectedCircleId, setSelectedCircleId] = useState(initialSelectedCircleId) // null = All
   const [selectedPubkey, setSelectedPubkey] = useState(null) // null = auto-fit-everyone view
+  // Member detail sheet visibility, separate from selectedPubkey so
+  // dragging the sheet down keeps the focus state (top bar visible,
+  // map still flown-to). Tapping the focus bar re-opens.
+  const [memberSheetVisible, setMemberSheetVisible] = useState(false)
   const [sheetOpen, setSheetOpen] = useState(false)
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [pendingPlaceCoords, setPendingPlaceCoords] = useState(null) // { lat, lon } from a map long-press, prefilled into AddPlaceForm
@@ -581,6 +591,7 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
   const focusMember = useCallback((pubkey) => {
     if (!pubkey) return
     setSelectedPubkey(pubkey)
+    setMemberSheetVisible(true)
     setMenuOpen(false)
     setSheetOpen(false)
     const seen = data.lastSeen?.[pubkey]
@@ -594,6 +605,7 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
 
   const clearFocus = useCallback(() => {
     setSelectedPubkey(null)
+    setMemberSheetVisible(false)
     mapApiRef.current?.fitAll()
   }, [])
 
@@ -736,17 +748,23 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
         {selectedMember && (
           <>
             <button type='button' style={s.iconBtn} onClick={clearFocus} aria-label='Back to all'>‹</button>
-            <Avatar base64={selectedMember.avatar} label={selectedMember.displayName} size={32} />
-            <div style={s.focusTextCol}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={s.focusName}>{selectedMember.displayName}</div>
-                <MotionGlyph speed={selectedMember.seen?.speed} size={14} />
-                <BatteryBadge level={selectedMember.seen?.battery} />
-              </div>
-              <div style={s.focusSub}>
-                {selectedMember.seen ? <LiveOrAge ts={selectedMember.seen.ts} /> : 'no location yet'}
-              </div>
-            </div>
+            <button
+              type='button'
+              onClick={() => setMemberSheetVisible(true)}
+              style={{
+                flex: 1, display: 'flex', alignItems: 'center', gap: 8,
+                background: 'transparent', border: 'none', padding: 0,
+                color: colors.text.primary, cursor: 'pointer', textAlign: 'left',
+                fontFamily: typography.fontFamily,
+              }}
+              aria-label='Open member detail'
+            >
+              <Avatar base64={selectedMember.avatar} label={selectedMember.displayName} size={32} />
+              <div style={s.focusName}>{selectedMember.displayName}</div>
+            </button>
+            {/* Battery, motion, freshness, and recent transitions live in the
+                MemberDetailSheet — this header is just an at-a-glance
+                back-to-all affordance, with a tap to reopen the sheet. */}
           </>
         )}
       </div>
@@ -755,18 +773,21 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
           dismissal so closing the menu doesn't disturb other UI state. */}
       {menuOpen && !selectedMember && <div style={s.menuScrim} onClick={() => setMenuOpen(false)} />}
 
-      {/* Floating circle pill + menu live in one positioned container so
-          they share the slide-down transform when a member is focused.
-          Pill stays visible alongside the focus bar (offset to clear it),
-          rather than fading out. */}
+      {/* Floating circle pill + menu. Hidden entirely while a member is
+          focused — the focus bar owns the top area and the dropdown
+          isn't useful with the member detail sheet covering the map.
+          Animates opacity for a soft cross-fade. */}
       <div
+        aria-hidden={!!selectedMember}
         style={{
           position: 'absolute',
           top: `calc(env(safe-area-inset-top, 24px) + 12px)`,
           left: '50%',
-          transform: selectedMember ? 'translate(-50%, 56px)' : 'translate(-50%, 0)',
-          transition: 'transform 250ms cubic-bezier(0.32, 0.72, 0, 1)',
+          transform: 'translate(-50%, 0)',
           width: 240, maxWidth: 'calc(100vw - 32px)',
+          opacity: selectedMember ? 0 : 1,
+          pointerEvents: selectedMember ? 'none' : 'auto',
+          transition: 'opacity 200ms ease',
           // Above the scrim (z 9) so dropdown items are clickable; the
           // scrim only catches taps outside the pill+menu container.
           zIndex: 20,
@@ -936,6 +957,16 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
         <button style={s.fab} onClick={() => setSheetOpen(true)}>
           Members ({memberCount}) · Places ({placeCount})
         </button>
+      )}
+
+      {selectedMember && memberSheetVisible && (
+        <MemberDetailSheet
+          member={selectedMember}
+          presence={data.presence?.[selectedPubkey] ?? null}
+          transitions={data.transitions}
+          placesById={placesById}
+          onClose={() => setMemberSheetVisible(false)}
+        />
       )}
 
       {sheetOpen && (
@@ -2424,6 +2455,134 @@ function initialsFor (label) {
   if (!trimmed) return '?'
   const parts = trimmed.split(/\s+/).slice(0, 2)
   return parts.map(p => p[0].toUpperCase()).join('')
+}
+
+// Member-detail sheet that slides up when a member pin is tapped. Keeps
+// the top focus bar around as an at-a-glance status header (per the UX
+// pick); this sheet adds rich detail (avatar, name, battery, motion,
+// presence, last seen with absolute + relative + reverse-geo, recent
+// transitions filtered to this member, "Focus on map" / "Get directions"
+// actions). Built on the same BottomSheet primitive as the members /
+// places list. Closing only hides the sheet; the focus state lives on
+// the parent so the user can re-open via tap-on-focus-bar without
+// re-flying the map.
+function MemberDetailSheet ({ member, presence, transitions, placesById, onClose }) {
+  const seen = member?.seen
+  const isPaused = effectivePresenceMuted(presence)
+  // Reverse-geocode label only when there's a fresh location and the
+  // user isn't muted; reuses the same hysteresis-aware hook the row
+  // version uses so the label stays stable across periodic refreshes.
+  const geoLabel = useReverseGeocodeForMember(
+    member?.pubkey || '',
+    seen?.lat,
+    seen?.lon,
+    !!seen && !isPaused,
+  )
+  if (!member) return null
+
+  const memberTransitions = (transitions ?? []).filter((t) => t.pubkey === member.pubkey)
+  const motion = motionState(seen?.speed)
+  const motionLabel = motion === 'walking' ? 'Walking'
+                    : motion === 'driving' ? 'Driving'
+                    : motion === 'still' ? 'Stationary'
+                    : null
+
+  const openDirections = async () => {
+    if (typeof seen?.lat !== 'number' || typeof seen?.lon !== 'number') return
+    const label = encodeURIComponent(member.displayName || 'destination')
+    // Universal geo: URI; Android resolves it to the default maps app.
+    // iOS support comes when shell:openUrl learns to swap to maps:// on Apple.
+    const url = `geo:${seen.lat},${seen.lon}?q=${seen.lat},${seen.lon}(${label})`
+    try { await pear.call('shell:openUrl', { url }) } catch {}
+  }
+
+  return (
+    <BottomSheet onClose={onClose}>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.sm, paddingTop: spacing.sm, paddingBottom: spacing.base }}>
+        <Avatar base64={member.avatar} label={member.displayName} size={80} />
+        <h2 style={{ ...typography.heading, margin: 0, color: colors.text.primary }}>{member.displayName}</h2>
+        {isPaused && (
+          <div style={{ ...typography.caption, color: colors.text.secondary }}>Sharing paused</div>
+        )}
+      </div>
+
+      {!isPaused && seen && (motionLabel || typeof seen.battery === 'number') && (
+        <div style={{ display: 'flex', justifyContent: 'center', gap: spacing.lg, alignItems: 'center', paddingBottom: spacing.base, borderBottom: `1px solid ${colors.border}` }}>
+          {typeof seen.battery === 'number' && <BatteryBadge level={seen.battery} />}
+          {motionLabel && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: colors.text.secondary }}>
+              {motion === 'walking' && <PersonSimpleWalk size={18} weight='thin' />}
+              {motion === 'driving' && <CarProfile size={18} weight='thin' />}
+              <span style={typography.body}>{motionLabel}</span>
+            </span>
+          )}
+        </div>
+      )}
+
+      <h3 style={{ ...typography.caption, color: colors.text.secondary, margin: `${spacing.base}px 0 ${spacing.sm}px`, textTransform: 'uppercase', letterSpacing: 0.5 }}>Last seen</h3>
+      {seen ? (
+        <div style={{ ...typography.body, color: colors.text.primary, lineHeight: 1.6 }}>
+          <div>{formatAbsoluteTime(seen.ts)} · <LiveOrAge ts={seen.ts} /></div>
+          {geoLabel && <div style={{ color: colors.text.secondary }}>near {geoLabel}</div>}
+          {Number.isFinite(seen.accuracy) && (
+            <div style={{ ...typography.caption, color: colors.text.muted }}>±{Math.round(seen.accuracy)} m accuracy</div>
+          )}
+        </div>
+      ) : (
+        <div style={{ ...typography.body, color: colors.text.muted }}>No location yet</div>
+      )}
+
+      <h3 style={{ ...typography.caption, color: colors.text.secondary, margin: `${spacing.lg}px 0 ${spacing.sm}px`, textTransform: 'uppercase', letterSpacing: 0.5 }}>Recent activity</h3>
+      {memberTransitions.length === 0 ? (
+        <div style={{ ...typography.body, color: colors.text.muted }}>No recent transitions.</div>
+      ) : (
+        <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          {memberTransitions.slice(0, 5).map((t, i) => {
+            const placeName = placesById?.[t.placeId]?.name ?? 'a place'
+            return (
+              <li key={`${t.ts}:${t.placeId}:${i}`} style={{ padding: `${spacing.sm}px 0`, borderBottom: `1px solid ${colors.divider}`, ...typography.body, color: colors.text.primary }}>
+                <div>{t.kind === 'enter' ? 'arrived at ' : 'left '}<strong style={{ fontWeight: 400 }}>{placeName}</strong></div>
+                <div style={{ ...typography.caption, color: colors.text.secondary }}>{formatAbsoluteTime(t.ts)} · {ageLabel(t.ts)}</div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
+      <div style={{ marginTop: spacing.lg }}>
+        <button
+          onClick={openDirections}
+          disabled={!seen}
+          style={{
+            width: '100%', padding: '12px', borderRadius: radius.md,
+            background: colors.accent, color: colors.text.onPrimary,
+            border: 'none', cursor: seen ? 'pointer' : 'default',
+            fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+            opacity: seen ? 1 : 0.5,
+          }}
+        >
+          Get directions
+        </button>
+      </div>
+    </BottomSheet>
+  )
+}
+
+// Today / Yesterday / "Mar 5" prefix + locale-formatted time. Used by
+// the member detail sheet for last-seen and transitions; pairs with
+// `ageLabel` for the relative version next to it.
+function formatAbsoluteTime (ts) {
+  if (typeof ts !== 'number') return ''
+  const d = new Date(ts)
+  const now = new Date()
+  const sameDay = d.toDateString() === now.toDateString()
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  const isYesterday = d.toDateString() === yesterday.toDateString()
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  if (sameDay) return `Today ${time}`
+  if (isYesterday) return `Yesterday ${time}`
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time
 }
 
 // Slide-up modal sheet, ported from pearcal-native/src/ui/App.jsx:5777.
