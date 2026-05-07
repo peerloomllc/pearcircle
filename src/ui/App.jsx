@@ -80,6 +80,12 @@ export function App () {
   //   settings | about | create | join | invite
   const [sheet, setSheet] = useState(null)
   const closeSheet = useCallback(() => setSheet(null), [])
+  // Owner-tear-down notice queue (proposal amendment 2026-05-07 §1).
+  // The worklet emits `circle:deleted` when an owner's tombstone lands;
+  // we show one alert per circle, then call circle:cleanup-deleted to
+  // free local state. Stored as an array because two circles could
+  // theoretically be deleted in quick succession.
+  const [deletedNotices, setDeletedNotices] = useState([])
 
   const refresh = useCallback(async () => {
     const [id, pr, sh] = await Promise.all([
@@ -115,6 +121,24 @@ export function App () {
       if (typeof circleId !== 'string' || typeof pubkey !== 'string') return
       setView({ name: 'home', selectCircle: circleId, focus: { circleId, pubkey, seq: Date.now() } })
     })
+    // Owner deleted a peer's circle. Worklet has already filtered its
+    // own emit so this only fires on peers, not the owner themselves.
+    // Queue a one-shot notice; user dismissal triggers the cleanup IPC.
+    pear.on('circle:deleted', ({ circleId, circleName }) => {
+      if (typeof circleId !== 'string') return
+      setDeletedNotices((prev) => {
+        if (prev.some((n) => n.circleId === circleId)) return prev
+        return [...prev, { circleId, circleName: circleName || 'Circle' }]
+      })
+    })
+  }, [refresh])
+
+  // Dismiss the head notice: tell the worklet to free local state, then
+  // pop it from the queue.
+  const dismissDeletedNotice = useCallback(async (circleId) => {
+    try { await pear.call('circle:cleanup-deleted', { circleId }) } catch {}
+    setDeletedNotices((prev) => prev.filter((n) => n.circleId !== circleId))
+    refresh()
   }, [refresh])
 
   // Single place that flips the sharing toggle: persist in worklet,
@@ -157,6 +181,7 @@ export function App () {
       />
       <SheetContainer open={sheet?.name === 'settings'}>
         <ProfileView
+          active={sheet?.name === 'settings'}
           profile={profile}
           sharing={sharing}
           setSharing={setSharingEnabled}
@@ -178,7 +203,55 @@ export function App () {
           <InviteShareView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
         )}
       </SheetContainer>
+      {deletedNotices.length > 0 && (
+        <CircleDeletedNotice
+          circleName={deletedNotices[0].circleName}
+          onDismiss={() => dismissDeletedNotice(deletedNotices[0].circleId)}
+        />
+      )}
     </>
+  )
+}
+
+// Modal alert shown when a peer's circle is torn down by its owner.
+// One-shot per circle: dismiss runs circle:cleanup-deleted on the
+// worklet side which frees local state and removes the circle from the
+// dropdown / sheets. zIndex sits above SheetContainer (100) and the
+// BottomSheet (200) so the user can't miss it. Brand-aligned plain
+// styling — no icons, no extra chrome.
+function CircleDeletedNotice ({ circleName, onDismiss }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 300,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(0,0,0,0.6)',
+      padding: spacing.lg,
+    }}>
+      <div style={{
+        background: colors.surface.elevated,
+        borderRadius: radius.lg,
+        padding: spacing.lg,
+        maxWidth: 400, width: '100%',
+        border: `1px solid ${colors.border}`,
+      }}>
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
+          Circle deleted
+        </div>
+        <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
+          The owner deleted the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.
+        </div>
+        <button
+          onClick={onDismiss}
+          style={{
+            width: '100%', padding: '12px', borderRadius: radius.md,
+            background: colors.accent, color: colors.text.onPrimary,
+            border: 'none', cursor: 'pointer',
+            fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+          }}>
+          OK
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -435,7 +508,15 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
         pear.call('circles:getAll'),
         pear.call('circles:peers'),
       ])
-      setCircles(all?.circles ?? [])
+      // Defensive filter: hide circles whose owner has marked them
+      // deleted. The worklet's init-cleanup sweep usually catches stale
+      // tombstones on cold-start, but if a deletion lands mid-session
+      // before the user dismisses the notice (or if the event was
+      // missed and we haven't restarted yet), this keeps the dropdown,
+      // sheets, and map roster in sync with what's actually live.
+      // Errored entries are also skipped so one broken circle doesn't
+      // poison the home view.
+      setCircles((all?.circles ?? []).filter((c) => !c.error && !c.circle?.deleted))
       setSelfSeen(all?.selfLastSeen ?? null)
       const sets = peersResp?.peers ?? {}
       let total = 0
@@ -1971,7 +2052,244 @@ function fitTo (map, lonLatPairs) {
   if (cam) map.flyTo({ center: cam.center, zoom: cam.zoom, ...opts })
 }
 
-function ProfileView ({ profile, sharing, setSharing, onClose, onSaved }) {
+// Circles section in Settings. Lists every circle the user is in,
+// surfaces the user's role (owner/member), and offers a per-circle
+// delete (owner) or leave (non-owner) action with a two-tap confirm
+// pattern (4s auto-disarm) mirroring the place-delete UX. Calls the
+// new circle:delete / circle:leave IPCs added by the proposal
+// 2026-05-07; success removes the row from the list locally and
+// triggers an onChanged hook so the parent can refresh anything else
+// downstream. The home view's periodic circles:getAll poll picks up
+// the change within a few seconds without needing an explicit signal.
+function CirclesSection ({ active = true, onChanged }) {
+  const [list, setList] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [armed, setArmed] = useState(null)
+  const [pending, setPending] = useState(null)
+  const [error, setError] = useState(null)
+  // Rename state: which circle is being edited, its draft name, and a
+  // saving flag. Single edit at a time keeps the row layout simple.
+  const [editingId, setEditingId] = useState(null)
+  const [editName, setEditName] = useState('')
+  const [savingRename, setSavingRename] = useState(false)
+
+  const refresh = useCallback(async () => {
+    try {
+      const [id, snap] = await Promise.all([
+        pear.call('identity:get'),
+        pear.call('circles:getAll'),
+      ])
+      const ourKey = id?.publicKey ?? ''
+      const next = (snap?.circles ?? [])
+        .filter(c => !c.error && !c.circle?.deleted)
+        .map(c => ({
+          circleId: c.circleId,
+          name: c.circle?.name ?? '...',
+          isOwner: c.circle?.ownerKey === ourKey,
+          memberCount: (c.members ?? []).length,
+        }))
+      setList(next)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  // Refresh on activation (sheet opens) so renames / leaves / new joins
+  // since the previous open are visible. Plus a slow poll while active
+  // so peer-side renames during a session also land. SheetContainer
+  // keeps this component mounted across opens, so without an explicit
+  // active signal the data would freeze at first-mount.
+  useEffect(() => {
+    if (!active) return
+    refresh()
+    const id = setInterval(refresh, 5000)
+    return () => clearInterval(id)
+  }, [active, refresh])
+
+  useEffect(() => {
+    if (!armed) return
+    const id = setTimeout(() => setArmed(null), 4000)
+    return () => clearTimeout(id)
+  }, [armed])
+
+  const onTapAction = async (c) => {
+    if (armed !== c.circleId) {
+      setArmed(c.circleId)
+      return
+    }
+    setArmed(null)
+    setPending(c.circleId)
+    setError(null)
+    try {
+      const ipc = c.isOwner ? 'circle:delete' : 'circle:leave'
+      const r = await pear.call(ipc, { circleId: c.circleId })
+      if (!r?.ok) throw new Error('Could not ' + (c.isOwner ? 'delete' : 'leave') + ' circle')
+      setList(prev => prev.filter(x => x.circleId !== c.circleId))
+      onChanged?.()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setPending(null)
+    }
+  }
+
+  const startRename = (c) => {
+    setEditingId(c.circleId)
+    setEditName(c.name)
+    setArmed(null)
+    setError(null)
+  }
+  const cancelRename = () => {
+    setEditingId(null)
+    setEditName('')
+  }
+  const saveRename = async () => {
+    if (!editingId) return
+    const trimmed = editName.trim()
+    if (!trimmed) return
+    setSavingRename(true)
+    setError(null)
+    try {
+      const r = await pear.call('circle:rename', { circleId: editingId, name: trimmed })
+      const finalName = r?.name || trimmed
+      setList(prev => prev.map(x => x.circleId === editingId ? { ...x, name: finalName } : x))
+      setEditingId(null)
+      setEditName('')
+      onChanged?.()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setSavingRename(false)
+    }
+  }
+
+  if (loading || list.length === 0) return null
+
+  return (
+    <>
+      <h2 style={s.h2}>Circles</h2>
+      <p style={s.muted}>
+        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy.
+      </p>
+      <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
+        {list.map(c => {
+          const isArmed = armed === c.circleId
+          const isPending = pending === c.circleId
+          const isEditing = editingId === c.circleId
+          const verb = c.isOwner ? 'Delete' : 'Leave'
+          const verbing = c.isOwner ? 'Deleting...' : 'Leaving...'
+          const armedLabel = c.isOwner ? 'Tap again to delete' : 'Tap again to leave'
+          const btnColor = c.isOwner ? colors.error : colors.text.primary
+          if (isEditing) {
+            // Edit mode: input replaces name + count column; Save / Cancel
+            // replace the action button. Disabled while saving so a
+            // double-tap doesn't fire two renames.
+            const canSave = !!editName.trim() && editName.trim() !== c.name && !savingRename
+            return (
+              <li key={c.circleId} style={{
+                display: 'flex', alignItems: 'center', gap: spacing.sm,
+                padding: `${spacing.sm}px 0`,
+                borderBottom: `1px solid ${colors.divider}`,
+              }}>
+                <input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  maxLength={64}
+                  disabled={savingRename}
+                  style={{
+                    flex: 1, minWidth: 0,
+                    padding: `${spacing.xs + 2}px ${spacing.sm}px`,
+                    background: colors.surface.input,
+                    color: colors.text.primary,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radius.md,
+                    fontFamily: typography.fontFamily, fontSize: 14,
+                    outline: 'none',
+                  }}
+                />
+                <button
+                  onClick={saveRename}
+                  disabled={!canSave}
+                  style={{
+                    padding: '8px 14px', borderRadius: radius.md,
+                    background: canSave ? colors.accent : 'transparent',
+                    color: canSave ? colors.text.onPrimary : colors.text.muted,
+                    border: `1px solid ${canSave ? colors.accent : colors.border}`,
+                    cursor: canSave ? 'pointer' : 'default',
+                    fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+                    whiteSpace: 'nowrap',
+                  }}>
+                  {savingRename ? 'Saving...' : 'Save'}
+                </button>
+                <button
+                  onClick={cancelRename}
+                  disabled={savingRename}
+                  style={{
+                    padding: '8px 14px', borderRadius: radius.md,
+                    background: 'transparent', color: colors.text.secondary,
+                    border: `1px solid ${colors.border}`, cursor: 'pointer',
+                    fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 300,
+                    whiteSpace: 'nowrap',
+                  }}>
+                  Cancel
+                </button>
+              </li>
+            )
+          }
+          return (
+            <li key={c.circleId} style={{
+              display: 'flex', alignItems: 'center', gap: spacing.sm,
+              padding: `${spacing.sm}px 0`,
+              borderBottom: `1px solid ${colors.divider}`,
+            }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</div>
+                <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                  {c.isOwner ? 'You own this · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
+                </div>
+              </div>
+              {c.isOwner && (
+                <button
+                  onClick={() => startRename(c)}
+                  disabled={isPending}
+                  style={{
+                    padding: '8px 12px', borderRadius: radius.md,
+                    background: 'transparent', color: colors.text.secondary,
+                    border: `1px solid ${colors.border}`,
+                    cursor: isPending ? 'default' : 'pointer',
+                    fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 300,
+                    opacity: isPending ? 0.5 : 1,
+                    whiteSpace: 'nowrap',
+                  }}>
+                  Rename
+                </button>
+              )}
+              <button
+                onClick={() => onTapAction(c)}
+                disabled={isPending}
+                style={{
+                  padding: '8px 14px', borderRadius: radius.md,
+                  background: 'transparent', color: btnColor,
+                  border: `1px solid ${isArmed ? btnColor : colors.border}`,
+                  cursor: isPending ? 'default' : 'pointer',
+                  fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 300,
+                  opacity: isPending ? 0.5 : 1,
+                  whiteSpace: 'nowrap',
+                }}>
+                {isPending ? verbing : (isArmed ? armedLabel : verb)}
+              </button>
+            </li>
+          )
+        })}
+      </ul>
+      {error && <p style={s.error}>{error}</p>}
+    </>
+  )
+}
+
+function ProfileView ({ active = true, profile, sharing, setSharing, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -2252,6 +2570,8 @@ function ProfileView ({ profile, sharing, setSharing, onClose, onSaved }) {
         </>
       )}
       {sharingError && <p style={s.error}>{sharingError}</p>}
+
+      <CirclesSection active={active} onChanged={onSaved} />
 
       {battery.supported && (
         <>

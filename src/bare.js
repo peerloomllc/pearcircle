@@ -32,6 +32,7 @@ const { buildInvite, parseInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel } = require('./pair')
 const { signValue, verifyValue } = require('./lib/sign')
+const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify } = require('./lib/geofence')
 
 // Reject values stamped more than 5 minutes in the future against the local
@@ -256,7 +257,33 @@ const handlers = {
       valueEncoding: 'json',
     })
     await base.ready()
+
+    // Stale-invite check (proposal amendment 2026-05-07 §1). Join the
+    // swarm topic briefly so we can pull the latest `circle:` row; if the
+    // owner has already torn down, refuse the join with a clear error.
+    // We mount the topic before checking so peers serving the deleted
+    // tombstone can reach us. If the post-sync circle row carries
+    // `deleted: true`, we close the autobase and clean up the namespace
+    // we never persisted; nothing lingers on disk.
     _circleBases.set(circleId, base)
+    joinCircleTopic(circleId, circleKey)
+    try {
+      await base.update()
+    } catch (e) { console.warn('[bare] base.update during join failed', e?.message) }
+    const circleRow = await base.view.get('circle')
+    if (circleRow?.value?.deleted) {
+      // Roll back: leave swarm, close base, clear in-memory state.
+      try {
+        const topic = topicForCircleKey(circleKey)
+        const topicHex = b4a.toString(topic, 'hex')
+        _topicToCircle.delete(topicHex)
+        _swarm?.leave(topic)
+      } catch {}
+      try { await base.close() } catch {}
+      _circleBases.delete(circleId)
+      _circlePeers.delete(circleId)
+      throw new Error('this circle has been deleted by the owner')
+    }
 
     const joinedAt = Date.now()
     const record = {
@@ -269,8 +296,6 @@ const handlers = {
       joinedAt,
     }
     await _localDb.put('circles:joined:' + circleId, record)
-
-    joinCircleTopic(circleId, circleKey)
 
     return { ...record, alreadyJoined: false }
   },
@@ -476,6 +501,131 @@ const handlers = {
     return { invite, name }
   },
 
+  // Owner-only rename. Appends a fresh `circle:` row with the new name
+  // retaining the rest of the row. The apply branch already restricts
+  // `circle:` to owner-write only and uses linearization order (last
+  // owner-write wins by ordering, no LWW-on-createdAt needed since the
+  // owner is the sole writer). createdAt stays at the original value
+  // so the UI's "Created on..." semantics stay intact.
+  'circle:rename': async ({ circleId, name } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof name !== 'string') throw new Error('name must be a string')
+    const trimmed = name.trim().slice(0, 64)
+    if (trimmed.length === 0) throw new Error('name must be non-empty')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const circleRow = await base.view.get('circle')
+    if (!circleRow?.value) throw new Error('circle metadata missing')
+    if (circleRow.value.ownerKey !== ourKeyHex) {
+      throw new Error('only the owner can rename this circle')
+    }
+    if (circleRow.value.deleted) throw new Error('this circle has been deleted')
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    if (circleRow.value.name === trimmed) return { ok: true, name: trimmed }
+    const updated = { ...circleRow.value, name: trimmed }
+    await base.append({ type: 'put', key: 'circle', value: updated })
+    // Mirror the new name to the local circles:joined record so the
+    // dropdown / sheets reflect the rename even before circles:getAll
+    // refreshes from the autobase view.
+    const localRecord = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+    if (localRecord?.value) {
+      await _localDb.put('circles:joined:' + circleId, { ...localRecord.value, name: trimmed }).catch(() => {})
+    }
+    return { ok: true, name: trimmed }
+  },
+
+  // Owner-only tear-down (proposal amendment 2026-05-07 §1). Appends a
+  // `circle:` row with `deleted: true, deletedAt` retaining all other
+  // existing fields, waits ~2s for replication-ack to currently-connected
+  // peers, then runs local teardown. Open Question #5 acknowledged: peers
+  // that aren't connected during the window won't see the tombstone until
+  // they next sync against an online peer that does have it (degenerate
+  // case if no such peer exists). Returns immediately on local teardown
+  // completion; the toast caveat lives in the UI layer.
+  'circle:delete': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const circleRow = await base.view.get('circle')
+    if (!circleRow?.value) throw new Error('circle metadata missing')
+    if (circleRow.value.ownerKey !== ourKeyHex) {
+      throw new Error('only the owner can delete this circle')
+    }
+    if (circleRow.value.deleted) {
+      // Idempotent: already deleted on the wire; just ensure local state
+      // is gone too.
+      await tearDownCircleLocally(circleId)
+      return { ok: true, alreadyDeleted: true }
+    }
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const tombstone = {
+      ...circleRow.value,
+      deleted: true,
+      deletedAt: Date.now(),
+    }
+    await base.append({ type: 'put', key: 'circle', value: tombstone })
+    // Brief replication window. Peers connected via Hyperswarm pull our
+    // hypercore over the duplex stream; 2s is a best-effort upper bound
+    // for letting an active connection drain. We don't have a true
+    // replication-ack primitive, so this is empirical (proposal §Open
+    // questions #2).
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    await tearDownCircleLocally(circleId)
+    return { ok: true, alreadyDeleted: false }
+  },
+
+  // Voluntary self-leave (proposal amendment 2026-05-07 §2). Appends a
+  // signed `left:{ourKey}` row with our identity pubkey, waits ~2s for
+  // peers to pull, then runs local teardown. Owners CAN call this for
+  // symmetry; the UI nudges owners toward `circle:delete` instead since
+  // owner-leave abandons the circle without a tombstone (other writers
+  // continue, but no future delete is possible without an active owner).
+  'circle:leave': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) {
+      // No autobase mounted — could be a stale local record left over
+      // from a partial cleanup. Just clear local state and return.
+      await tearDownCircleLocally(circleId)
+      return { ok: true, alreadyLeft: true }
+    }
+    if (!base.writable) {
+      // We were never granted writer access — our `left:` write would be
+      // dropped by the apply branch. Skip the on-wire write, just remove
+      // ourselves locally; peers never knew us as a writer anyway.
+      await tearDownCircleLocally(circleId)
+      return { ok: true, alreadyLeft: true }
+    }
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const value = signValue({
+      pubkey: ourKeyHex,
+      leftAt: Date.now(),
+      v: 1,
+    }, _identity.secretKey)
+    await base.append({ type: 'put', key: 'left:' + ourKeyHex, value })
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    await tearDownCircleLocally(circleId)
+    return { ok: true, alreadyLeft: false }
+  },
+
+  // Peer-side post-notification cleanup (proposal amendment 2026-05-07).
+  // Bare emits `circle:deleted` when the apply branch processes an
+  // owner-tear-down tombstone; the UI shows a one-time notice and then
+  // calls this to actually free local state. Splitting emission from
+  // teardown gives the UI a chance to surface the message before the
+  // circle disappears from the user's list.
+  'circle:cleanup-deleted': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    await tearDownCircleLocally(circleId)
+    return { ok: true }
+  },
+
   'circles:list': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const circles = []
@@ -675,18 +825,37 @@ async function snapshotCircle (circleId, base) {
   await base.update()
   const view = base.view
   const circleRow = await view.get('circle')
+  // Pull `left:` rows up front so the member / lastSeen / presence
+  // streams below can filter against them via the leftAt > joinedAt rule
+  // (proposal amendment 2026-05-07 §2). leavers stay hidden until they
+  // rejoin with a fresh member: write whose joinedAt > left.leftAt.
+  const leftAtByPubkey = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'left:', lt: 'left:~' })) {
+    const pubkey = key.slice('left:'.length)
+    if (typeof value?.leftAt === 'number') leftAtByPubkey.set(pubkey, value.leftAt)
+  }
   const members = []
   for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+    const leftAt = leftAtByPubkey.get(value?.pubkey)
+    if (memberHiddenByLeft(leftAt, value?.joinedAt)) continue
     members.push({ key, value })
   }
   const lastSeen = {}
   for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
     const pubkey = key.slice('lastSeen:'.length)
+    if (leftAtByPubkey.has(pubkey)) {
+      const memberRow = await view.get('member:' + pubkey)
+      if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
+    }
     lastSeen[pubkey] = value
   }
   const presence = {}
   for await (const { key, value } of view.createReadStream({ gt: 'presence:', lt: 'presence:~' })) {
     const pubkey = key.slice('presence:'.length)
+    if (leftAtByPubkey.has(pubkey)) {
+      const memberRow = await view.get('member:' + pubkey)
+      if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
+    }
     presence[pubkey] = value
   }
   const places = []
@@ -694,7 +863,9 @@ async function snapshotCircle (circleId, base) {
     if (value && !isDeleted(value)) places.push(value)
   }
   // Most recent 50 transitions, newest first. Reverse-stream the
-  // ts-prefixed keys so we don't have to load the whole range.
+  // ts-prefixed keys so we don't have to load the whole range. We don't
+  // filter transitions by `left:` — they're historical events; hiding
+  // them after the fact would rewrite history (proposal §2).
   const transitions = []
   for await (const { value } of view.createReadStream({
     gt: 'transition:', lt: 'transition:~', reverse: true, limit: 50,
@@ -740,6 +911,37 @@ function joinCircleTopic (circleId, circleKey) {
   _swarm.join(topic, { server: true, client: true })
 }
 
+// Local teardown for a circle (proposal amendment 2026-05-07): leave the
+// swarm topic, close the autobase, drop in-memory geofence + peer state,
+// remove the local `circles:joined` record. Used by both `circle:delete`
+// (owner) and `circle:leave` (member) after the on-wire write has been
+// appended and given a brief replication window. Idempotent — repeated
+// calls on an already-cleaned-up circle are no-ops.
+async function tearDownCircleLocally (circleId) {
+  const record = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+  if (record?.value?.circleKey && _swarm) {
+    try {
+      const topic = topicForCircleKey(record.value.circleKey)
+      const topicHex = b4a.toString(topic, 'hex')
+      _topicToCircle.delete(topicHex)
+      const discovery = _swarm.leave(topic)
+      if (discovery && typeof discovery.flushed === 'function') {
+        try { await discovery.flushed() } catch {}
+      }
+    } catch (e) { console.warn('[bare] swarm leave failed', e?.message) }
+  }
+  const base = _circleBases.get(circleId)
+  if (base) {
+    try { await base.close() } catch (e) { console.warn('[bare] base close failed', e?.message) }
+    _circleBases.delete(circleId)
+  }
+  _circlePeers.delete(circleId)
+  for (const key of Array.from(_circlePlaces.keys())) {
+    if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
+  }
+  await _localDb.del('circles:joined:' + circleId).catch(() => {})
+}
+
 // Autobase hooks. The view is a Hyperbee on a sub-core named 'view'; apply
 // routes ops by record kind (proposal §4). For 6D scope, only `circle` and
 // `member:*` are handled; addWriter and other kinds land in subsequent slices.
@@ -768,11 +970,51 @@ async function applyCircleNodes (nodes, view, base, circleId) {
     }
 
     if (op.type === 'put' && typeof op.key === 'string') {
-      // `circle`: owner-write only — bootstrap writer authored or ignored
+      // `circle`: owner-write only — bootstrap writer authored or ignored.
+      // The optional `deleted: true, deletedAt` shape (proposal amendment
+      // 2026-05-07) is the owner's tear-down tombstone. We pass it through
+      // unchanged; consumers (snapshot helpers, circles:list, circle:join)
+      // are responsible for filtering. Emit `circle:deleted` once the
+      // deleted state lands so the shell can show a one-time notice and
+      // clean up local state.
       if (op.key === 'circle') {
         const fromHex = b4a.toString(node.from.key, 'hex')
         if (fromHex !== bootstrapHex) continue
+        const wasDeleted = !!(await view.get('circle'))?.value?.deleted
         await view.put('circle', op.value)
+        // Suppress the event when this device originated the write — the
+        // owner's own `circle:delete` IPC already runs the teardown, so
+        // they don't need a "deleted by its owner" notification about
+        // themselves. base.local.key is our writer-core key on this
+        // autobase; for the owner it equals bootstrapHex, for peers it
+        // doesn't.
+        const ourLocalKey = base.local && b4a.toString(base.local.key, 'hex')
+        const isOurOwnWrite = ourLocalKey && ourLocalKey === fromHex
+        if (circleId && op.value?.deleted && !wasDeleted && !isOurOwnWrite) {
+          try {
+            send({ event: 'circle:deleted', data: {
+              circleId,
+              circleName: op.value?.name || 'Circle',
+              deletedAt: typeof op.value?.deletedAt === 'number' ? op.value.deletedAt : Date.now(),
+            }})
+          } catch (e) { console.warn('[bare] circle:deleted emit failed', e?.message) }
+        }
+        continue
+      }
+      // `left:{pubkey}` (proposal amendment 2026-05-07): voluntary-leave
+      // tombstone. Self-write only — signature must verify against the
+      // value's pubkey, and the key segment must match. Filter rule lives
+      // in the snapshot helpers: a member is hidden when
+      // left.leftAt > member.joinedAt. Rejoin works without any explicit
+      // unset because the new member-row's joinedAt beats the older leftAt.
+      if (op.key.startsWith('left:')) {
+        const incoming = op.value
+        if (!verifyValue(incoming)) continue
+        if (typeof incoming.leftAt !== 'number') continue
+        if (incoming.leftAt > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
+        const keyPubkey = op.key.slice('left:'.length)
+        if (keyPubkey !== incoming.pubkey) continue
+        await view.put(op.key, incoming)
         continue
       }
       // `member:*`: any current writer
@@ -1038,6 +1280,25 @@ async function init ({ dataDir } = {}, attempt = 0) {
       }
     }
     if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
+  }
+
+  // Stale-deleted sweep (proposal amendment 2026-05-07). If a previous
+  // session pulled an owner's circle.deleted tombstone but the
+  // circle:deleted event was lost (e.g., fired before the WebView was
+  // loaded — the queue-until-loaded pattern only protects deeplink and
+  // notification:focus), the local circles:joined record is still here
+  // and the autobase view shows deleted=true. Tear down silently — the
+  // user already missed the in-app notice on the prior session, so a
+  // fresh notification on every cold-start would be noise.
+  for (const [circleId, base] of Array.from(_circleBases)) {
+    try {
+      const circleRow = await base.view.get('circle')
+      if (circleRow?.value?.deleted) {
+        await tearDownCircleLocally(circleId)
+      }
+    } catch (e) {
+      console.warn('[bare] stale-deleted check failed for', circleId, e?.message)
+    }
   }
 
   // Populate the in-process geofence tracker from each circle's current

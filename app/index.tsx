@@ -262,6 +262,11 @@ export default function Index() {
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
     onEvent('sharing:changed', (data) => emitEvent('sharing:changed', data))
+    // Owner tear-down notice (proposal amendment 2026-05-07). The worklet
+    // suppresses this on the owner's own device, so we only see it when
+    // a peer's circle has been deleted by its owner. UI surfaces a
+    // one-time toast and then runs circle:cleanup-deleted.
+    onEvent('circle:deleted', (data) => emitEvent('circle:deleted', data))
     // Geofence transitions land here; fire OS notification if it's a peer
     // (not us) and the place isn't muted on this device.
     onEvent('transition:applied', (data) => { fireTransitionNotification(data) })

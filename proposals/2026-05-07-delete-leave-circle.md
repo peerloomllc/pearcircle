@@ -1,6 +1,6 @@
 # Delete-circle (owner) and leave-circle (member)
 
-**Status**: Approved 2026-05-07. Open questions resolved per the recommendations in §Open questions; approval record will land in `reviews/2026-05-07-delete-leave-circle.md` after the implementation slice ships. Subsequent protocol changes follow the Constitution §3 proposal gate.
+**Status**: Approved 2026-05-07. Open questions resolved per the recommendations in §Open questions. Implementation shipped 2026-05-07; approval record at `reviews/2026-05-07-delete-leave-circle.md`. Subsequent protocol changes follow the Constitution §3 proposal gate.
 
 **Goal**: Let an owner permanently tear down a circle they created (cascading a "circle deleted" tombstone to all peers) and let any member voluntarily leave a circle they joined (clean local-only departure with peer-side cleanup of their replicated rows).
 
