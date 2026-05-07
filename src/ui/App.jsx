@@ -3,7 +3,10 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile } from '@phosphor-icons/react'
+import { motionState } from '../lib/motion.js'
+import motionWalkingUrl from '../../assets/images/motion_walking.png'
+import motionDrivingUrl from '../../assets/images/motion_driving.png'
 
 // Inject the Manrope @font-face once per WebView load. Mirrors PearCal's
 // pattern so the family resolves before any styled element renders.
@@ -11,6 +14,34 @@ if (typeof document !== 'undefined' && !document.getElementById('pearcircle-font
   const styleEl = document.createElement('style')
   styleEl.id = 'pearcircle-font-styles'
   styleEl.textContent = FONT_CSS
+  document.head.appendChild(styleEl)
+}
+
+// Motion-badge pulse keyframe injected once. Used by the walking / driving
+// sticker overlay on member pins. Subtle scale-only animation so it reads
+// as breathing rather than throbbing; sticker artwork stays crisp.
+if (typeof document !== 'undefined' && !document.getElementById('pearcircle-motion-pulse')) {
+  const styleEl = document.createElement('style')
+  styleEl.id = 'pearcircle-motion-pulse'
+  styleEl.textContent = `@keyframes pearcircle-motion-pulse {
+    0%   { transform: scale(0.95); }
+    50%  { transform: scale(1.08); }
+    100% { transform: scale(0.95); }
+  }`
+  document.head.appendChild(styleEl)
+}
+
+// Focus-pin spin keyframe. Drives the rotating cyan conic-gradient ring
+// that surrounds the selected member's avatar. The avatar itself stays
+// stationary (the ring is a sibling element behind it), so only the
+// gradient halo rotates.
+if (typeof document !== 'undefined' && !document.getElementById('pearcircle-focus-spin')) {
+  const styleEl = document.createElement('style')
+  styleEl.id = 'pearcircle-focus-spin'
+  styleEl.textContent = `@keyframes pearcircle-focus-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }`
   document.head.appendChild(styleEl)
 }
 import QRCode from 'qrcode'
@@ -709,6 +740,7 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
             <div style={s.focusTextCol}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <div style={s.focusName}>{selectedMember.displayName}</div>
+                <MotionGlyph speed={selectedMember.seen?.speed} size={14} />
                 <BatteryBadge level={selectedMember.seen?.battery} />
               </div>
               <div style={s.focusSub}>
@@ -1744,9 +1776,12 @@ function buildBubbleElement (clickRef) {
 // swaps to a cyan ring with a glow halo.
 function renderBubble (root, member, selected, last) {
   const pubkey = member.value?.pubkey ?? ''
-  const size = selected ? 48 : 40
-  const ring = selected ? 3 : 2
-  const ringColor = selected ? '#7ec4cf' : '#1a1a1a'
+  const size = selected ? 72 : 60
+  const ring = selected ? 4 : 3
+  // Selected state's ring is the rotating conic-gradient (rendered as a
+  // sibling below). Non-selected uses a thin static dark border on the
+  // avatar div for a clean edge against bright map tiles.
+  const ringColor = '#1a1a1a'
 
   const avatar = member.value?.avatar
   const label = member.value?.displayName ?? '?'
@@ -1765,8 +1800,29 @@ function renderBubble (root, member, selected, last) {
     ? Math.round(last.battery) : null
   const battColor = batt == null ? null : (batt < 20 ? '#e57373' : batt < 50 ? '#ffb74d' : '#81c784')
   const battHtml = batt == null ? '' : (
-    `<div style="position:absolute;bottom:-3px;left:50%;transform:translateX(-50%);width:20px;height:9px;background:#1a1a1a;border:1px solid #888;border-radius:2px;box-sizing:border-box;overflow:hidden;pointer-events:none;">` +
+    `<div style="position:absolute;z-index:2;bottom:-5px;left:50%;transform:translateX(-50%);width:30px;height:14px;background:#1a1a1a;border:1px solid #888;border-radius:3px;box-sizing:border-box;overflow:hidden;pointer-events:none;">` +
     `<div style="width:${batt}%;height:100%;background:${battColor};"></div>` +
+    `</div>`
+  )
+
+  // Motion overlay: hand-illustrated sticker (walking shoe / car) inside
+  // a dark circular badge anchored at the top-right of the avatar. Dark
+  // backdrop boosts the cyan strokes against bright map tiles. Plain DOM
+  // (no SVG — renderBubble saga). Subtle pulse keyframe (defined once at
+  // module load) reads as breathing motion since the sticker itself is
+  // static. "Still" renders nothing so resting members don't get a glyph
+  // cluttering the pin.
+  const motion = motionState(last?.speed)
+  const motionUrl = motion === 'walking' ? motionWalkingUrl : motion === 'driving' ? motionDrivingUrl : null
+  // Negative animation-delay aligns the pulse to wall-clock so it stays
+  // in phase across the periodic innerHTML rewrites in syncMembers
+  // (otherwise the animation restarts at 0% every refresh and looks choppy).
+  // Same trick is applied to the focus-ring spin below.
+  const pulseDelay = -((Date.now() % 1600) / 1000)
+  const spinDelay = -((Date.now() % 2400) / 1000)
+  const motionHtml = motionUrl == null ? '' : (
+    `<div style="position:absolute;z-index:2;top:-6px;right:-9px;width:36px;height:36px;background:#0f1417;border:1px solid #2a3338;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.5);pointer-events:none;animation:pearcircle-motion-pulse 1.6s ease-in-out infinite;animation-delay:${pulseDelay}s;transform-origin:center;">` +
+    `<img src="${motionUrl}" alt="" style="width:27px;height:auto;display:block;" />` +
     `</div>`
   )
 
@@ -1784,9 +1840,28 @@ function renderBubble (root, member, selected, last) {
   root.style.filter = selected
     ? 'drop-shadow(0 0 10px rgba(126,196,207,0.7)) drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
     : 'drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
+  // Rotating focus ring: only present when selected. Sits behind the
+  // avatar as a positioned sibling (DOM-order first); inset:-${ring}px
+  // makes it extend that many pixels beyond root, so only the ring band
+  // around the avatar shows the gradient. The avatar itself doesn't
+  // rotate because the spin animation is on the ring element only.
+  // Conic distribution: a soft cyan blob occupying ~quarter of the
+  // circumference, dark elsewhere, so the cyan reads as a moving
+  // highlight rather than a full halo.
+  const focusRingHtml = selected ? (
+    `<div style="position:absolute;z-index:0;inset:-${ring}px;border-radius:50%;background:conic-gradient(from 0deg, #1a1a1a 0%, #7ec4cf 25%, #1a1a1a 50%, #1a1a1a 100%);animation:pearcircle-focus-spin 2.4s linear infinite;animation-delay:${spinDelay}s;pointer-events:none;"></div>`
+  ) : ''
+
+  // Avatar inner div: when selected, no internal border (the rotating
+  // ring takes over the visual); when non-selected, the thin dark edge
+  // keeps the pin readable on bright tiles.
+  const avatarBorder = selected ? 'none' : `${ring}px solid ${ringColor}`
+
   root.innerHTML =
-    `<div style="width:100%;height:100%;border-radius:50%;overflow:hidden;border:${ring}px solid ${ringColor};background:#fc7;box-sizing:border-box;">${inner}</div>` +
-    battHtml
+    focusRingHtml +
+    `<div style="position:relative;z-index:1;width:100%;height:100%;border-radius:50%;overflow:hidden;border:${avatarBorder};background:#fc7;box-sizing:border-box;">${inner}</div>` +
+    battHtml +
+    motionHtml
 }
 
 function syncMembers (map, data, selectedPubkey, states, clickRef, ensureRaf) {
@@ -2447,7 +2522,10 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
         <Avatar base64={member.value?.avatar} label={displayName} size={36} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-            <div style={{ ...s.memberName, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
+              <div style={{ ...s.memberName, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
+              {!isPaused && <MotionGlyph speed={seen?.speed} size={14} />}
+            </div>
             {!isPaused && <BatteryBadge level={seen?.battery} />}
           </div>
           {isPaused ? (
@@ -2469,6 +2547,25 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
         </div>
       </div>
     </li>
+  )
+}
+
+// Walking / driving glyph derived from lastSeen.speed (m/s). Returns
+// null for null / negative / "still" so most rows render no glyph and
+// only the in-motion ones get an icon. Used inline next to the member's
+// displayName in the bottom-sheet roster and the focus bar.
+function MotionGlyph ({ speed, size = 14 }) {
+  const state = motionState(speed)
+  if (state !== 'walking' && state !== 'driving') return null
+  const Icon = state === 'walking' ? PersonSimpleWalk : CarProfile
+  const label = state === 'walking' ? 'walking' : 'driving'
+  return (
+    <Icon
+      size={size}
+      weight='thin'
+      aria-label={label}
+      style={{ color: colors.text.secondary, flexShrink: 0 }}
+    />
   )
 }
 
