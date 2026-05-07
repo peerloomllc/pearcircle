@@ -32,8 +32,8 @@ describe('haversineMeters', () => {
 })
 
 describe('classify state machine', () => {
-  test('first observation inside fires initial-trigger enter', () => {
-    expect(classify(50, 100, null)).toEqual({ classification: 'inside', kind: 'enter' })
+  test('first observation inside establishes baseline silently', () => {
+    expect(classify(50, 100, null)).toEqual({ classification: 'inside', kind: null })
   })
 
   test('first observation outside is silent', () => {

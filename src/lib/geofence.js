@@ -24,8 +24,10 @@ function haversineMeters (lat1, lon1, lat2, lon2) {
 // was crossed.
 //
 // `prev` is one of:
-//   null       — first observation; an initial-trigger 'enter' fires when
-//                inside (matches OS GeofencingRequest INITIAL_TRIGGER_ENTER)
+//   null       — no baseline yet (first-ever observation, or cold start
+//                before classification was persisted). Establishes the
+//                baseline silently; no transition fires. Notifications
+//                only happen when the user actually crosses the boundary.
 //   'inside'   — last observation was within the radius
 //   'outside'  — last observation was outside the radius
 //
@@ -33,7 +35,7 @@ function haversineMeters (lat1, lon1, lat2, lon2) {
 function classify (distance, radius, prev) {
   const inside = distance <= radius
   const next = inside ? 'inside' : 'outside'
-  if (prev === null) return { classification: next, kind: inside ? 'enter' : null }
+  if (prev === null) return { classification: next, kind: null }
   if (prev === 'outside' && inside) return { classification: next, kind: 'enter' }
   if (prev === 'inside' && !inside) return { classification: next, kind: 'exit' }
   return { classification: next, kind: null }

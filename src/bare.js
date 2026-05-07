@@ -64,8 +64,8 @@ let _sharingExpiryTimer = null    // setTimeout handle for the pending auto-resu
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
 // transitions when classification flips. lastClassification === null is
-// the "haven't seen a location yet" state and lets the next observation
-// inside fire an initial-trigger enter (matching INITIAL_TRIGGER_ENTER).
+// the "haven't seen a location yet" state; the next observation
+// establishes the baseline silently (no spurious enter on cold start).
 const _circlePlaces = new Map() // "{circleId}|{placeId}" → state
 
 function trackPlace (circleId, place) {
@@ -1026,8 +1026,9 @@ async function init ({ dataDir } = {}, attempt = 0) {
 
   // Populate the in-process geofence tracker from each circle's current
   // view. Places landing later via apply branch will be added there too.
-  // Initial classification is null so the first location:update fires an
-  // initial-trigger enter if the user is already inside the radius.
+  // Initial classification is null; the first location:update establishes
+  // the baseline silently so a cold start while inside a Place doesn't
+  // fire a spurious "arrived" notification.
   _circlePlaces.clear()
   for (const [circleId, base] of _circleBases) {
     try {
