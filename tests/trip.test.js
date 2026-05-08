@@ -124,6 +124,60 @@ describe('stepTrip state machine', () => {
     expect(r.completed).toBeNull()
     expect(r.state.phase).toBe('idle')
   })
+
+  test('tracks running max speed across phases and stashes on completed record', () => {
+    let s = newTripState()
+    expect(s.maxSpeedMps).toBe(0)
+    let ts = 0
+    // Idle -> arming. First point sets max from speed at entry.
+    s = stepTrip(s, pointAt(0, ts, 6)).state
+    expect(s.maxSpeedMps).toBe(6)
+    // Arming step with a higher speed bumps the max.
+    ts += 5000
+    s = stepTrip(s, pointAt(1, ts, 12)).state
+    expect(s.maxSpeedMps).toBe(12)
+    // A lower-but-still-moving speed leaves the max untouched.
+    ts += 5000
+    s = stepTrip(s, pointAt(2, ts, 8)).state
+    expect(s.maxSpeedMps).toBe(12)
+    // Push past arming into active, with a new peak speed.
+    ts += TRIP_ARMING_DURATION_MS
+    s = stepTrip(s, pointAt(3, ts, 25)).state
+    expect(s.phase).toBe('active')
+    expect(s.maxSpeedMps).toBe(25)
+    // Pad active phase past the min duration gate.
+    ts += TRIP_MIN_DURATION_MS
+    s = stepTrip(s, pointAt(4, ts, 18)).state
+    expect(s.maxSpeedMps).toBe(25)
+    // Active -> cooldown.
+    ts += 1000
+    s = stepTrip(s, pointAt(5, ts, 0)).state
+    expect(s.phase).toBe('cooldown')
+    // Cooldown elapses -> trip completes; max speed is on the record.
+    ts += TRIP_COOLDOWN_DURATION_MS
+    const r = stepTrip(s, pointAt(5, ts, 0))
+    expect(r.completed).not.toBeNull()
+    expect(r.completed.maxSpeedMps).toBe(25)
+  })
+
+  test('preserves max speed when active step receives garbage speed', () => {
+    // Get into 'active' with maxSpeedMps=15.
+    let s = newTripState()
+    let ts = 0
+    s = stepTrip(s, pointAt(0, ts, 15)).state // idle -> arming, max=15
+    ts += TRIP_ARMING_DURATION_MS
+    s = stepTrip(s, pointAt(1, ts, 8)).state  // arming -> active, max stays 15
+    expect(s.phase).toBe('active')
+    expect(s.maxSpeedMps).toBe(15)
+    // CLLocation -1 unknown-speed sentinel during an active trip: the
+    // state machine routes it to cooldown (moving check fails) but max
+    // is preserved -- the guard inside bumpMaxSpeed never lets it
+    // overwrite a real reading even on the entry-to-cooldown step.
+    ts += 1000
+    s = stepTrip(s, pointAt(2, ts, -1)).state
+    expect(s.phase).toBe('cooldown')
+    expect(s.maxSpeedMps).toBe(15)
+  })
 })
 
 describe('polylineDistanceMeters', () => {

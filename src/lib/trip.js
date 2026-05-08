@@ -35,7 +35,15 @@ function newTripState () {
     startTs: null,
     polyline: [],
     cooldownStartTs: null,
+    maxSpeedMps: 0,
   }
+}
+
+// Returns the higher of the running max and a candidate speed, ignoring
+// non-finite, negative, and CLLocation's -1 unknown-speed sentinel.
+function bumpMaxSpeed (current, candidate) {
+  if (typeof candidate !== 'number' || !Number.isFinite(candidate) || candidate < 0) return current
+  return candidate > current ? candidate : current
 }
 
 // Extend the polyline if the new point is meaningfully different from
@@ -79,6 +87,7 @@ function stepTrip (state, { lat, lon, ts, speed }) {
           startTs: null,
           polyline: [[lat, lon, ts]],
           cooldownStartTs: null,
+          maxSpeedMps: bumpMaxSpeed(0, speed),
         },
         completed: null,
       }
@@ -89,31 +98,34 @@ function stepTrip (state, { lat, lon, ts, speed }) {
         return { state: newTripState(), completed: null }
       }
       const polyline = appendPoint(state.polyline, lat, lon, ts)
+      const maxSpeedMps = bumpMaxSpeed(state.maxSpeedMps, speed)
       if (ts - state.armingStartTs >= TRIP_ARMING_DURATION_MS) {
         return {
-          state: { ...state, phase: 'active', startTs: state.armingStartTs, polyline },
+          state: { ...state, phase: 'active', startTs: state.armingStartTs, polyline, maxSpeedMps },
           completed: null,
         }
       }
-      return { state: { ...state, polyline }, completed: null }
+      return { state: { ...state, polyline, maxSpeedMps }, completed: null }
     }
     case 'active': {
       const polyline = appendPoint(state.polyline, lat, lon, ts)
+      const maxSpeedMps = bumpMaxSpeed(state.maxSpeedMps, speed)
       if (!moving) {
         return {
-          state: { ...state, phase: 'cooldown', cooldownStartTs: ts, polyline },
+          state: { ...state, phase: 'cooldown', cooldownStartTs: ts, polyline, maxSpeedMps },
           completed: null,
         }
       }
-      return { state: { ...state, polyline }, completed: null }
+      return { state: { ...state, polyline, maxSpeedMps }, completed: null }
     }
     case 'cooldown': {
       if (moving) {
         // Brief stop is over; resume the same trip and keep extending
         // the polyline from the new point.
         const polyline = appendPoint(state.polyline, lat, lon, ts)
+        const maxSpeedMps = bumpMaxSpeed(state.maxSpeedMps, speed)
         return {
-          state: { ...state, phase: 'active', cooldownStartTs: null, polyline },
+          state: { ...state, phase: 'active', cooldownStartTs: null, polyline, maxSpeedMps },
           completed: null,
         }
       }
@@ -132,10 +144,12 @@ function stepTrip (state, { lat, lon, ts, speed }) {
             polyline: state.polyline,
             distanceMeters,
             durationMs,
+            maxSpeedMps: state.maxSpeedMps,
           },
         }
       }
       // Still in cooldown; user is stopped, don't extend the polyline.
+      // Speed is below threshold so maxSpeedMps doesn't move.
       return { state, completed: null }
     }
   }

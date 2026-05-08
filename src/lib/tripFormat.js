@@ -15,6 +15,16 @@ function formatDistance (meters, unit = 'km') {
   return km < 10 ? `${km.toFixed(1)} km` : `${km.toFixed(0)} km`
 }
 
+// Speed formatter for the trip detail view. `mps` is meters/second
+// straight from FusedLocationProvider (Android) / CLLocation.speed
+// (iOS, when it lands). Negative or non-finite values render empty so
+// older trip records lacking maxSpeedMps degrade gracefully.
+function formatSpeed (mps, unit = 'km') {
+  if (typeof mps !== 'number' || !Number.isFinite(mps) || mps < 0) return ''
+  if (unit === 'miles') return `${(mps * 2.2369362921).toFixed(0)} mph`
+  return `${(mps * 3.6).toFixed(0)} km/h`
+}
+
 function formatDuration (ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return ''
   const totalMin = Math.round(ms / 60_000)
@@ -106,6 +116,7 @@ function polylineGeoJson (polyline) {
 module.exports = {
   formatDistance,
   formatDuration,
+  formatSpeed,
   formatTripDate,
   tripBoundingBox,
   polylineSvgPath,

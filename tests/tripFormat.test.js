@@ -1,6 +1,7 @@
 const {
   formatDistance,
   formatDuration,
+  formatSpeed,
   formatTripDate,
   tripBoundingBox,
   polylineSvgPath,
@@ -46,6 +47,22 @@ describe('formatDuration', () => {
   test('rejects garbage input', () => {
     expect(formatDuration(NaN)).toBe('')
     expect(formatDuration(-5)).toBe('')
+  })
+})
+
+describe('formatSpeed', () => {
+  test('km/h conversion', () => {
+    expect(formatSpeed(35)).toBe('126 km/h') // 35 m/s = 126 km/h
+    expect(formatSpeed(0)).toBe('0 km/h')
+  })
+  test('mph conversion', () => {
+    expect(formatSpeed(35, 'miles')).toBe('78 mph') // 35 m/s ≈ 78.3 mph
+    expect(formatSpeed(0, 'miles')).toBe('0 mph')
+  })
+  test('rejects garbage', () => {
+    expect(formatSpeed(-1)).toBe('') // CLLocation unknown-speed sentinel
+    expect(formatSpeed(NaN)).toBe('')
+    expect(formatSpeed(undefined)).toBe('')
   })
 })
 

@@ -5,7 +5,7 @@ import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
-import { formatDistance, formatDuration, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
+import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
 
@@ -1999,9 +1999,17 @@ function EdgeIndicators ({ map, ready, members, lastSeen, selectedPubkey, onSele
   const h = canvas.clientHeight
   if (w === 0 || h === 0) return null
 
+  // TOP/BOTTOM/SIDE define the rect the indicator gets *clamped* into when
+  // shown, so it doesn't tuck under the focus bar / FABs. They are NOT
+  // the on-screen test -- a pin can sit under the top bar and still be
+  // mostly visible, and we don't want to double up with an indicator.
+  // PIN_HALF covers the avatar (size/2 = 36 for selected) plus the motion
+  // badge's ~9px overhang to the right; using one symmetric value is a
+  // tiny over-correction on directions without overhang, which is fine.
   const TOP = 80
   const BOTTOM = 96
   const SIDE = 32
+  const PIN_HALF = 40
   const cx = w / 2
   const cy = (TOP + (h - BOTTOM)) / 2
   const halfW = w / 2 - SIDE
@@ -2017,7 +2025,12 @@ function EdgeIndicators ({ map, ready, members, lastSeen, selectedPubkey, onSele
     let p
     try { p = map.project([seen.lon, seen.lat]) } catch { continue }
     if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue
-    const onScreen = p.x >= SIDE && p.x <= w - SIDE && p.y >= TOP && p.y <= h - BOTTOM
+    // Only show the indicator once the pin's bounding box has fully
+    // cleared the canvas in some direction. A pin whose center is even
+    // 1px inside the screen still has 39px of avatar visible, so the
+    // user can see it -- no indicator needed.
+    const onScreen = p.x >= -PIN_HALF && p.x <= w + PIN_HALF
+                  && p.y >= -PIN_HALF && p.y <= h + PIN_HALF
     if (onScreen) continue
 
     const dx = p.x - cx
@@ -3662,6 +3675,9 @@ function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
           {trip && (
             <div style={{ ...typography.caption, color: colors.text.secondary }}>
               {formatDistance(trip.distanceMeters, distanceUnit)} · {formatDuration(trip.durationMs)}
+              {formatSpeed(trip.maxSpeedMps, distanceUnit)
+                ? ` · max ${formatSpeed(trip.maxSpeedMps, distanceUnit)}`
+                : ''}
             </div>
           )}
         </div>

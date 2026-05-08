@@ -792,6 +792,7 @@ const handlers = {
           polyline: r.completed.polyline,
           distanceMeters: r.completed.distanceMeters,
           durationMs: r.completed.durationMs,
+          maxSpeedMps: r.completed.maxSpeedMps ?? 0,
           v: 1,
         }
         await _localDb.put(tripKey, trip)
