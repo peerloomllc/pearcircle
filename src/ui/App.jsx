@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
@@ -53,6 +53,15 @@ const pear = {
   on: (...args) => window.pear.on(...args),
 }
 
+// Tactile feedback helper. Fire-and-forget: a missed haptic is never a
+// reason to block the visible action that triggered it. Kinds match the
+// shell's `shell:haptic` IPC handler:
+//   light | medium | heavy  -> impact
+//   warn  | success         -> notification
+function haptic (kind) {
+  try { pear.call('shell:haptic', { kind }) } catch {}
+}
+
 // Inject MapLibre's stylesheet exactly once per page. esbuild's
 // --loader:.css=text drops the CSS into the JS bundle as a string so we
 // can stamp it into a <style> tag at runtime - we have no separate CSS
@@ -66,9 +75,11 @@ function ensureMapLibreCss () {
   _mapLibreCssInjected = true
 }
 
-// OpenFreeMap is a free, key-less, OSM-based MapLibre style. Swap to
-// Protomaps in a follow-up slice once we have an API key (TODO.md).
-const TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
+// OpenFreeMap is a free, key-less, OSM-based MapLibre style. Default
+// fallback when there's no override in AsyncStorage. The user can swap
+// to Protomaps or any other MapLibre-style URL via Settings -> Map tiles
+// without rebuilding the app.
+const DEFAULT_TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
 
 export function App () {
   const [view, setView] = useState({ name: 'home' })
@@ -86,6 +97,16 @@ export function App () {
   // free local state. Stored as an array because two circles could
   // theoretically be deleted in quick succession.
   const [deletedNotices, setDeletedNotices] = useState([])
+  // MapLibre style URL. Hydrated from AsyncStorage (via shell:tileStyle:get)
+  // on mount; passed down to HomeMapView -> CircleMap so the map can hot-
+  // swap on edit. Settings -> Map tiles writes through both AsyncStorage
+  // and this state via setTileStyleUrlAndPersist.
+  const [tileStyleUrl, setTileStyleUrl] = useState(DEFAULT_TILE_STYLE_URL)
+  const setTileStyleUrlAndPersist = useCallback(async (url) => {
+    const next = url == null || url === '' ? null : url
+    try { await pear.call('shell:tileStyle:set', { url: next }) } catch {}
+    setTileStyleUrl(next ?? DEFAULT_TILE_STYLE_URL)
+  }, [])
 
   const refresh = useCallback(async () => {
     const [id, pr, sh] = await Promise.all([
@@ -103,6 +124,11 @@ export function App () {
 
   useEffect(() => {
     refresh()
+    // Pull the persisted tile-style override (if any). Failures fall back
+    // to the default; a missing override is normal on first launch.
+    pear.call('shell:tileStyle:get').then((r) => {
+      if (r?.url && typeof r.url === 'string') setTileStyleUrl(r.url)
+    }).catch(() => {})
     pear.on('ready', refresh)
     pear.on('sharing:changed', ({ enabled, expiresAt }) => {
       setSharing({
@@ -131,6 +157,19 @@ export function App () {
         return [...prev, { circleId, circleName: circleName || 'Circle' }]
       })
     })
+    // Light tactile feedback on every button tap. Capture-phase listener
+    // so it fires before any onClick handler stops propagation. Buttons
+    // that fire a stronger haptic (data-haptic="warn", "medium", etc.)
+    // opt out so the user feels one buzz per tap, not a double-tap.
+    // Disabled buttons skip the haptic since the visible action also won't fire.
+    const onAnyClick = (e) => {
+      const btn = e.target.closest('button')
+      if (!btn || btn.disabled) return
+      if (btn.dataset.haptic) return
+      haptic('light')
+    }
+    document.addEventListener('click', onAnyClick, true)
+    return () => { document.removeEventListener('click', onAnyClick, true) }
   }, [refresh])
 
   // Dismiss the head notice: tell the worklet to free local state, then
@@ -174,6 +213,7 @@ export function App () {
         identity={identity}
         profile={profile}
         sharing={sharing.enabled}
+        tileStyleUrl={tileStyleUrl}
         setView={setView}
         setSheet={setSheet}
         initialSelectedCircleId={view.selectCircle ?? null}
@@ -185,6 +225,8 @@ export function App () {
           profile={profile}
           sharing={sharing}
           setSharing={setSharingEnabled}
+          tileStyleUrl={tileStyleUrl}
+          setTileStyleUrl={setTileStyleUrlAndPersist}
           onClose={closeSheet}
           onSaved={refresh}
         />
@@ -474,7 +516,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSelectedCircleId = null, initialFocus = null }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
@@ -856,6 +898,7 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
           data={data}
           selectedPubkey={selectedPubkey}
           connectedPubkeys={connectedPubkeys}
+          tileStyleUrl={tileStyleUrl}
           onMemberClick={onPinTap}
           onLongPress={onMapLongPress}
         />
@@ -1083,6 +1126,39 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
         }}
       >
         <InfoIcon size={22} weight='thin' />
+      </button>
+      {/* Find-me FAB stacked above the About FAB. Plain camera helper:
+          tap = flyTo self's last-known coords, no focus-mode change, no
+          sheet. Dimmed/no-op when we don't have a fix yet (selfSeen is
+          null on cold-start before the first location:update). */}
+      <button
+        type='button'
+        onClick={() => {
+          if (!selfSeen) return
+          mapApiRef.current?.flyTo({
+            center: [selfSeen.lon, selfSeen.lat], zoom: 16, duration: 1100,
+          })
+        }}
+        aria-label={selfSeen ? 'Center on my location' : 'Waiting for your location'}
+        title={selfSeen ? 'Center on my location' : 'Waiting for your location'}
+        style={{
+          position: 'absolute',
+          right: 16,
+          bottom: `calc(env(safe-area-inset-bottom, 0px) + 72px)`,
+          width: 44, height: 44, borderRadius: '50%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(26,26,26,0.92)',
+          backdropFilter: 'blur(8px)',
+          WebkitBackdropFilter: 'blur(8px)',
+          border: `1px solid ${colors.border}`,
+          color: colors.text.primary,
+          cursor: selfSeen ? 'pointer' : 'default',
+          opacity: selfSeen ? 1 : 0.5,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+          zIndex: 5,
+        }}
+      >
+        <NavigationArrow size={22} weight='thin' />
       </button>
 
       {circles.length === 0 ? (
@@ -1551,9 +1627,14 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
 }
 
 const CircleMap = React.forwardRef(function CircleMap (
-  { data, selectedPubkey, connectedPubkeys, onMemberClick, onLongPress },
+  { data, selectedPubkey, connectedPubkeys, tileStyleUrl, onMemberClick, onLongPress },
   apiRef,
 ) {
+  // Initial style at mount time. We can't read this from a ref/prop on
+  // every map instantiation (the map mounts once), so we pin it to the
+  // value at first render and rely on the dedicated setStyle effect
+  // below to swap on subsequent edits.
+  const initialStyleRef = useRef(tileStyleUrl || DEFAULT_TILE_STYLE_URL)
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const fittedRef = useRef(false)
@@ -1650,7 +1731,7 @@ const CircleMap = React.forwardRef(function CircleMap (
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: TILE_STYLE_URL,
+      style: initialStyleRef.current,
       center: [0, 0],
       zoom: 1.5,
       attributionControl: false,
@@ -1746,6 +1827,21 @@ const CircleMap = React.forwardRef(function CircleMap (
       map.remove()
     }
   }, [])
+
+  // Hot-swap the MapLibre style when the user changes the tile-provider
+  // override in Settings. Skips on mount (the initial style is set in
+  // the map constructor) and any time the URL didn't actually change.
+  // setStyle clears layers/sources from the previous style, so the data-
+  // sync effect below re-runs on the next style-load to repopulate the
+  // place rings, member markers, etc.
+  useEffect(() => {
+    const map = mapRef.current
+    const want = tileStyleUrl || DEFAULT_TILE_STYLE_URL
+    if (!map || want === initialStyleRef.current) return
+    initialStyleRef.current = want
+    fittedRef.current = false // re-fit after the new style finishes loading
+    try { map.setStyle(want) } catch (e) { console.warn('setStyle failed', e?.message) }
+  }, [tileStyleUrl])
 
   // Sync features and member markers whenever data or selection
   // changes. Wait for the style to finish loading on the first call.
@@ -2378,7 +2474,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharing, onClose, onSaved }) {
+function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -2687,7 +2783,134 @@ function ProfileView ({ active = true, profile, sharing, setSharing, onClose, on
           {batteryError && <p style={s.error}>{batteryError}</p>}
         </>
       )}
+
+      <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
     </div>
+  )
+}
+
+// Map-tiles section in Settings. The default is OpenFreeMap; advanced
+// users can paste any MapLibre style JSON URL (e.g. their own Protomaps
+// or self-hosted server) and the map hot-swaps without a relaunch.
+// Reset clears the override so we fall back to DEFAULT_TILE_STYLE_URL.
+function TileStyleSection ({ url, onChange }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(url ?? '')
+  const [error, setError] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const isCustom = !!url && url !== DEFAULT_TILE_STYLE_URL
+
+  const startEdit = () => {
+    setDraft(url ?? DEFAULT_TILE_STYLE_URL)
+    setError(null)
+    setEditing(true)
+  }
+  const cancelEdit = () => {
+    setEditing(false)
+    setError(null)
+  }
+  const validate = (s) => {
+    const t = (s ?? '').trim()
+    if (!t) return 'URL is required'
+    if (!/^https?:\/\//i.test(t)) return 'URL must start with http:// or https://'
+    return null
+  }
+  const save = async () => {
+    const err = validate(draft)
+    if (err) { setError(err); return }
+    setBusy(true)
+    try {
+      await onChange(draft.trim())
+      setEditing(false)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const reset = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await onChange(null)
+      setEditing(false)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <h2 style={s.h2}>Map tiles</h2>
+      <p style={s.muted}>
+        The map fetches tile imagery from this MapLibre style URL.
+        Default is OpenFreeMap, an OpenStreetMap-based service. Change
+        this if the default is unavailable or you want to point at your
+        own provider.
+      </p>
+      {!editing && (
+        <>
+          <div style={{
+            ...typography.caption, color: colors.text.secondary,
+            background: colors.surface.input,
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.md,
+            padding: `${spacing.sm}px ${spacing.md}px`,
+            wordBreak: 'break-all',
+            marginBottom: spacing.sm,
+            fontFamily: typography.monoFamily,
+          }}>
+            {url || DEFAULT_TILE_STYLE_URL}
+            {!isCustom && (
+              <span style={{ color: colors.text.muted, marginLeft: spacing.xs }}>(default)</span>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={startEdit}>
+              Edit URL
+            </button>
+            {isCustom && (
+              <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={reset} disabled={busy}>
+                Reset to default
+              </button>
+            )}
+          </div>
+        </>
+      )}
+      {editing && (
+        <>
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder='https://...'
+            spellCheck={false}
+            autoCapitalize='off'
+            style={{
+              width: '100%', boxSizing: 'border-box',
+              padding: `${spacing.sm}px ${spacing.md}px`,
+              background: colors.surface.input,
+              color: colors.text.primary,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.md,
+              fontFamily: typography.monoFamily, fontSize: 13,
+              outline: 'none',
+              marginBottom: spacing.sm,
+            }}
+          />
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={save} disabled={busy}>
+              {busy ? 'Saving...' : 'Save'}
+            </button>
+            <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={cancelEdit} disabled={busy}>
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
+      {error && <p style={s.error}>{error}</p>}
+    </>
   )
 }
 
@@ -3020,7 +3243,10 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
   const onHandleTouchMove = (e) => {
     if (touchStartY.current === null) return
     const dy = e.touches[0].clientY - touchStartY.current
-    if (dy > 60) { touchStartY.current = null; close() }
+    // Medium impact haptic on swipe-down dismissal so the gesture has a
+    // tactile "released" feel. Scrim taps also close but don't fire
+    // haptics -- that's a lighter intent and shouldn't buzz.
+    if (dy > 60) { touchStartY.current = null; haptic('medium'); close() }
   }
 
   const translateY = (!visible || closing) ? '100%' : '0%'
@@ -3106,7 +3332,15 @@ function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive =
           Cancel
         </button>
         <button
-          onClick={onConfirm}
+          data-haptic={destructive ? 'warn' : 'light'}
+          onClick={() => {
+            // Warn-level notification haptic on destructive commits
+            // (delete-circle, leave-circle, place-delete) -- the
+            // data-haptic attribute opts this button out of the global
+            // light-tick so the user feels one warn buzz, not light+warn.
+            if (destructive) haptic('warn')
+            onConfirm?.()
+          }}
           disabled={busy}
           style={{
             flex: 1, padding: '12px 16px', borderRadius: radius.md,

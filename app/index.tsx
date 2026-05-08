@@ -8,6 +8,7 @@ import * as FileSystem from 'expo-file-system/legacy'
 import * as Linking from 'expo-linking'
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Notifications from 'expo-notifications'
+import * as Haptics from 'expo-haptics'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 
 const { PearCircleLocation } = NativeModules
@@ -29,6 +30,11 @@ Notifications.setNotificationHandler({
 // WebView is the editor; RN holds the source of truth for fast lookup when
 // transition:applied events arrive.
 const MUTES_KEY = 'pc:notif:mutes'
+// Persisted MapLibre style URL. Default lives in src/ui/App.jsx so the
+// WebView can fall back when AsyncStorage has nothing yet. Keeping the
+// string here too avoids a chicken-and-egg dance on first launch (we'd
+// have to round-trip to the WebView before showing the map).
+const TILE_STYLE_KEY = 'pc:tile:styleUrl'
 const _mutes = new Set<string>()
 let _ourPubkey: string | null = null
 
@@ -464,6 +470,32 @@ export default function Index() {
       respond(msg.id, { ok: true })
       return
     }
+    if (msg.method === 'shell:tileStyle:get') {
+      // MapLibre style URL override. null means "use default" (the WebView
+      // has the default constant). Tile-provider independence per TODO.md.
+      try {
+        const raw = await AsyncStorage.getItem(TILE_STYLE_KEY)
+        respond(msg.id, { url: typeof raw === 'string' && raw.length > 0 ? raw : null })
+      } catch (err: any) {
+        respond(msg.id, { url: null, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:tileStyle:set') {
+      // url === null clears the override and falls back to the WebView's
+      // default. Truthy strings are stored verbatim; the WebView is
+      // responsible for validating before calling.
+      const url = msg.args?.url
+      try {
+        if (url == null) await AsyncStorage.removeItem(TILE_STYLE_KEY)
+        else if (typeof url === 'string' && url.length > 0) await AsyncStorage.setItem(TILE_STYLE_KEY, url)
+        else { respond(msg.id, { ok: false, error: 'url must be a non-empty string or null' }); return }
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
     if (msg.method === 'shell:openUrl') {
       // Hand a URL off to the OS for resolution. Used by the member
       // detail sheet's "Get directions" action with a geo: URI; could
@@ -481,6 +513,23 @@ export default function Index() {
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
       }
+      return
+    }
+    if (msg.method === 'shell:haptic') {
+      // Tactile feedback for high-touch interactions in the WebView.
+      // Routes through the shell because expo-haptics is a native
+      // module not directly accessible from the WebView. Failures are
+      // silently swallowed -- a missing haptic is never a reason to
+      // block the user-visible action that triggered it.
+      const kind = msg.args?.kind
+      try {
+        if (kind === 'light') await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+        else if (kind === 'medium') await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
+        else if (kind === 'heavy') await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy)
+        else if (kind === 'warn') await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning)
+        else if (kind === 'success') await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
+      } catch {}
+      respond(msg.id, { ok: true })
       return
     }
     if (msg.method === 'shell:battery:requestExempt') {
