@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, Modal, TouchableOpacity } from 'react-native'
+import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, Modal, TouchableOpacity, BackHandler } from 'react-native'
 import { WebView } from 'react-native-webview'
 import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
@@ -331,7 +331,20 @@ export default function Index() {
       }
     })
 
-    return () => { sub.remove(); linkSub.remove(); notifSub.remove() }
+    // Hardware-back / back-gesture handling. We always consume the event
+    // here (return true) and let the WebView decide what to do via the
+    // back:pressed event: if it has anything to dismiss (open sheet,
+    // active focus, etc.) it consumes; otherwise it calls shell:exitApp
+    // and we exit. The handler returns true unconditionally because
+    // BackHandler is synchronous and we can't wait for the WebView's
+    // async response -- exitApp is the WebView's explicit signal that
+    // the back was effectively unhandled.
+    const backSub = BackHandler.addEventListener('hardwareBackPress', () => {
+      emitEvent('back:pressed', null)
+      return true
+    })
+
+    return () => { sub.remove(); linkSub.remove(); notifSub.remove(); backSub.remove() }
   }, [])
 
   const deliverDeeplink = (url: string) => {
@@ -479,6 +492,18 @@ export default function Index() {
       } catch (err: any) {
         respond(msg.id, { url: null, error: err?.message ?? String(err) })
       }
+      return
+    }
+    if (msg.method === 'shell:exitApp') {
+      // Last-resort exit. The WebView's back:pressed handler walks its
+      // own dismissal stack first; only when nothing is left to close
+      // does it call this. BackHandler.exitApp() bypasses the OS's
+      // recents-suspend route and actually finishes the activity --
+      // the foreground location service still keeps the worklet alive
+      // (per network-change-handler design), so location sharing
+      // continues in the background.
+      try { BackHandler.exitApp() } catch {}
+      respond(msg.id, { ok: true })
       return
     }
     if (msg.method === 'shell:tileStyle:set') {

@@ -62,6 +62,29 @@ function haptic (kind) {
   try { pear.call('shell:haptic', { kind }) } catch {}
 }
 
+// Module-level LIFO stack for hardware-back handlers. Each component
+// that wants to claim back uses useBackHandler() to push its handler
+// while it's "active" (sheet open, focus set, etc.). The shell's
+// BackHandler emits a `back:pressed` event; App walks this stack
+// from the top (most recently pushed = innermost UI), and the first
+// handler to return true consumes the event. If none consume, App
+// falls through to `shell:exitApp`. Mirrors React's render-order
+// nesting so an inner sheet/modal naturally dismisses first.
+const _backStack = []
+function useBackHandler (handler, active = true) {
+  const handlerRef = useRef(handler)
+  useEffect(() => { handlerRef.current = handler }, [handler])
+  useEffect(() => {
+    if (!active) return
+    const wrapped = () => handlerRef.current?.()
+    _backStack.push(wrapped)
+    return () => {
+      const i = _backStack.lastIndexOf(wrapped)
+      if (i >= 0) _backStack.splice(i, 1)
+    }
+  }, [active])
+}
+
 // Inject MapLibre's stylesheet exactly once per page. esbuild's
 // --loader:.css=text drops the CSS into the JS bundle as a string so we
 // can stamp it into a <style> tag at runtime - we have no separate CSS
@@ -91,6 +114,17 @@ export function App () {
   //   settings | about | create | join | invite
   const [sheet, setSheet] = useState(null)
   const closeSheet = useCallback(() => setSheet(null), [])
+  // Back gesture closes the current overlay (settings / about / create /
+  // join / invite). Only active while a sheet is open so it doesn't sit
+  // in _backStack at idle. ConfirmSheet (a nested BottomSheet) registers
+  // its own handler when mounted, so back inside an open Settings sheet
+  // dismisses the ConfirmSheet first, then on the next back this fires
+  // to close Settings.
+  useBackHandler(useCallback(() => {
+    if (!sheet) return false
+    closeSheet()
+    return true
+  }, [sheet, closeSheet]), !!sheet)
   // Owner-tear-down notice queue (proposal amendment 2026-05-07 §1).
   // The worklet emits `circle:deleted` when an owner's tombstone lands;
   // we show one alert per circle, then call circle:cleanup-deleted to
@@ -169,6 +203,18 @@ export function App () {
       haptic('light')
     }
     document.addEventListener('click', onAnyClick, true)
+
+    // Hardware-back precedence chain. Walk the LIFO _backStack from the
+    // top; first handler to return true consumes the event (closes a
+    // sheet, clears focus, etc.). If nothing consumes it, ask the shell
+    // to exit the app. The shell registers BackHandler in app/index.tsx
+    // and relays here via the back:pressed event.
+    pear.on('back:pressed', () => {
+      for (let i = _backStack.length - 1; i >= 0; i--) {
+        try { if (_backStack[i]() === true) return } catch {}
+      }
+      pear.call('shell:exitApp').catch(() => {})
+    })
     return () => { document.removeEventListener('click', onAnyClick, true) }
   }, [refresh])
 
@@ -792,6 +838,17 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     setMemberSheetVisible(false)
     mapApiRef.current?.fitAll()
   }, [])
+
+  // Back gesture clears member focus and returns the camera to the all-
+  // fit baseline. Only active while a member is focused, so back at
+  // idle (no sheets, no focus) falls through to shell:exitApp. Member
+  // detail sheet (a BottomSheet) registers a handler of its own that
+  // pops first if it's open.
+  useBackHandler(useCallback(() => {
+    if (!selectedPubkey) return false
+    clearFocus()
+    return true
+  }, [selectedPubkey, clearFocus]), !!selectedPubkey)
 
   // Notification-tap focus delivered via prop from App. Each tap arrives
   // with a fresh seq so we can detect new taps even on repeat-tap of the
@@ -3238,6 +3295,17 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
       return true
     })
   }, [onClose])
+
+  // Hardware back closes the sheet. Returns true so the back-stack walk
+  // stops here -- nested sheets stack naturally (most-recently-mounted
+  // is at the top of _backStack, so it gets first crack). Skipped while
+  // already in the closing animation so a second back during the slide-
+  // out doesn't cascade into the next handler too early.
+  useBackHandler(useCallback(() => {
+    if (closing) return true
+    close()
+    return true
+  }, [closing, close]))
 
   const onHandleTouchStart = (e) => { touchStartY.current = e.touches[0].clientY }
   const onHandleTouchMove = (e) => {
