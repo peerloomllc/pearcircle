@@ -35,6 +35,7 @@ const { signValue, verifyValue } = require('./lib/sign')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
+const { newTripState, stepTrip } = require('./lib/trip')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -79,6 +80,14 @@ let _selfLastSeen = null          // latest signed location for own pubkey, used
 let _sharingEnabled = true        // local privacy/battery toggle; when false location:update is dropped. Persisted in _localDb under `sharing`. Loaded on init.
 let _sharingExpiresAt = null      // ms timestamp. While _sharingEnabled is false and expiresAt is in the future, mute is "until then"; once now > expiresAt, the worklet auto-resumes (writes a fresh visible presence row + restarts the local toggle). null means indefinite mute (manual resume only).
 let _sharingExpiryTimer = null    // setTimeout handle for the pending auto-resume, cleared whenever sharing:set is called again or auto-resume fires.
+// In-process trip-detection state. Lives only in memory; if the worklet
+// dies mid-trip the in-flight polyline is lost. v1 doesn't persist
+// every checkpoint to disk -- the cost would dominate the budget for
+// no real benefit, since the most common loss case (force-stop or OOM)
+// also kills the active drive use case. See proposal-deferred slice 2
+// if this ever needs to survive crashes.
+let _tripState = newTripState()
+
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
@@ -763,7 +772,47 @@ const handlers = {
     // but the second write is byte-identical so the view is unchanged).
     await checkPlaceTransitions(lat, lon, accuracy, stamp, batt)
 
+    // Trip detection: feed the speed/coord pair through the state
+    // machine. A completed trip (return value's `completed` is set)
+    // gets persisted to the local Hyperbee under
+    // `trips:{ourKey}:{startTs}` and broadcast as a `trip:completed`
+    // event so the UI / OS-notification layer can react. Per CLAUDE.md
+    // trips are local-only by default; the per-circle autobase doesn't
+    // see them.
+    try {
+      const sp = typeof speed === 'number' ? speed : null
+      const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
+      _tripState = r.state
+      if (r.completed) {
+        const tripKey = 'trips:' + ourKey + ':' + r.completed.startTs
+        const trip = {
+          pubkey: ourKey,
+          startTs: r.completed.startTs,
+          endTs: r.completed.endTs,
+          polyline: r.completed.polyline,
+          distanceMeters: r.completed.distanceMeters,
+          durationMs: r.completed.durationMs,
+          v: 1,
+        }
+        await _localDb.put(tripKey, trip)
+        send({ event: 'trip:completed', data: trip })
+      }
+    } catch (e) { console.warn('[bare] trip step failed', e?.message) }
+
     return { ok: true, written, pubkey: ourKey }
+  },
+
+  'trips:list': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const trips = []
+    for await (const { value } of _localDb.createReadStream({
+      gt: 'trips:' + ourKey + ':',
+      lt: 'trips:' + ourKey + ':~',
+    })) {
+      if (value) trips.push(value)
+    }
+    return { trips }
   },
 }
 
