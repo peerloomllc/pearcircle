@@ -1,30 +1,63 @@
 // Visual tokens for PearCircle. Structure mirrors PearGuard's theme so
-// the family looks coherent across PeerLoom apps. PearCircle is dark-
-// only for now; light-mode follow-up if/when needed.
+// the family looks coherent across PeerLoom apps.
 //
-// Colors lean green-forward to match the app icon (the lime pear on a
-// dark forest-green background). Teal accent is kept separately for
-// member-pin selection rings since it pops better against the green
-// avatar bubbles.
+// Theming uses CSS variables defined in App.jsx's pearcircle-theme-vars
+// <style> block. There are two palettes -- dark (default) and light --
+// and the two resolve through the same var(--color-*) names. The values
+// exported here are the var() strings themselves, so any inline style
+// referencing colors.x picks up the current theme automatically without
+// a re-render.
+//
+// For non-CSS contexts that need a literal hex (MapLibre paint props,
+// some marker rendering paths), import colorsRaw -- it holds the dark
+// palette and is theme-stable. App.jsx's themeColor() helper can also
+// read the live computed value off documentElement when needed.
 
 export const colors = {
-  primary: '#9FE15A',          // brand lime (matches the pear)
-  primaryDark: '#5BAF3A',
-  accent: '#7ec4cf',           // teal for selection rings, "Live" pill kept green
-  error: '#ef5350',
-  warn: '#ffb74d',
-  success: '#7ec77a',
+  primary:     'var(--color-primary)',
+  primaryDark: 'var(--color-primary-dark)',
+  accent:      'var(--color-accent)',
+  error:       'var(--color-error)',
+  warn:        'var(--color-warn)',
+  success:     'var(--color-success)',
   surface: {
-    base: '#0d0d0d',           // app background
-    card: '#1a1a1a',           // cards, list items, inputs
-    elevated: '#252525',       // headers, sheets above cards
-    input: '#1c1c1c',
+    base:     'var(--color-surface-base)',
+    card:     'var(--color-surface-card)',
+    elevated: 'var(--color-surface-elevated)',
+    input:    'var(--color-surface-input)',
   },
   text: {
-    primary: '#f0f0f0',
+    primary:    'var(--color-text-primary)',
+    secondary:  'var(--color-text-secondary)',
+    muted:      'var(--color-text-muted)',
+    onPrimary:  'var(--color-text-on-primary)',
+  },
+  border: 'var(--color-border)',
+  divider: 'var(--color-divider)',
+}
+
+// Raw palette. Dark values; what colors.* used to resolve to before the
+// CSS-variable refactor. Use only when var() can't (MapLibre paint props,
+// canvas, anything that needs a static literal). Tests also import this
+// for pure-Node assertions.
+export const colorsRaw = {
+  primary:     '#9FE15A',
+  primaryDark: '#5BAF3A',
+  accent:      '#7ec4cf',
+  error:       '#ef5350',
+  warn:        '#ffb74d',
+  success:     '#7ec77a',
+  surface: {
+    base:     '#0d0d0d',
+    card:     '#1a1a1a',
+    elevated: '#252525',
+    input:    '#1c1c1c',
+  },
+  text: {
+    primary:   '#f0f0f0',
     secondary: '#a0a0a0',
-    muted: '#666666',
-    onPrimary: '#0a1f23',      // text on primary-color buttons
+    muted:     '#666666',
+    onPrimary: '#0a1f23',
   },
   border: '#2a2a2a',
   divider: '#222222',

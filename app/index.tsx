@@ -38,6 +38,10 @@ const TILE_STYLE_KEY = 'pc:tile:styleUrl'
 // Display preference: 'km' (default) or 'miles'. Persisted via the
 // shell:distanceUnit IPC so the WebView can hydrate it on boot.
 const DISTANCE_UNIT_KEY = 'pc:distanceUnit'
+// Theme preference: 'dark' (default) or 'light'. CSS variables in the
+// WebView swap palettes via document.documentElement.dataset.theme; this
+// just persists the user's choice across launches.
+const THEME_KEY = 'pc:theme'
 const _mutes = new Set<string>()
 let _ourPubkey: string | null = null
 
@@ -520,6 +524,29 @@ export default function Index() {
         respond(msg.id, { unit: raw === 'miles' ? 'miles' : 'km' })
       } catch (err: any) {
         respond(msg.id, { unit: 'km', error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:theme:get') {
+      try {
+        const raw = await AsyncStorage.getItem(THEME_KEY)
+        respond(msg.id, { theme: raw === 'light' ? 'light' : 'dark' })
+      } catch (err: any) {
+        respond(msg.id, { theme: 'dark', error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:theme:set') {
+      const theme = msg.args?.theme
+      if (theme !== 'dark' && theme !== 'light') {
+        respond(msg.id, { ok: false, error: "theme must be 'dark' or 'light'" })
+        return
+      }
+      try {
+        await AsyncStorage.setItem(THEME_KEY, theme)
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
       }
       return
     }

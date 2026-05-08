@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
-import { colors, typography, spacing, radius } from './theme.js'
+import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
@@ -44,6 +44,80 @@ if (typeof document !== 'undefined' && !document.getElementById('pearcircle-focu
     to   { transform: rotate(360deg); }
   }`
   document.head.appendChild(styleEl)
+}
+
+// Theme palette. CSS variables on :root provide the dark default (matches
+// pre-theme behavior, no flash on cold start). [data-theme="light"]
+// overrides every variable in the light palette. JS toggles by setting
+// document.documentElement.setAttribute('data-theme', 'light' | 'dark').
+//
+// Inline styles in this file reference these via the colors export from
+// theme.js -- e.g. `colors.text.primary` resolves to `var(--color-text-primary)`.
+// Non-CSS contexts (MapLibre paint props, marker conic-gradients, anything
+// that needs a literal hex) read the raw values via colorsRaw / themeColor()
+// helpers; those won't auto-update on theme switch but have either a
+// theme-neutral palette already or get refreshed via setPaintProperty.
+if (typeof document !== 'undefined' && !document.getElementById('pearcircle-theme-vars')) {
+  const styleEl = document.createElement('style')
+  styleEl.id = 'pearcircle-theme-vars'
+  styleEl.textContent = `
+    :root {
+      --color-primary: #9FE15A;
+      --color-primary-dark: #5BAF3A;
+      --color-accent: #7ec4cf;
+      --color-error: #ef5350;
+      --color-warn: #ffb74d;
+      --color-success: #7ec77a;
+      --color-text-primary: #f0f0f0;
+      --color-text-secondary: #a0a0a0;
+      --color-text-muted: #666666;
+      --color-text-on-primary: #0a1f23;
+      --color-surface-base: #0d0d0d;
+      --color-surface-card: #1a1a1a;
+      --color-surface-elevated: #252525;
+      --color-surface-input: #1c1c1c;
+      --color-border: #2a2a2a;
+      --color-divider: #222222;
+    }
+    [data-theme="light"] {
+      --color-primary: #5BAF3A;
+      --color-primary-dark: #3F8A26;
+      --color-accent: #3a8a99;
+      --color-error: #c62828;
+      --color-warn: #b8730f;
+      --color-success: #2e7d32;
+      --color-text-primary: #1a1916;
+      --color-text-secondary: #5a5a5a;
+      --color-text-muted: #999999;
+      --color-text-on-primary: #ffffff;
+      --color-surface-base: #f7f5f0;
+      --color-surface-card: #ffffff;
+      --color-surface-elevated: #fafafa;
+      --color-surface-input: #f0ede8;
+      --color-border: #e0ddd5;
+      --color-divider: #ececec;
+    }
+  `
+  document.head.appendChild(styleEl)
+  // Default to dark until persisted preference loads. App's effect calls
+  // setTheme() with the persisted value (or system pref) once known.
+  document.documentElement.setAttribute('data-theme', 'dark')
+}
+
+// Set the data-theme attribute on the root element. Effective immediately
+// for everything reading var(--color-*) in inline styles. MapLibre layers
+// don't respond to CSS var changes; refreshMapTheme() handles those.
+function setTheme (mode) {
+  if (typeof document === 'undefined') return
+  document.documentElement.setAttribute('data-theme', mode === 'light' ? 'light' : 'dark')
+}
+
+// Read a CSS variable's resolved value. Used by code that needs a literal
+// hex (MapLibre paint props, canvas rendering). Caller must call again
+// after setTheme() to get the current-mode value.
+function themeColor (name) {
+  if (typeof document === 'undefined') return ''
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
 }
 import QRCode from 'qrcode'
 
@@ -154,6 +228,17 @@ export function App () {
     try { await pear.call('shell:distanceUnit:set', { unit: next }) } catch {}
     setDistanceUnit(next)
   }, [])
+  // Theme mode preference. CSS variables in the pearcircle-theme-vars
+  // <style> block resolve via document.documentElement[data-theme="..."],
+  // which setTheme() flips. Hydrated from AsyncStorage on mount; default
+  // dark (matches the pre-toggle look). Persists via shell:theme:set.
+  const [themeMode, setThemeMode] = useState('dark')
+  const setThemeModeAndPersist = useCallback(async (mode) => {
+    const next = mode === 'light' ? 'light' : 'dark'
+    setTheme(next)
+    try { await pear.call('shell:theme:set', { theme: next }) } catch {}
+    setThemeMode(next)
+  }, [])
 
   const refresh = useCallback(async () => {
     const [id, pr, sh] = await Promise.all([
@@ -178,6 +263,11 @@ export function App () {
     }).catch(() => {})
     pear.call('shell:distanceUnit:get').then((r) => {
       if (r?.unit === 'miles' || r?.unit === 'km') setDistanceUnit(r.unit)
+    }).catch(() => {})
+    pear.call('shell:theme:get').then((r) => {
+      const mode = r?.theme === 'light' ? 'light' : 'dark'
+      setTheme(mode)
+      setThemeMode(mode)
     }).catch(() => {})
     pear.on('ready', refresh)
     pear.on('sharing:changed', ({ enabled, expiresAt }) => {
@@ -291,6 +381,8 @@ export function App () {
           setTileStyleUrl={setTileStyleUrlAndPersist}
           distanceUnit={distanceUnit}
           setDistanceUnit={setDistanceUnitAndPersist}
+          themeMode={themeMode}
+          setThemeMode={setThemeModeAndPersist}
           onClose={closeSheet}
           onSaved={refresh}
         />
@@ -1011,7 +1103,10 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           background: 'rgba(26,26,26,0.92)',
           backdropFilter: 'blur(8px)',
           WebkitBackdropFilter: 'blur(8px)',
-          borderBottom: `1px solid ${colors.border}`,
+          // Use raw (dark-mode) border on these map-overlay surfaces so
+          // light mode doesn't render a light border on a dark fab.
+          borderBottom: `1px solid ${colorsRaw.border}`,
+          color: colorsRaw.text.primary,
           display: 'flex', alignItems: 'center', gap: 8,
           transform: selectedMember ? 'translateY(0)' : 'translateY(-100%)',
           transition: 'transform 250ms cubic-bezier(0.32, 0.72, 0, 1)',
@@ -1021,20 +1116,29 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       >
         {selectedMember && (
           <>
-            <button type='button' style={s.iconBtn} onClick={clearFocus} aria-label='Back to all'>‹</button>
+            {/* Inline color override on the back arrow + name: this whole
+                bar is theme-stable (dark fab over light tiles), so we
+                pin to the raw dark-mode text color rather than letting
+                colors.text.primary flip dark in light mode. */}
+            <button
+              type='button'
+              style={{ ...s.iconBtn, color: colorsRaw.text.primary }}
+              onClick={clearFocus}
+              aria-label='Back to all'
+            >‹</button>
             <button
               type='button'
               onClick={() => setMemberSheetVisible(true)}
               style={{
                 flex: 1, display: 'flex', alignItems: 'center', gap: 8,
                 background: 'transparent', border: 'none', padding: 0,
-                color: colors.text.primary, cursor: 'pointer', textAlign: 'left',
+                color: colorsRaw.text.primary, cursor: 'pointer', textAlign: 'left',
                 fontFamily: typography.fontFamily,
               }}
               aria-label='Open member detail'
             >
               <Avatar base64={selectedMember.avatar} label={selectedMember.displayName} size={32} />
-              <div style={s.focusName}>{selectedMember.displayName}</div>
+              <div style={{ ...s.focusName, color: colorsRaw.text.primary }}>{selectedMember.displayName}</div>
             </button>
             {/* Battery, motion, freshness, and recent transitions live in the
                 MemberDetailSheet — this header is just an at-a-glance
@@ -1077,9 +1181,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             background: 'rgba(26,26,26,0.92)',
             backdropFilter: 'blur(8px)',
             WebkitBackdropFilter: 'blur(8px)',
-            border: `1px solid ${colors.border}`,
+            // Map-overlay surface stays dark-themed regardless of UI mode
+            // (the map tiles below are usually light); raw values keep
+            // text/border legible in both themes.
+            border: `1px solid ${colorsRaw.border}`,
             borderRadius: radius.full,
-            color: colors.text.primary,
+            color: colorsRaw.text.primary,
             fontFamily: typography.fontFamily,
             fontSize: 14, fontWeight: 300,
             cursor: 'pointer',
@@ -1087,11 +1194,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           }}
         >
           <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', textAlign: 'left' }}>{filterLabel}</span>
-          <span style={{ display: 'inline-flex', alignItems: 'center', color: colors.text.secondary, transform: menuOpen ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 200ms' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', color: colorsRaw.text.secondary, transform: menuOpen ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 200ms' }}>
             <CaretDown size={11} weight='thin' />
           </span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, marginLeft: 4, color: colors.text.secondary }}>
-            <span style={{ width: 6, height: 6, borderRadius: '50%', background: peerCount > 0 ? '#7ec77a' : '#555' }} />
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: peerCount > 0 ? colors.success : colors.text.muted }} />
             <span style={{ fontSize: 12 }}>{peerCount}</span>
           </span>
         </button>
@@ -1179,8 +1286,9 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           background: 'rgba(26,26,26,0.92)',
           backdropFilter: 'blur(8px)',
           WebkitBackdropFilter: 'blur(8px)',
-          border: `1px solid ${colors.border}`,
-          color: colors.text.primary,
+          // Map-overlay FAB: theme-stable since it floats over light tiles.
+          border: `1px solid ${colorsRaw.border}`,
+          color: colorsRaw.text.primary,
           cursor: 'pointer',
           boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
           zIndex: 5,
@@ -1213,8 +1321,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           background: 'rgba(26,26,26,0.92)',
           backdropFilter: 'blur(8px)',
           WebkitBackdropFilter: 'blur(8px)',
-          border: `1px solid ${colors.border}`,
-          color: colors.text.primary,
+          border: `1px solid ${colorsRaw.border}`,
+          color: colorsRaw.text.primary,
           cursor: 'pointer',
           boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
           zIndex: 5,
@@ -1245,8 +1353,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           background: 'rgba(26,26,26,0.92)',
           backdropFilter: 'blur(8px)',
           WebkitBackdropFilter: 'blur(8px)',
-          border: `1px solid ${colors.border}`,
-          color: colors.text.primary,
+          border: `1px solid ${colorsRaw.border}`,
+          color: colorsRaw.text.primary,
           cursor: selfSeen ? 'pointer' : 'default',
           opacity: selfSeen ? 1 : 0.5,
           boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
@@ -1342,9 +1450,9 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                           aria-label={isMuted ? 'Unmute notifications' : 'Mute notifications'}
                           style={{
                             ...iconBtnStyle({ disabled: false }),
-                            color: isMuted ? '#fc9' : colors.text.secondary,
-                            borderColor: isMuted ? '#5a3f1f' : colors.border,
-                            background: isMuted ? '#3a2a14' : 'transparent',
+                            color: isMuted ? colors.warn : colors.text.secondary,
+                            borderColor: isMuted ? colors.warn : colors.border,
+                            background: 'transparent',
                           }}>
                           {isMuted
                             ? <BellSimpleSlash size={18} weight="regular" />
@@ -1552,7 +1660,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
                 style={{
                   ...s.durationBtn,
                   ...(targetCircleId === c.circleId
-                    ? { background: '#243237', color: '#7ec4cf', borderColor: '#7ec4cf' }
+                    ? { background: colors.surface.elevated, color: colors.accent, borderColor: colors.accent }
                     : null),
                 }}
                 onClick={() => setTargetCircleId(c.circleId)}
@@ -2067,9 +2175,9 @@ function EdgeIndicators ({ map, ready, members, lastSeen, selectedPubkey, onSele
         >
           <div style={{
             width: 32, height: 32, borderRadius: '50%',
-            border: '2px solid ' + (i.selected ? '#7ec4cf' : '#fc7'),
+            border: '2px solid ' + (i.selected ? colors.accent : '#fc7'),
             boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
-            background: '#1a1a1a',
+            background: colors.surface.card,
             overflow: 'hidden',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>
@@ -2083,7 +2191,7 @@ function EdgeIndicators ({ map, ready, members, lastSeen, selectedPubkey, onSele
             left: 22 + Math.cos(i.angle * Math.PI / 180) * 18,
             top: 17 + Math.sin(i.angle * Math.PI / 180) * 18,
             width: 0, height: 0,
-            borderLeft: '7px solid ' + (i.selected ? '#7ec4cf' : '#fc7'),
+            borderLeft: '7px solid ' + (i.selected ? colors.accent : '#fc7'),
             borderTop: '5px solid transparent',
             borderBottom: '5px solid transparent',
             transform: `rotate(${i.angle}deg)`,
@@ -2608,7 +2716,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, onClose, onSaved }) {
+function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -2822,8 +2930,8 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
               style={{
                 flex: 1, minWidth: 96,
                 fontSize: 12, padding: `${spacing.xs + 1}px ${spacing.md + 2}px`,
-                borderRadius: radius.md, border: '1px solid #d45f7a',
-                background: 'transparent', color: '#d45f7a',
+                borderRadius: radius.md, border: `1px solid ${colors.error}`,
+                background: 'transparent', color: colors.error,
                 cursor: 'pointer', fontWeight: 300, fontFamily: typography.fontFamily,
                 opacity: photoSaving ? 0.5 : 1,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2919,10 +3027,11 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
                     onClick={() => stopSharing(ms)}
                     style={{
                       flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`,
-                      // Lighter than the parent card surface (#252525) so
-                      // the button reads as raised, with a bright border
-                      // for definition against either side.
-                      background: '#3a3a3a', color: colors.text.primary,
+                      // Inset surface against the elevated card -- darker
+                      // than card in dark mode, lighter than card in light
+                      // mode. Bright border (text.secondary) for definition
+                      // either way.
+                      background: colors.surface.input, color: colors.text.primary,
                       border: `1px solid ${colors.text.secondary}`, borderRadius: radius.md,
                       fontSize: typography.body.fontSize, fontWeight: 400,
                       fontFamily: typography.fontFamily,
@@ -2956,7 +3065,9 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
       </Collapsible>
 
       <Collapsible title='Display' icon={Palette} open={displayOpen} onToggle={() => setDisplayOpen(v => !v)}>
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
+        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
+        <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
+        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
         <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
       </Collapsible>
 
@@ -2992,6 +3103,31 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
   )
 }
 
+function ThemeToggleSection ({ mode, onChange }) {
+  const cur = mode === 'light' ? 'light' : 'dark'
+  const btn = (label, value) => (
+    <button
+      onClick={() => { if (cur !== value) onChange?.(value) }}
+      style={{
+        flex: 1, padding: '10px', borderRadius: radius.sm,
+        background: cur === value ? colors.primary : 'transparent',
+        color: cur === value ? colors.text.onPrimary : colors.text.primary,
+        border: `1px solid ${cur === value ? colors.primary : colors.border}`,
+        cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+      }}
+    >
+      {label}
+    </button>
+  )
+  return (
+    <div style={{ display: 'flex', gap: spacing.sm }}>
+      {btn('Dark', 'dark')}
+      {btn('Light', 'light')}
+    </div>
+  )
+}
+
 function DistanceUnitSection ({ unit, onChange }) {
   const cur = unit === 'miles' ? 'miles' : 'km'
   const btn = (label, value) => (
@@ -2999,9 +3135,9 @@ function DistanceUnitSection ({ unit, onChange }) {
       onClick={() => { if (cur !== value) onChange?.(value) }}
       style={{
         flex: 1, padding: '10px', borderRadius: radius.sm,
-        background: cur === value ? colors.accent : 'transparent',
+        background: cur === value ? colors.primary : 'transparent',
         color: cur === value ? colors.text.onPrimary : colors.text.primary,
-        border: `1px solid ${cur === value ? colors.accent : colors.border}`,
+        border: `1px solid ${cur === value ? colors.primary : colors.border}`,
         cursor: 'pointer',
         fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
       }}
@@ -4000,8 +4136,8 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
         onClick={(e) => e.stopPropagation()}
         style={{
           width: '100%', maxWidth: 600,
-          background: '#1a1a1a',
-          color: '#eee',
+          background: colors.surface.card,
+          color: colors.text.primary,
           borderRadius: '20px 20px 0 0',
           maxHeight: '85dvh', overflowY: 'auto', overflowX: 'hidden',
           padding: '0 16px 32px',
@@ -4017,7 +4153,7 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
           onClick={close}
           style={{ display: 'flex', justifyContent: 'center', padding: '12px 0 4px', cursor: 'pointer' }}
         >
-          <div style={{ width: 36, height: 4, borderRadius: 2, background: '#444' }} />
+          <div style={{ width: 36, height: 4, borderRadius: 2, background: colors.text.muted }} />
         </div>
         {children}
       </div>
@@ -4311,7 +4447,7 @@ const s = {
   actions: { display: 'flex', flexDirection: 'column', gap: spacing.sm, marginBottom: spacing.sm },
   primaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.primary, color: colors.text.onPrimary, border: 'none', borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, cursor: 'pointer' },
   secondaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.surface.elevated, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer', marginTop: spacing.sm },
-  dangerBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: '#5a1f1f', color: '#fcc', border: '1px solid #7a2a2a', borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, cursor: 'pointer' },
+  dangerBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: 'transparent', color: colors.error, border: `1px solid ${colors.error}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer' },
   durationRow: { display: 'flex', gap: spacing.sm },
   durationBtn: { flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`, background: colors.surface.input, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.body.fontSize, cursor: 'pointer' },
   sharingOffDot: { position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: radius.full, background: colors.error, border: `2px solid ${colors.surface.card}`, pointerEvents: 'none' },
@@ -4323,9 +4459,9 @@ const s = {
   label: { fontSize: typography.caption.fontSize, color: colors.text.secondary, display: 'block', marginBottom: 6, marginTop: spacing.sm },
   input: { width: '100%', padding: spacing.md, background: colors.surface.card, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.subheading.fontSize, marginBottom: spacing.base, boxSizing: 'border-box' },
   textarea: { width: '100%', padding: spacing.md, background: colors.surface.card, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.body.fontSize, fontFamily: typography.monoFamily, resize: 'vertical', marginBottom: spacing.base, boxSizing: 'border-box' },
-  inviteBox: { width: '100%', padding: spacing.md, background: colors.surface.card, color: '#9cf', border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.micro.fontSize, fontFamily: typography.monoFamily, resize: 'vertical', marginBottom: spacing.md, minHeight: 80, boxSizing: 'border-box' },
+  inviteBox: { width: '100%', padding: spacing.md, background: colors.surface.card, color: colors.accent, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.micro.fontSize, fontFamily: typography.monoFamily, resize: 'vertical', marginBottom: spacing.md, minHeight: 80, boxSizing: 'border-box' },
   muted: { color: colors.text.muted, fontSize: typography.body.fontSize },
-  error: { color: '#f77', marginTop: spacing.sm, fontSize: typography.body.fontSize },
+  error: { color: colors.error, marginTop: spacing.sm, fontSize: typography.body.fontSize },
   section: { background: colors.surface.card, padding: spacing.md, borderRadius: radius.lg, marginBottom: spacing.md },
   row: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: typography.body.fontSize },
   memberList: { listStyle: 'none', padding: 0, margin: 0 },
@@ -4335,39 +4471,46 @@ const s = {
   placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.sm },
   placeRowActions: { display: 'flex', gap: 6, flexShrink: 0 },
   placeRadiusLine: { fontSize: typography.micro.fontSize, color: colors.text.muted, marginTop: spacing.xs, fontFamily: typography.monoFamily },
-  coordsMissing: { fontSize: typography.caption.fontSize, color: '#fa9', padding: `${spacing.sm}px ${spacing.md}px`, background: '#2a1f0f', border: '1px solid #4a3520', borderRadius: radius.md, marginBottom: spacing.md, lineHeight: 1.4 },
+  coordsMissing: { fontSize: typography.caption.fontSize, color: colors.warn, padding: `${spacing.sm}px ${spacing.md}px`, background: colors.surface.elevated, border: `1px solid ${colors.warn}`, borderRadius: radius.md, marginBottom: spacing.md, lineHeight: 1.4 },
   avatarRow: { display: 'flex', alignItems: 'center', gap: spacing.base, marginBottom: spacing.base },
+  // Avatar placeholder bg + initial color stay literal: this is a stable
+  // brand placeholder, not a theme-following surface.
   avatarPreview: { width: 96, height: 96, borderRadius: radius.full, overflow: 'hidden', background: '#2a3a3f', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   avatarImg: { width: '100%', height: '100%', objectFit: 'cover' },
   avatarFallback: { color: '#cfe', fontSize: 36, fontWeight: 400, fontFamily: typography.fontFamily },
-  lastSeen: { fontSize: typography.micro.fontSize, color: '#9cf', marginTop: spacing.xs, fontFamily: typography.monoFamily },
-  lastSeenMuted: { fontSize: typography.micro.fontSize, color: '#555', marginTop: spacing.xs, fontStyle: 'italic' },
-  status: { fontSize: typography.caption.fontSize, color: '#cfc', marginTop: spacing.xs, fontWeight: 400 },
+  lastSeen: { fontSize: typography.micro.fontSize, color: colors.accent, marginTop: spacing.xs, fontFamily: typography.monoFamily },
+  lastSeenMuted: { fontSize: typography.micro.fontSize, color: colors.text.muted, marginTop: spacing.xs, fontStyle: 'italic' },
+  status: { fontSize: typography.caption.fontSize, color: colors.success, marginTop: spacing.xs, fontWeight: 400 },
   transitionBtns: { display: 'flex', gap: spacing.sm, marginTop: spacing.sm },
   smallBtn: { flex: 1, padding: `${spacing.sm}px ${spacing.sm + 2}px`, background: colors.surface.elevated, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.sm + 2, fontSize: typography.micro.fontSize, cursor: 'pointer' },
-  mapWrap: { position: 'relative', height: '100%', width: '100%', background: '#0a0a0a' },
+  mapWrap: { position: 'relative', height: '100%', width: '100%', background: colors.surface.base },
   mapCanvas: { height: '100%', width: '100%' },
+  // Attribution stays white-on-translucent-black: it overlays map tiles
+  // (any theme) and the dark scrim makes it readable against any tile.
   mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: radius.sm, pointerEvents: 'none' },
-  mapFirstRoot: { position: 'fixed', inset: 0, color: '#eee', background: '#111', fontFamily: '-apple-system, system-ui, Roboto, sans-serif', overflow: 'hidden' },
+  mapFirstRoot: { position: 'fixed', inset: 0, color: colors.text.primary, background: colors.surface.base, fontFamily: '-apple-system, system-ui, Roboto, sans-serif', overflow: 'hidden' },
   mapFill: { position: 'absolute', inset: 0 },
   mapTopBar: {
     position: 'absolute', top: 0, left: 0, right: 0, zIndex: 5,
     display: 'flex', alignItems: 'center', gap: 8,
     padding: '8px 12px',
     paddingTop: 'calc(env(safe-area-inset-top, 24px) + 8px)',
-    background: '#1a1a1a',
-    borderBottom: '1px solid #2a2a2a',
+    background: colors.surface.card,
+    borderBottom: `1px solid ${colors.border}`,
   },
-  mapTitle: { fontSize: 18, margin: 0, flex: 1, fontWeight: 400, color: '#eee' },
-  peerBadge: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 13, color: '#bbb', padding: '4px 8px' },
+  mapTitle: { fontSize: 18, margin: 0, flex: 1, fontWeight: 400, color: colors.text.primary },
+  peerBadge: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 13, color: colors.text.secondary, padding: '4px 8px' },
   peerDot: { width: 8, height: 8, borderRadius: '50%' },
+  // Map-overlay pill: theme-stable since it floats over light tiles.
+  // Text and border use the raw (dark-mode) values so light-mode UI
+  // doesn't render dark text on a dark fab.
   fab: {
     position: 'absolute',
     bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
     left: '50%', transform: 'translateX(-50%)',
     padding: '10px 18px',
-    background: 'rgba(26,26,26,0.92)', color: colors.text.primary,
-    border: `1px solid ${colors.border}`, borderRadius: 999,
+    background: 'rgba(26,26,26,0.92)', color: colorsRaw.text.primary,
+    border: `1px solid ${colorsRaw.border}`, borderRadius: 999,
     fontSize: 14, fontWeight: 300,
     backdropFilter: 'blur(8px)',
     WebkitBackdropFilter: 'blur(8px)',
@@ -4378,15 +4521,15 @@ const s = {
   },
   dropdownBtn: {
     display: 'flex', alignItems: 'center', gap: 6, flex: 1,
-    padding: '6px 10px', background: 'transparent', color: '#eee',
+    padding: '6px 10px', background: 'transparent', color: colors.text.primary,
     border: 'none', borderRadius: 8, fontSize: 16, fontWeight: 400,
     cursor: 'pointer', textAlign: 'left',
   },
   dropdownLabel: { flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-  dropdownChevron: { fontSize: 12, color: '#888' },
+  dropdownChevron: { fontSize: 12, color: colors.text.muted },
   focusTextCol: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center' },
-  focusName: { fontSize: 15, fontWeight: 400, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-  focusSub: { fontSize: 12, color: '#9cf', fontFamily: 'monospace' },
+  focusName: { fontSize: 15, fontWeight: 400, color: colors.text.primary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  focusSub: { fontSize: 12, color: colors.accent, fontFamily: 'monospace' },
   avatarBtn: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
@@ -4396,18 +4539,27 @@ const s = {
   },
   menu: {
     position: 'absolute', top: 'calc(env(safe-area-inset-top, 24px) + 56px)', left: 12,
-    background: '#1a1a1a', border: '1px solid #2a2a2a', borderRadius: 10,
+    background: colors.surface.card, border: `1px solid ${colors.border}`, borderRadius: 10,
     padding: 6, minWidth: 220, maxWidth: 'calc(100% - 24px)',
     boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 10,
   },
   menuItem: {
     display: 'block', width: '100%', padding: '10px 12px',
-    background: 'transparent', color: '#eee', border: 'none', borderRadius: 6,
+    background: 'transparent', color: colors.text.primary, border: 'none', borderRadius: 6,
     fontSize: 14, textAlign: 'left', cursor: 'pointer',
   },
-  menuItemActive: { background: '#243237', color: '#7ec4cf', fontWeight: 400 },
-  menuDivider: { height: 1, background: '#2a2a2a', margin: '6px 4px' },
+  // Active selection uses accent for the text and a faint accent-tinted
+  // surface; the elevated surface var keeps the contrast right in both
+  // themes (slight tint on dark, slight wash on light).
+  menuItemActive: { background: colors.surface.elevated, color: colors.accent, fontWeight: 400 },
+  menuDivider: { height: 1, background: colors.border, margin: '6px 4px' },
+  // QR code background stays white in both themes -- QR scanners require
+  // the high-contrast quiet-zone, swapping to dark would break scanning.
   qrWrap: { display: 'flex', justifyContent: 'center', padding: 12, background: '#fff', borderRadius: 12, marginBottom: 12 },
+  // Floating empty-hint over the map. rgba uses the dark surface even in
+  // light mode because the FAB-pill aesthetic above it is dark; switching
+  // both to light surface would lose contrast against the map tiles.
+  // Revisit if light-mode legibility audit flags this.
   emptyHint: {
     position: 'absolute', left: 16, right: 16,
     bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
