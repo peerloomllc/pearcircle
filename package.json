@@ -11,11 +11,10 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "build:bare": "bare-pack --linked --defer fs --defer path src/bare.js -o assets/bare-universal.bundle",
-    "build:bare:ios": "bare-pack --host ios-arm64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios.bundle",
-    "build:bare:ios-sim": "bare-pack --host ios-x64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios-sim.bundle",
+    "build:bare:ios": "bare-pack --preset ios --defer fs --defer path src/bare.js -o assets/bare-ios.bundle",
     "build:ui": "esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic --loader:.js=jsx --loader:.css=text --loader:.png=dataurl --define:process.env.NODE_ENV=\\\"production\\\" --outfile=assets/app-ui.bundle",
     "test": "jest",
-    "verify": "npm test && npm run build:bare && npm run build:ui",
+    "verify": "npm test && npm run build:bare && npm run build:bare:ios && npm run build:ui",
     "postinstall": "patch-package"
   },
   "dependencies": {

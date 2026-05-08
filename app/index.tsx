@@ -192,12 +192,21 @@ async function startWorklet() {
   _workletStarted = true
 
   shellMark('worklet:bundle-load:start')
-  const asset = Asset.fromModule(require('../assets/bare-universal.bundle'))
+  // Bare bundles bake the linked native-addon resolver per host. Android
+  // uses the `--linked` universal bundle (host comes from the gradle
+  // build's NDK ABI). iOS needs the `--preset ios` fat bundle which
+  // includes ios-arm64 (device), ios-arm64-simulator (Apple Silicon),
+  // and ios-x64-simulator (Intel/Rosetta) addon variants.
+  const asset = Asset.fromModule(
+    Platform.OS === 'ios'
+      ? require('../assets/bare-ios.bundle')
+      : require('../assets/bare-universal.bundle')
+  )
   await asset.downloadAsync()
   const bundle = await FileSystem.readAsStringAsync(asset.localUri!, {
     encoding: FileSystem.EncodingType.Base64
   })
-  shellMark('worklet:bundle-load:done', { bytes: bundle.length })
+  shellMark('worklet:bundle-load:done', { bytes: bundle.length, platform: Platform.OS })
 
   _worklet = new Worklet()
   await _worklet.start('/app.bundle', b4a.from(bundle, 'base64'))

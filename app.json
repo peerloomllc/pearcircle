@@ -88,7 +88,8 @@
       ]
     ],
     "assets": [
-      "./assets/bare-universal.bundle"
+      "./assets/bare-universal.bundle",
+      "./assets/bare-ios.bundle"
     ],
     "version": "0.1.0"
   }
