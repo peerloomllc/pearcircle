@@ -5,6 +5,7 @@ import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
+import { formatDistance, formatDuration, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
 
@@ -122,6 +123,9 @@ export function App () {
   // to close Settings.
   useBackHandler(useCallback(() => {
     if (!sheet) return false
+    // Trip detail → back to the trips list (preserve list scroll/state),
+    // matches the in-sheet ‹ button.
+    if (sheet.name === 'tripDetail') { setSheet({ name: 'trips' }); return true }
     closeSheet()
     return true
   }, [sheet, closeSheet]), !!sheet)
@@ -140,6 +144,15 @@ export function App () {
     const next = url == null || url === '' ? null : url
     try { await pear.call('shell:tileStyle:set', { url: next }) } catch {}
     setTileStyleUrl(next ?? DEFAULT_TILE_STYLE_URL)
+  }, [])
+  // Distance unit preference for the Trips list / detail. Hydrated from
+  // AsyncStorage on mount; default 'km'. Trip records always store meters,
+  // we just format on the way out.
+  const [distanceUnit, setDistanceUnit] = useState('km')
+  const setDistanceUnitAndPersist = useCallback(async (unit) => {
+    const next = unit === 'miles' ? 'miles' : 'km'
+    try { await pear.call('shell:distanceUnit:set', { unit: next }) } catch {}
+    setDistanceUnit(next)
   }, [])
 
   const refresh = useCallback(async () => {
@@ -162,6 +175,9 @@ export function App () {
     // to the default; a missing override is normal on first launch.
     pear.call('shell:tileStyle:get').then((r) => {
       if (r?.url && typeof r.url === 'string') setTileStyleUrl(r.url)
+    }).catch(() => {})
+    pear.call('shell:distanceUnit:get').then((r) => {
+      if (r?.unit === 'miles' || r?.unit === 'km') setDistanceUnit(r.unit)
     }).catch(() => {})
     pear.on('ready', refresh)
     pear.on('sharing:changed', ({ enabled, expiresAt }) => {
@@ -273,9 +289,30 @@ export function App () {
           setSharing={setSharingEnabled}
           tileStyleUrl={tileStyleUrl}
           setTileStyleUrl={setTileStyleUrlAndPersist}
+          distanceUnit={distanceUnit}
+          setDistanceUnit={setDistanceUnitAndPersist}
           onClose={closeSheet}
           onSaved={refresh}
         />
+      </SheetContainer>
+      <SheetContainer open={sheet?.name === 'trips'}>
+        <TripsView
+          active={sheet?.name === 'trips'}
+          distanceUnit={distanceUnit}
+          tileStyleUrl={tileStyleUrl}
+          onOpenTrip={(startTs) => setSheet({ name: 'tripDetail', startTs })}
+          onClose={closeSheet}
+        />
+      </SheetContainer>
+      <SheetContainer open={sheet?.name === 'tripDetail'}>
+        {sheet?.name === 'tripDetail' && (
+          <TripDetailView
+            startTs={sheet.startTs}
+            distanceUnit={distanceUnit}
+            tileStyleUrl={tileStyleUrl}
+            onBack={() => setSheet({ name: 'trips' })}
+          />
+        )}
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'about'}>
         <AboutView onClose={closeSheet} />
@@ -776,29 +813,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     }
   }, [data, myPubkey, refresh])
 
-  // Debug helper for the speed-only flight detection: fires a synthetic
-  // location:update with a chosen speed at the user's current coords so
-  // the motion classifier picks it up as 'flying' (or 'still', or any
-  // other bucket we want to test). The next real GPS update overwrites,
-  // so this is a brief override -- if the device is parked indoors with
-  // no GPS movement the fake state sticks until reset via this same
-  // helper. No-op when we don't have a self position yet.
-  const fireFakeMotion = useCallback(async (speedMps) => {
-    const lat = selfSeen?.lat
-    const lon = selfSeen?.lon
-    if (typeof lat !== 'number' || typeof lon !== 'number') return
-    try {
-      await pear.call('location:update', {
-        lat, lon,
-        accuracy: typeof selfSeen?.accuracy === 'number' ? selfSeen.accuracy : null,
-        ts: Date.now(),
-        speed: speedMps,
-        battery: typeof selfSeen?.battery === 'number' ? selfSeen.battery : null,
-      })
-      await refresh()
-    } catch {}
-  }, [selfSeen, refresh])
-
   const focusMember = useCallback((pubkey) => {
     if (!pubkey) return
     setSelectedPubkey(pubkey)
@@ -1258,6 +1272,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           presence={data.presence?.[selectedPubkey] ?? null}
           transitions={data.transitions}
           placesById={placesById}
+          isSelf={selectedPubkey === myPubkey}
+          onOpenTrips={() => {
+            setMemberSheetVisible(false)
+            setSheet({ name: 'trips' })
+          }}
           onClose={() => setMemberSheetVisible(false)}
         />
       )}
@@ -1378,20 +1397,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                 )
               })}
             </ul>
-          )}
-          {/* Motion-state debug: spoof the speed on a self location:update
-              so the flying / driving / walking glyphs can be exercised
-              without an actual flight or car ride. No-op when self
-              has no fix yet. */}
-          {selfSeen && (
-            <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
-              <button style={{ ...s.smallBtn, flex: 1 }} onClick={() => fireFakeMotion(80)}>
-                Fire flying (debug)
-              </button>
-              <button style={{ ...s.smallBtn, flex: 1 }} onClick={() => fireFakeMotion(0)}>
-                Fire stationary (debug)
-              </button>
-            </div>
           )}
           {transitionError && <p style={s.error}>{transitionError}</p>}
           {deleteError && <p style={s.error}>{deleteError}</p>}
@@ -2582,7 +2587,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, onClose, onSaved }) {
+function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -2893,7 +2898,40 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
       )}
 
       <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
+
+      <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
     </div>
+  )
+}
+
+function DistanceUnitSection ({ unit, onChange }) {
+  const cur = unit === 'miles' ? 'miles' : 'km'
+  const btn = (label, value) => (
+    <button
+      onClick={() => { if (cur !== value) onChange?.(value) }}
+      style={{
+        flex: 1, padding: '10px', borderRadius: radius.sm,
+        background: cur === value ? colors.accent : 'transparent',
+        color: cur === value ? colors.text.onPrimary : colors.text.primary,
+        border: `1px solid ${cur === value ? colors.accent : colors.border}`,
+        cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+      }}
+    >
+      {label}
+    </button>
+  )
+  return (
+    <>
+      <h2 style={{ ...typography.heading, color: colors.text.primary, marginTop: spacing.lg, marginBottom: spacing.sm }}>Distance unit</h2>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
+        Used to display trip distances. Stored data is unchanged.
+      </p>
+      <div style={{ display: 'flex', gap: spacing.sm }}>
+        {btn('Kilometers', 'km')}
+        {btn('Miles', 'miles')}
+      </div>
+    </>
   )
 }
 
@@ -3206,7 +3244,7 @@ function initialsFor (label) {
 // places list. Closing only hides the sheet; the focus state lives on
 // the parent so the user can re-open via tap-on-focus-bar without
 // re-flying the map.
-function MemberDetailSheet ({ member, presence, transitions, placesById, onClose }) {
+function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, onOpenTrips, onClose }) {
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
   // Reverse-geocode label only when there's a fresh location and the
@@ -3291,22 +3329,349 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, onClose
         </ul>
       )}
 
-      <div style={{ marginTop: spacing.lg }}>
-        <button
-          onClick={openDirections}
-          disabled={!seen}
-          style={{
-            width: '100%', padding: '12px', borderRadius: radius.md,
-            background: colors.accent, color: colors.text.onPrimary,
-            border: 'none', cursor: seen ? 'pointer' : 'default',
-            fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
-            opacity: seen ? 1 : 0.5,
-          }}
-        >
-          Get directions
-        </button>
-      </div>
+      {isSelf ? (
+        <div style={{ marginTop: spacing.lg }}>
+          <button
+            onClick={onOpenTrips}
+            style={{
+              width: '100%', padding: '12px', borderRadius: radius.md,
+              background: colors.accent, color: colors.text.onPrimary,
+              border: 'none', cursor: 'pointer',
+              fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+            }}
+          >
+            View my trips
+          </button>
+        </div>
+      ) : (
+        <div style={{ marginTop: spacing.lg }}>
+          <button
+            onClick={openDirections}
+            disabled={!seen}
+            style={{
+              width: '100%', padding: '12px', borderRadius: radius.md,
+              background: colors.accent, color: colors.text.onPrimary,
+              border: 'none', cursor: seen ? 'pointer' : 'default',
+              fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              opacity: seen ? 1 : 0.5,
+            }}
+          >
+            Get directions
+          </button>
+        </div>
+      )}
     </BottomSheet>
+  )
+}
+
+// Trip-row thumbnail. Prefers the rendered map snapshot from
+// useTripThumbnails (real OSM tiles + polyline baked in by MapLibre);
+// falls back to an SVG-only route shape while the snapshot is still
+// being prepared (or if rendering fails outright).
+function MiniRoutePreview ({ polyline, dataUrl, width = 80, height = 60 }) {
+  if (dataUrl) {
+    return (
+      <img
+        src={dataUrl} width={width} height={height} alt=''
+        style={{ borderRadius: radius.sm, flexShrink: 0, display: 'block' }}
+      />
+    )
+  }
+  const d = polylineSvgPath(polyline, width, height, 4)
+  return (
+    <svg
+      width={width} height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      style={{ background: colors.surface.card, borderRadius: radius.sm, flexShrink: 0 }}
+    >
+      {d ? (
+        <path d={d} fill='none' stroke={colors.accent} strokeWidth={2} strokeLinecap='round' strokeLinejoin='round' />
+      ) : null}
+    </svg>
+  )
+}
+
+// Off-screen MapLibre instance that renders each trip into its hidden
+// canvas, captures the result via toDataURL(), and yields a map of
+// { [startTs]: dataURL }. Sequential rendering keeps tile-fetch
+// pressure low and avoids WebGL-context-limit pitfalls. The fallback
+// SVG in MiniRoutePreview shows immediately while these stream in.
+function useTripThumbnails (trips, tileStyleUrl) {
+  const [thumbs, setThumbs] = useState({})
+  const keyList = useMemo(
+    () => (trips ? trips.map(t => t.startTs).filter(Boolean).join(',') : ''),
+    [trips],
+  )
+  useEffect(() => { setThumbs({}) }, [tileStyleUrl])
+
+  useEffect(() => {
+    if (!trips || trips.length === 0) return
+    let cancelled = false
+    let map = null
+    let container = null
+    const run = async () => {
+      ensureMapLibreCss()
+      container = document.createElement('div')
+      container.style.cssText = 'position:fixed;left:-10000px;top:0;width:160px;height:120px;visibility:hidden;pointer-events:none;'
+      document.body.appendChild(container)
+      map = new maplibregl.Map({
+        container,
+        style: tileStyleUrl || DEFAULT_TILE_STYLE_URL,
+        attributionControl: false,
+        interactive: false,
+        // Required so getCanvas().toDataURL() returns the rendered frame
+        // instead of a cleared buffer.
+        preserveDrawingBuffer: true,
+      })
+      await new Promise((resolve) => map.once('load', resolve))
+      if (cancelled) return
+      map.addSource('thumb', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+      map.addLayer({
+        id: 'thumb-line', type: 'line', source: 'thumb',
+        paint: { 'line-color': colors.accent, 'line-width': 3, 'line-opacity': 0.95 },
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+      })
+      // Snapshot is taken from `thumbs` at effect-run time; subsequent
+      // setThumbs calls inside the loop can't filter live, so we use the
+      // captured-at-start list. Already-rendered entries from a prior
+      // run get re-rendered on style change but skipped on simple
+      // trip-list refreshes (the dep `keyList` doesn't change unless a
+      // trip is added/removed).
+      for (const trip of trips) {
+        if (cancelled) break
+        if (thumbs[trip.startTs]) continue
+        const geo = polylineGeoJson(trip.polyline)
+        if (geo.geometry.coordinates.length < 2) continue
+        const src = map.getSource('thumb')
+        if (!src) break
+        src.setData(geo)
+        const lons = geo.geometry.coordinates.map(c => c[0])
+        const lats = geo.geometry.coordinates.map(c => c[1])
+        const bounds = [[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]]
+        try { map.fitBounds(bounds, { padding: 12, duration: 0, animate: false }) } catch { continue }
+        await new Promise((resolve) => map.once('idle', resolve))
+        if (cancelled) break
+        try {
+          const dataUrl = map.getCanvas().toDataURL('image/png')
+          setThumbs((prev) => ({ ...prev, [trip.startTs]: dataUrl }))
+        } catch (e) {
+          console.warn('[trips] thumbnail capture failed', e?.message)
+        }
+      }
+    }
+    run().catch((e) => console.warn('[trips] thumbnail renderer failed', e?.message))
+    return () => {
+      cancelled = true
+      try { map?.remove() } catch {}
+      try { container?.remove() } catch {}
+    }
+  }, [keyList, tileStyleUrl])
+
+  return thumbs
+}
+
+// Self-only trip history list. Pulls trips from the local Hyperbee via
+// the worklet's `trips:list` IPC; refreshes on `trip:completed` events
+// so a trip that finalizes while the sheet is open appears at the top.
+// Per-member visibility for circle-mates is queued as a T3 amendment in
+// TODO.md -- requires moving the trip records into the per-circle
+// autobase so they replicate.
+function TripsView ({ active, distanceUnit, tileStyleUrl, onOpenTrip, onClose }) {
+  const [trips, setTrips] = useState(null)
+  const [error, setError] = useState(null)
+  const thumbs = useTripThumbnails(active && trips ? trips : null, tileStyleUrl)
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await pear.call('trips:list')
+      const list = Array.isArray(r?.trips) ? r.trips : []
+      list.sort((a, b) => (b.startTs ?? 0) - (a.startTs ?? 0))
+      setTrips(list)
+      setError(null)
+    } catch (e) {
+      setError(e?.message || 'Failed to load trips')
+      setTrips([])
+    }
+  }, [])
+
+  // Refresh on mount and whenever the sheet is reopened. The
+  // `trip:completed` listener registers once at component lifetime;
+  // pear.on has no unsubscribe in this codebase, so we gate the
+  // refresh on the latest `active` value via a ref so stale-closure
+  // refreshes don't fire while the sheet is hidden.
+  const activeRef = useRef(active)
+  useEffect(() => { activeRef.current = active }, [active])
+  useEffect(() => {
+    pear.on('trip:completed', () => { if (activeRef.current) refresh() })
+  }, [refresh])
+  useEffect(() => {
+    if (active) refresh()
+  }, [active, refresh])
+
+  return (
+    <div style={{
+      padding: spacing.lg,
+      paddingTop: `calc(env(safe-area-inset-top, 24px) + ${spacing.base}px)`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: spacing.lg }}>
+        <h1 style={{ ...typography.heading, margin: 0, color: colors.text.primary }}>My trips</h1>
+        <button
+          onClick={onClose}
+          style={{
+            background: 'transparent', border: 'none', color: colors.text.secondary,
+            fontSize: 24, cursor: 'pointer', padding: '4px 8px',
+          }}
+          aria-label='Close'
+        >×</button>
+      </div>
+
+      {trips == null && (
+        <div style={{ ...typography.body, color: colors.text.muted }}>Loading…</div>
+      )}
+      {trips != null && trips.length === 0 && !error && (
+        <div style={{ ...typography.body, color: colors.text.muted, lineHeight: 1.6 }}>
+          No trips yet. Drives over 1 minute and 100 m show up here automatically.
+        </div>
+      )}
+      {error && (
+        <div style={{ ...typography.body, color: colors.error }}>{error}</div>
+      )}
+
+      {trips != null && trips.length > 0 && (
+        <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          {trips.map((t) => (
+            <li key={t.startTs}>
+              <button
+                onClick={() => onOpenTrip(t.startTs)}
+                style={{
+                  width: '100%', display: 'flex', alignItems: 'center', gap: spacing.base,
+                  padding: `${spacing.sm}px 0`, borderBottom: `1px solid ${colors.divider}`,
+                  background: 'transparent', border: 'none', cursor: 'pointer', textAlign: 'left',
+                }}
+              >
+                <MiniRoutePreview polyline={t.polyline} dataUrl={thumbs[t.startTs]} width={80} height={60} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ ...typography.body, color: colors.text.primary }}>
+                    {formatTripDate(t.startTs)}
+                  </div>
+                  <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2 }}>
+                    {formatDistance(t.distanceMeters, distanceUnit)} · {formatDuration(t.durationMs)}
+                  </div>
+                </div>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+// Full-screen detail for one trip: header with the formatted date,
+// stat row, and a MapLibre map filling the rest of the sheet with the
+// route polyline rendered and bounds-fitted. Loads its own copy of the
+// trip from the worklet to avoid prop-drilling the list through the
+// sheet stack; the local Hyperbee read is sub-ms.
+function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
+  const containerRef = useRef(null)
+  const mapRef = useRef(null)
+  const [trip, setTrip] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    pear.call('trips:list').then((r) => {
+      if (cancelled) return
+      const found = (r?.trips ?? []).find(t => t.startTs === startTs)
+      if (!found) setError('Trip not found')
+      else setTrip(found)
+    }).catch((e) => {
+      if (!cancelled) setError(e?.message || 'Failed to load trip')
+    })
+    return () => { cancelled = true }
+  }, [startTs])
+
+  useEffect(() => {
+    if (!trip || !containerRef.current) return
+    ensureMapLibreCss()
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      style: tileStyleUrl || DEFAULT_TILE_STYLE_URL,
+      attributionControl: false,
+      interactive: true,
+    })
+    mapRef.current = map
+
+    const onLoad = () => {
+      const geo = polylineGeoJson(trip.polyline)
+      map.addSource('trip', { type: 'geojson', data: geo })
+      map.addLayer({
+        id: 'trip-line',
+        type: 'line',
+        source: 'trip',
+        paint: {
+          'line-color': colors.accent,
+          'line-width': 4,
+          'line-opacity': 0.9,
+        },
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+      })
+      // Endpoint markers help orient the user when the polyline is short
+      // or doubles back on itself.
+      const coords = geo.geometry.coordinates
+      if (coords.length >= 2) {
+        const start = coords[0]
+        const end = coords[coords.length - 1]
+        new maplibregl.Marker({ color: colors.text.muted }).setLngLat(start).addTo(map)
+        new maplibregl.Marker({ color: colors.accent }).setLngLat(end).addTo(map)
+        const lons = coords.map(c => c[0])
+        const lats = coords.map(c => c[1])
+        const minLon = Math.min(...lons), maxLon = Math.max(...lons)
+        const minLat = Math.min(...lats), maxLat = Math.max(...lats)
+        map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 40, duration: 0 })
+      }
+    }
+
+    map.on('load', onLoad)
+    return () => {
+      try { map.remove() } catch {}
+      mapRef.current = null
+    }
+  }, [trip, tileStyleUrl])
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div style={{
+        padding: `${spacing.base}px ${spacing.lg}px`,
+        paddingTop: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+        borderBottom: `1px solid ${colors.border}`,
+        display: 'flex', alignItems: 'center', gap: spacing.sm,
+      }}>
+        <button
+          onClick={onBack}
+          style={{
+            background: 'transparent', border: 'none', color: colors.text.primary,
+            fontSize: 22, cursor: 'pointer', padding: '4px 8px',
+          }}
+          aria-label='Back'
+        >‹</button>
+        <div style={{ flex: 1 }}>
+          <div style={{ ...typography.body, color: colors.text.primary }}>
+            {trip ? formatTripDate(trip.startTs) : '…'}
+          </div>
+          {trip && (
+            <div style={{ ...typography.caption, color: colors.text.secondary }}>
+              {formatDistance(trip.distanceMeters, distanceUnit)} · {formatDuration(trip.durationMs)}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div style={{ padding: spacing.lg, ...typography.body, color: colors.error }}>{error}</div>
+      )}
+      <div ref={containerRef} style={{ flex: 1, minHeight: 320, background: colors.surface.base }} />
+    </div>
   )
 }
 

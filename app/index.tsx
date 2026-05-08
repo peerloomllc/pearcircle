@@ -35,6 +35,9 @@ const MUTES_KEY = 'pc:notif:mutes'
 // string here too avoids a chicken-and-egg dance on first launch (we'd
 // have to round-trip to the WebView before showing the map).
 const TILE_STYLE_KEY = 'pc:tile:styleUrl'
+// Display preference: 'km' (default) or 'miles'. Persisted via the
+// shell:distanceUnit IPC so the WebView can hydrate it on boot.
+const DISTANCE_UNIT_KEY = 'pc:distanceUnit'
 const _mutes = new Set<string>()
 let _ourPubkey: string | null = null
 
@@ -504,6 +507,29 @@ export default function Index() {
       // continues in the background.
       try { BackHandler.exitApp() } catch {}
       respond(msg.id, { ok: true })
+      return
+    }
+    if (msg.method === 'shell:distanceUnit:get') {
+      try {
+        const raw = await AsyncStorage.getItem(DISTANCE_UNIT_KEY)
+        respond(msg.id, { unit: raw === 'miles' ? 'miles' : 'km' })
+      } catch (err: any) {
+        respond(msg.id, { unit: 'km', error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:distanceUnit:set') {
+      const unit = msg.args?.unit
+      if (unit !== 'km' && unit !== 'miles') {
+        respond(msg.id, { ok: false, error: "unit must be 'km' or 'miles'" })
+        return
+      }
+      try {
+        await AsyncStorage.setItem(DISTANCE_UNIT_KEY, unit)
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
       return
     }
     if (msg.method === 'shell:tileStyle:set') {
