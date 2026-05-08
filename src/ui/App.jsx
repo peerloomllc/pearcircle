@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
@@ -2193,9 +2193,18 @@ function renderBubble (root, member, selected, last, connected) {
   const batt = (typeof last?.battery === 'number' && last.battery >= 0 && last.battery <= 100)
     ? Math.round(last.battery) : null
   const battColor = batt == null ? null : (batt < 20 ? '#e57373' : batt < 50 ? '#ffb74d' : '#81c784')
+  const battCharging = !!last?.isCharging
+  // Charging bolt: unicode glyph centered over the battery rect when
+  // plugged in. Pure DOM (no SVG) per the renderBubble saga -- using
+  // a unicode character avoids the zoom-dependent drift that bit us
+  // last time we tried inline SVG inside a marker.
+  const battBoltHtml = (batt == null || !battCharging) ? '' : (
+    `<div style="position:absolute;z-index:1;top:50%;left:50%;transform:translate(-50%,-50%);font-size:11px;line-height:1;color:#fff;text-shadow:0 0 2px rgba(0,0,0,0.9);font-family:${typography.fontFamily};pointer-events:none;">&#9889;</div>`
+  )
   const battHtml = batt == null ? '' : (
     `<div style="position:absolute;z-index:2;bottom:-5px;left:50%;transform:translateX(-50%);width:30px;height:14px;background:#1a1a1a;border:1px solid #888;border-radius:3px;box-sizing:border-box;overflow:hidden;pointer-events:none;">` +
     `<div style="width:${batt}%;height:100%;background:${battColor};"></div>` +
+    battBoltHtml +
     `</div>`
   )
 
@@ -2464,7 +2473,6 @@ function CirclesSection ({ active = true, onChanged }) {
 
   return (
     <>
-      <h2 style={s.h2}>Circles</h2>
       <p style={s.muted}>
         Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy.
       </p>
@@ -2617,6 +2625,13 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
   // service during idle.
   const [battery, setBattery] = useState({ supported: null, exempt: false })
   const [batteryError, setBatteryError] = useState(null)
+  // Collapsible state for the secondary settings groups. Closed by
+  // default so first open of Settings is profile + sharing only;
+  // user expands what they need. Persists across sheet open/close
+  // (SheetContainer keeps the component mounted).
+  const [circlesOpen, setCirclesOpen] = useState(false)
+  const [displayOpen, setDisplayOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   // Re-render once a second while a mute has an active expiresAt so
   // the countdown ticks. Stops once the expiry passes.
   const [, setNowTick] = useState(0)
@@ -2852,67 +2867,127 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
 
-      <h2 style={s.h2}>Location sharing</h2>
-      {sharing.enabled ? (
-        <>
-          <p style={s.muted}>
-            Your location is being shared with the circles you're in.
-          </p>
-          <button style={s.dangerBtn} disabled={togglingSharing} onClick={() => stopSharing(null)}>
-            {togglingSharing ? 'Stopping...' : 'Stop sharing'}
-          </button>
-          <p style={{ ...s.muted, marginTop: 16, marginBottom: 6 }}>Or pause briefly:</p>
-          <div style={s.durationRow}>
-            <button style={s.durationBtn} disabled={togglingSharing} onClick={() => stopSharing(15 * 60_000)}>15 min</button>
-            <button style={s.durationBtn} disabled={togglingSharing} onClick={() => stopSharing(60 * 60_000)}>1 hour</button>
-            <button style={s.durationBtn} disabled={togglingSharing} onClick={() => stopSharing(4 * 60 * 60_000)}>4 hours</button>
-          </div>
-        </>
-      ) : (
-        <>
-          <p style={s.muted}>
-            {sharing.expiresAt
-              ? `Sharing paused. Resumes in ${formatRemaining(sharing.expiresAt - Date.now())}.`
-              : 'Sharing is paused. Other members see your last known location until you resume.'}
-          </p>
-          <button style={s.primaryBtn} disabled={togglingSharing} onClick={resumeSharing}>
-            {togglingSharing ? 'Resuming...' : 'Resume sharing'}
-          </button>
-        </>
-      )}
-      {sharingError && <p style={s.error}>{sharingError}</p>}
-
-      <CirclesSection active={active} onChanged={onSaved} />
-
-      {battery.supported && (
-        <>
-          <h2 style={s.h2}>Battery optimization</h2>
-          {battery.exempt ? (
-            <p style={s.muted}>
-              Battery optimization is off for PearCircle. Location sharing
-              should keep working through extended idle.
-            </p>
+      {/* Static (non-collapsible) card. Matches Collapsible chrome so it
+          slots into the page visually as a peer of the collapsibles
+          below, but keeps the controls always-visible -- toggling
+          sharing is the most safety-critical action in the app. */}
+      <div style={{
+        background: colors.surface.elevated,
+        borderRadius: radius.lg,
+        marginBottom: spacing.sm + 2,
+        overflow: 'hidden',
+      }}>
+        <div style={{
+          padding: `${spacing.md}px ${spacing.base}px`,
+          fontSize: 14, fontWeight: 400, color: colors.text.primary,
+          fontFamily: typography.fontFamily,
+          textAlign: 'center',
+        }}>
+          Location sharing
+        </div>
+        <div style={{ padding: `0 ${spacing.base}px ${spacing.base}px` }}>
+          {sharing.enabled ? (
+            <>
+              <p style={{ ...s.muted, marginTop: 0 }}>
+                Your location is being shared with the circles you're in.
+              </p>
+              <button
+                style={{
+                  width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`,
+                  background: 'transparent', color: colors.error,
+                  border: `1px solid ${colors.error}`, borderRadius: radius.lg,
+                  fontSize: typography.subheading.fontSize, fontWeight: 400,
+                  fontFamily: typography.fontFamily,
+                  cursor: togglingSharing ? 'default' : 'pointer',
+                  opacity: togglingSharing ? 0.5 : 1,
+                }}
+                disabled={togglingSharing}
+                onClick={() => stopSharing(null)}
+              >
+                {togglingSharing ? 'Stopping...' : 'Stop sharing'}
+              </button>
+              <p style={{ ...s.muted, marginTop: spacing.base, marginBottom: spacing.xs + 2 }}>Or pause briefly:</p>
+              <div style={{ display: 'flex', gap: spacing.sm }}>
+                {[
+                  { label: '15 min', ms: 15 * 60_000 },
+                  { label: '1 hour', ms: 60 * 60_000 },
+                  { label: '4 hours', ms: 4 * 60 * 60_000 },
+                ].map(({ label, ms }) => (
+                  <button
+                    key={label}
+                    disabled={togglingSharing}
+                    onClick={() => stopSharing(ms)}
+                    style={{
+                      flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`,
+                      // Lighter than the parent card surface (#252525) so
+                      // the button reads as raised, with a bright border
+                      // for definition against either side.
+                      background: '#3a3a3a', color: colors.text.primary,
+                      border: `1px solid ${colors.text.secondary}`, borderRadius: radius.md,
+                      fontSize: typography.body.fontSize, fontWeight: 400,
+                      fontFamily: typography.fontFamily,
+                      cursor: togglingSharing ? 'default' : 'pointer',
+                      opacity: togglingSharing ? 0.5 : 1,
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </>
           ) : (
             <>
-              <p style={s.muted}>
-                Battery optimization is on. Android may pause location sharing
-                during long idle periods (overnight, in a meeting), so peers
-                won't see your updates until your phone wakes. Disabling this
-                for PearCircle keeps sharing reliable but uses slightly more
-                battery.
+              <p style={{ ...s.muted, marginTop: 0 }}>
+                {sharing.expiresAt
+                  ? `Sharing paused. Resumes in ${formatRemaining(sharing.expiresAt - Date.now())}.`
+                  : 'Sharing is paused. Other members see your last known location until you resume.'}
               </p>
-              <button style={s.secondaryBtn} onClick={requestBatteryExempt}>
-                Disable battery optimization
+              <button style={{ ...s.primaryBtn, fontFamily: typography.fontFamily }} disabled={togglingSharing} onClick={resumeSharing}>
+                {togglingSharing ? 'Resuming...' : 'Resume sharing'}
               </button>
             </>
           )}
-          {batteryError && <p style={s.error}>{batteryError}</p>}
-        </>
-      )}
+          {sharingError && <p style={s.error}>{sharingError}</p>}
+        </div>
+      </div>
 
-      <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
+      <Collapsible title='Circles' icon={UsersThree} open={circlesOpen} onToggle={() => setCirclesOpen(v => !v)} maxHeight='1200px'>
+        <CirclesSection active={active && circlesOpen} onChanged={onSaved} />
+      </Collapsible>
 
-      <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
+      <Collapsible title='Display' icon={Palette} open={displayOpen} onToggle={() => setDisplayOpen(v => !v)}>
+        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
+        <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
+      </Collapsible>
+
+      <Collapsible title='Advanced' icon={Wrench} open={advancedOpen} onToggle={() => setAdvancedOpen(v => !v)} maxHeight='1200px'>
+        {battery.supported && (
+          <div style={{ marginBottom: spacing.lg }}>
+            <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Battery optimization</p>
+            {battery.exempt ? (
+              <p style={s.muted}>
+                Battery optimization is off for PearCircle. Location sharing
+                should keep working through extended idle.
+              </p>
+            ) : (
+              <>
+                <p style={s.muted}>
+                  Battery optimization is on. Android may pause location sharing
+                  during long idle periods, so peers won't see your updates until
+                  your phone wakes. Disabling this for PearCircle keeps sharing
+                  reliable but uses slightly more battery.
+                </p>
+                <button style={s.secondaryBtn} onClick={requestBatteryExempt}>
+                  Disable battery optimization
+                </button>
+              </>
+            )}
+            {batteryError && <p style={s.error}>{batteryError}</p>}
+          </div>
+        )}
+        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Map tiles</p>
+        <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
+      </Collapsible>
     </div>
   )
 }
@@ -2936,7 +3011,6 @@ function DistanceUnitSection ({ unit, onChange }) {
   )
   return (
     <>
-      <h2 style={{ ...typography.heading, color: colors.text.primary, marginTop: spacing.lg, marginBottom: spacing.sm }}>Distance unit</h2>
       <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
         Used to display trip distances. Stored data is unchanged.
       </p>
@@ -3002,12 +3076,10 @@ function TileStyleSection ({ url, onChange }) {
 
   return (
     <>
-      <h2 style={s.h2}>Map tiles</h2>
       <p style={s.muted}>
         The map fetches tile imagery from this MapLibre style URL.
-        Default is OpenFreeMap, an OpenStreetMap-based service. Change
-        this if the default is unavailable or you want to point at your
-        own provider.
+        Default is OpenFreeMap. Change if the default is unavailable
+        or you want to point at your own provider.
       </p>
       {!editing && (
         <>
@@ -3077,82 +3149,243 @@ function TileStyleSection ({ url, onChange }) {
 // prose sections explaining the model, a couple of action buttons. No
 // donation flow yet (PearCircle hasn't shipped to stores; can layer in
 // later with the same iOS guideline 3.1.1 gating PearGuard uses).
+const LIGHTNING_ADDRESS = 'peerloomllc@strike.me'
+
+const LIGHTNING_WALLETS = [
+  { name: 'Strike',            url: 'https://strike.me',          desc: 'Simple Lightning payments' },
+  { name: 'Cash App',          url: 'https://cash.app',           desc: 'Send Bitcoin via Lightning' },
+  { name: 'Wallet of Satoshi', url: 'https://walletofsatoshi.com', desc: 'Beginner-friendly Lightning wallet' },
+  { name: 'Phoenix',           url: 'https://phoenix.acinq.co',   desc: 'Self-custodial Lightning wallet' },
+]
+
+// Inline collapsible card. Mirrors PearGuard's AboutTab pattern: header
+// is a clickable row with a leading icon, title, and a chevron that
+// rotates 90deg when open. Body uses a max-height transition so it
+// animates instead of snapping.
+function Collapsible ({ title, icon: Icon, open, onToggle, maxHeight = '480px', children }) {
+  return (
+    <div style={{
+      background: colors.surface.elevated,
+      borderRadius: radius.lg,
+      marginBottom: spacing.sm + 2,
+      overflow: 'hidden',
+    }}>
+      {/* <button> rather than <div> so the global capture-phase click
+          listener (App.jsx:215) picks it up and fires the light haptic
+          for free. Default button chrome is reset back to the parent
+          card's surface. */}
+      <button
+        onClick={onToggle}
+        style={{
+          width: '100%', textAlign: 'left',
+          background: 'transparent', border: 'none',
+          color: colors.text.primary, fontFamily: typography.fontFamily,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: `${spacing.md}px ${spacing.base}px`, cursor: 'pointer',
+        }}
+        aria-expanded={open}
+      >
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: spacing.sm,
+          fontSize: 14, fontWeight: 400, color: colors.text.primary,
+          fontFamily: typography.fontFamily,
+        }}>
+          {Icon ? <Icon size={18} weight='thin' color={colors.text.secondary} /> : null}
+          {title}
+        </div>
+        <span style={{
+          fontSize: 16, color: colors.text.muted,
+          transition: 'transform 0.3s', display: 'inline-block',
+          transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+        }}>&rsaquo;</span>
+      </button>
+      <div style={{
+        maxHeight: open ? maxHeight : '0px',
+        overflow: 'hidden',
+        transition: 'max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1)',
+      }}>
+        <div style={{ padding: `0 ${spacing.base}px ${spacing.base}px` }}>
+          {children}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function AboutView ({ onClose }) {
-  const share = async () => {
+  // App Store guideline 3.1.1 forbids non-IAP digital purchases including
+  // donations. Hide the Support development section on iOS until we've
+  // been approved -- once approved we can revisit (Apple has loosened
+  // for some non-IAP "value for value" patterns, but the safe default
+  // is to omit until reviewed). Android keeps the section.
+  const isIOS = typeof window !== 'undefined' && window.__pearPlatform === 'ios'
+  const [walletModal, setWalletModal] = useState(false)
+  const [howOpen, setHowOpen] = useState(false)
+  const [supportOpen, setSupportOpen] = useState(false)
+  const [bitcoinOpen, setBitcoinOpen] = useState(false)
+  const [shareOpen, setShareOpen] = useState(false)
+  const [contactOpen, setContactOpen] = useState(false)
+
+  const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
+
+  const share = () => {
     try {
-      await pear.call('shell:share', {
+      pear.call('shell:share', {
         title: 'PearCircle',
-        text: 'PearCircle - private peer-to-peer location sharing. No accounts, no servers, no subscriptions.\n\nhttps://peerloomllc.com/pearcircle/',
+        text: 'Check out PearCircle - a private, peer-to-peer location-sharing app with no servers or accounts.\n\nhttps://peerloomllc.com/pearcircle/',
       })
     } catch {}
   }
-  const sectionTitle = { ...typography.subheading, color: colors.text.primary, margin: `${spacing.lg}px 0 ${spacing.sm}px 0` }
-  const body = { ...typography.body, color: colors.text.secondary, lineHeight: 1.6, margin: `0 0 ${spacing.md}px 0` }
-  const card = {
-    background: colors.surface.card,
-    border: `1px solid ${colors.border}`,
-    borderRadius: radius.lg,
-    padding: spacing.base,
-    marginBottom: spacing.md,
+
+  const handleDonateBTC = async () => {
+    try {
+      const r = await pear.call('shell:canOpenURL', { url: 'lightning:test' })
+      if (r?.can) openURL('lightning:' + LIGHTNING_ADDRESS)
+      else setWalletModal(true)
+    } catch {
+      setWalletModal(true)
+    }
   }
+
+  const reportIssue = () => openURL('https://github.com/peerloomllc/pearcircle/issues')
+  const sendEmail = () => openURL('mailto:peerloomllc@proton.me?subject=%5BPearCircle%5D%20Feedback')
+
+  const body = {
+    fontSize: 13, fontWeight: 300,
+    color: colors.text.muted, lineHeight: 1.6,
+    margin: `0 0 ${spacing.md}px 0`,
+    fontFamily: typography.fontFamily,
+  }
+  // Brand-colored pill for the calls-to-action inside collapsibles.
+  // Lime-on-dark contrasts with the elevated card surface and matches
+  // s.primaryBtn elsewhere in the app.
+  const pillBtn = {
+    width: '100%', padding: `${spacing.sm + 2}px`, borderRadius: radius.md,
+    border: 'none', background: colors.primary,
+    color: colors.text.onPrimary,
+    fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+    cursor: 'pointer',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
+  }
+
   return (
     <div style={s.screen}>
-      <BackBar onBack={onClose} title='About' />
+      <BackBar onBack={onClose} title='' />
 
-      <div style={{ ...card, textAlign: 'center', padding: spacing.xl }}>
-        <div style={{ ...typography.display, color: colors.primary, fontWeight: 400, marginBottom: spacing.xs }}>PearCircle</div>
-        <div style={{ ...typography.caption, color: colors.text.muted }}>Private. Peer-to-Peer. No Servers.</div>
+      {/* App-info header */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.xs, marginBottom: spacing.lg }}>
+        <div style={{ fontSize: 20, fontWeight: 400, color: colors.text.primary, fontFamily: typography.fontFamily }}>PearCircle</div>
+        <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted, fontFamily: typography.fontFamily }}>
+          Private. Peer-to-Peer. No Servers.
+        </div>
       </div>
 
-      <div style={card}>
-        <h3 style={sectionTitle}>What this is</h3>
+      <Collapsible title='How it works' icon={InfoIcon} open={howOpen} onToggle={() => setHowOpen(v => !v)}>
         <p style={body}>
-          PearCircle is a peer-to-peer location-sharing app. You form
-          private circles with people you trust, share live location, and
-          get notified when someone arrives at or leaves a Place.
+          PearCircle syncs locations directly between devices using
+          peer-to-peer technology powered by Hypercore Protocol. Your
+          circle's data never touches a server - it lives only on the
+          devices in your circles. No accounts. No subscriptions. No
+          data collection.
         </p>
+        <button onClick={() => openURL('https://pears.com/')} style={pillBtn}>
+          Learn about P2P <ArrowSquareOut size={14} weight='thin' />
+        </button>
+      </Collapsible>
+
+      {!isIOS && (
+        <Collapsible title='Support development' icon={Lightning} open={supportOpen} onToggle={() => setSupportOpen(v => !v)}>
+          <p style={body}>
+            PearCircle is free and open source. If you receive value from
+            it, please consider returning value.
+          </p>
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            <button onClick={handleDonateBTC} style={{ ...pillBtn, flex: 1 }}>
+              <Lightning size={14} weight='thin' /> BTC <Lightning size={14} weight='thin' />
+            </button>
+            <button onClick={() => openURL('https://buymeacoffee.com/peerloomllc')} style={{ ...pillBtn, flex: 1 }}>
+              <CurrencyDollar size={14} weight='thin' /> USD <CurrencyDollar size={14} weight='thin' />
+            </button>
+          </div>
+        </Collapsible>
+      )}
+
+      <Collapsible title='Learn about Bitcoin' icon={BookOpen} open={bitcoinOpen} onToggle={() => setBitcoinOpen(v => !v)}>
         <p style={body}>
-          There are no accounts, no servers, no subscriptions. Your circle's
-          data lives on the devices in the circle and syncs directly between
-          them over the internet or your local network.
+          New to Bitcoin? The Satoshi Nakamoto Institute has a free,
+          concise crash course explaining how Bitcoin works and why it
+          matters.
         </p>
+        <button onClick={() => openURL('https://nakamotoinstitute.org/crash-course/')} style={pillBtn}>
+          <BookOpen size={16} weight='thin' /> Bitcoin Crash Course <ArrowSquareOut size={14} weight='thin' />
+        </button>
+      </Collapsible>
+
+      <Collapsible title='Share the app' icon={ShareNetwork} open={shareOpen} onToggle={() => setShareOpen(v => !v)}>
+        <p style={body}>
+          Know someone who'd want a private, serverless way to share
+          location with friends or family? Share PearCircle with them.
+        </p>
+        <button onClick={share} style={pillBtn}>
+          <ShareNetwork size={16} weight='thin' /> Share PearCircle
+        </button>
+      </Collapsible>
+
+      <Collapsible title='Contact' icon={EnvelopeSimple} open={contactOpen} onToggle={() => setContactOpen(v => !v)}>
+        <div style={{ display: 'flex', gap: spacing.sm }}>
+          <button onClick={sendEmail} style={{ ...pillBtn, flex: 1 }}>
+            <EnvelopeSimple size={14} weight='thin' /> Email <ArrowSquareOut size={13} weight='thin' />
+          </button>
+          <button onClick={reportIssue} style={{ ...pillBtn, flex: 1 }}>
+            <Bug size={14} weight='thin' /> Issue <ArrowSquareOut size={13} weight='thin' />
+          </button>
+        </div>
+      </Collapsible>
+
+      <div style={{ textAlign: 'center', fontSize: 11, fontWeight: 300, color: colors.text.muted, paddingTop: spacing.base, paddingBottom: spacing.xs, fontFamily: typography.fontFamily }}>
+        v0.1.0
       </div>
 
-      <div style={card}>
-        <h3 style={sectionTitle}>How it works</h3>
-        <p style={body}>
-          PearCircle is built on the Holepunch P2P stack: each circle is an
-          append-only log shared between members, replicated peer-to-peer
-          via Hyperswarm. Membership is gated by signed invites; new members
-          join by scanning a QR code or tapping a deep link.
-        </p>
-        <p style={body}>
-          Location updates are signed by your device's key and replicated
-          to other circle members. Geofence transitions ("arrived at Home",
-          "left Work") are computed locally on each device.
-        </p>
-      </div>
-
-      <div style={card}>
-        <h3 style={sectionTitle}>Privacy</h3>
-        <p style={body}>
-          Because there are no servers, no third party sees your location
-          or who's in your circles. Members of a circle see each other's
-          shared location while sharing is on; toggle Stop sharing to pause
-          broadcasting at any time. Place names are local to the circle.
-        </p>
-        <p style={body}>
-          The "near X" labels in member rows use OpenStreetMap's Nominatim
-          service to translate coordinates into place names. The coordinates
-          you share with peers do not pass through any third party.
-        </p>
-      </div>
-
-      <button style={s.secondaryBtn} onClick={share}>Share PearCircle</button>
-
-      <p style={{ ...typography.micro, color: colors.text.muted, textAlign: 'center', marginTop: spacing.xl }}>
-        Part of PeerLoom &middot; v0.1.0
-      </p>
+      {walletModal && (
+        <BottomSheet onClose={() => setWalletModal(false)} zIndex={300}>
+          <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px` }}>
+            <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.xs + 2, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
+              <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
+            </div>
+            <p style={{ ...body, marginBottom: spacing.lg, textAlign: 'left' }}>
+              No Lightning wallet was detected on your device. Bitcoin
+              Lightning is a fast, low-fee payment network built on top
+              of Bitcoin. To send a tip, install one of these wallets:
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm + 2 }}>
+              {LIGHTNING_WALLETS.map((w) => (
+                <button
+                  key={w.name}
+                  onClick={() => openURL(w.url)}
+                  style={{
+                    background: colors.surface.card,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radius.lg,
+                    padding: `${spacing.md}px ${spacing.base}px`,
+                    display: 'flex', alignItems: 'center', gap: spacing.md,
+                    cursor: 'pointer', width: '100%', textAlign: 'left',
+                    fontFamily: typography.fontFamily,
+                  }}
+                >
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 400, color: colors.text.primary }}>{w.name}</div>
+                    <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted }}>{w.desc}</div>
+                  </div>
+                  <ArrowSquareOut size={14} weight='thin' color={colors.text.muted} />
+                </button>
+              ))}
+            </div>
+            <p style={{ ...body, textAlign: 'center', marginTop: spacing.base, marginBottom: 0 }}>
+              After installing, return here and tap BTC again.
+            </p>
+          </div>
+        </BottomSheet>
+      )}
     </div>
   )
 }
@@ -3300,7 +3533,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
 
       {!isPaused && seen && (motionLabel || typeof seen.battery === 'number') && (
         <div style={{ display: 'flex', justifyContent: 'center', gap: spacing.lg, alignItems: 'center', paddingBottom: spacing.base, borderBottom: `1px solid ${colors.border}` }}>
-          {typeof seen.battery === 'number' && <BatteryBadge level={seen.battery} />}
+          {typeof seen.battery === 'number' && <BatteryBadge level={seen.battery} charging={!!seen.isCharging} />}
           {motionLabel && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: colors.text.secondary }}>
               {motion === 'walking' && <PersonSimpleWalk size={18} weight='thin' />}
@@ -3890,7 +4123,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
               <div style={{ ...s.memberName, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
               {!isPaused && <MotionGlyph speed={seen?.speed} size={14} />}
             </div>
-            {!isPaused && <BatteryBadge level={seen?.battery} />}
+            {!isPaused && <BatteryBadge level={seen?.battery} charging={!!seen?.isCharging} />}
           </div>
           {isPaused ? (
             <div style={s.lastSeenMuted}>Sharing paused</div>
@@ -3938,7 +4171,7 @@ function MotionGlyph ({ speed, size = 14 }) {
 // and a color band: green > 50, amber 20-50, red < 20. Sits on the
 // member row's title line so it stays visible regardless of subtitle
 // state (paused / transition / lastSeen / no-loc-yet).
-function BatteryBadge ({ level }) {
+function BatteryBadge ({ level, charging = false }) {
   if (typeof level !== 'number' || !Number.isFinite(level)) return null
   const pct = Math.max(0, Math.min(100, Math.round(level)))
   const color = pct < 20 ? '#e57373' : pct < 50 ? '#ffb74d' : '#81c784'
@@ -3949,6 +4182,11 @@ function BatteryBadge ({ level }) {
         <rect x="0.5" y="0.5" width="15" height="9" rx="1.5" fill="none" stroke="#888" strokeWidth="1"/>
         <rect x="16" y="3" width="2" height="4" rx="0.5" fill="#888"/>
         <rect x="2" y="2" width={fillW} height="6" fill={color}/>
+        {/* Charging bolt: white zigzag inside the battery body, drawn on
+            top of the colored fill so it reads at any percentage. */}
+        {charging ? (
+          <path d="M 9 2 L 6.5 5.4 L 8 5.4 L 7 8 L 9.5 4.6 L 8 4.6 Z" fill="#fff" stroke="#000" strokeWidth="0.3" />
+        ) : null}
       </svg>
       <span style={{ fontSize: 12, color: pct < 20 ? '#e57373' : '#aaa', fontVariantNumeric: 'tabular-nums', minWidth: 30, textAlign: 'right', display: 'inline-block' }}>{pct}%</span>
     </span>
@@ -3981,7 +4219,7 @@ function BackBar ({ onBack, title }) {
   return (
     <header style={s.header}>
       <button style={s.iconBtn} onClick={onBack} aria-label='Back'>‹</button>
-      <h1 style={{ ...s.h1, textAlign: 'center' }}>{title}</h1>
+      {title ? <h1 style={{ ...s.h1, textAlign: 'center' }}>{title}</h1> : <span style={{ flex: 1 }} />}
       <span style={{ width: 32 }} />
     </header>
   )

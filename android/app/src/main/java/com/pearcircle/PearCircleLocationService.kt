@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.location.Location
 import android.os.BatteryManager
@@ -92,6 +93,15 @@ class PearCircleLocationService : Service() {
         val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
         val cap = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
         val battery: Double? = if (cap in 0..100) cap.toDouble() else null
+        // Charging state via the sticky ACTION_BATTERY_CHANGED broadcast.
+        // registerReceiver(null, ...) returns the most recent battery
+        // intent without subscribing -- cheap, no leak. Treat both
+        // STATUS_CHARGING and STATUS_FULL as "charging" because users
+        // see the bolt icon on a fully-charged plugged-in device.
+        val battStatusIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val status = battStatusIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING
+            || status == BatteryManager.BATTERY_STATUS_FULL
         PearCircleLocationModule.instance?.emitLocation(
             loc.latitude,
             loc.longitude,
@@ -99,6 +109,7 @@ class PearCircleLocationService : Service() {
             loc.time.toDouble(),
             loc.speed.toDouble(),
             battery,
+            isCharging,
         )
     }
 

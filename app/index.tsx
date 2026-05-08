@@ -228,6 +228,10 @@ async function startWorklet() {
 }
 
 function buildHtml(jsBundle: string) {
+  // Platform identifier injected before the JS bundle runs so the WebView
+  // can branch on it (e.g. About page hides Support development on iOS
+  // until App Store approval per guideline 3.1.1).
+  const platform = JSON.stringify(Platform.OS)
   return `<!DOCTYPE html>
 <html>
   <head>
@@ -237,6 +241,7 @@ function buildHtml(jsBundle: string) {
       html, body, #root { height: 100%; margin: 0; padding: 0; background: #111; }
       body { -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
     </style>
+    <script>window.__pearPlatform = ${platform};</script>
   </head>
   <body>
     <div id="root"></div>
@@ -563,6 +568,26 @@ export default function Index() {
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:canOpenURL') {
+      // Probe whether the OS has a registered handler for a given URL
+      // scheme. Used by the About page to detect a Lightning wallet
+      // (`lightning:`) before showing a wallet-list modal -- if a wallet
+      // is installed we hand the lightning: URI off to it directly via
+      // shell:openUrl; if none is installed, we surface the modal of
+      // wallet recommendations instead.
+      const url = msg.args?.url
+      if (typeof url !== 'string' || url.length === 0) {
+        respond(msg.id, { ok: false, error: 'url must be a non-empty string' })
+        return
+      }
+      try {
+        const can = await Linking.canOpenURL(url)
+        respond(msg.id, { ok: true, can: !!can })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, can: false, error: err?.message ?? String(err) })
       }
       return
     }

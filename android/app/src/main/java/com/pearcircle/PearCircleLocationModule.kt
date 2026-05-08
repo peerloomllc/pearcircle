@@ -90,7 +90,7 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     @ReactMethod fun addListener(eventName: String) { /* no-op */ }
     @ReactMethod fun removeListeners(count: Int) { /* no-op */ }
 
-    fun emitLocation(lat: Double, lon: Double, accuracy: Double, ts: Double, speed: Double, battery: Double?) {
+    fun emitLocation(lat: Double, lon: Double, accuracy: Double, ts: Double, speed: Double, battery: Double?, isCharging: Boolean) {
         val payload: WritableMap = Arguments.createMap().apply {
             putDouble("lat", lat)
             putDouble("lon", lon)
@@ -98,6 +98,7 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
             putDouble("ts", ts)
             putDouble("speed", speed)
             if (battery != null) putDouble("battery", battery) else putNull("battery")
+            putBoolean("isCharging", isCharging)
         }
         try {
             ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
