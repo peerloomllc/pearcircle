@@ -34,6 +34,7 @@ const { setupPairChannel } = require('./pair')
 const { signValue, verifyValue } = require('./lib/sign')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify } = require('./lib/geofence')
+const { handleNetworkChange } = require('./lib/networkChange')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -47,6 +48,23 @@ const FUTURE_TS_TOLERANCE_MS = 5 * 60 * 1000
 // ceiling for animated GIF/WebP that we store raw to preserve
 // animation. Pattern matches PearGuard's MAX_ANIMATED_BASE64.
 const AVATAR_MAX_BASE64 = 500_000
+
+// Cold-start instrumentation. _bootTs anchors all timing relative to
+// the moment Bare loaded this script; mark() emits a tagged console
+// line so `adb logcat | grep coldstart` reconstructs the timeline.
+// See TODO.md "Investigate ~60s cold-start delay".
+const _bootTs = Date.now()
+function mark (name, extra) {
+  const dt = Date.now() - _bootTs
+  if (extra !== undefined) console.warn('[coldstart worklet+' + dt + 'ms] ' + name + ' ' + JSON.stringify(extra))
+  else console.warn('[coldstart worklet+' + dt + 'ms] ' + name)
+}
+mark('worklet:loaded')
+
+const _firstPeerMarked = new Set()      // circleIds with peer:first-connected emitted
+const _firstWriterMarked = new Set()    // circleIds with writer:first-added emitted
+const _firstLastSeenWriteMarked = new Set()   // circleIds with our first own lastSeen write
+const _firstLastSeenRemoteMarked = new Set()  // circleIds where a non-self lastSeen has applied
 
 let _store = null
 let _localDb = null
@@ -102,6 +120,26 @@ const handlers = {
   'ping': async () => ({ ok: true, ts: Date.now() }),
 
   'app:state': async ({ state }) => ({ state }),
+
+  // Default-network change on the device (wifi <-> cell, vpn on/off,
+  // ethernet plug). The Android side debounces the burst of native
+  // callbacks during a single transition; we receive one event per real
+  // network identity change. Hyperswarm's prior DHT announcement is now
+  // stale (announced an IP that's no longer ours) and any existing peer
+  // sockets are dead until TCP keepalive eventually times them out.
+  // _swarm.flush() forces a fresh announce on the current network so
+  // peers can find this device again within seconds instead of waiting
+  // on Hyperswarm's internal periodic re-announce. See proposal
+  // 2026-05-07-network-change-handler.md.
+  'network:changed': async ({ transport, netHandle } = {}) => {
+    if (!_initialized) return { ok: false, reason: 'not_initialized' }
+    mark('network:changed', { transport, netHandle })
+    const result = await handleNetworkChange(_swarm)
+    if (!result.ok && result.error) {
+      console.warn('[bare] swarm.flush after network:changed failed', result.error)
+    }
+    return result
+  },
 
   'identity:get': async () => {
     if (!_identity) return { publicKey: null, ready: false }
@@ -705,11 +743,16 @@ const handlers = {
     _selfLastSeen = value
 
     let written = 0
-    for (const [, base] of _circleBases) {
+    for (const [circleId, base] of _circleBases) {
       if (!base.writable) continue
       try {
         await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
         written++
+        if (!_firstLastSeenWriteMarked.has(circleId)) {
+          _firstLastSeenWriteMarked.add(circleId)
+          const peers = _circlePeers.get(circleId)?.size ?? 0
+          mark('lastseen:first-write', { circleId, peers })
+        }
       } catch {
         // base closed mid-flight, etc.
       }
@@ -1034,6 +1077,13 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         const keyPubkey = op.key.slice('lastSeen:'.length)
         if (keyPubkey !== incoming.pubkey) continue
         await view.put(op.key, incoming)
+        if (circleId && !_firstLastSeenRemoteMarked.has(circleId)) {
+          const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
+          if (ourKeyHex && keyPubkey !== ourKeyHex) {
+            _firstLastSeenRemoteMarked.add(circleId)
+            mark('lastseen:first-remote', { circleId, from: keyPubkey.slice(0, 8) })
+          }
+        }
         continue
       }
       // `presence:{pubkey}` (proposal §3 / §4): signed by the user-
@@ -1148,6 +1198,10 @@ async function autoAppendMemberRow (circleId) {
   if (profile.avatar) memberValue.avatar = profile.avatar
   try {
     await base.append({ type: 'put', key: 'member:' + ourKey, value: memberValue })
+    if (!_firstWriterMarked.has(circleId)) {
+      _firstWriterMarked.add(circleId)
+      mark('writer:first-added', { circleId })
+    }
     send({ event: 'circle:writer:added', data: { circleId, writerKey: ourKey } })
   } catch {
     // base closed / already appended via race; harmless
@@ -1209,16 +1263,25 @@ function onSwarmConnection (conn, info) {
   for (const circleId of matchedCircleIds) {
     const peers = _circlePeers.get(circleId)
     if (peers) peers.add(remotePublicKey)
+    if (!_firstPeerMarked.has(circleId)) {
+      _firstPeerMarked.add(circleId)
+      mark('peer:first-connected', { circleId, remote: remotePublicKey.slice(0, 8) })
+    } else {
+      mark('peer:reconnected', { circleId, remote: remotePublicKey.slice(0, 8) })
+    }
     send({ event: 'peer:connected', data: { circleId, remotePublicKey } })
   }
   conn.on('close', () => {
     for (const circleId of matchedCircleIds) {
       const peers = _circlePeers.get(circleId)
       if (peers) peers.delete(remotePublicKey)
+      mark('peer:disconnected', { circleId, remote: remotePublicKey.slice(0, 8) })
       send({ event: 'peer:disconnected', data: { circleId, remotePublicKey } })
     }
   })
-  conn.on('error', () => { /* swallow; close fires too */ })
+  conn.on('error', (err) => {
+    mark('peer:error', { remote: remotePublicKey.slice(0, 8), err: err?.message ?? String(err) })
+  })
 }
 
 async function init ({ dataDir } = {}, attempt = 0) {
@@ -1229,6 +1292,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
   if (!dataDir || typeof dataDir !== 'string') {
     throw new Error('init requires { dataDir: string }')
   }
+  mark('init:start', { attempt })
 
   // Retry on lock errors: BareKit may restart the worklet before the prior
   // instance has released the corestore lock file.
@@ -1242,6 +1306,8 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
     throw e
   }
+
+  mark('init:store-ready')
 
   const localCore = _store.get({ name: 'local' })
   await localCore.ready()
@@ -1262,9 +1328,11 @@ async function init ({ dataDir } = {}, attempt = 0) {
       createdAt: Date.now(),
     })
   }
+  mark('init:identity-ready', { fresh: !stored })
 
   _swarm = new Hyperswarm({ keyPair: _identity })
   _swarm.on('connection', onSwarmConnection)
+  mark('init:swarm-created')
 
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced
@@ -1281,6 +1349,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
     if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
   }
+  mark('init:circles-mounted', { count: _circleBases.size })
 
   // Stale-deleted sweep (proposal amendment 2026-05-07). If a previous
   // session pulled an owner's circle.deleted tombstone but the
@@ -1350,6 +1419,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
   armSharingExpiryTimer()
 
   _initialized = true
+  mark('init:done', { circles: _circleBases.size })
   send({
     event: 'ready',
     data: {

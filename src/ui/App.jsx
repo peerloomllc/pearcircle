@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
@@ -478,6 +478,11 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
+  // Per-circle peer pubkey sets (Hyperswarm-level). Filtered to the
+  // active-circle subset and unioned for the map's online-dot indicator
+  // and any future "live link" affordance. Refreshed on the same cadence
+  // as the circle snapshots, plus on peer:connected/disconnected events.
+  const [peersByCircle, setPeersByCircle] = useState({})
   const [selectedCircleId, setSelectedCircleId] = useState(initialSelectedCircleId) // null = All
   const [selectedPubkey, setSelectedPubkey] = useState(null) // null = auto-fit-everyone view
   // Member detail sheet visibility, separate from selectedPubkey so
@@ -488,7 +493,8 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [pendingPlaceCoords, setPendingPlaceCoords] = useState(null) // { lat, lon } from a map long-press, prefilled into AddPlaceForm
   const [editingPlace, setEditingPlace] = useState(null) // { circleId, id, name, radiusMeters } or null
-  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null) // place.id awaiting a second tap to delete
+  const [confirmingDeletePlace, setConfirmingDeletePlace] = useState(null) // place object awaiting confirm-sheet decision
+  const [deletingPlaceId, setDeletingPlaceId] = useState(null)             // place.id with in-flight place:delete IPC
   const [deleteError, setDeleteError] = useState(null)
   const [transitionError, setTransitionError] = useState(null)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -522,6 +528,7 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
       let total = 0
       for (const k of Object.keys(sets)) total += sets[k]?.length ?? 0
       setPeerCount(total)
+      setPeersByCircle(sets)
     } catch {}
   }, [])
 
@@ -593,6 +600,18 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
     ? circles.filter(c => c.circleId === selectedCircleId)
     : circles
   const merged = mergeCircleSnapshots(activeCircles)
+
+  // Union of pubkeys currently connected via Hyperswarm in any of the
+  // active circles. Drives the green online-dot indicator on pin avatars.
+  const connectedPubkeys = useMemo(() => {
+    const set = new Set()
+    for (const c of activeCircles) {
+      const arr = peersByCircle?.[c.circleId]
+      if (!arr) continue
+      for (const pk of arr) set.add(pk)
+    }
+    return set
+  }, [activeCircles, peersByCircle])
 
   // Inject self into the map even when the user has no circles yet
   // (zero-circle empty state) or hasn't appeared in any circle's lastSeen
@@ -684,6 +703,48 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
     }
   }, [data])
 
+  // Two-stage pin / edge-indicator tap (user TODO 2026-05-08): the first
+  // tap on an unfocused pin is focus-only (camera flyTo + top-bar swap)
+  // so the user can see where the person is without the bottom sheet
+  // immediately covering half the map; a second tap on the already-
+  // focused pin opens the detail sheet -- BUT only if the member is
+  // still in view. If the user has panned / zoomed away, the second tap
+  // recenters back on the member instead, so finding-them-again takes
+  // priority over the sheet. Roster-row taps and the notification:focus
+  // path keep using `focusMember` directly because there's no camera-
+  // intermediate state to show in those flows.
+  const onPinTap = useCallback((pubkey) => {
+    if (!pubkey) return
+    const seen = data.lastSeen?.[pubkey]
+    const isAlreadyFocused = selectedPubkey === pubkey
+    if (isAlreadyFocused) {
+      const inView = seen ? mapApiRef.current?.isInView([seen.lon, seen.lat]) : true
+      if (!inView && seen) {
+        // Panned away -- recenter, leave the sheet closed (or as-is) so
+        // the next tap can do the open-sheet thing once they're back in
+        // frame. Don't toggle memberSheetVisible here; the user already
+        // saw the pin, they're just bringing the camera back to it.
+        justFocusedRef.current = true
+        mapApiRef.current?.flyTo({
+          center: [seen.lon, seen.lat], zoom: 16, duration: 1100,
+        })
+        return
+      }
+      if (!memberSheetVisible) setMemberSheetVisible(true)
+      return
+    }
+    setSelectedPubkey(pubkey)
+    setMemberSheetVisible(false)
+    setMenuOpen(false)
+    setSheetOpen(false)
+    if (seen) {
+      justFocusedRef.current = true
+      mapApiRef.current?.flyTo({
+        center: [seen.lon, seen.lat], zoom: 16, duration: 1100,
+      })
+    }
+  }, [selectedPubkey, memberSheetVisible, data])
+
   const clearFocus = useCallback(() => {
     setSelectedPubkey(null)
     setMemberSheetVisible(false)
@@ -719,16 +780,6 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
     setSheetOpen(true)
   }, [writableCircles])
 
-  // Two-tap delete: first tap arms the confirm state for one place,
-  // second tap on the same place's button actually fires the delete.
-  // Auto-disarm after 4s so a stray earlier tap doesn't strand the
-  // user one click away from a destructive action.
-  useEffect(() => {
-    if (!confirmingDeleteId) return
-    const id = setTimeout(() => setConfirmingDeleteId(null), 4000)
-    return () => clearTimeout(id)
-  }, [confirmingDeleteId])
-
   // Dismissing the bottom sheet (scrim tap or drag-to-close) cancels
   // any pending add/edit/delete-confirm flow, so reopening the sheet
   // is a fresh state. Without this the user gets the surprise of
@@ -738,21 +789,24 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
     setEditingPlace(null)
     setShowAddPlace(false)
     setPendingPlaceCoords(null)
-    setConfirmingDeleteId(null)
+    setConfirmingDeletePlace(null)
     setDeleteError(null)
     setTransitionError(null)
   }, [sheetOpen])
 
   const deletePlace = useCallback(async (place) => {
     setDeleteError(null)
+    setDeletingPlaceId(place.id)
     try {
       await pear.call('place:delete', { circleId: place.circleId, placeId: place.id })
-      setConfirmingDeleteId(null)
+      setConfirmingDeletePlace(null)
       // Close any open edit form pointing at the just-deleted place.
       setEditingPlace((cur) => (cur && cur.id === place.id ? null : cur))
       await refresh()
     } catch (e) {
       setDeleteError(String(e?.message ?? e))
+    } finally {
+      setDeletingPlaceId(null)
     }
   }, [refresh])
 
@@ -801,7 +855,8 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
           ref={mapApiRef}
           data={data}
           selectedPubkey={selectedPubkey}
-          onMemberClick={focusMember}
+          connectedPubkeys={connectedPubkeys}
+          onMemberClick={onPinTap}
           onLongPress={onMapLongPress}
         />
       </div>
@@ -1087,6 +1142,9 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
               {data.places.map(p => {
                 const placeCircle = circles.find(c => c.circleId === p.circleId)
                 const placeWritable = !!placeCircle?.writable
+                const muteKey = p.circleId + ':' + p.id
+                const isMuted = mutedPlaces.has(muteKey)
+                const isDeleting = deletingPlaceId === p.id
                 const focusOn = (e) => {
                   // Don't trigger if a debug button inside the row was tapped.
                   if (e.target.closest('button')) return
@@ -1103,22 +1161,22 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
                       <div style={s.memberName}>{p.name}</div>
                       <div style={s.placeRowActions}>
                         <button
-                          style={{
-                            ...s.smallBtn,
-                            flex: 'none',
-                            padding: '6px 12px',
-                            background: mutedPlaces.has(p.circleId + ':' + p.id) ? '#3a2a14' : '#222',
-                            color: mutedPlaces.has(p.circleId + ':' + p.id) ? '#fc9' : '#ccc',
-                            borderColor: mutedPlaces.has(p.circleId + ':' + p.id) ? '#5a3f1f' : '#333',
-                          }}
                           onClick={(e) => { e.stopPropagation(); toggleMute(p) }}
-                        >
-                          {mutedPlaces.has(p.circleId + ':' + p.id) ? 'Muted' : 'Mute'}
+                          title={isMuted ? 'Unmute notifications' : 'Mute notifications'}
+                          aria-label={isMuted ? 'Unmute notifications' : 'Mute notifications'}
+                          style={{
+                            ...iconBtnStyle({ disabled: false }),
+                            color: isMuted ? '#fc9' : colors.text.secondary,
+                            borderColor: isMuted ? '#5a3f1f' : colors.border,
+                            background: isMuted ? '#3a2a14' : 'transparent',
+                          }}>
+                          {isMuted
+                            ? <BellSimpleSlash size={18} weight="regular" />
+                            : <BellSimple size={18} weight="regular" />}
                         </button>
                         {placeWritable && (
                           <>
                             <button
-                              style={{ ...s.smallBtn, flex: 'none', padding: '6px 12px' }}
                               onClick={(e) => {
                                 e.stopPropagation()
                                 setEditingPlace({
@@ -1128,27 +1186,21 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
                                   radiusMeters: p.radiusMeters,
                                 })
                                 setShowAddPlace(false)
-                                setConfirmingDeleteId(null)
+                                setConfirmingDeletePlace(null)
                               }}
-                            >
-                              Edit
+                              disabled={isDeleting}
+                              title="Edit place"
+                              aria-label="Edit place"
+                              style={iconBtnStyle({ disabled: isDeleting })}>
+                              <PencilSimple size={18} weight="regular" />
                             </button>
                             <button
-                              style={{
-                                ...s.smallBtn,
-                                flex: 'none',
-                                padding: '6px 12px',
-                                background: confirmingDeleteId === p.id ? '#5a1f1f' : '#222',
-                                color: confirmingDeleteId === p.id ? '#fcc' : '#ccc',
-                                borderColor: confirmingDeleteId === p.id ? '#7a2a2a' : '#333',
-                              }}
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                if (confirmingDeleteId === p.id) deletePlace(p)
-                                else setConfirmingDeleteId(p.id)
-                              }}
-                            >
-                              {confirmingDeleteId === p.id ? 'Tap to confirm' : 'Delete'}
+                              onClick={(e) => { e.stopPropagation(); setConfirmingDeletePlace(p) }}
+                              disabled={isDeleting}
+                              title="Delete place"
+                              aria-label="Delete place"
+                              style={iconBtnStyle({ disabled: isDeleting, destructive: true })}>
+                              <Trash size={18} weight="regular" />
                             </button>
                           </>
                         )}
@@ -1193,6 +1245,17 @@ function HomeMapView ({ identity, profile, sharing, setView, setSheet, initialSe
           )}
           {actionTargetCircleId && !actionTargetWritable && (
             <p style={s.muted}>Read-only until owner adds you as a writer.</p>
+          )}
+          {confirmingDeletePlace && (
+            <ConfirmSheet
+              title="Delete place?"
+              message={<>Delete <strong>{confirmingDeletePlace.name}</strong>? Members will stop getting notifications about arrivals at and departures from this place. This cannot be undone.</>}
+              confirmLabel="Delete"
+              destructive
+              busy={deletingPlaceId === confirmingDeletePlace.id}
+              onConfirm={() => deletePlace(confirmingDeletePlace)}
+              onClose={() => { if (deletingPlaceId !== confirmingDeletePlace.id) setConfirmingDeletePlace(null) }}
+            />
           )}
         </BottomSheet>
       )}
@@ -1488,7 +1551,7 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
 }
 
 const CircleMap = React.forwardRef(function CircleMap (
-  { data, selectedPubkey, onMemberClick, onLongPress },
+  { data, selectedPubkey, connectedPubkeys, onMemberClick, onLongPress },
   apiRef,
 ) {
   const containerRef = useRef(null)
@@ -1542,6 +1605,16 @@ const CircleMap = React.forwardRef(function CircleMap (
       }
       if (coords.length > 0) fitTo(m, coords)
       else if (d.places?.length > 0) fitTo(m, d.places.map(p => [p.lon, p.lat]))
+    },
+    // Used by the two-stage pin tap (App.onPinTap): when the user taps a
+    // pin or edge indicator for an already-focused member, we check
+    // whether the member is currently visible. If yes, the second tap
+    // opens the detail sheet; if no (user panned/zoomed away), we
+    // recenter first and the detail sheet only opens on a follow-up tap.
+    isInView: ([lng, lat]) => {
+      const m = mapRef.current
+      if (!m || !Number.isFinite(lng) || !Number.isFinite(lat)) return false
+      try { return m.getBounds().contains([lng, lat]) } catch { return false }
     },
   }), [])
 
@@ -1681,11 +1754,11 @@ const CircleMap = React.forwardRef(function CircleMap (
     if (!map || !data) return
     const apply = () => {
       syncFeatures(map, data, fittedRef)
-      syncMembers(map, data, selectedPubkey, markerStatesRef.current, onMemberClickRef, ensureRaf)
+      syncMembers(map, data, selectedPubkey, connectedPubkeys, markerStatesRef.current, onMemberClickRef, ensureRaf)
     }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [data, selectedPubkey, ensureRaf])
+  }, [data, selectedPubkey, connectedPubkeys, ensureRaf])
 
   return (
     <div style={s.mapWrap}>
@@ -1886,7 +1959,7 @@ function buildBubbleElement (clickRef) {
 // avatar is the location indicator, with a colored ring for contrast
 // and a drop-shadow for depth. Selected state grows the badge and
 // swaps to a cyan ring with a glow halo.
-function renderBubble (root, member, selected, last) {
+function renderBubble (root, member, selected, last, connected) {
   const pubkey = member.value?.pubkey ?? ''
   const size = selected ? 72 : 60
   const ring = selected ? 4 : 3
@@ -1969,14 +2042,24 @@ function renderBubble (root, member, selected, last) {
   // keeps the pin readable on bright tiles.
   const avatarBorder = selected ? 'none' : `${ring}px solid ${ringColor}`
 
+  // Online-status dot: small green dot at the top-left of the avatar
+  // when the peer is currently connected via Hyperswarm. Top-left
+  // because the motion glyph already lives at top-right and the battery
+  // hangs below. Dark border outlines the dot against light avatars and
+  // bright map tiles. Plain DOM (no SVG) per the renderBubble saga.
+  const onlineHtml = connected ? (
+    `<div style="position:absolute;z-index:3;top:-1px;left:-1px;width:14px;height:14px;border-radius:50%;background:#7ec77a;border:2px solid #0d0d0d;box-sizing:border-box;pointer-events:none;"></div>`
+  ) : ''
+
   root.innerHTML =
     focusRingHtml +
     `<div style="position:relative;z-index:1;width:100%;height:100%;border-radius:50%;overflow:hidden;border:${avatarBorder};background:#fc7;box-sizing:border-box;">${inner}</div>` +
     battHtml +
-    motionHtml
+    motionHtml +
+    onlineHtml
 }
 
-function syncMembers (map, data, selectedPubkey, states, clickRef, ensureRaf) {
+function syncMembers (map, data, selectedPubkey, connectedPubkeys, states, clickRef, ensureRaf) {
   const seen = new Set()
   for (const m of data?.members ?? []) {
     const pubkey = m.value?.pubkey
@@ -2017,7 +2100,7 @@ function syncMembers (map, data, selectedPubkey, states, clickRef, ensureRaf) {
       }
       // else: position unchanged within ~0.5m, skip the tween.
     }
-    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey, last)
+    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey, last, !!connectedPubkeys?.has(pubkey))
   }
 
   for (const [pubkey, state] of states) {
@@ -2053,19 +2136,20 @@ function fitTo (map, lonLatPairs) {
 }
 
 // Circles section in Settings. Lists every circle the user is in,
-// surfaces the user's role (owner/member), and offers a per-circle
-// delete (owner) or leave (non-owner) action with a two-tap confirm
-// pattern (4s auto-disarm) mirroring the place-delete UX. Calls the
-// new circle:delete / circle:leave IPCs added by the proposal
-// 2026-05-07; success removes the row from the list locally and
-// triggers an onChanged hook so the parent can refresh anything else
-// downstream. The home view's periodic circles:getAll poll picks up
-// the change within a few seconds without needing an explicit signal.
+// surfaces the user's role (owner/member), and offers per-circle
+// rename (owner), delete (owner), and leave (non-owner) actions.
+// Buttons are icon affordances; destructive actions (delete, leave)
+// route through a ConfirmSheet rather than a two-tap prime so the
+// user has a moment to read what they're about to do (and what it
+// affects). Rename keeps its inline-edit mode, just triggered by
+// the pencil icon. Calls circle:delete / circle:leave / circle:rename
+// IPCs (proposal 2026-05-07); success drops the row locally and fires
+// onChanged so the home view's circles:getAll poll picks up the rest.
 function CirclesSection ({ active = true, onChanged }) {
   const [list, setList] = useState([])
   const [loading, setLoading] = useState(true)
-  const [armed, setArmed] = useState(null)
-  const [pending, setPending] = useState(null)
+  const [confirmingFor, setConfirmingFor] = useState(null) // circle object pending confirm
+  const [pending, setPending] = useState(null)             // circleId with in-flight IPC
   const [error, setError] = useState(null)
   // Rename state: which circle is being edited, its draft name, and a
   // saving flag. Single edit at a time keeps the row layout simple.
@@ -2108,18 +2192,7 @@ function CirclesSection ({ active = true, onChanged }) {
     return () => clearInterval(id)
   }, [active, refresh])
 
-  useEffect(() => {
-    if (!armed) return
-    const id = setTimeout(() => setArmed(null), 4000)
-    return () => clearTimeout(id)
-  }, [armed])
-
-  const onTapAction = async (c) => {
-    if (armed !== c.circleId) {
-      setArmed(c.circleId)
-      return
-    }
-    setArmed(null)
+  const performAction = async (c) => {
     setPending(c.circleId)
     setError(null)
     try {
@@ -2127,6 +2200,7 @@ function CirclesSection ({ active = true, onChanged }) {
       const r = await pear.call(ipc, { circleId: c.circleId })
       if (!r?.ok) throw new Error('Could not ' + (c.isOwner ? 'delete' : 'leave') + ' circle')
       setList(prev => prev.filter(x => x.circleId !== c.circleId))
+      setConfirmingFor(null)
       onChanged?.()
     } catch (e) {
       setError(String(e?.message ?? e))
@@ -2138,7 +2212,6 @@ function CirclesSection ({ active = true, onChanged }) {
   const startRename = (c) => {
     setEditingId(c.circleId)
     setEditName(c.name)
-    setArmed(null)
     setError(null)
   }
   const cancelRename = () => {
@@ -2175,13 +2248,8 @@ function CirclesSection ({ active = true, onChanged }) {
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
         {list.map(c => {
-          const isArmed = armed === c.circleId
           const isPending = pending === c.circleId
           const isEditing = editingId === c.circleId
-          const verb = c.isOwner ? 'Delete' : 'Leave'
-          const verbing = c.isOwner ? 'Deleting...' : 'Leaving...'
-          const armedLabel = c.isOwner ? 'Tap again to delete' : 'Tap again to leave'
-          const btnColor = c.isOwner ? colors.error : colors.text.primary
           if (isEditing) {
             // Edit mode: input replaces name + count column; Save / Cancel
             // replace the action button. Disabled while saving so a
@@ -2254,39 +2322,60 @@ function CirclesSection ({ active = true, onChanged }) {
                 <button
                   onClick={() => startRename(c)}
                   disabled={isPending}
-                  style={{
-                    padding: '8px 12px', borderRadius: radius.md,
-                    background: 'transparent', color: colors.text.secondary,
-                    border: `1px solid ${colors.border}`,
-                    cursor: isPending ? 'default' : 'pointer',
-                    fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 300,
-                    opacity: isPending ? 0.5 : 1,
-                    whiteSpace: 'nowrap',
-                  }}>
-                  Rename
+                  title="Rename"
+                  aria-label="Rename"
+                  style={iconBtnStyle({ disabled: isPending })}>
+                  <PencilSimple size={18} weight="regular" />
                 </button>
               )}
               <button
-                onClick={() => onTapAction(c)}
+                onClick={() => setConfirmingFor(c)}
                 disabled={isPending}
-                style={{
-                  padding: '8px 14px', borderRadius: radius.md,
-                  background: 'transparent', color: btnColor,
-                  border: `1px solid ${isArmed ? btnColor : colors.border}`,
-                  cursor: isPending ? 'default' : 'pointer',
-                  fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 300,
-                  opacity: isPending ? 0.5 : 1,
-                  whiteSpace: 'nowrap',
-                }}>
-                {isPending ? verbing : (isArmed ? armedLabel : verb)}
+                title={c.isOwner ? 'Delete circle' : 'Leave circle'}
+                aria-label={c.isOwner ? 'Delete circle' : 'Leave circle'}
+                style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                {c.isOwner
+                  ? <Trash size={18} weight="regular" />
+                  : <SignOut size={18} weight="regular" />}
               </button>
             </li>
           )
         })}
       </ul>
       {error && <p style={s.error}>{error}</p>}
+      {confirmingFor && (
+        <ConfirmSheet
+          title={confirmingFor.isOwner ? 'Delete circle?' : 'Leave circle?'}
+          message={confirmingFor.isOwner
+            ? <>Delete <strong>{confirmingFor.name}</strong>? This removes the circle for everyone in it. This cannot be undone.</>
+            : <>Leave <strong>{confirmingFor.name}</strong>? You will stop sharing with this circle. You can rejoin later if someone shares the invite again.</>}
+          confirmLabel={confirmingFor.isOwner ? 'Delete' : 'Leave'}
+          destructive
+          busy={pending === confirmingFor.circleId}
+          onConfirm={() => performAction(confirmingFor)}
+          onClose={() => { if (pending !== confirmingFor.circleId) setConfirmingFor(null) }}
+        />
+      )}
     </>
   )
+}
+
+// Icon button styling shared by the Settings rows. 36x36 square,
+// transparent fill with a subtle border, fades + flips cursor when
+// disabled. Destructive variant tints the icon error-red; the border
+// stays neutral so the row reads calm at rest (the loud confirmation
+// happens in the sheet, not the row).
+function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
+  return {
+    width: 36, height: 36,
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    padding: 0, borderRadius: radius.md,
+    background: 'transparent',
+    color: destructive ? colors.error : colors.text.secondary,
+    border: `1px solid ${colors.border}`,
+    cursor: disabled ? 'default' : 'pointer',
+    opacity: disabled ? 0.5 : 1,
+  }
 }
 
 function ProfileView ({ active = true, profile, sharing, setSharing, onClose, onSaved }) {
@@ -2972,6 +3061,66 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
         {children}
       </div>
     </div>
+  )
+}
+
+// Generic confirmation sheet for destructive actions (delete circle,
+// leave circle, delete place, etc). Built on the BottomSheet primitive
+// so the dim layer + slide animation + swipe-down dismissal come for
+// free, and so confirms stack naturally above any underlying sheet
+// (zIndex 250 sits above the default BottomSheet zIndex 200).
+//
+// Props:
+//   title          — short prompt shown as the sheet's heading
+//   message        — body copy (string or JSX) explaining what'll happen
+//   confirmLabel   — verb on the destructive button (e.g. "Delete")
+//   destructive    — when true, confirm button uses the error color
+//   busy           — disables both buttons + swaps confirm label to "..."
+//   onConfirm      — called when the destructive button is tapped
+//   onClose        — called for cancel / scrim tap / swipe-down
+function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive = true, busy = false, onConfirm, onClose }) {
+  const accentColor = destructive ? colors.error : colors.accent
+  return (
+    <BottomSheet onClose={onClose} zIndex={250}>
+      <h2 style={{
+        margin: `${spacing.sm}px 0 ${spacing.xs}px`,
+        fontSize: 18, fontWeight: 400, color: colors.text.primary,
+      }}>
+        {title}
+      </h2>
+      <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
+        {message}
+      </div>
+      <div style={{ display: 'flex', gap: spacing.sm }}>
+        <button
+          onClick={onClose}
+          disabled={busy}
+          style={{
+            flex: 1, padding: '12px 16px', borderRadius: radius.md,
+            background: 'transparent', color: colors.text.secondary,
+            border: `1px solid ${colors.border}`,
+            cursor: busy ? 'default' : 'pointer',
+            fontFamily: typography.fontFamily, fontSize: 14, fontWeight: 400,
+            opacity: busy ? 0.5 : 1,
+          }}>
+          Cancel
+        </button>
+        <button
+          onClick={onConfirm}
+          disabled={busy}
+          style={{
+            flex: 1, padding: '12px 16px', borderRadius: radius.md,
+            background: accentColor,
+            color: '#fff',
+            border: `1px solid ${accentColor}`,
+            cursor: busy ? 'default' : 'pointer',
+            fontFamily: typography.fontFamily, fontSize: 14, fontWeight: 500,
+            opacity: busy ? 0.7 : 1,
+          }}>
+          {busy ? '...' : confirmLabel}
+        </button>
+      </div>
+    </BottomSheet>
   )
 }
 

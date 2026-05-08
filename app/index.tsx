@@ -117,6 +117,17 @@ async function fireTransitionNotification(payload: any) {
   }
 }
 
+// Cold-start instrumentation. _shellT0 anchors shell-side timing relative
+// to JS bundle load; the worklet has its own _bootTs (see src/bare.js).
+// Grep `adb logcat` for `coldstart` to see the interleaved timeline. The
+// `shell:worklet-started` mark records the offset between the two clocks.
+const _shellT0 = Date.now()
+function shellMark(name: string, extra?: any) {
+  const dt = Date.now() - _shellT0
+  if (extra !== undefined) console.warn('[coldstart shell+' + dt + 'ms] ' + name + ' ' + JSON.stringify(extra))
+  else console.warn('[coldstart shell+' + dt + 'ms] ' + name)
+}
+
 let _worklet: any = null
 let _workletStarted = false
 let _nextId = 1
@@ -134,6 +145,13 @@ function ensureLocationListener() {
   // its task has been swiped from recents.
   emitter.addListener('PearCircleLocation:update', (data: any) => {
     sendToWorklet({ method: 'location:update', args: data })
+  })
+  // Default-network change (wifi <-> cell, vpn on/off, etc). Native
+  // module debounces the burst Android emits during a transition and
+  // delivers one event per real change. Worklet responds by forcing
+  // Hyperswarm to re-announce on the new network.
+  emitter.addListener('PearCircleLocation:network:changed', (data: any) => {
+    sendToWorklet({ method: 'network:changed', args: data })
   })
   _locationListenerSet = true
 }
@@ -160,14 +178,17 @@ async function startWorklet() {
   if (_workletStarted) return
   _workletStarted = true
 
+  shellMark('worklet:bundle-load:start')
   const asset = Asset.fromModule(require('../assets/bare-universal.bundle'))
   await asset.downloadAsync()
   const bundle = await FileSystem.readAsStringAsync(asset.localUri!, {
     encoding: FileSystem.EncodingType.Base64
   })
+  shellMark('worklet:bundle-load:done', { bytes: bundle.length })
 
   _worklet = new Worklet()
   await _worklet.start('/app.bundle', b4a.from(bundle, 'base64'))
+  shellMark('worklet:started')
 
   let buffer = ''
   _worklet.IPC.on('data', (chunk: any) => {
@@ -241,8 +262,9 @@ export default function Index() {
   const scanResolveRef = useRef<((value: string | null) => void) | null>(null)
 
   useEffect(() => {
+    shellMark('shell:mount')
     startWorklet().catch((e) => console.warn('worklet start failed', e))
-    loadUiHtml().then(setHtml).catch((e) => console.warn('UI bundle load failed', e))
+    loadUiHtml().then((h) => { shellMark('ui:html-ready'); setHtml(h) }).catch((e) => console.warn('UI bundle load failed', e))
 
     const sub = AppState.addEventListener('change', (s) => {
       sendToWorklet({ method: 'app:state', args: { state: s } })
@@ -254,6 +276,7 @@ export default function Index() {
 
     // Forward worklet events to the WebView so the UI can react.
     onEvent('ready', (data) => {
+      shellMark('worklet:ready-received')
       // Capture our pubkey so transition:applied can suppress self-notifications.
       if (data?.publicKey && typeof data.publicKey === 'string') _ourPubkey = data.publicKey
       emitEvent('ready', data)
@@ -322,6 +345,7 @@ export default function Index() {
   }
 
   const onLoad = () => {
+    shellMark('webview:loaded')
     webViewLoaded.current = true
     if (pendingDeeplink.current) {
       emitEvent('deeplink:invite', { url: pendingDeeplink.current })

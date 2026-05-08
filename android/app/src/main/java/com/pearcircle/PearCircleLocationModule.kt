@@ -4,10 +4,16 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -22,7 +28,10 @@ import com.facebook.react.modules.core.PermissionListener
 class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     : ReactContextBaseJavaModule(ctx) {
 
-    init { instance = this }
+    init {
+        instance = this
+        registerNetworkCallback()
+    }
 
     override fun getName() = "PearCircleLocation"
 
@@ -152,9 +161,126 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         )
     }
 
+    // Default-network change handling. Hyperswarm's DHT announcement is
+    // tied to the local IP at the time of the announce; when the device
+    // moves between wifi and cell, peers can't find us until Hyperswarm's
+    // internal periodic re-announce eventually fires (minute-ish in the
+    // 2026-05-07 cold-start investigation). Detect default-network
+    // changes here, debounce 2s to coalesce the burst Android emits
+    // during a single transition, and emit one event per real network
+    // identity change. The worklet's `network:changed` handler responds
+    // by calling `_swarm.flush()` so the announce happens promptly on
+    // the new network.
+    // Initialized lazily inside registerNetworkCallback() rather than as
+    // a `by lazy` delegate, because `init {}` runs before the delegate
+    // field is wired up — the resulting NPE wasted a smoke-test iteration
+    // before the diagnostic Log.w surfaced it.
+    private var connectivity: ConnectivityManager? = null
+    private val debounceHandler = Handler(Looper.getMainLooper())
+    private var pendingEmit: Runnable? = null
+    private var lastNetHandle: Long? = null
+    private var hasSeenInitialNetwork = false
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    private fun registerNetworkCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            Log.w(TAG, "registerNetworkCallback: skipped, API < N")
+            return
+        }
+        if (networkCallback != null) {
+            Log.w(TAG, "registerNetworkCallback: already registered")
+            return
+        }
+        val cm = try {
+            ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        } catch (e: Throwable) {
+            Log.w(TAG, "registerNetworkCallback: getSystemService threw: ${e.message}")
+            null
+        }
+        if (cm == null) {
+            Log.w(TAG, "registerNetworkCallback: ConnectivityManager unavailable")
+            return
+        }
+        connectivity = cm
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val handle = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) network.networkHandle else 0L
+                Log.w(TAG, "onAvailable handle=$handle prev=$lastNetHandle hasSeenInitial=$hasSeenInitialNetwork")
+                if (lastNetHandle == handle) return
+                lastNetHandle = handle
+                // Skip the first onAvailable across the lifetime of this
+                // module instance: it's the network the worklet is already
+                // running on at app start. Re-announcing on the initial
+                // network is wasted work. After wifi off -> on cycles,
+                // hasSeenInitialNetwork stays true so the new onAvailable
+                // correctly emits a change.
+                if (!hasSeenInitialNetwork) {
+                    hasSeenInitialNetwork = true
+                    Log.w(TAG, "onAvailable: marking initial, skipping emit")
+                    return
+                }
+                Log.w(TAG, "onAvailable: scheduling debounced emit")
+                scheduleDebouncedEmit(network)
+            }
+            override fun onLost(network: Network) {
+                Log.w(TAG, "onLost handle=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) network.networkHandle else 0L}")
+                pendingEmit?.let { debounceHandler.removeCallbacks(it) }
+                pendingEmit = null
+                lastNetHandle = null
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+            Log.w(TAG, "registerNetworkCallback: registered")
+        } catch (e: Throwable) {
+            Log.w(TAG, "registerNetworkCallback: failed: ${e.message}")
+        }
+    }
+
+    private fun scheduleDebouncedEmit(network: Network) {
+        pendingEmit?.let { debounceHandler.removeCallbacks(it) }
+        val r = Runnable {
+            pendingEmit = null
+            emitNetworkChanged(network)
+        }
+        pendingEmit = r
+        debounceHandler.postDelayed(r, DEBOUNCE_MS)
+    }
+
+    private fun emitNetworkChanged(network: Network) {
+        val cm = connectivity
+        val caps = if (cm != null) {
+            try { cm.getNetworkCapabilities(network) } catch (_: Throwable) { null }
+        } else null
+        val transport = when {
+            caps == null -> "unknown"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+            else -> "unknown"
+        }
+        val handle = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) network.networkHandle else 0L
+        Log.w(TAG, "emitNetworkChanged transport=$transport handle=$handle")
+        val payload: WritableMap = Arguments.createMap().apply {
+            putString("transport", transport)
+            putDouble("netHandle", handle.toDouble())
+        }
+        try {
+            ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit("PearCircleLocation:network:changed", payload)
+            Log.w(TAG, "emitNetworkChanged: emitted to JS")
+        } catch (e: Throwable) {
+            Log.w(TAG, "emitNetworkChanged: emit failed: ${e.message}")
+        }
+    }
+
     companion object {
+        private const val TAG = "PearCircleLocation"
         private const val REQ_FINE = 4711
         private const val REQ_NOTIFICATIONS = 4713
+        private const val DEBOUNCE_MS = 2000L
         @JvmStatic var instance: PearCircleLocationModule? = null
     }
 }
