@@ -1,4 +1,4 @@
-const { motionState, STILL_THRESHOLD_MPS, DRIVING_THRESHOLD_MPS } = require('../src/lib/motion')
+const { motionState, STILL_THRESHOLD_MPS, DRIVING_THRESHOLD_MPS, FLYING_THRESHOLD_MPS } = require('../src/lib/motion')
 
 describe('motionState', () => {
   test('null speed returns null', () => {
@@ -46,5 +46,17 @@ describe('motionState', () => {
 
   test('highway speed (30 m/s ~ 67 mph) is driving', () => {
     expect(motionState(30)).toBe('driving')
+  })
+
+  test('just under FLYING_THRESHOLD is driving', () => {
+    expect(motionState(FLYING_THRESHOLD_MPS - 0.01)).toBe('driving')
+  })
+
+  test('exactly FLYING_THRESHOLD is flying', () => {
+    expect(motionState(FLYING_THRESHOLD_MPS)).toBe('flying')
+  })
+
+  test('cruise speed (240 m/s ~ 537 mph) is flying', () => {
+    expect(motionState(240)).toBe('flying')
   })
 })

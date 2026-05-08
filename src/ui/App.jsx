@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
@@ -776,6 +776,29 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     }
   }, [data, myPubkey, refresh])
 
+  // Debug helper for the speed-only flight detection: fires a synthetic
+  // location:update with a chosen speed at the user's current coords so
+  // the motion classifier picks it up as 'flying' (or 'still', or any
+  // other bucket we want to test). The next real GPS update overwrites,
+  // so this is a brief override -- if the device is parked indoors with
+  // no GPS movement the fake state sticks until reset via this same
+  // helper. No-op when we don't have a self position yet.
+  const fireFakeMotion = useCallback(async (speedMps) => {
+    const lat = selfSeen?.lat
+    const lon = selfSeen?.lon
+    if (typeof lat !== 'number' || typeof lon !== 'number') return
+    try {
+      await pear.call('location:update', {
+        lat, lon,
+        accuracy: typeof selfSeen?.accuracy === 'number' ? selfSeen.accuracy : null,
+        ts: Date.now(),
+        speed: speedMps,
+        battery: typeof selfSeen?.battery === 'number' ? selfSeen.battery : null,
+      })
+      await refresh()
+    } catch {}
+  }, [selfSeen, refresh])
+
   const focusMember = useCallback((pubkey) => {
     if (!pubkey) return
     setSelectedPubkey(pubkey)
@@ -955,6 +978,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           data={data}
           selectedPubkey={selectedPubkey}
           connectedPubkeys={connectedPubkeys}
+          myPubkey={myPubkey}
           tileStyleUrl={tileStyleUrl}
           onMemberClick={onPinTap}
           onLongPress={onMapLongPress}
@@ -1355,6 +1379,20 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               })}
             </ul>
           )}
+          {/* Motion-state debug: spoof the speed on a self location:update
+              so the flying / driving / walking glyphs can be exercised
+              without an actual flight or car ride. No-op when self
+              has no fix yet. */}
+          {selfSeen && (
+            <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
+              <button style={{ ...s.smallBtn, flex: 1 }} onClick={() => fireFakeMotion(80)}>
+                Fire flying (debug)
+              </button>
+              <button style={{ ...s.smallBtn, flex: 1 }} onClick={() => fireFakeMotion(0)}>
+                Fire stationary (debug)
+              </button>
+            </div>
+          )}
           {transitionError && <p style={s.error}>{transitionError}</p>}
           {deleteError && <p style={s.error}>{deleteError}</p>}
 
@@ -1684,7 +1722,7 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
 }
 
 const CircleMap = React.forwardRef(function CircleMap (
-  { data, selectedPubkey, connectedPubkeys, tileStyleUrl, onMemberClick, onLongPress },
+  { data, selectedPubkey, connectedPubkeys, myPubkey, tileStyleUrl, onMemberClick, onLongPress },
   apiRef,
 ) {
   // Initial style at mount time. We can't read this from a ref/prop on
@@ -1907,11 +1945,11 @@ const CircleMap = React.forwardRef(function CircleMap (
     if (!map || !data) return
     const apply = () => {
       syncFeatures(map, data, fittedRef)
-      syncMembers(map, data, selectedPubkey, connectedPubkeys, markerStatesRef.current, onMemberClickRef, ensureRaf)
+      syncMembers(map, data, selectedPubkey, connectedPubkeys, myPubkey, markerStatesRef.current, onMemberClickRef, ensureRaf)
     }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [data, selectedPubkey, connectedPubkeys, ensureRaf])
+  }, [data, selectedPubkey, connectedPubkeys, myPubkey, ensureRaf])
 
   return (
     <div style={s.mapWrap}>
@@ -2151,16 +2189,26 @@ function renderBubble (root, member, selected, last, connected) {
   // static. "Still" renders nothing so resting members don't get a glyph
   // cluttering the pin.
   const motion = motionState(last?.speed)
-  const motionUrl = motion === 'walking' ? motionWalkingUrl : motion === 'driving' ? motionDrivingUrl : null
+  // Walking / driving have hand-drawn PNG stickers; flying uses a plain
+  // unicode airplane glyph (no PNG asset yet, and SVG inside markers is
+  // off-limits per the renderBubble saga). Still renders nothing.
+  const motionUrl = motion === 'walking' ? motionWalkingUrl
+                  : motion === 'driving' ? motionDrivingUrl
+                  : null
   // Negative animation-delay aligns the pulse to wall-clock so it stays
   // in phase across the periodic innerHTML rewrites in syncMembers
   // (otherwise the animation restarts at 0% every refresh and looks choppy).
   // Same trick is applied to the focus-ring spin below.
   const pulseDelay = -((Date.now() % 1600) / 1000)
   const spinDelay = -((Date.now() % 2400) / 1000)
-  const motionHtml = motionUrl == null ? '' : (
+  const motionInner = motionUrl != null
+    ? `<img src="${motionUrl}" alt="" style="width:27px;height:auto;display:block;" />`
+    : motion === 'flying'
+      ? `<span style="font-size:22px;line-height:1;color:${colors.text.primary};font-family:${typography.fontFamily};">&#9992;</span>`
+      : ''
+  const motionHtml = motionInner === '' ? '' : (
     `<div style="position:absolute;z-index:2;top:-6px;right:-9px;width:36px;height:36px;background:#0f1417;border:1px solid #2a3338;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.5);pointer-events:none;animation:pearcircle-motion-pulse 1.6s ease-in-out infinite;animation-delay:${pulseDelay}s;transform-origin:center;">` +
-    `<img src="${motionUrl}" alt="" style="width:27px;height:auto;display:block;" />` +
+    motionInner +
     `</div>`
   )
 
@@ -2195,14 +2243,15 @@ function renderBubble (root, member, selected, last, connected) {
   // keeps the pin readable on bright tiles.
   const avatarBorder = selected ? 'none' : `${ring}px solid ${ringColor}`
 
-  // Online-status dot: small green dot at the top-left of the avatar
-  // when the peer is currently connected via Hyperswarm. Top-left
-  // because the motion glyph already lives at top-right and the battery
-  // hangs below. Dark border outlines the dot against light avatars and
-  // bright map tiles. Plain DOM (no SVG) per the renderBubble saga.
-  const onlineHtml = connected ? (
-    `<div style="position:absolute;z-index:3;top:-1px;left:-1px;width:14px;height:14px;border-radius:50%;background:#7ec77a;border:2px solid #0d0d0d;box-sizing:border-box;pointer-events:none;"></div>`
-  ) : ''
+  // Connection-status dot at the top-left of the avatar. Green when the
+  // peer is currently connected via Hyperswarm, grey when not. Suppressed
+  // for self (connected === null) since the affordance is "are they
+  // online" and you're always online to yourself. Top-left because the
+  // motion glyph lives at top-right and the battery hangs below. Plain
+  // DOM (no SVG) per the renderBubble saga.
+  const onlineHtml = connected === null ? '' : (
+    `<div style="position:absolute;z-index:3;top:-1px;left:-1px;width:14px;height:14px;border-radius:50%;background:${connected ? '#7ec77a' : '#666'};border:2px solid #0d0d0d;box-sizing:border-box;pointer-events:none;"></div>`
+  )
 
   root.innerHTML =
     focusRingHtml +
@@ -2212,7 +2261,7 @@ function renderBubble (root, member, selected, last, connected) {
     onlineHtml
 }
 
-function syncMembers (map, data, selectedPubkey, connectedPubkeys, states, clickRef, ensureRaf) {
+function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, states, clickRef, ensureRaf) {
   const seen = new Set()
   for (const m of data?.members ?? []) {
     const pubkey = m.value?.pubkey
@@ -2253,7 +2302,9 @@ function syncMembers (map, data, selectedPubkey, connectedPubkeys, states, click
       }
       // else: position unchanged within ~0.5m, skip the tween.
     }
-    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey, last, !!connectedPubkeys?.has(pubkey))
+    // null = self (no dot at all); true/false = remote member's link state
+    const connected = pubkey === myPubkey ? null : !!connectedPubkeys?.has(pubkey)
+    renderBubble(state.marker.getElement(), m, pubkey === selectedPubkey, last, connected)
   }
 
   for (const [pubkey, state] of states) {
@@ -3173,6 +3224,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, onClose
   const motion = motionState(seen?.speed)
   const motionLabel = motion === 'walking' ? 'Walking'
                     : motion === 'driving' ? 'Driving'
+                    : motion === 'flying' ? 'Flying'
                     : motion === 'still' ? 'Stationary'
                     : null
 
@@ -3202,6 +3254,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, onClose
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: colors.text.secondary }}>
               {motion === 'walking' && <PersonSimpleWalk size={18} weight='thin' />}
               {motion === 'driving' && <CarProfile size={18} weight='thin' />}
+              {motion === 'flying' && <AirplaneTilt size={18} weight='thin' />}
               <span style={typography.body}>{motionLabel}</span>
             </span>
           )}
@@ -3486,14 +3539,15 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
 // displayName in the bottom-sheet roster and the focus bar.
 function MotionGlyph ({ speed, size = 14 }) {
   const state = motionState(speed)
-  if (state !== 'walking' && state !== 'driving') return null
-  const Icon = state === 'walking' ? PersonSimpleWalk : CarProfile
-  const label = state === 'walking' ? 'walking' : 'driving'
+  if (state !== 'walking' && state !== 'driving' && state !== 'flying') return null
+  const Icon = state === 'walking' ? PersonSimpleWalk
+             : state === 'driving' ? CarProfile
+             : AirplaneTilt
   return (
     <Icon
       size={size}
       weight='thin'
-      aria-label={label}
+      aria-label={state}
       style={{ color: colors.text.secondary, flexShrink: 0 }}
     />
   )
