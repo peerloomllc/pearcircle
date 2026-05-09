@@ -28,7 +28,7 @@ Android (local):
 iOS (Mac mini, dev install):
 - `./scripts/ios-dev-install.sh` — rsync, pod install, archive (Release, generic/platform=iOS), export development IPA, install + launch on the paired iPhone via `xcrun devicectl`. Uses automatic signing under team G79ALD29NA against Xcode's cached wildcard team profile; `PearCircle.entitlements` is empty by design so no Apple-portal trip is needed.
 - `SKIP_SYNC=1` / `SKIP_INSTALL=1` env vars short-circuit the corresponding stages.
-- Cold-start trace on a real device is interactive only (the iPhone is paired via CoreDevice's network tunnel, so `idevicesyslog` doesn't see it; use Xcode → Window → Devices and Simulators → Open Console for live os_log).
+- Cold-start trace on a real device: the worklet ships its buffered `mark()` lines to the shell as a `coldstart:trace` IPC event at `init:done`; the shell writes them to `FileSystem.documentDirectory/coldstart.log`. Pull with `xcrun devicectl device copy from --device <udid> --domain-type appDataContainer --domain-identifier com.pearcircle --source Documents/coldstart.log --destination /tmp/coldstart.log`. Necessary because `log collect --device` requires root and `idevicesyslog` only sees USB-paired devices (the iPhone is paired via the CoreDevice network tunnel).
 
 Never uninstall on a paired device — wipes Hyperbee identity and forces a fresh invite.
 

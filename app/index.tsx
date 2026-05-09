@@ -308,6 +308,23 @@ export default function Index() {
       if (data?.publicKey && typeof data.publicKey === 'string') _ourPubkey = data.publicKey
       emitEvent('ready', data)
     })
+    // Phase-4 device verification side-channel: write the worklet's
+    // buffered cold-start trace to FileSystem.documentDirectory/coldstart.log
+    // so it can be pulled off the iPhone with `xcrun devicectl device copy from`.
+    // os_log streaming on a real device requires root or interactive Console.app;
+    // the file path works headless. Shell-side logs are also concatenated so a
+    // single file gives the full picture.
+    onEvent('coldstart:trace', async (data) => {
+      try {
+        const lines = Array.isArray(data?.lines) ? data.lines : []
+        const shellLine = '[coldstart shell+' + (Date.now() - _shellT0) + 'ms] coldstart:trace-received'
+        const body = lines.join('\n') + '\n' + shellLine + '\n'
+        const path = FileSystem.documentDirectory + 'coldstart.log'
+        await FileSystem.writeAsStringAsync(path, body)
+      } catch (e: any) {
+        console.warn('coldstart trace write failed', e?.message)
+      }
+    })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))

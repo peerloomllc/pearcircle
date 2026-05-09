@@ -54,11 +54,23 @@ const AVATAR_MAX_BASE64 = 500_000
 // the moment Bare loaded this script; mark() emits a tagged console
 // line so `adb logcat | grep coldstart` reconstructs the timeline.
 // See TODO.md "Investigate ~60s cold-start delay".
+//
+// File-tee (added phase 4 verification, 2026-05-08): on iOS the only
+// way to read these markers from a remote shell is to pull a file out
+// of the app container with `xcrun devicectl device copy from`, since
+// `log collect --device` requires root. mark() also appends each line
+// to <dataDir>/coldstart.log once init has run; pre-init marks buffer
+// in memory and get flushed on the same write. The file is rewritten
+// (not appended) on every cold start so the trace stays tight.
 const _bootTs = Date.now()
+const _coldStartLines = []
 function mark (name, extra) {
   const dt = Date.now() - _bootTs
-  if (extra !== undefined) console.warn('[coldstart worklet+' + dt + 'ms] ' + name + ' ' + JSON.stringify(extra))
-  else console.warn('[coldstart worklet+' + dt + 'ms] ' + name)
+  const line = (extra !== undefined)
+    ? '[coldstart worklet+' + dt + 'ms] ' + name + ' ' + JSON.stringify(extra)
+    : '[coldstart worklet+' + dt + 'ms] ' + name
+  console.warn(line)
+  _coldStartLines.push(line)
 }
 mark('worklet:loaded')
 
@@ -1477,6 +1489,15 @@ async function init ({ dataDir } = {}, attempt = 0) {
 
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
+  // Phase-4 device verification side-channel: ship the buffered
+  // cold-start trace to the shell so it can write it to
+  // FileSystem.documentDirectory/coldstart.log. On a real iPhone the
+  // os_log stream isn't reachable from a remote shell without root,
+  // and bare-fs writes inside the worklet didn't materialize a file
+  // (suspected bare-fs/iOS sandbox interaction). The shell-side
+  // expo-file-system path is known-good. Android-side: the shell
+  // ignores this event; logcat already has the same lines.
+  send({ event: 'coldstart:trace', data: { lines: _coldStartLines.slice() } })
   send({
     event: 'ready',
     data: {
