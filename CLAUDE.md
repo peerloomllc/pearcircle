@@ -21,11 +21,16 @@ Wire protocol v1 locked 2026-05-03. See `proposals/2026-05-03-wire-protocol.md` 
 
 ## Build & Deploy
 
-To be filled in once a first device build runs. Will mirror PearCal/PearGuard:
+Android (local):
 - `npm run build:bare` then `npm run build:ui` then `cd android && ./gradlew assembleDebug`
-- iOS via Mac Mini SSH using the same `Tims-Mac-mini.local` keychain pattern PearCal uses
-- `adb install -r` on Android, `ideviceinstaller` on iOS
-- Never uninstall on a paired device — wipes Hyperbee identity and forces a fresh invite
+- `adb install -r android/app/build/outputs/apk/debug/app-debug.apk`
+
+iOS (Mac mini, dev install):
+- `./scripts/ios-dev-install.sh` — rsync, pod install, archive (Release, generic/platform=iOS), export development IPA, install + launch on the paired iPhone via `xcrun devicectl`. Uses automatic signing under team G79ALD29NA against Xcode's cached wildcard team profile; `PearCircle.entitlements` is empty by design so no Apple-portal trip is needed.
+- `SKIP_SYNC=1` / `SKIP_INSTALL=1` env vars short-circuit the corresponding stages.
+- Cold-start trace on a real device is interactive only (the iPhone is paired via CoreDevice's network tunnel, so `idevicesyslog` doesn't see it; use Xcode → Window → Devices and Simulators → Open Console for live os_log).
+
+Never uninstall on a paired device — wipes Hyperbee identity and forces a fresh invite.
 
 ## Verify gate
 
