@@ -309,7 +309,7 @@ export default function Index() {
       // banner, flipped the toggle, and bounced back -- in which case
       // the banner needs to auto-dismiss / change copy without
       // requiring a relaunch. Cheap (single native call), idempotent.
-      if (s === 'active' && Platform.OS === 'ios' && PearCircleLocation?.getAuthorizationStatus) {
+      if (s === 'active' && PearCircleLocation?.getAuthorizationStatus) {
         PearCircleLocation.getAuthorizationStatus().then((status: string) => {
           emitEvent('permission:status', { status })
         }).catch(() => {})
@@ -468,10 +468,17 @@ export default function Index() {
         }
         return
       }
-      // Android: existing flow.
-      PearCircleLocation.startUpdates?.().catch?.((e: any) =>
-        console.warn('startUpdates failed', e),
-      )
+      // Android: existing flow. Emit permission:status after the
+      // request resolves so the home banner can nudge "Allow only
+      // while using the app" users toward Settings → "Allow all the
+      // time" (background-location parity with iOS Always).
+      try {
+        await PearCircleLocation.startUpdates?.()
+        const post: string = await PearCircleLocation.getAuthorizationStatus?.()
+        if (typeof post === 'string') emitEvent('permission:status', { status: post })
+      } catch (e: any) {
+        console.warn('startUpdates failed', e?.message)
+      }
     }
     onEvent('ready', onReadyOnce)
 
@@ -668,8 +675,9 @@ export default function Index() {
     }
     if (msg.method === 'shell:permission:status') {
       // On-demand status query from the WebView (e.g., the home banner
-      // refreshes after the user returns from Settings).
-      if (Platform.OS !== 'ios') { respond(msg.id, { status: 'always' }); return }
+      // refreshes after the user returns from Settings). Both iOS and
+      // Android implement getAuthorizationStatus with the same string
+      // vocabulary (proposal-aligned UI handles both).
       try {
         const status = await PearCircleLocation?.getAuthorizationStatus?.()
         respond(msg.id, { status: typeof status === 'string' ? status : 'unknown' })

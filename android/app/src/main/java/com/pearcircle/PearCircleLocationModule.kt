@@ -90,6 +90,32 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     @ReactMethod fun addListener(eventName: String) { /* no-op */ }
     @ReactMethod fun removeListeners(count: Int) { /* no-op */ }
 
+    // Cross-platform parity with the iOS PearCircleLocationModule.swift
+    // getAuthorizationStatus. Returns one of:
+    //   'always'         FINE + BACKGROUND_LOCATION both granted (or
+    //                    background isn't required on pre-Q devices)
+    //   'whenInUse'      FINE granted but BACKGROUND_LOCATION not.
+    //                    Android calls this "Allow only while using the
+    //                    app" in Settings.
+    //   'denied'         FINE not granted (Android can't cleanly
+    //                    distinguish notDetermined from denied without
+    //                    activity-scoped permission rationale, so we
+    //                    fold both into 'denied' from the UI's point
+    //                    of view — the banner copy works either way).
+    // Pure read; never triggers a dialog. Used by the shell to drive
+    // the home banner that nudges users to Settings → "Allow all the
+    // time".
+    @ReactMethod
+    fun getAuthorizationStatus(promise: Promise) {
+        val fine = hasFineLocation()
+        if (!fine) { promise.resolve("denied"); return }
+        val bgRequired = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        val bgGranted = !bgRequired ||
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+        promise.resolve(if (bgGranted) "always" else "whenInUse")
+    }
+
     fun emitLocation(lat: Double, lon: Double, accuracy: Double, ts: Double, speed: Double, battery: Double?, isCharging: Boolean) {
         val payload: WritableMap = Arguments.createMap().apply {
             putDouble("lat", lat)
