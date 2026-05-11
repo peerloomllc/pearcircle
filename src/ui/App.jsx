@@ -549,16 +549,30 @@ function PermissionBanner ({ status, onOpenSettings, onDismiss }) {
       padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
       background: 'rgba(26,26,26,0.92)',
       borderBottom: `1px solid ${colors.border}`,
-      display: 'flex', alignItems: 'flex-start', gap: spacing.sm,
     }}>
-      <div style={{ flex: 1, minWidth: 0 }}>
+      {/* Dismiss × stays absolutely positioned in the top-right corner
+          so the headline + body + button can center within the full
+          banner width without being shifted by the close button. */}
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+          right: spacing.sm,
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
         <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{headline}</div>
         <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>{body}</div>
         <button
           onClick={onOpenSettings}
           style={{
+            display: 'inline-block',
             marginTop: spacing.sm,
-            padding: '6px 12px',
+            padding: '6px 14px',
             background: colors.primary, color: colors.text.onPrimary,
             border: 'none', borderRadius: radius.sm,
             fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
@@ -568,14 +582,6 @@ function PermissionBanner ({ status, onOpenSettings, onDismiss }) {
           Open Settings
         </button>
       </div>
-      <button
-        onClick={onDismiss}
-        aria-label='Dismiss'
-        style={{
-          background: 'transparent', border: 'none', color: colors.text.secondary,
-          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
-        }}
-      >×</button>
     </div>
   )
 }
