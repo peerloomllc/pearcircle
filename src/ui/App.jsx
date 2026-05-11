@@ -302,6 +302,14 @@ export function App () {
     pear.on('permission:status', ({ status }) => {
       if (typeof status === 'string') setPermissionStatus(status)
     })
+    // Pull the current status once on mount. The shell also emits on
+    // startUpdates and on AppState.active, but on a cold launch the
+    // shell's emit fires before the WebView finishes loading and the
+    // injectJavaScript silently drops — so without this pull the banner
+    // only appeared after the first background/foreground cycle.
+    pear.call('shell:permission:status').then((r) => {
+      if (r && typeof r.status === 'string') setPermissionStatus(r.status)
+    }).catch(() => {})
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setSheet({ name: 'join', invite: url })
     })
