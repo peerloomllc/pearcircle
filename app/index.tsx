@@ -132,9 +132,13 @@ async function fireTransitionNotification(payload: any) {
         // fields and delivers a notification:focus event to the WebView,
         // which sets the circle filter + focuses the member.
         data: { kind: 'transition', circleId, pubkey: transition.pubkey },
-        ...(Platform.OS === 'android' ? { channelId: 'geofence' } : {}),
       },
-      trigger: null,
+      // expo-notifications 0.32 ignores content.channelId on Android when
+      // trigger is null (see build/scheduleNotificationAsync.js:109-119 -
+      // the channel-trigger fallback only reads channelId off the trigger
+      // object), so the OS routes to its fallback channel. Putting the
+      // channelId on the trigger fires immediately on the named channel.
+      trigger: Platform.OS === 'android' ? { channelId: 'geofence' } : null,
     })
   } catch (e: any) {
     console.warn('fire transition notification failed: ' + e?.message)
