@@ -472,7 +472,7 @@ export function App () {
         )}
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'about'}>
-        <AboutView onClose={closeSheet} />
+        <AboutView onClose={closeSheet} initialExpand={sheet?.name === 'about' ? sheet.expand : null} />
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'create'}>
         <CreateView onClose={closeSheet} onCreated={onCircleCreated} setSheet={setSheet} />
@@ -509,6 +509,14 @@ export function App () {
             setDonateReminderVisible(false)
             try { await pear.call('shell:donateReminder:setShown') } catch {}
           }}
+          onDonate={async () => {
+            setDonateReminderVisible(false)
+            try { await pear.call('shell:donateReminder:setShown') } catch {}
+            // Hand the user to the About sheet with Support-development
+            // pre-expanded. The shared lightning flow lives there
+            // (canOpenURL probe → lightning: URI or wallet picker).
+            setSheet({ name: 'about', expand: 'support' })
+          }}
         />
       )}
     </>
@@ -525,22 +533,7 @@ export function App () {
 // fallback wallet picker if not). All three buttons (Donate / Maybe
 // later / Already donated) dismiss + persist shown=true so the modal
 // only fires once per install.
-function DonationReminderModal ({ onDismiss }) {
-  const [walletModal, setWalletModal] = useState(false)
-  const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
-  const handleDonate = async () => {
-    try {
-      const r = await pear.call('shell:canOpenURL', { url: 'lightning:test' })
-      if (r?.can) {
-        openURL('lightning:' + LIGHTNING_ADDRESS)
-        onDismiss()
-      } else {
-        setWalletModal(true)
-      }
-    } catch {
-      setWalletModal(true)
-    }
-  }
+function DonationReminderModal ({ onDismiss, onDonate }) {
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 360,
@@ -565,7 +558,7 @@ function DonationReminderModal ({ onDismiss }) {
           PearCircle is free and open source with no ads, accounts, or subscriptions. If you've received value from it, consider returning value to support development.
         </div>
         <button
-          onClick={handleDonate}
+          onClick={onDonate}
           style={{
             width: '100%', padding: '13px',
             background: colors.primary, color: colors.text.onPrimary,
@@ -598,9 +591,6 @@ function DonationReminderModal ({ onDismiss }) {
           Already donated ✓
         </button>
       </div>
-      {walletModal && (
-        <LightningWalletModal onClose={() => { setWalletModal(false); onDismiss() }} />
-      )}
     </div>
   )
 }
@@ -3767,7 +3757,7 @@ function Collapsible ({ title, icon: Icon, open, onToggle, maxHeight = '480px', 
   )
 }
 
-function AboutView ({ onClose }) {
+function AboutView ({ onClose, initialExpand = null }) {
   // App Store guideline 3.1.1 forbids non-IAP digital purchases including
   // donations. Hide the Support development section on iOS until we've
   // been approved -- once approved we can revisit (Apple has loosened
@@ -3775,11 +3765,29 @@ function AboutView ({ onClose }) {
   // is to omit until reviewed). Android keeps the section.
   const isIOS = typeof window !== 'undefined' && window.__pearPlatform === 'ios'
   const [walletModal, setWalletModal] = useState(false)
+  // initialExpand opens a single section on navigation (e.g., the
+  // donation reminder modal hands us 'support' so the user lands on
+  // the Support-development collapsible already open). Per-section
+  // state stays user-controlled after that — the user can close it
+  // and we don't reopen until the next navigation with expand='support'.
+  //
+  // Why useEffect rather than useState's lazy initializer: SheetContainer
+  // keeps AboutView mounted across navigations (translates off-screen
+  // when closed), so the initializer only runs on the very first mount.
+  // The effect re-runs whenever the prop changes — i.e., every time
+  // setSheet({name:'about', expand:'...'}) lands a new value.
   const [howOpen, setHowOpen] = useState(false)
   const [supportOpen, setSupportOpen] = useState(false)
   const [bitcoinOpen, setBitcoinOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [contactOpen, setContactOpen] = useState(false)
+  useEffect(() => {
+    if (initialExpand === 'support') setSupportOpen(true)
+    else if (initialExpand === 'how') setHowOpen(true)
+    else if (initialExpand === 'bitcoin') setBitcoinOpen(true)
+    else if (initialExpand === 'share') setShareOpen(true)
+    else if (initialExpand === 'contact') setContactOpen(true)
+  }, [initialExpand])
 
   const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
 
