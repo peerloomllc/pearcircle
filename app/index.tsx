@@ -42,6 +42,13 @@ const DISTANCE_UNIT_KEY = 'pc:distanceUnit'
 // WebView swap palettes via document.documentElement.dataset.theme; this
 // just persists the user's choice across launches.
 const THEME_KEY = 'pc:theme'
+// First-run onboarding gates. Both default to a fresh-launch state
+// (onboarding pending, tour pending). The UI flips them via
+// shell:onboarding:set; a Settings "Reset onboarding" entry can flip
+// them back. Local to the install — uninstall wipes them along with
+// the rest of AsyncStorage.
+const ONBOARDING_COMPLETE_KEY = 'pc:onboardingComplete'
+const TOUR_PENDING_KEY = 'pc:tourPending'
 // Two-week donation-reminder modal (mirrors PearCal/PearGuard). The
 // firstLaunch key is auto-seeded with Date.now() on the very first
 // shell:donateReminder:get call so we have a reference point for the
@@ -307,6 +314,12 @@ export default function Index() {
   // IPC call when the camera reads a code (or the user cancels).
   const [scannerVisible, setScannerVisible] = useState(false)
   const scanResolveRef = useRef<((value: string | null) => void) | null>(null)
+  // Promise resolved when ensureNotifications() completes (whether the
+  // user granted, denied, or skipped). The worklet `ready` handler
+  // awaits this on Android before calling startUpdates so the two
+  // runtime permission requests don't race through a single shared
+  // PermissionListener.
+  const notifSetupReadyRef = useRef<Promise<void>>(Promise.resolve())
 
   useEffect(() => {
     shellMark('shell:mount')
@@ -369,9 +382,19 @@ export default function Index() {
     onEvent('transition:applied', (data) => { fireTransitionNotification(data) })
 
     // Notification setup runs in parallel with worklet startup; it's
-    // independent and either order is fine.
+    // independent and either order is fine. We stash the promise so the
+    // worklet's `ready` handler can await it before calling startUpdates
+    // -- on Android, expo-notifications' POST_NOTIFICATIONS dialog and
+    // our native FINE_LOCATION request both go through the activity's
+    // single in-flight PermissionListener, and racing them on fresh
+    // install lets the wrong listener receive the wrong grant result,
+    // which auto-starts the location FGS without permission and crashes
+    // (Android 14+ rejects FGS type=location without runtime grant).
+    // Resolving the notifications grant first eliminates the race.
     loadMutes().catch(() => {})
-    ensureNotifications().catch((e) => console.warn('notif setup failed', e))
+    notifSetupReadyRef.current = ensureNotifications().catch((e) => {
+      console.warn('notif setup failed', e)
+    })
 
     // Deep links: pear://pearcircle/join?... and https equivalent.
     Linking.getInitialURL().then((url) => {
@@ -486,8 +509,14 @@ export default function Index() {
       // Android: existing flow. Emit permission:status after the
       // request resolves so the home banner can nudge "Allow only
       // while using the app" users toward Settings → "Allow all the
-      // time" (background-location parity with iOS Always).
+      // time" (background-location parity with iOS Always). We await
+      // notifSetupReadyRef first so the POST_NOTIFICATIONS dialog
+      // resolves before we kick off FINE_LOCATION -- otherwise the
+      // two share a PermissionListener and the wrong grant result can
+      // start the FGS without location permission, crashing the
+      // process on Android 14+.
       try {
+        await notifSetupReadyRef.current
         await PearCircleLocation.startUpdates?.()
         const post: string = await PearCircleLocation.getAuthorizationStatus?.()
         if (typeof post === 'string') emitEvent('permission:status', { status: post })
@@ -649,6 +678,36 @@ export default function Index() {
       }
       try {
         await AsyncStorage.setItem(DISTANCE_UNIT_KEY, unit)
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:onboarding:get') {
+      try {
+        const [complete, tourPending] = await Promise.all([
+          AsyncStorage.getItem(ONBOARDING_COMPLETE_KEY),
+          AsyncStorage.getItem(TOUR_PENDING_KEY),
+        ])
+        respond(msg.id, {
+          complete: complete === 'true',
+          tourPending: tourPending === 'true',
+        })
+      } catch (err: any) {
+        respond(msg.id, { complete: false, tourPending: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:onboarding:set') {
+      const { complete, tourPending } = msg.args ?? {}
+      try {
+        if (typeof complete === 'boolean') {
+          await AsyncStorage.setItem(ONBOARDING_COMPLETE_KEY, complete ? 'true' : 'false')
+        }
+        if (typeof tourPending === 'boolean') {
+          await AsyncStorage.setItem(TOUR_PENDING_KEY, tourPending ? 'true' : 'false')
+        }
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })

@@ -7,6 +7,37 @@ import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
+import { OnboardingFlow } from './components/OnboardingFlow.jsx'
+import { Tour } from './components/Tour.jsx'
+
+// Steps for the post-onboarding spotlight tour. Anchors resolve in
+// App's main JSX via [data-tour="..."]; missing anchors fall through
+// to a centered tooltip in Tour.jsx (e.g. the welcome step has no
+// anchor on purpose, so it floats over the map).
+const TOUR_STEPS = [
+  {
+    anchor: '__no-anchor__',
+    title: 'This is your map',
+    body: 'Pins show people in your circles. Yours shows up here too once your location starts coming in.',
+  },
+  {
+    anchor: '__no-anchor__',
+    title: 'Drop a Place',
+    body: 'Long-press anywhere on the map to add a Place. Anyone in that circle gets notified when someone arrives or leaves it.',
+  },
+  {
+    anchor: 'menu-button',
+    title: 'Your circles live here',
+    body: 'Tap to switch between circles, invite people, or jump into Settings and your profile.',
+    placement: 'bottom',
+  },
+  {
+    anchor: 'members-fab',
+    title: 'Members and places',
+    body: 'Open this to see everyone in the active circle, add a Place, and get notified when people arrive or leave.',
+    placement: 'top',
+  },
+]
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
 
@@ -257,6 +288,18 @@ export function App () {
     try { await pear.call('shell:theme:set', { theme: next }) } catch {}
     setThemeMode(next)
   }, [])
+  // First-run onboarding state. Both flags hydrate from AsyncStorage
+  // (shell:onboarding:get) on mount; `loaded` gates the modal so we
+  // don't flash it on cold start before the IPC resolves. Order of
+  // operations is: OnboardingFlow shows first (welcome + name + pair
+  // choice), on complete it flips both flags so the Tour fires next
+  // over the live map UI, on tour done/skip the tour flag clears.
+  const [onboardingComplete, setOnboardingComplete] = useState(true)
+  const [tourPending, setTourPending] = useState(false)
+  const [onboardingLoaded, setOnboardingLoaded] = useState(false)
+  const persistOnboarding = useCallback(async (patch) => {
+    try { await pear.call('shell:onboarding:set', patch) } catch {}
+  }, [])
 
   const refresh = useCallback(async () => {
     const [id, pr, sh] = await Promise.all([
@@ -287,6 +330,11 @@ export function App () {
       setTheme(mode)
       setThemeMode(mode)
     }).catch(() => {})
+    pear.call('shell:onboarding:get').then((r) => {
+      setOnboardingComplete(!!r?.complete)
+      setTourPending(!!r?.tourPending)
+      setOnboardingLoaded(true)
+    }).catch(() => { setOnboardingLoaded(true) })
     pear.on('ready', refresh)
     pear.on('sharing:changed', ({ enabled, expiresAt }) => {
       setSharing({
@@ -423,6 +471,7 @@ export function App () {
         permissionStatus={permissionStatus}
         bannerDismissed={bannerDismissed}
         onPermissionBannerDismiss={() => setBannerDismissed(true)}
+        tourActive={onboardingLoaded && onboardingComplete && tourPending && !sheet}
       />
       <SheetContainer open={sheet?.name === 'settings'}>
         <ProfileView
@@ -472,7 +521,15 @@ export function App () {
         )}
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'about'}>
-        <AboutView onClose={closeSheet} initialExpand={sheet?.name === 'about' ? sheet.expand : null} />
+        <AboutView
+          onClose={closeSheet}
+          initialExpand={sheet?.name === 'about' ? sheet.expand : null}
+          onReplayOnboarding={() => {
+            setOnboardingComplete(false)
+            setTourPending(false)
+            persistOnboarding({ complete: false, tourPending: false })
+          }}
+        />
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'create'}>
         <CreateView onClose={closeSheet} onCreated={onCircleCreated} setSheet={setSheet} />
@@ -516,6 +573,41 @@ export function App () {
             // pre-expanded. The shared lightning flow lives there
             // (canOpenURL probe → lightning: URI or wallet picker).
             setSheet({ name: 'about', expand: 'support' })
+          }}
+        />
+      )}
+      {/* First-run onboarding (welcome → name → create/join). Gated on
+          the hydrated AsyncStorage flag so we don't flash on cold start
+          before the IPC resolves. */}
+      {onboardingLoaded && !onboardingComplete && (
+        <OnboardingFlow
+          profile={profile}
+          onCreate={() => setSheet({ name: 'create' })}
+          onJoin={() => setSheet({ name: 'join' })}
+          onComplete={() => {
+            setOnboardingComplete(true)
+            setTourPending(true)
+            persistOnboarding({ complete: true, tourPending: true })
+          }}
+          onSkip={() => {
+            setOnboardingComplete(true)
+            setTourPending(true)
+            persistOnboarding({ complete: true, tourPending: true })
+          }}
+        />
+      )}
+      {/* Spotlight tour over the live map UI. Runs once after onboarding;
+          the "Reset onboarding" entry in About re-arms both flags. */}
+      {onboardingLoaded && onboardingComplete && tourPending && !sheet && (
+        <Tour
+          steps={TOUR_STEPS}
+          onDone={() => {
+            setTourPending(false)
+            persistOnboarding({ tourPending: false })
+          }}
+          onSkip={() => {
+            setTourPending(false)
+            persistOnboarding({ tourPending: false })
           }}
         />
       )}
@@ -959,7 +1051,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {} }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
@@ -1363,8 +1455,13 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           below 'always' and the user hasn't dismissed it this session.
           Apple's openSettingsURLString deep-link is the one supported
           recovery path once the system dialog has been answered (it
-          can only show once per install). */}
-      {permissionStatus !== 'always' && permissionStatus !== 'unknown' && !bannerDismissed && (
+          can only show once per install). Suppressed for notDetermined:
+          before the user has been prompted at least once, iOS's Settings
+          page for the app omits the Location row entirely, so "Open
+          Settings" lands on a page where there's nothing to change. The
+          PermissionPrime modal handles notDetermined; the banner picks
+          up once status moves to whenInUse / denied / restricted. */}
+      {permissionStatus !== 'always' && permissionStatus !== 'unknown' && permissionStatus !== 'notDetermined' && !bannerDismissed && !tourActive && (
         <PermissionBanner
           status={permissionStatus}
           onOpenSettings={() => { pear.call('shell:openSettings').catch(() => {}) }}
@@ -1437,6 +1534,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           isn't useful with the member detail sheet covering the map.
           Animates opacity for a soft cross-fade. */}
       <div
+        data-tour='menu-button'
         aria-hidden={!!selectedMember}
         style={{
           position: 'absolute',
@@ -1650,7 +1748,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           You're not in any circles yet. Use the menu above to create one or join via an invite link.
         </div>
       ) : (
-        <button style={s.fab} onClick={() => setSheetOpen(true)}>
+        <button data-tour='members-fab' style={s.fab} onClick={() => setSheetOpen(true)}>
           Members ({memberCount}) · Places ({placeCount})
         </button>
       )}
@@ -3757,7 +3855,7 @@ function Collapsible ({ title, icon: Icon, open, onToggle, maxHeight = '480px', 
   )
 }
 
-function AboutView ({ onClose, initialExpand = null }) {
+function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }) {
   // App Store guideline 3.1.1 forbids non-IAP digital purchases including
   // donations. Hide the Support development section on iOS until we've
   // been approved -- once approved we can revisit (Apple has loosened
@@ -3908,6 +4006,21 @@ function AboutView ({ onClose, initialExpand = null }) {
       <div style={{ textAlign: 'center', fontSize: 11, fontWeight: 300, color: colors.text.muted, paddingTop: spacing.base, paddingBottom: spacing.xs, fontFamily: typography.fontFamily }}>
         v0.1.0
       </div>
+
+      {onReplayOnboarding && (
+        <button
+          onClick={() => { onReplayOnboarding(); onClose() }}
+          style={{
+            background: 'none', border: 'none',
+            color: colors.text.muted,
+            fontSize: 12, fontWeight: 300, fontFamily: typography.fontFamily,
+            cursor: 'pointer', padding: spacing.xs,
+            alignSelf: 'center',
+          }}
+        >
+          Replay welcome tour
+        </button>
+      )}
 
       {walletModal && (
         <LightningWalletModal onClose={() => setWalletModal(false)} />
@@ -5113,10 +5226,14 @@ const s = {
   // both to light surface would lose contrast against the map tiles.
   // Revisit if light-mode legibility audit flags this.
   emptyHint: {
-    position: 'absolute', left: 16, right: 16,
-    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
+    // Sit above the bottom-corner Settings/About FABs (44px tall + 16px
+    // bottom inset). Inset the sides past the FAB columns so they remain
+    // tappable even though the hint shares the same z.
+    position: 'absolute', left: 72, right: 72,
+    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 76px)',
     padding: 14, background: 'rgba(26,26,26,0.92)',
     borderRadius: 10, color: '#ccc', fontSize: 14, lineHeight: 1.4,
+    textAlign: 'center',
     zIndex: 5,
   },
 }

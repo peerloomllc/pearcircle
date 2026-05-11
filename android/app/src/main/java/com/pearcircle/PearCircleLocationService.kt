@@ -1,5 +1,6 @@
 package com.pearcircle
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,6 +9,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.location.Location
 import android.os.BatteryManager
@@ -15,6 +17,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -41,6 +44,19 @@ class PearCircleLocationService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Android 14+ rejects startForeground(TYPE_LOCATION) with
+        // SecurityException unless FINE or COARSE is already granted. On
+        // fresh installs the JS-side permission flow can lose its
+        // PermissionListener to expo-notifications' POST_NOTIFICATIONS
+        // request, leading the location callback to receive the wrong
+        // result and start this service before the location permission
+        // was actually granted. Defensively skip the foreground promotion
+        // in that case so the process doesn't die; the next explicit
+        // startUpdates after a real grant will bring us up clean.
+        if (!hasLocationPermission()) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         ensureChannel()
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -56,6 +72,14 @@ class PearCircleLocationService : Service() {
         // START_STICKY: if the OS kills us under memory pressure, retry
         // when resources free up. Cold-start-from-boot is a separate slice.
         return START_STICKY
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        return fine || coarse
     }
 
     override fun onDestroy() {
