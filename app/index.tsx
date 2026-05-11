@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, Modal, TouchableOpacity, BackHandler } from 'react-native'
+import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, Modal, TouchableOpacity, BackHandler, StatusBar } from 'react-native'
 import { WebView } from 'react-native-webview'
 import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
@@ -320,6 +320,12 @@ export default function Index() {
   // runtime permission requests don't race through a single shared
   // PermissionListener.
   const notifSetupReadyRef = useRef<Promise<void>>(Promise.resolve())
+  // Status bar icon tint. 'light-content' (white icons) is the default
+  // because most of the app is dark-themed. The home view with the
+  // light map tiles flips it to 'dark-content' via shell:statusBar:set
+  // so the icons remain readable. WebView is the source of truth since
+  // it knows whether the map is visible (vs a sheet covering it).
+  const [statusBarStyle, setStatusBarStyle] = useState<'dark-content' | 'light-content'>('light-content')
 
   useEffect(() => {
     shellMark('shell:mount')
@@ -699,6 +705,15 @@ export default function Index() {
       }
       return
     }
+    if (msg.method === 'shell:statusBar:set') {
+      // 'dark' = dark icons (for light backgrounds, e.g. map tiles)
+      // 'light' = light icons (for dark backgrounds, e.g. sheets)
+      const style = msg.args?.style
+      if (style === 'dark') setStatusBarStyle('dark-content')
+      else if (style === 'light') setStatusBarStyle('light-content')
+      respond(msg.id, { ok: true })
+      return
+    }
     if (msg.method === 'shell:onboarding:set') {
       const { complete, tourPending } = msg.args ?? {}
       try {
@@ -933,6 +948,7 @@ export default function Index() {
 
   return (
     <>
+      <StatusBar barStyle={statusBarStyle} translucent backgroundColor='transparent' />
       <WebView
         ref={webViewRef}
         // baseUrl https://localhost/ rather than about:blank: the

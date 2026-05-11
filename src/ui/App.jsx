@@ -310,6 +310,31 @@ export function App () {
   const [tilesOffline, setTilesOffline] = useState(false)
   const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false)
   useEffect(() => subscribeOfflineState(setTilesOffline), [])
+
+  // Status bar icon tint: light (white) icons on dark surfaces, dark
+  // icons on the bare map view. The bare map area is the only place
+  // where the status bar sits over a light background; every other
+  // overlay we mount -- sheets, banners, onboarding/tour scrims, the
+  // priming and donation modals -- is darkly colored, so they all
+  // need the default light icons to stay legible. The floating menu
+  // pill on the home view sits BELOW the status bar (safe-area-inset
+  // + 12px), so it doesn't enter the icon-overlap area.
+  useEffect(() => {
+    const bannerShowing =
+      permissionStatus !== 'always' &&
+      permissionStatus !== 'unknown' &&
+      permissionStatus !== 'notDetermined' &&
+      !bannerDismissed
+    const overlayShowing =
+      !!sheet ||
+      primingVisible ||
+      donateReminderVisible ||
+      (onboardingLoaded && !onboardingComplete) ||
+      tourPending ||
+      bannerShowing
+    const style = overlayShowing ? 'light' : 'dark'
+    pear.call('shell:statusBar:set', { style }).catch(() => {})
+  }, [sheet, primingVisible, donateReminderVisible, onboardingLoaded, onboardingComplete, tourPending, permissionStatus, bannerDismissed])
   const persistOnboarding = useCallback(async (patch) => {
     try { await pear.call('shell:onboarding:set', patch) } catch {}
   }, [])
