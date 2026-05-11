@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
@@ -390,9 +390,18 @@ export function App () {
       <SheetContainer open={sheet?.name === 'trips'}>
         <TripsView
           active={sheet?.name === 'trips'}
+          ownerPubkey={sheet?.name === 'trips' ? sheet.ownerPubkey : null}
+          myPubkey={identity?.publicKey ?? null}
+          ownerName={sheet?.name === 'trips' ? sheet.ownerName : null}
           distanceUnit={distanceUnit}
           tileStyleUrl={tileStyleUrl}
-          onOpenTrip={(startTs) => setSheet({ name: 'tripDetail', startTs })}
+          onOpenTrip={(startTs) => setSheet({
+            name: 'tripDetail',
+            startTs,
+            ownerPubkey: sheet?.name === 'trips' ? sheet.ownerPubkey : null,
+            ownerName: sheet?.name === 'trips' ? sheet.ownerName : null,
+            returnTo: { name: 'trips', ownerPubkey: sheet?.name === 'trips' ? sheet.ownerPubkey : null, ownerName: sheet?.name === 'trips' ? sheet.ownerName : null },
+          })}
           onClose={closeSheet}
         />
       </SheetContainer>
@@ -400,9 +409,12 @@ export function App () {
         {sheet?.name === 'tripDetail' && (
           <TripDetailView
             startTs={sheet.startTs}
+            ownerPubkey={sheet.ownerPubkey ?? null}
+            myPubkey={identity?.publicKey ?? null}
+            ownerName={sheet.ownerName ?? null}
             distanceUnit={distanceUnit}
             tileStyleUrl={tileStyleUrl}
-            onBack={() => setSheet({ name: 'trips' })}
+            onBack={() => setSheet(sheet.returnTo ?? { name: 'trips' })}
           />
         )}
       </SheetContainer>
@@ -1383,7 +1395,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           isSelf={selectedPubkey === myPubkey}
           onOpenTrips={() => {
             setMemberSheetVisible(false)
-            setSheet({ name: 'trips' })
+            const isSelf = selectedPubkey === myPubkey
+            setSheet({
+              name: 'trips',
+              ownerPubkey: isSelf ? null : selectedPubkey,
+              ownerName: isSelf ? null : (members.find(m => m.pubkey === selectedPubkey)?.displayName || null),
+            })
           }}
           onClose={() => setMemberSheetVisible(false)}
         />
@@ -2738,6 +2755,7 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
   // user expands what they need. Persists across sheet open/close
   // (SheetContainer keeps the component mounted).
   const [circlesOpen, setCirclesOpen] = useState(false)
+  const [tripSharingOpen, setTripSharingOpen] = useState(false)
   const [displayOpen, setDisplayOpen] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   // Re-render once a second while a mute has an active expiresAt so
@@ -3064,6 +3082,10 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
         <CirclesSection active={active && circlesOpen} onChanged={onSaved} />
       </Collapsible>
 
+      <Collapsible title='Trip sharing' icon={MapTrifold} open={tripSharingOpen} onToggle={() => setTripSharingOpen(v => !v)} maxHeight='1200px'>
+        <TripsSharingSection active={active && tripSharingOpen} />
+      </Collapsible>
+
       <Collapsible title='Display' icon={Palette} open={displayOpen} onToggle={() => setDisplayOpen(v => !v)}>
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
@@ -3124,6 +3146,120 @@ function ThemeToggleSection ({ mode, onChange }) {
     <div style={{ display: 'flex', gap: spacing.sm }}>
       {btn('Dark', 'dark')}
       {btn('Light', 'light')}
+    </div>
+  )
+}
+
+// Per-circle trip-sharing toggle list (proposal 2026-05-10). Default
+// off everywhere. Toggling on shows a confirmation surfacing the
+// privacy posture; toggling off is non-destructive (future trips
+// stop replicating, past shared trips remain visible until the user
+// deletes them from the trip detail view).
+function TripsSharingSection ({ active = true }) {
+  const [list, setList] = useState([])
+  const [sharing, setSharing] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [pendingCircleId, setPendingCircleId] = useState(null)
+  const [confirming, setConfirming] = useState(null) // { circleId, name, value }
+
+  const refresh = useCallback(async () => {
+    try {
+      const [snap, sharingR] = await Promise.all([
+        pear.call('circles:getAll'),
+        pear.call('trips:sharing:get'),
+      ])
+      const next = (snap?.circles ?? [])
+        .filter((c) => !c.error && !c.circle?.deleted)
+        .map((c) => ({ circleId: c.circleId, name: c.circle?.name ?? '...' }))
+      setList(next)
+      setSharing(sharingR?.sharing ?? {})
+    } catch {
+      // Surface nothing here; the Collapsible just stays empty.
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { if (active) refresh() }, [active, refresh])
+
+  const onCommit = async () => {
+    if (!confirming) return
+    const { circleId, value } = confirming
+    setPendingCircleId(circleId)
+    try {
+      await pear.call('trips:sharing:set', { circleId, enabled: value })
+      setSharing((prev) => ({ ...prev, [circleId]: value }))
+    } catch {
+      // Leave UI in last-known state; user can retry.
+    } finally {
+      setPendingCircleId(null)
+      setConfirming(null)
+    }
+  }
+
+  if (loading) {
+    return <p style={{ ...typography.caption, color: colors.text.muted }}>Loading…</p>
+  }
+  if (list.length === 0) {
+    return (
+      <p style={{ ...typography.caption, color: colors.text.muted }}>
+        No circles yet. Trip sharing applies once you join or create one.
+      </p>
+    )
+  }
+
+  return (
+    <div>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, fontWeight: 400 }}>
+        When on, future trips you take are shared with members of that circle. Past trips remain private until you turn this on. Off any time.
+      </p>
+      {list.map((c) => {
+        const on = !!sharing[c.circleId]
+        const busy = pendingCircleId === c.circleId
+        return (
+          <div
+            key={c.circleId}
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: `${spacing.sm}px 0`, borderBottom: `1px solid ${colors.divider}`,
+            }}
+          >
+            <div style={{ ...typography.body, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {c.name}
+            </div>
+            <button
+              onClick={() => setConfirming({ circleId: c.circleId, name: c.name, value: !on })}
+              disabled={busy}
+              style={{
+                padding: '8px 14px', borderRadius: radius.sm,
+                background: on ? colors.primary : 'transparent',
+                color: on ? colors.text.onPrimary : colors.text.primary,
+                border: `1px solid ${on ? colors.primary : colors.border}`,
+                cursor: busy ? 'default' : 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 13,
+                opacity: busy ? 0.5 : 1,
+              }}
+            >
+              {on ? 'Sharing' : 'Off'}
+            </button>
+          </div>
+        )
+      })}
+      {confirming && (
+        <ConfirmSheet
+          title={confirming.value
+            ? `Share trips with "${confirming.name}"?`
+            : `Stop sharing trips with "${confirming.name}"?`}
+          message={confirming.value
+            ? <>Members of <strong>{confirming.name}</strong> will see trips you take from now on. Past trips stay private. You can turn this off any time.</>
+            : <>Future trips won't be shared with <strong>{confirming.name}</strong>. Trips you've already shared remain visible to members until you delete them from the trip detail view.</>}
+          confirmLabel={confirming.value ? 'Share' : 'Stop sharing'}
+          destructive={!confirming.value}
+          busy={pendingCircleId === confirming.circleId}
+          onConfirm={onCommit}
+          onClose={() => { if (pendingCircleId !== confirming.circleId) setConfirming(null) }}
+        />
+      )}
     </div>
   )
 }
@@ -3629,6 +3765,25 @@ function initialsFor (label) {
 function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, onOpenTrips, onClose }) {
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
+  // Whether this member has any trips visible to us. Async-probed
+  // after mount via trips:listFor; null = still loading, false = no
+  // trips (hide the button), number = trip count (show the button).
+  // For self the check is essentially "do we have any local trips
+  // saved"; for non-self it's "do we have any replicated trips for
+  // them in any circle we're in."
+  const [tripCount, setTripCount] = useState(null)
+  useEffect(() => {
+    if (!member?.pubkey) return
+    let cancelled = false
+    pear.call('trips:listFor', { pubkey: member.pubkey }).then((r) => {
+      if (cancelled) return
+      const list = Array.isArray(r?.trips) ? r.trips : []
+      setTripCount(list.length)
+    }).catch(() => {
+      if (!cancelled) setTripCount(0)
+    })
+    return () => { cancelled = true }
+  }, [member?.pubkey])
   // Reverse-geocode label only when there's a fresh location and the
   // user isn't muted; reuses the same hysteresis-aware hook the row
   // version uses so the label stays stable across periodic refreshes.
@@ -3726,7 +3881,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
           </button>
         </div>
       ) : (
-        <div style={{ marginTop: spacing.lg }}>
+        <div style={{ marginTop: spacing.lg, display: 'flex', flexDirection: 'column', gap: spacing.sm }}>
           <button
             onClick={openDirections}
             disabled={!seen}
@@ -3740,6 +3895,19 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
           >
             Get directions
           </button>
+          {tripCount > 0 && (
+            <button
+              onClick={onOpenTrips}
+              style={{
+                width: '100%', padding: '12px', borderRadius: radius.md,
+                background: 'transparent', color: colors.text.primary,
+                border: `1px solid ${colors.border}`, cursor: 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              }}
+            >
+              {tripCount === 1 ? 'View 1 trip' : `View ${tripCount} trips`}
+            </button>
+          )}
         </div>
       )}
     </BottomSheet>
@@ -3863,14 +4031,23 @@ function useTripThumbnails (trips, tileStyleUrl) {
 // Per-member visibility for circle-mates is queued as a T3 amendment in
 // TODO.md -- requires moving the trip records into the per-circle
 // autobase so they replicate.
-function TripsView ({ active, distanceUnit, tileStyleUrl, onOpenTrip, onClose }) {
+function TripsView ({ active, ownerPubkey, myPubkey, ownerName, distanceUnit, tileStyleUrl, onOpenTrip, onClose }) {
   const [trips, setTrips] = useState(null)
   const [error, setError] = useState(null)
   const thumbs = useTripThumbnails(active && trips ? trips : null, tileStyleUrl)
 
+  // Self when ownerPubkey is null/undefined or matches myPubkey. The
+  // self view uses trips:listFor with our pubkey so it shows both
+  // local-Hyperbee trips and any replicated ones from circles we've
+  // shared into (which dedup via mergeTripStreams in the worklet).
+  // Non-self uses the same IPC with the target's pubkey.
+  const targetPubkey = ownerPubkey || myPubkey
+  const isSelf = !ownerPubkey || ownerPubkey === myPubkey
+
   const refresh = useCallback(async () => {
+    if (!targetPubkey) return
     try {
-      const r = await pear.call('trips:list')
+      const r = await pear.call('trips:listFor', { pubkey: targetPubkey })
       const list = Array.isArray(r?.trips) ? r.trips : []
       list.sort((a, b) => (b.startTs ?? 0) - (a.startTs ?? 0))
       setTrips(list)
@@ -3879,18 +4056,21 @@ function TripsView ({ active, distanceUnit, tileStyleUrl, onOpenTrip, onClose })
       setError(e?.message || 'Failed to load trips')
       setTrips([])
     }
-  }, [])
+  }, [targetPubkey])
 
   // Refresh on mount and whenever the sheet is reopened. The
   // `trip:completed` listener registers once at component lifetime;
   // pear.on has no unsubscribe in this codebase, so we gate the
   // refresh on the latest `active` value via a ref so stale-closure
-  // refreshes don't fire while the sheet is hidden.
+  // refreshes don't fire while the sheet is hidden. Listener only
+  // refreshes the self view (a peer's trip completing fires on their
+  // device, not ours — replication arrives later via apply, which
+  // doesn't emit an event today).
   const activeRef = useRef(active)
   useEffect(() => { activeRef.current = active }, [active])
   useEffect(() => {
-    pear.on('trip:completed', () => { if (activeRef.current) refresh() })
-  }, [refresh])
+    pear.on('trip:completed', () => { if (activeRef.current && isSelf) refresh() })
+  }, [refresh, isSelf])
   useEffect(() => {
     if (active) refresh()
   }, [active, refresh])
@@ -3901,7 +4081,9 @@ function TripsView ({ active, distanceUnit, tileStyleUrl, onOpenTrip, onClose })
       paddingTop: `calc(env(safe-area-inset-top, 24px) + ${spacing.base}px)`,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: spacing.lg }}>
-        <h1 style={{ ...typography.heading, margin: 0, color: colors.text.primary }}>My trips</h1>
+        <h1 style={{ ...typography.heading, margin: 0, color: colors.text.primary }}>
+          {isSelf ? 'My trips' : (ownerName ? ownerName + "'s trips" : 'Trips')}
+        </h1>
         <button
           onClick={onClose}
           style={{
@@ -3917,7 +4099,9 @@ function TripsView ({ active, distanceUnit, tileStyleUrl, onOpenTrip, onClose })
       )}
       {trips != null && trips.length === 0 && !error && (
         <div style={{ ...typography.body, color: colors.text.muted, lineHeight: 1.6 }}>
-          No trips yet. Drives over 1 minute and 100 m show up here automatically.
+          {isSelf
+            ? 'No trips yet. Drives over 1 minute and 100 m show up here automatically.'
+            : "No trips visible. " + (ownerName || 'This member') + " hasn't shared trips with this circle yet."}
         </div>
       )}
       {error && (
@@ -3959,15 +4143,36 @@ function TripsView ({ active, distanceUnit, tileStyleUrl, onOpenTrip, onClose })
 // route polyline rendered and bounds-fitted. Loads its own copy of the
 // trip from the worklet to avoid prop-drilling the list through the
 // sheet stack; the local Hyperbee read is sub-ms.
-function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
+function TripDetailView ({ startTs, ownerPubkey, myPubkey, ownerName, distanceUnit, tileStyleUrl, onBack }) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const [trip, setTrip] = useState(null)
   const [error, setError] = useState(null)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const targetPubkey = ownerPubkey || myPubkey
+  const isSelf = !ownerPubkey || ownerPubkey === myPubkey
+
+  const onDelete = async () => {
+    setDeleting(true)
+    try {
+      // scope: 'all' deletes from local Hyperbee AND writes soft-delete
+      // tombstones to every per-circle autobase containing the trip.
+      // Most users want "just gone everywhere"; advanced scope chooser
+      // (local-only / circle-only) is deferred until a real need emerges.
+      await pear.call('trips:delete', { startTs, scope: 'all' })
+      setConfirmingDelete(false)
+      onBack()
+    } catch (e) {
+      setError(e?.message || 'Failed to delete trip')
+      setDeleting(false)
+    }
+  }
 
   useEffect(() => {
+    if (!targetPubkey) return
     let cancelled = false
-    pear.call('trips:list').then((r) => {
+    pear.call('trips:listFor', { pubkey: targetPubkey }).then((r) => {
       if (cancelled) return
       const found = (r?.trips ?? []).find(t => t.startTs === startTs)
       if (!found) setError('Trip not found')
@@ -3976,7 +4181,7 @@ function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
       if (!cancelled) setError(e?.message || 'Failed to load trip')
     })
     return () => { cancelled = true }
-  }, [startTs])
+  }, [startTs, targetPubkey])
 
   useEffect(() => {
     if (!trip || !containerRef.current) return
@@ -4058,12 +4263,36 @@ function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
             </div>
           )}
         </div>
+        {isSelf && trip && (
+          <button
+            onClick={() => setConfirmingDelete(true)}
+            style={{
+              background: 'transparent', border: 'none', color: colors.error,
+              cursor: 'pointer', padding: '4px 8px',
+              display: 'flex', alignItems: 'center',
+            }}
+            aria-label='Delete trip'
+          >
+            <Trash size={20} weight='thin' />
+          </button>
+        )}
       </div>
 
       {error && (
         <div style={{ padding: spacing.lg, ...typography.body, color: colors.error }}>{error}</div>
       )}
       <div ref={containerRef} style={{ flex: 1, minHeight: 320, background: colors.surface.base }} />
+      {confirmingDelete && trip && (
+        <ConfirmSheet
+          title='Delete this trip?'
+          message={<>This deletes the trip from this device and from any circles you shared it with. It can't be undone.</>}
+          confirmLabel='Delete'
+          destructive
+          busy={deleting}
+          onConfirm={onDelete}
+          onClose={() => { if (!deleting) setConfirmingDelete(false) }}
+        />
+      )}
     </div>
   )
 }

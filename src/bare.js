@@ -36,7 +36,7 @@ const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
-const { padTripStartTs, tripApplyDecision, shouldReplicateTrip } = require('./lib/tripWire')
+const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -852,8 +852,46 @@ const handlers = {
     return { trips }
   },
 
-  // Scan the per-circle autobase view for `trip:{pubkey}:*` rows
+  // Unified trip lookup for any member, merged across the local
+  // Hyperbee (if pubkey is self) and every per-circle autobase the
+  // user is in. Per proposal 2026-05-10 Q4, dedup happens here via
+  // mergeTripStreams so the UI gets a single chronological list with
+  // any-tombstone-wins semantics. Used by TripsView for both self and
+  // non-self paths.
+  'trips:listFor': async ({ pubkey } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof pubkey !== 'string') throw new Error('pubkey must be a string')
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+
+    const localTrips = []
+    if (pubkey === ourKey) {
+      for await (const { value } of _localDb.createReadStream({
+        gt: 'trips:' + pubkey + ':',
+        lt: 'trips:' + pubkey + ':~',
+      })) {
+        if (value) localTrips.push(value)
+      }
+    }
+
+    const circleTrips = []
+    for (const [, base] of _circleBases) {
+      const list = []
+      for await (const { value } of base.view.createReadStream({
+        gt: 'trip:' + pubkey + ':',
+        lt: 'trip:' + pubkey + ':~',
+      })) {
+        if (value) list.push(value)
+      }
+      if (list.length > 0) circleTrips.push(list)
+    }
+
+    return { trips: mergeTripStreams({ localTrips, circleTrips }) }
+  },
+
+  // Scan a single circle's autobase view for `trip:{pubkey}:*` rows
   // (proposal 2026-05-10). Returns deleted-tombstone rows filtered out.
+  // Kept alongside trips:listFor for callers (Settings UI) that need a
+  // per-circle count rather than the merged view.
   'trips:listForMember': async ({ circleId, pubkey } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
