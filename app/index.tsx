@@ -304,6 +304,16 @@ export default function Index() {
       // that change outside the app (e.g. the battery-optimization
       // toggle reflects after the user dismisses the system dialog).
       emitEvent('app:state', { state: s })
+      // iOS: re-query authorization status whenever we come back to
+      // foreground. The user may have gone to Settings via the home
+      // banner, flipped the toggle, and bounced back -- in which case
+      // the banner needs to auto-dismiss / change copy without
+      // requiring a relaunch. Cheap (single native call), idempotent.
+      if (s === 'active' && Platform.OS === 'ios' && PearCircleLocation?.getAuthorizationStatus) {
+        PearCircleLocation.getAuthorizationStatus().then((status: string) => {
+          emitEvent('permission:status', { status })
+        }).catch(() => {})
+      }
     })
 
     // Forward worklet events to the WebView so the UI can react.
