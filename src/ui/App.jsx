@@ -4428,7 +4428,9 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
 //   onConfirm      — called when the destructive button is tapped
 //   onClose        — called for cancel / scrim tap / swipe-down
 function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive = true, busy = false, onConfirm, onClose }) {
-  const accentColor = destructive ? colors.error : colors.accent
+  // destructive → red error; non-destructive (affirmative actions like
+  // "Share") → brand green to match the rest of the primary CTAs.
+  const accentColor = destructive ? colors.error : colors.primary
   return (
     <BottomSheet onClose={onClose} zIndex={250}>
       <h2 style={{
