@@ -9,6 +9,8 @@ import { motionState } from '../lib/motion.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
+import { subscribeOfflineState } from './lib/tileFetch.js'
+import { downloadRegion, estimateTilesInBbox } from './lib/regionDownload.js'
 
 // Steps for the post-onboarding spotlight tour. Anchors resolve in
 // App's main JSX via [data-tour="..."]; missing anchors fall through
@@ -263,6 +265,10 @@ export function App () {
   // swap on edit. Settings -> Map tiles writes through both AsyncStorage
   // and this state via setTileStyleUrlAndPersist.
   const [tileStyleUrl, setTileStyleUrl] = useState(DEFAULT_TILE_STYLE_URL)
+  // Publish on window so the region downloader (lives in a sibling
+  // module, not in the React tree) can discover the active tile
+  // source URL without prop-drilling.
+  useEffect(() => { window.__pearTileStyleUrl = tileStyleUrl }, [tileStyleUrl])
   const setTileStyleUrlAndPersist = useCallback(async (url) => {
     const next = url == null || url === '' ? null : url
     try { await pear.call('shell:tileStyle:set', { url: next }) } catch {}
@@ -297,6 +303,13 @@ export function App () {
   const [onboardingComplete, setOnboardingComplete] = useState(true)
   const [tourPending, setTourPending] = useState(false)
   const [onboardingLoaded, setOnboardingLoaded] = useState(false)
+  // Offline tile-fetch state. tileFetch.js publishes via subscribeOfflineState
+  // when MapLibre's tile requests fail repeatedly (sliding window in the
+  // interceptor); we render a discovery banner pointing at Settings so
+  // the user knows offline-tile management exists.
+  const [tilesOffline, setTilesOffline] = useState(false)
+  const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false)
+  useEffect(() => subscribeOfflineState(setTilesOffline), [])
   const persistOnboarding = useCallback(async (patch) => {
     try { await pear.call('shell:onboarding:set', patch) } catch {}
   }, [])
@@ -575,6 +588,49 @@ export function App () {
             setSheet({ name: 'about', expand: 'support' })
           }}
         />
+      )}
+      {/* Offline-tile discovery banner. Surfaces only after MapLibre's
+          tile fetches have failed enough times to flip the offline flag
+          (tileFetch.js's sliding-window heuristic). Routes the user
+          into Settings -> Map tiles where Clear / Download live. Hidden
+          while any sheet is open since they're already in nav, and
+          dismissible per session so it doesn't nag. */}
+      {tilesOffline && !offlineBannerDismissed && !sheet && (
+        <div
+          role='button'
+          onClick={() => { setOfflineBannerDismissed(true); setSheet({ name: 'settings' }) }}
+          style={{
+            position: 'absolute',
+            left: 16, right: 16,
+            bottom: `calc(env(safe-area-inset-bottom, 0px) + 76px)`,
+            zIndex: 60,
+            display: 'flex', alignItems: 'center', gap: 12,
+            padding: '12px 14px',
+            background: 'rgba(26,26,26,0.95)',
+            border: `1px solid ${colors.border}`,
+            borderRadius: 10,
+            color: colors.text.primary,
+            fontFamily: typography.fontFamily,
+            fontSize: 13, fontWeight: 400,
+            cursor: 'pointer',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+          }}
+        >
+          <div style={{ flex: 1 }}>
+            <div>Map tiles unavailable</div>
+            <div style={{ ...typography.caption, color: colors.text.muted, marginTop: 2 }}>
+              Tap to manage offline tiles in Settings.
+            </div>
+          </div>
+          <button
+            onClick={(e) => { e.stopPropagation(); setOfflineBannerDismissed(true) }}
+            aria-label='Dismiss'
+            style={{
+              background: 'transparent', border: 'none', color: colors.text.secondary,
+              fontSize: 20, cursor: 'pointer', padding: '0 4px', lineHeight: 1,
+            }}
+          >×</button>
+        </div>
       )}
       {/* First-run onboarding (welcome → name → create/join). Gated on
           the hydrated AsyncStorage flag so we don't flash on cold start
@@ -2330,6 +2386,23 @@ const CircleMap = React.forwardRef(function CircleMap (
     })
     mapRef.current = map
 
+    // Publish the current viewport on every move/zoom so the offline
+    // tile downloader can pick up the user's current view without
+    // prop-drilling a map ref into Settings.
+    const publishViewport = () => {
+      try {
+        const b = map.getBounds()
+        window.__pearMapViewport = {
+          bbox: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
+          center: [map.getCenter().lng, map.getCenter().lat],
+          zoom: map.getZoom(),
+        }
+      } catch {}
+    }
+    map.on('moveend', publishViewport)
+    map.on('zoomend', publishViewport)
+    publishViewport()
+
     map.on('load', () => {
       map.addSource('places', { type: 'geojson', data: emptyFC() })
       // Place geofences only render at neighborhood-or-closer zoom.
@@ -3491,6 +3564,7 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
         )}
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
+        <TileCacheSection />
       </Collapsible>
     </div>
   )
@@ -3785,6 +3859,328 @@ function TileStyleSection ({ url, onChange }) {
       )}
       {error && <p style={s.error}>{error}</p>}
     </>
+  )
+}
+
+// Offline tile cache stats + admin. Reads from window.__pearTileCache
+// (installed in main.jsx at boot). The map fetches every tile through
+// the cache, so size grows naturally as the user explores; this UI
+// surfaces what's cached, lets them clear LRU entries, and opens the
+// region-download manager for explicit offline coverage.
+function TileCacheSection () {
+  const [stats, setStats] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [regions, setRegions] = useState([])
+  const [downloadOpen, setDownloadOpen] = useState(false)
+
+  const refresh = useCallback(async () => {
+    const cache = window.__pearTileCache
+    if (!cache) return
+    try {
+      const s = await cache.stats()
+      const rs = await cache.listRegions()
+      setStats(s)
+      setRegions(rs)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    refresh()
+    // Periodic refresh while the section is mounted so size updates
+    // as the user explores the map without leaving Settings open
+    // for too long. 5s is plenty -- the user only sees this while
+    // the section is expanded.
+    const t = setInterval(refresh, 5000)
+    return () => clearInterval(t)
+  }, [refresh])
+
+  const clear = async () => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await window.__pearTileCache?.clear()
+      await refresh()
+    } finally { setBusy(false) }
+  }
+  const deleteRegion = async (id) => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await window.__pearTileCache?.deleteRegion(id)
+      await refresh()
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>
+        Offline tiles
+      </p>
+      <p style={s.muted}>
+        Tiles you've viewed stay cached so the map keeps working without a network connection.
+      </p>
+      <div style={{
+        display: 'flex', gap: spacing.base,
+        background: colors.surface.input,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.md,
+        padding: `${spacing.sm + 2}px ${spacing.md}px`,
+        marginBottom: spacing.sm,
+      }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ ...typography.caption, color: colors.text.muted }}>Cached</div>
+          <div style={{ ...typography.body, color: colors.text.primary, fontVariantNumeric: 'tabular-nums' }}>
+            {stats ? `${formatBytes(stats.totalBytes)} · ${stats.count.toLocaleString()} tiles` : '...'}
+          </div>
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ ...typography.caption, color: colors.text.muted }}>Limit</div>
+          <div style={{ ...typography.body, color: colors.text.primary, fontVariantNumeric: 'tabular-nums' }}>
+            {stats ? formatBytes(stats.maxBytes) : '...'}
+          </div>
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: spacing.sm, marginBottom: regions.length > 0 ? spacing.base : 0 }}>
+        <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1 }} onClick={() => setDownloadOpen(true)}>
+          Download tiles
+        </button>
+        <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1 }} onClick={clear} disabled={busy}>
+          Clear cache
+        </button>
+      </div>
+      {regions.length > 0 && (
+        <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          {regions.map((r) => (
+            <li key={r.id} style={{
+              display: 'flex', alignItems: 'center', gap: spacing.sm,
+              padding: `${spacing.sm}px 0`,
+              borderTop: `1px solid ${colors.divider}`,
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ ...typography.body, color: colors.text.primary }}>{r.name}</div>
+                <div style={{ ...typography.caption, color: colors.text.muted, fontVariantNumeric: 'tabular-nums' }}>
+                  {r.status === 'downloading'
+                    ? `${formatBytes(r.sizeBytes)} · ${r.downloadedTiles?.toLocaleString() ?? 0} / ${r.totalTiles?.toLocaleString() ?? '?'} tiles · downloading`
+                    : r.status === 'failed'
+                      ? `${formatBytes(r.sizeBytes)} · ${r.downloadedTiles?.toLocaleString() ?? 0} tiles · failed`
+                      : `${formatBytes(r.sizeBytes)} · ${r.downloadedTiles?.toLocaleString() ?? r.totalTiles?.toLocaleString() ?? 0} tiles`}
+                </div>
+              </div>
+              <button
+                onClick={() => deleteRegion(r.id)}
+                disabled={busy}
+                aria-label={'Delete ' + r.name}
+                style={{
+                  background: 'transparent', border: 'none',
+                  color: colors.text.muted, cursor: 'pointer',
+                  padding: spacing.sm,
+                }}
+              >
+                <Trash size={18} weight='regular' />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {downloadOpen && (
+        <RegionDownloadModal
+          onClose={() => { setDownloadOpen(false); refresh() }}
+        />
+      )}
+    </>
+  )
+}
+
+function formatBytes (n) {
+  if (!n && n !== 0) return ''
+  if (n < 1024) return n + ' B'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB'
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB'
+}
+
+// Pre-emptive download bottom-sheet. Reads the current map viewport
+// from window.__pearMapViewport (published by CircleMap), lets the
+// user pick a zoom range, estimates the download, and runs it.
+// Progress updates persist into the cache's region record so
+// dismissing / reopening Settings while a download is in flight
+// still surfaces live progress in the TileCacheSection's regions
+// list. Bottom-sheet rather than centered modal because the entry
+// button lives at the bottom of the Map tiles section and a centered
+// modal lands above the user's scroll position.
+function RegionDownloadModal ({ onClose }) {
+  const viewport = (typeof window !== 'undefined') ? window.__pearMapViewport : null
+  const [name, setName] = useState('')
+  const [zMax, setZMax] = useState(13)
+  const [running, setRunning] = useState(false)
+  const [progress, setProgress] = useState(null)
+  const [error, setError] = useState(null)
+  const abortRef = useRef(null)
+  const tileStyleUrl = (typeof window !== 'undefined' ? window.__pearTileStyleUrl : null) || DEFAULT_TILE_STYLE_URL
+  const zMin = 6  // fixed -- lower than 6 is world-scale and adds negligible bytes
+
+  const tileEstimate = useMemo(() => {
+    if (!viewport?.bbox) return 0
+    return estimateTilesInBbox(viewport.bbox, zMin, zMax)
+  }, [viewport, zMin, zMax])
+  const sizeEstimate = tileEstimate * 15 * 1024  // ~15 KB per vector tile
+
+  const start = async () => {
+    if (!viewport?.bbox) { setError('Pan the map to the area you want first.'); return }
+    let cache = window.__pearTileCache
+    if (!cache) {
+      // Cache wasn't initialized at boot -- last-ditch open in case
+      // main.jsx's init lost a race with the WebView's IDB worker.
+      try {
+        const mod = await import('./lib/tileCache.js')
+        cache = await mod.openTileCache()
+        window.__pearTileCache = cache
+      } catch (e) {
+        setError('Tile cache could not open: ' + (e?.message || e))
+        return
+      }
+    }
+    setError(null)
+    setRunning(true)
+    setProgress(null)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const regionId = 'region-' + Date.now()
+    const regionName = name.trim() || ('Offline area · ' + new Date().toLocaleString())
+    try {
+      await downloadRegion({
+        bbox: viewport.bbox,
+        zMin, zMax,
+        regionId,
+        name: regionName,
+        tileStyleUrl,
+        cache,
+        signal: controller.signal,
+        onProgress: (r) => setProgress(r),
+      })
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setRunning(false)
+      abortRef.current = null
+    }
+  }
+  const cancel = () => {
+    abortRef.current?.abort()
+  }
+
+  return (
+    <BottomSheet onClose={onClose} zIndex={420}>
+      <div style={{ padding: `${spacing.lg}px ${spacing.lg}px ${spacing.base}px` }}>
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
+          Download tiles
+        </div>
+        {!viewport?.bbox ? (
+          <div style={{ ...typography.body, color: colors.text.secondary, lineHeight: 1.5 }}>
+            Open the map and pan to the area you want to download, then come back here.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.base }}>
+            <div style={{ ...typography.body, color: colors.text.secondary, lineHeight: 1.5 }}>
+              The current map view will be cached down to your chosen zoom level. Higher zoom = more detail and more storage.
+            </div>
+            <div>
+              <div style={{ ...typography.caption, color: colors.text.muted, marginBottom: spacing.xs }}>Name (optional)</div>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder='e.g. Denver area'
+                disabled={running}
+                style={{
+                  width: '100%', boxSizing: 'border-box',
+                  padding: '10px 12px',
+                  background: colors.surface.input,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: radius.md,
+                  color: colors.text.primary,
+                  fontSize: 14, fontFamily: typography.fontFamily,
+                }}
+              />
+            </div>
+            <div>
+              <div style={{ ...typography.caption, color: colors.text.muted, marginBottom: spacing.xs }}>
+                Maximum zoom: {zMax} <span style={{ color: colors.text.muted }}>(11 = neighborhood, 13 = street, 15 = building)</span>
+              </div>
+              <input
+                type='range'
+                min={10} max={15}
+                value={zMax}
+                disabled={running}
+                onChange={(e) => setZMax(parseInt(e.target.value, 10))}
+                style={{ width: '100%' }}
+              />
+            </div>
+            <div style={{
+              background: colors.surface.input,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.md,
+              padding: `${spacing.sm}px ${spacing.md}px`,
+              ...typography.caption, color: colors.text.secondary,
+              fontVariantNumeric: 'tabular-nums',
+            }}>
+              {progress
+                ? `${progress.downloadedTiles.toLocaleString()} / ${progress.totalTiles.toLocaleString()} tiles · ${formatBytes(progress.sizeBytes)}`
+                : `~${tileEstimate.toLocaleString()} tiles · ~${formatBytes(sizeEstimate)}`
+              }
+            </div>
+            {error && (
+              <div style={{ ...typography.caption, color: colors.error }}>{error}</div>
+            )}
+            <div style={{ display: 'flex', gap: spacing.sm }}>
+              {running ? (
+                <button
+                  onClick={cancel}
+                  style={{
+                    flex: 1, padding: '13px', borderRadius: radius.md,
+                    background: 'transparent', color: colors.text.primary,
+                    border: `1px solid ${colors.border}`,
+                    cursor: 'pointer',
+                    fontFamily: typography.fontFamily, fontSize: 14,
+                  }}
+                >
+                  Cancel
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={onClose}
+                    style={{
+                      flex: 1, padding: '13px', borderRadius: radius.md,
+                      background: 'transparent', color: colors.text.primary,
+                      border: `1px solid ${colors.border}`,
+                      cursor: 'pointer',
+                      fontFamily: typography.fontFamily, fontSize: 14,
+                    }}
+                  >
+                    {progress?.status === 'complete' ? 'Close' : 'Cancel'}
+                  </button>
+                  {progress?.status !== 'complete' && (
+                    <button
+                      onClick={start}
+                      disabled={tileEstimate === 0}
+                      style={{
+                        flex: 1, padding: '13px', borderRadius: radius.md,
+                        background: colors.primary, color: colors.text.onPrimary,
+                        border: 'none', cursor: tileEstimate > 0 ? 'pointer' : 'default',
+                        opacity: tileEstimate > 0 ? 1 : 0.5,
+                        fontFamily: typography.fontFamily, fontSize: 14,
+                      }}
+                    >
+                      Download
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </BottomSheet>
   )
 }
 

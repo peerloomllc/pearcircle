@@ -7,6 +7,25 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App.jsx'
+import { openTileCache } from './lib/tileCache.js'
+import { installTileFetchInterceptor } from './lib/tileFetch.js'
+
+// Tile cache must be installed before MapLibre initializes (App.jsx
+// imports maplibre-gl-js, which registers no fetches yet but will fire
+// them on first map mount). We open the cache, install the fetch
+// interceptor, and expose the handle on window so Settings can read
+// stats and run admin ops (clear, region delete) without re-opening
+// the IDB connection. App render is deferred until this resolves so
+// MapLibre's first request is guaranteed to go through the cache.
+async function initTileCache () {
+  try {
+    const cache = await openTileCache()
+    installTileFetchInterceptor({ cache })
+    window.__pearTileCache = cache
+  } catch (e) {
+    console.warn('tile cache init failed:', e?.message || e)
+  }
+}
 
 let _nextId = 1
 const _pending = new Map()
@@ -37,5 +56,7 @@ window.__pearEvent = (event, data) => {
 
 window.pear = { call, on }
 
-const root = createRoot(document.getElementById('root'))
-root.render(<App />)
+initTileCache().then(() => {
+  const root = createRoot(document.getElementById('root'))
+  root.render(<App />)
+})

@@ -935,7 +935,14 @@ export default function Index() {
     <>
       <WebView
         ref={webViewRef}
-        source={{ html, baseUrl: 'about:blank' }}
+        // baseUrl https://localhost/ rather than about:blank: the
+        // WebView treats about:blank as a non-secure null-origin
+        // context and denies IndexedDB (SecurityError on IDBFactory.open).
+        // localhost is a recognized "secure context" on both Chromium
+        // and WKWebView, so IDB-backed tile caching works. OpenFreeMap
+        // and Protomaps ship permissive CORS headers, so cross-origin
+        // tile fetches still succeed from this origin.
+        source={{ html, baseUrl: 'https://localhost/' }}
         onMessage={onMessage}
         onLoad={onLoad}
         style={{ flex: 1, backgroundColor: '#111' }}
