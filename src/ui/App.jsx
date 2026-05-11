@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import { createPortal } from 'react-dom'
 import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
@@ -4363,7 +4364,16 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
 
   const translateY = (!visible || closing) ? '100%' : '0%'
 
-  return (
+  // Portal to document.body so the position:fixed scrim/sheet escape any
+  // transformed ancestor (notably SheetContainer's transform:translateY,
+  // which creates a containing block for position:fixed descendants — without
+  // this, a ConfirmSheet mounted from inside Settings ends up positioned
+  // relative to the SheetContainer rather than the viewport, and the
+  // bottom edge can land short of the actual screen bottom).
+  // Bottom padding includes env(safe-area-inset-bottom) so on gesture-nav
+  // devices the sheet's last interactive element doesn't crowd the home
+  // indicator; falls back to a flat 32px on hardware without insets.
+  return createPortal(
     <div
       style={{
         position: 'fixed', inset: 0, zIndex,
@@ -4381,7 +4391,7 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
           color: colors.text.primary,
           borderRadius: '20px 20px 0 0',
           maxHeight: '85dvh', overflowY: 'auto', overflowX: 'hidden',
-          padding: '0 16px 32px',
+          padding: `0 16px calc(env(safe-area-inset-bottom, 0px) + 24px)`,
           transform: `translateY(${translateY})`,
           transition: `transform ${DURATION}ms cubic-bezier(0.32,0.72,0,1)`,
           WebkitOverflowScrolling: 'touch',
@@ -4398,7 +4408,8 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
         </div>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 
