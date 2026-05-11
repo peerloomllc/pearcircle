@@ -2376,18 +2376,22 @@ function renderBubble (root, member, selected, last, connected) {
   root.style.border = 'none'
   root.style.background = 'transparent'
   root.style.filter = selected
-    ? 'drop-shadow(0 0 10px rgba(126,196,207,0.7)) drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
+    ? 'drop-shadow(0 0 10px rgba(159,225,90,0.7)) drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
     : 'drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
   // Rotating focus ring: only present when selected. Sits behind the
   // avatar as a positioned sibling (DOM-order first); inset:-${ring}px
   // makes it extend that many pixels beyond root, so only the ring band
   // around the avatar shows the gradient. The avatar itself doesn't
   // rotate because the spin animation is on the ring element only.
-  // Conic distribution: a soft cyan blob occupying ~quarter of the
-  // circumference, dark elsewhere, so the cyan reads as a moving
-  // highlight rather than a full halo.
+  // Conic distribution: a soft brand-green blob occupying ~quarter of
+  // the circumference, dark elsewhere, so the green reads as a moving
+  // highlight rather than a full halo. Matches the brand color used on
+  // primary buttons and toggle pills (colorsRaw.primary). Literal hex
+  // rather than var(--color-primary) so the ring stays the dark-mode
+  // brand green regardless of the active theme — the dark `#1a1a1a`
+  // backdrop in the gradient is tuned for that specific green.
   const focusRingHtml = selected ? (
-    `<div style="position:absolute;z-index:0;inset:-${ring}px;border-radius:50%;background:conic-gradient(from 0deg, #1a1a1a 0%, #7ec4cf 25%, #1a1a1a 50%, #1a1a1a 100%);animation:pearcircle-focus-spin 2.4s linear infinite;animation-delay:${spinDelay}s;pointer-events:none;"></div>`
+    `<div style="position:absolute;z-index:0;inset:-${ring}px;border-radius:50%;background:conic-gradient(from 0deg, #1a1a1a 0%, #9FE15A 25%, #1a1a1a 50%, #1a1a1a 100%);animation:pearcircle-focus-spin 2.4s linear infinite;animation-delay:${spinDelay}s;pointer-events:none;"></div>`
   ) : ''
 
   // Avatar inner div: when selected, no internal border (the rotating
@@ -3872,7 +3876,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
             onClick={onOpenTrips}
             style={{
               width: '100%', padding: '12px', borderRadius: radius.md,
-              background: colors.accent, color: colors.text.onPrimary,
+              background: colors.primary, color: colors.text.onPrimary,
               border: 'none', cursor: 'pointer',
               fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
             }}
@@ -3887,7 +3891,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
             disabled={!seen}
             style={{
               width: '100%', padding: '12px', borderRadius: radius.md,
-              background: colors.accent, color: colors.text.onPrimary,
+              background: colors.primary, color: colors.text.onPrimary,
               border: 'none', cursor: seen ? 'pointer' : 'default',
               fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
               opacity: seen ? 1 : 0.5,
