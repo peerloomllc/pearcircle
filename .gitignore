@@ -22,6 +22,10 @@ assets/app-ui.bundle
 TODO.md
 DONE.md
 
+# Release-pipeline secrets (sourced by scripts/release.sh + ios-appstore.sh)
+scripts/.env
+.env
+
 # Logs / OS junk
 *.log
 .DS_Store
