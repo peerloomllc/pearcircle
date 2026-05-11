@@ -283,6 +283,11 @@ export default function Index() {
   const webViewLoaded = useRef(false)
   const pendingDeeplink = useRef<string | null>(null)
   const pendingNotificationFocus = useRef<{ circleId: string; pubkey: string } | null>(null)
+  // True while the iOS priming modal is up — startUpdates hasn't been
+  // called yet because we're waiting for the user's Continue tap. The
+  // WebView's shell:permission:proceed IPC flips this back to false and
+  // kicks off the actual permission request + status emit.
+  const pendingLocationStart = useRef<boolean>(false)
   // QR scanner is a JS-driven modal that resolves a pending shell:scanQr
   // IPC call when the camera reads a code (or the user cancels).
   const [scannerVisible, setScannerVisible] = useState(false)
@@ -424,8 +429,36 @@ export default function Index() {
     // sharing toggle says otherwise. The worklet emits its current
     // `sharingEnabled` on the `ready` event, before any user
     // interaction. We listen once and start (or skip) accordingly.
-    const onReadyOnce = (data: any) => {
+    //
+    // On iOS we gate the FIRST startUpdates behind a priming screen:
+    // before the system dialog fires (which can only happen once per
+    // install), we surface a WebView modal explaining why "Always" is
+    // needed. The user taps Continue → shell:permission:proceed IPC →
+    // startUpdates → status emitted to WebView so the home banner can
+    // nudge declined / WhenInUse-stuck users toward Settings.
+    // Android skips the priming (no equivalent permission tier) and
+    // the existing FusedLocation runtime-permission flow handles itself.
+    const onReadyOnce = async (data: any) => {
       if (data?.sharingEnabled === false) return
+      if (Platform.OS === 'ios') {
+        try {
+          const status: string = await PearCircleLocation.getAuthorizationStatus?.()
+          if (status === 'notDetermined') {
+            // Stash the resolver; WebView's Continue button triggers the actual start.
+            pendingLocationStart.current = true
+            emitEvent('permission:prime', { reason: 'first-time' })
+            return  // wait for shell:permission:proceed
+          }
+          // Already determined (any state): start updates, then publish status.
+          await PearCircleLocation.startUpdates?.()
+          const post: string = await PearCircleLocation.getAuthorizationStatus?.()
+          emitEvent('permission:status', { status: post })
+        } catch (e: any) {
+          console.warn('startUpdates failed', e?.message)
+        }
+        return
+      }
+      // Android: existing flow.
       PearCircleLocation.startUpdates?.().catch?.((e: any) =>
         console.warn('startUpdates failed', e),
       )
@@ -599,6 +632,52 @@ export default function Index() {
         if (url == null) await AsyncStorage.removeItem(TILE_STYLE_KEY)
         else if (typeof url === 'string' && url.length > 0) await AsyncStorage.setItem(TILE_STYLE_KEY, url)
         else { respond(msg.id, { ok: false, error: 'url must be a non-empty string or null' }); return }
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:permission:proceed') {
+      // WebView's "Continue" tap on the priming modal. iOS: now fire
+      // the system dialog. Whatever the user picks (Always, WhenInUse,
+      // Don't Allow, Allow Once), we then publish the post-decision
+      // status so the home banner can react.
+      if (Platform.OS !== 'ios') { respond(msg.id, { ok: false, reason: 'not_ios' }); return }
+      if (!pendingLocationStart.current) { respond(msg.id, { ok: false, reason: 'not_pending' }); return }
+      pendingLocationStart.current = false
+      try {
+        await PearCircleLocation?.startUpdates?.()
+        const post: string = await PearCircleLocation?.getAuthorizationStatus?.()
+        emitEvent('permission:status', { status: post })
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:permission:status') {
+      // On-demand status query from the WebView (e.g., the home banner
+      // refreshes after the user returns from Settings).
+      if (Platform.OS !== 'ios') { respond(msg.id, { status: 'always' }); return }
+      try {
+        const status = await PearCircleLocation?.getAuthorizationStatus?.()
+        respond(msg.id, { status: typeof status === 'string' ? status : 'unknown' })
+      } catch (err: any) {
+        respond(msg.id, { status: 'unknown', error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:openSettings') {
+      // Deep-link to the OS Settings app at this app's location entry.
+      // iOS: native openSettings → UIApplication.openSettingsURLString.
+      // Android: open the app's settings page via Linking.
+      try {
+        if (Platform.OS === 'ios') {
+          await PearCircleLocation?.openSettings?.()
+        } else if (Platform.OS === 'android') {
+          await Linking.openSettings()
+        }
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })

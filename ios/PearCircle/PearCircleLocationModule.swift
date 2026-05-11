@@ -124,6 +124,53 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     }
   }
 
+  // Read the current authorization status without triggering a dialog.
+  // Used by the shell to decide whether to show the priming screen and
+  // by the home banner to nudge users stuck below Always toward the
+  // iOS Settings deep-link.
+  @objc func getAuthorizationStatus(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      let mgr = self.ensureManager()
+      let status: CLAuthorizationStatus
+      if #available(iOS 14.0, *) {
+        status = mgr.authorizationStatus
+      } else {
+        status = CLLocationManager.authorizationStatus()
+      }
+      let s: String
+      switch status {
+      case .notDetermined:        s = "notDetermined"
+      case .restricted:           s = "restricted"
+      case .denied:               s = "denied"
+      case .authorizedWhenInUse:  s = "whenInUse"
+      case .authorizedAlways:     s = "always"
+      @unknown default:           s = "unknown"
+      }
+      resolve(s)
+    }
+  }
+
+  // Deep-link into the iOS Settings app's PearCircle entry. Apple allows
+  // this URL; it's the canonical "send the user to fix this permission"
+  // path. Resolves true on a successful open.
+  @objc func openSettings(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      guard let url = URL(string: UIApplication.openSettingsURLString) else {
+        resolve(false)
+        return
+      }
+      UIApplication.shared.open(url, options: [:]) { ok in
+        resolve(ok)
+      }
+    }
+  }
+
   // MARK: - CLLocationManagerDelegate
 
   // iOS 14+ delegate.

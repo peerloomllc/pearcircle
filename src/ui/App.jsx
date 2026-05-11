@@ -210,6 +210,19 @@ export function App () {
   // free local state. Stored as an array because two circles could
   // theoretically be deleted in quick succession.
   const [deletedNotices, setDeletedNotices] = useState([])
+  // iOS Always-location flow state. permissionStatus tracks the latest
+  // status published by the shell ('always' | 'whenInUse' | 'denied' |
+  // 'restricted' | 'notDetermined' | 'unknown'); the home banner reads
+  // it to decide whether to show the "Open Settings" nudge. Default to
+  // 'always' so Android and pre-status-emit iOS don't show the banner.
+  // primingVisible drives the one-time priming modal that runs before
+  // the iOS system dialog; setPrimingVisible(true) on permission:prime,
+  // setPrimingVisible(false) once the user taps Continue (after shell
+  // confirms the IPC handoff). bannerDismissed is per-session so the
+  // banner doesn't keep nagging within a single launch.
+  const [permissionStatus, setPermissionStatus] = useState('always')
+  const [primingVisible, setPrimingVisible] = useState(false)
+  const [bannerDismissed, setBannerDismissed] = useState(false)
   // MapLibre style URL. Hydrated from AsyncStorage (via shell:tileStyle:get)
   // on mount; passed down to HomeMapView -> CircleMap so the map can hot-
   // swap on edit. Settings -> Map tiles writes through both AsyncStorage
@@ -276,6 +289,18 @@ export function App () {
         enabled: enabled !== false,
         expiresAt: typeof expiresAt === 'number' ? expiresAt : null,
       })
+    })
+    // iOS Always-location priming flow. Shell sends `permission:prime`
+    // before the first system dialog (notDetermined state) so we can
+    // explain why Always is needed. After the user picks (Always /
+    // WhenInUse / Don't Allow / Allow Once), shell publishes the
+    // resulting status via `permission:status` so the home banner
+    // can nudge declined / stuck users toward Settings.
+    pear.on('permission:prime', () => {
+      setPrimingVisible(true)
+    })
+    pear.on('permission:status', ({ status }) => {
+      if (typeof status === 'string') setPermissionStatus(status)
     })
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setSheet({ name: 'join', invite: url })
@@ -371,6 +396,9 @@ export function App () {
         setSheet={setSheet}
         initialSelectedCircleId={view.selectCircle ?? null}
         initialFocus={view.focus ?? null}
+        permissionStatus={permissionStatus}
+        bannerDismissed={bannerDismissed}
+        onPermissionBannerDismiss={() => setBannerDismissed(true)}
       />
       <SheetContainer open={sheet?.name === 'settings'}>
         <ProfileView
@@ -439,7 +467,116 @@ export function App () {
           onDismiss={() => dismissDeletedNotice(deletedNotices[0].circleId)}
         />
       )}
+      {primingVisible && (
+        <PermissionPrimingModal
+          onContinue={async () => {
+            // Fire-and-forget; we close the modal optimistically. The
+            // status emit from the shell will arrive shortly after the
+            // user picks an option in the iOS system dialog and will
+            // drive any subsequent banner.
+            setPrimingVisible(false)
+            try { await pear.call('shell:permission:proceed') } catch {}
+          }}
+        />
+      )}
     </>
+  )
+}
+
+// One-shot priming modal that runs before the iOS Always-location
+// system dialog (Apple lets us trigger that dialog ONCE per install,
+// so we set expectations carefully first). Plain card centered over a
+// dim scrim, single Continue button. Skipped on Android (no equivalent
+// permission tier) and on iOS for users whose status is already
+// determined.
+function PermissionPrimingModal ({ onContinue }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 350,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(0,0,0,0.65)',
+      padding: spacing.lg,
+    }}>
+      <div style={{
+        width: '100%', maxWidth: 360,
+        background: colors.surface.card,
+        borderRadius: radius.lg,
+        padding: spacing.lg,
+        boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+      }}>
+        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary }}>
+          Location access
+        </h2>
+        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
+          PearCircle uses your location to share live position with your circles and notify them when you arrive at or leave the Places you've set.
+        </p>
+        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.lg, lineHeight: 1.5 }}>
+          On the next screen, choose <strong style={{ color: colors.text.primary, fontWeight: 400 }}>Always</strong> so sharing keeps working when the app is in the background. <strong style={{ color: colors.text.primary, fontWeight: 400 }}>While Using App</strong> works too, but sharing pauses whenever you leave the app.
+        </p>
+        <button
+          onClick={onContinue}
+          style={{
+            width: '100%', padding: '12px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.md,
+            fontFamily: typography.fontFamily, fontSize: 14, fontWeight: 400,
+            cursor: 'pointer',
+          }}
+        >
+          Continue
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// In-app banner shown at the top of the map when iOS location permission
+// is below 'always' (and not dismissed for the session). Apple permits
+// deep-linking to the app's Settings entry via openSettingsURLString,
+// which is what shell:openSettings does. The banner stays dismissable
+// because some users genuinely don't want Always — we explain it once
+// and trust them.
+function PermissionBanner ({ status, onOpenSettings, onDismiss }) {
+  const headline = status === 'denied' || status === 'restricted'
+    ? 'Location turned off'
+    : 'Sharing pauses when the app is closed'
+  const body = status === 'denied' || status === 'restricted'
+    ? "PearCircle can't share your location. Turn it on in Settings to keep your circles in sync."
+    : "You've allowed location only while using the app. Set it to Always so sharing keeps running in the background."
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+      display: 'flex', alignItems: 'flex-start', gap: spacing.sm,
+    }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{headline}</div>
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>{body}</div>
+        <button
+          onClick={onOpenSettings}
+          style={{
+            marginTop: spacing.sm,
+            padding: '6px 12px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.sm,
+            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+            cursor: 'pointer',
+          }}
+        >
+          Open Settings
+        </button>
+      </div>
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+    </div>
   )
 }
 
@@ -704,7 +841,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {} }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   const [peerCount, setPeerCount] = useState(0)
@@ -1103,6 +1240,19 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           onLongPress={onMapLongPress}
         />
       </div>
+
+      {/* iOS Always-location nudge banner. Shows when permission is
+          below 'always' and the user hasn't dismissed it this session.
+          Apple's openSettingsURLString deep-link is the one supported
+          recovery path once the system dialog has been answered (it
+          can only show once per install). */}
+      {permissionStatus !== 'always' && permissionStatus !== 'unknown' && !bannerDismissed && (
+        <PermissionBanner
+          status={permissionStatus}
+          onOpenSettings={() => { pear.call('shell:openSettings').catch(() => {}) }}
+          onDismiss={onPermissionBannerDismiss}
+        />
+      )}
 
       {/* Slide-down member-focus top bar. Always mounted so the slide
           animation has content; hidden above the viewport when no member
