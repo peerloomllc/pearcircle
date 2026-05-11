@@ -687,14 +687,30 @@ export default function Index() {
       return
     }
     if (msg.method === 'shell:openSettings') {
-      // Deep-link to the OS Settings app at this app's location entry.
-      // iOS: native openSettings → UIApplication.openSettingsURLString.
-      // Android: open the app's settings page via Linking.
+      // Deep-link the user to "where they can fix the location
+      // permission." Each OS exposes a different best path:
+      //   iOS:     UIApplication.openSettingsURLString — app's Settings
+      //            entry. Apple doesn't expose a deeper deep-link.
+      //   Android: if FINE is already granted (whenInUse status), call
+      //            requestBackgroundLocation which the OS routes to the
+      //            location-permission detail page directly (Android
+      //            11+) or shows the upgrade dialog (Android 10). If
+      //            FINE is not granted, fall back to Linking.openSettings
+      //            (general app-info page) since the request flow needs
+      //            FINE first.
       try {
         if (Platform.OS === 'ios') {
           await PearCircleLocation?.openSettings?.()
         } else if (Platform.OS === 'android') {
-          await Linking.openSettings()
+          let landed = false
+          try {
+            const status = await PearCircleLocation?.getAuthorizationStatus?.()
+            if (status === 'whenInUse' && PearCircleLocation?.requestBackgroundLocation) {
+              await PearCircleLocation.requestBackgroundLocation()
+              landed = true
+            }
+          } catch {}
+          if (!landed) await Linking.openSettings()
         }
         respond(msg.id, { ok: true })
       } catch (err: any) {

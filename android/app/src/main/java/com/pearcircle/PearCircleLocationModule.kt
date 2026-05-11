@@ -116,6 +116,44 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         promise.resolve(if (bgGranted) "always" else "whenInUse")
     }
 
+    // Direct path to upgrade from "Allow only while using the app" to
+    // "Allow all the time" — Android-only equivalent of iOS's
+    // settings deep-link, but cleaner because we can hand the user
+    // straight to the OS-managed background-location upgrade flow
+    // rather than the generic app-info page.
+    //   Android 10 (API 29): system dialog with "Allow all the time"
+    //     and "Allow only while using the app" choices.
+    //   Android 11+ (API 30+): the system silently denies the runtime
+    //     request and surfaces a "Set in Settings" screen that opens
+    //     directly to this app's Location permission detail, not the
+    //     two-clicks-deep app-permissions list.
+    // Requires FINE to already be granted; otherwise the request
+    // can't succeed and the caller should fall back to the generic
+    // app settings page.
+    @ReactMethod
+    fun requestBackgroundLocation(promise: Promise) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // Pre-Q: background location isn't a separate runtime permission.
+            promise.resolve(true)
+            return
+        }
+        if (!hasFineLocation()) {
+            promise.resolve(false)  // caller falls back to openSettings
+            return
+        }
+        val activity = getCurrentActivity() as? PermissionAwareActivity
+        if (activity == null) { promise.resolve(false); return }
+        val listener = PermissionListener { _, _, results ->
+            promise.resolve(results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED)
+            true
+        }
+        activity.requestPermissions(
+            arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
+            REQ_BACKGROUND,
+            listener,
+        )
+    }
+
     fun emitLocation(lat: Double, lon: Double, accuracy: Double, ts: Double, speed: Double, battery: Double?, isCharging: Boolean) {
         val payload: WritableMap = Arguments.createMap().apply {
             putDouble("lat", lat)
@@ -306,6 +344,7 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     companion object {
         private const val TAG = "PearCircleLocation"
         private const val REQ_FINE = 4711
+        private const val REQ_BACKGROUND = 4712
         private const val REQ_NOTIFICATIONS = 4713
         private const val DEBOUNCE_MS = 2000L
         @JvmStatic var instance: PearCircleLocationModule? = null
