@@ -100,6 +100,17 @@ let _sharingExpiryTimer = null    // setTimeout handle for the pending auto-resu
 // if this ever needs to survive crashes.
 let _tripState = newTripState()
 
+// Suppress duplicate `transition:applied` IPC emits when autobase
+// re-applies the same op (indexer reorganization on writer-add or
+// fork-merge can replay previously-processed nodes). The shell already
+// dedups close-in-time repeats with a 10s TTL, but re-applies can
+// land minutes apart and slip through. Keyed by the autobase op key
+// `transition:{ts}:{pubkey}:{placeId}` which uniquely identifies a
+// single transition write. Bounded to keep memory flat over long
+// sessions; eviction is FIFO-on-overflow.
+const _emittedTransitionKeys = new Set()
+const _EMITTED_TRANSITION_MAX = 1024
+
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
@@ -1219,23 +1230,37 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (keyPlaceId !== incoming.placeId) continue
         await view.put(op.key, incoming)
         // Emit transition:applied so the RN shell can fire an OS notification.
-        // Resolved displayName + placeName piggyback on the event so the
-        // receiver doesn't need to round-trip back to the worklet.
-        try {
-          if (circleId) {
-            const memberRow = await view.get('member:' + incoming.pubkey)
-            const placeRow = await view.get('place:' + incoming.placeId)
-            const placeDeleted = !!(placeRow?.value && isDeleted(placeRow.value))
-            if (!placeDeleted) {
-              send({ event: 'transition:applied', data: {
-                circleId,
-                transition: incoming,
-                displayName: memberRow?.value?.displayName || incoming.pubkey.slice(0, 8),
-                placeName: placeRow?.value?.name || 'a place',
-              }})
-            }
+        // Skip the emit when we've already fired for this exact op key in
+        // this worklet session -- autobase re-applies the same node when
+        // the indexer reorganizes (writer-add, fork-merge), and each
+        // re-apply would otherwise produce another notification minutes
+        // after the first. Resolved displayName + placeName piggyback on
+        // the event so the receiver doesn't need to round-trip back to
+        // the worklet.
+        if (!_emittedTransitionKeys.has(op.key)) {
+          if (_emittedTransitionKeys.size >= _EMITTED_TRANSITION_MAX) {
+            // FIFO-on-overflow: drop the oldest half. Cheap, bounded.
+            const arr = [..._emittedTransitionKeys]
+            _emittedTransitionKeys.clear()
+            for (let i = arr.length >> 1; i < arr.length; i++) _emittedTransitionKeys.add(arr[i])
           }
-        } catch (e) { console.warn('[bare] transition:applied emit failed', e?.message) }
+          _emittedTransitionKeys.add(op.key)
+          try {
+            if (circleId) {
+              const memberRow = await view.get('member:' + incoming.pubkey)
+              const placeRow = await view.get('place:' + incoming.placeId)
+              const placeDeleted = !!(placeRow?.value && isDeleted(placeRow.value))
+              if (!placeDeleted) {
+                send({ event: 'transition:applied', data: {
+                  circleId,
+                  transition: incoming,
+                  displayName: memberRow?.value?.displayName || incoming.pubkey.slice(0, 8),
+                  placeName: placeRow?.value?.name || 'a place',
+                }})
+              }
+            }
+          } catch (e) { console.warn('[bare] transition:applied emit failed', e?.message) }
+        }
         continue
       }
       // Other prefixes (presence, removed) not yet wired — silently

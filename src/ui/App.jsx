@@ -3810,7 +3810,12 @@ function useTripThumbnails (trips, tileStyleUrl) {
       map.addSource('thumb', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
       map.addLayer({
         id: 'thumb-line', type: 'line', source: 'thumb',
-        paint: { 'line-color': colors.accent, 'line-width': 3, 'line-opacity': 0.95 },
+        // colorsRaw, not colors: MapLibre paint props need a literal
+        // color string, and the theme-toggle refactor (commit 17aeb64)
+        // made colors.accent resolve to 'var(--color-accent)' which
+        // MapLibre treats as invalid (renders the layer transparent,
+        // which is what makes the polyline disappear from thumbnails).
+        paint: { 'line-color': colorsRaw.accent, 'line-width': 3, 'line-opacity': 0.95 },
         layout: { 'line-cap': 'round', 'line-join': 'round' },
       })
       // Snapshot is taken from `thumbs` at effect-run time; subsequent
@@ -3991,8 +3996,11 @@ function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
         id: 'trip-line',
         type: 'line',
         source: 'trip',
+        // colorsRaw, not colors: MapLibre paint properties need a
+        // literal color string; see useTripThumbnails for the same
+        // theme-refactor gotcha.
         paint: {
-          'line-color': colors.accent,
+          'line-color': colorsRaw.accent,
           'line-width': 4,
           'line-opacity': 0.9,
         },
@@ -4004,8 +4012,8 @@ function TripDetailView ({ startTs, distanceUnit, tileStyleUrl, onBack }) {
       if (coords.length >= 2) {
         const start = coords[0]
         const end = coords[coords.length - 1]
-        new maplibregl.Marker({ color: colors.text.muted }).setLngLat(start).addTo(map)
-        new maplibregl.Marker({ color: colors.accent }).setLngLat(end).addTo(map)
+        new maplibregl.Marker({ color: colorsRaw.text.muted }).setLngLat(start).addTo(map)
+        new maplibregl.Marker({ color: colorsRaw.accent }).setLngLat(end).addTo(map)
         const lons = coords.map(c => c[0])
         const lats = coords.map(c => c[1])
         const minLon = Math.min(...lons), maxLon = Math.max(...lons)
