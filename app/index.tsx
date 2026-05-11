@@ -42,6 +42,17 @@ const DISTANCE_UNIT_KEY = 'pc:distanceUnit'
 // WebView swap palettes via document.documentElement.dataset.theme; this
 // just persists the user's choice across launches.
 const THEME_KEY = 'pc:theme'
+// Two-week donation-reminder modal (mirrors PearCal/PearGuard). The
+// firstLaunch key is auto-seeded with Date.now() on the very first
+// shell:donateReminder:get call so we have a reference point for the
+// 14-day window. The shown key flips to true after the user picks
+// Donate / Maybe later / Already donated. Both keys are local to the
+// shell; the WebView reads them via shell:donateReminder:get and writes
+// the shown flag via shell:donateReminder:setShown. Skipped on iOS at
+// the WebView layer per App Store guideline 3.1.1 (same gating as the
+// About page's donate section).
+const DONATE_FIRST_LAUNCH_KEY = 'pc:donateReminder:firstLaunch'
+const DONATE_SHOWN_KEY = 'pc:donateReminder:shown'
 const _mutes = new Set<string>()
 let _ourPubkey: string | null = null
 
@@ -712,6 +723,40 @@ export default function Index() {
           } catch {}
           if (!landed) await Linking.openSettings()
         }
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:donateReminder:get') {
+      // Returns { firstLaunch, shown, elapsedMs }. firstLaunch is auto-
+      // seeded with Date.now() on the very first call so the WebView
+      // doesn't need a separate "init" step. Storage failures fall
+      // back to "shown=true" so a broken AsyncStorage doesn't pin the
+      // modal open forever.
+      try {
+        let firstLaunchStr = await AsyncStorage.getItem(DONATE_FIRST_LAUNCH_KEY)
+        if (!firstLaunchStr) {
+          const now = String(Date.now())
+          await AsyncStorage.setItem(DONATE_FIRST_LAUNCH_KEY, now)
+          firstLaunchStr = now
+        }
+        const shownStr = await AsyncStorage.getItem(DONATE_SHOWN_KEY)
+        const firstLaunch = Number(firstLaunchStr)
+        respond(msg.id, {
+          firstLaunch,
+          shown: shownStr === '1',
+          elapsedMs: Date.now() - firstLaunch,
+        })
+      } catch (err: any) {
+        respond(msg.id, { firstLaunch: Date.now(), shown: true, elapsedMs: 0, error: err?.message })
+      }
+      return
+    }
+    if (msg.method === 'shell:donateReminder:setShown') {
+      try {
+        await AsyncStorage.setItem(DONATE_SHOWN_KEY, '1')
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })

@@ -223,6 +223,10 @@ export function App () {
   const [permissionStatus, setPermissionStatus] = useState('always')
   const [primingVisible, setPrimingVisible] = useState(false)
   const [bannerDismissed, setBannerDismissed] = useState(false)
+  // Two-week donation reminder (PearCal/PearGuard parity). Skipped on
+  // iOS per App Store guideline 3.1.1; on Android, set true at mount
+  // when the shell reports {shown:false, elapsedMs >= 14 days}.
+  const [donateReminderVisible, setDonateReminderVisible] = useState(false)
   // MapLibre style URL. Hydrated from AsyncStorage (via shell:tileStyle:get)
   // on mount; passed down to HomeMapView -> CircleMap so the map can hot-
   // swap on edit. Settings -> Map tiles writes through both AsyncStorage
@@ -310,6 +314,18 @@ export function App () {
     pear.call('shell:permission:status').then((r) => {
       if (r && typeof r.status === 'string') setPermissionStatus(r.status)
     }).catch(() => {})
+    // Two-week donation reminder check. Skipped on iOS per App Store
+    // policy 3.1.1 (same gating as the About page's Support section).
+    const isIOSPlatform = typeof window !== 'undefined' && window.__pearPlatform === 'ios'
+    if (!isIOSPlatform) {
+      const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000
+      pear.call('shell:donateReminder:get').then((r) => {
+        if (!r || r.shown) return
+        if (typeof r.elapsedMs === 'number' && r.elapsedMs >= FOURTEEN_DAYS_MS) {
+          setDonateReminderVisible(true)
+        }
+      }).catch(() => {})
+    }
     pear.on('deeplink:invite', ({ url }) => {
       if (typeof url === 'string') setSheet({ name: 'join', invite: url })
     })
@@ -487,7 +503,105 @@ export function App () {
           }}
         />
       )}
+      {donateReminderVisible && (
+        <DonationReminderModal
+          onDismiss={async () => {
+            setDonateReminderVisible(false)
+            try { await pear.call('shell:donateReminder:setShown') } catch {}
+          }}
+        />
+      )}
     </>
+  )
+}
+
+// Two-week donation reminder modal (PearCal/PearGuard parity). Mounted
+// at App scope and triggered once when the install is at least 14 days
+// old and the user hasn't already dismissed. Skipped on iOS at the
+// trigger layer per App Store guideline 3.1.1 — there's no donation
+// surface on iOS yet so a prompt would be both off-policy and
+// dead-end. Donate routes through the same lightning-address flow
+// AboutView uses (lightning: URI if a wallet handler is registered,
+// fallback wallet picker if not). All three buttons (Donate / Maybe
+// later / Already donated) dismiss + persist shown=true so the modal
+// only fires once per install.
+function DonationReminderModal ({ onDismiss }) {
+  const [walletModal, setWalletModal] = useState(false)
+  const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
+  const handleDonate = async () => {
+    try {
+      const r = await pear.call('shell:canOpenURL', { url: 'lightning:test' })
+      if (r?.can) {
+        openURL('lightning:' + LIGHTNING_ADDRESS)
+        onDismiss()
+      } else {
+        setWalletModal(true)
+      }
+    } catch {
+      setWalletModal(true)
+    }
+  }
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 360,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(0,0,0,0.75)',
+      padding: spacing.lg,
+    }}>
+      <div style={{
+        width: '100%', maxWidth: 360,
+        background: colors.surface.card,
+        borderRadius: radius.lg,
+        padding: `${spacing.lg + 8}px ${spacing.lg}px`,
+        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.base,
+        textAlign: 'center',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+      }}>
+        <div style={{ fontSize: 52, lineHeight: 1 }}>⚡</div>
+        <div style={{ ...typography.heading, margin: 0, color: colors.text.primary }}>
+          Enjoying PearCircle?
+        </div>
+        <div style={{ ...typography.body, color: colors.text.secondary, lineHeight: 1.6, margin: 0 }}>
+          PearCircle is free and open source with no ads, accounts, or subscriptions. If you've received value from it, consider returning value to support development.
+        </div>
+        <button
+          onClick={handleDonate}
+          style={{
+            width: '100%', padding: '13px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.md,
+            fontFamily: typography.fontFamily, fontSize: 15, fontWeight: 400,
+            cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.xs,
+          }}
+        >
+          Donate
+        </button>
+        <button
+          onClick={onDismiss}
+          style={{
+            background: 'none', border: 'none', color: colors.text.muted,
+            fontSize: 13, fontWeight: 400, cursor: 'pointer',
+            fontFamily: typography.fontFamily, padding: '4px',
+          }}
+        >
+          Maybe later
+        </button>
+        <button
+          onClick={onDismiss}
+          style={{
+            background: 'none', border: 'none', color: colors.text.muted,
+            fontSize: 13, fontWeight: 400, cursor: 'pointer',
+            fontFamily: typography.fontFamily, padding: '4px',
+          }}
+        >
+          Already donated ✓
+        </button>
+      </div>
+      {walletModal && (
+        <LightningWalletModal onClose={() => { setWalletModal(false); onDismiss() }} />
+      )}
+    </div>
   )
 }
 
@@ -3788,46 +3902,58 @@ function AboutView ({ onClose }) {
       </div>
 
       {walletModal && (
-        <BottomSheet onClose={() => setWalletModal(false)} zIndex={300}>
-          <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px` }}>
-            <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.xs + 2, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
-              <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
-            </div>
-            <p style={{ ...body, marginBottom: spacing.lg, textAlign: 'left' }}>
-              No Lightning wallet was detected on your device. Bitcoin
-              Lightning is a fast, low-fee payment network built on top
-              of Bitcoin. To send a tip, install one of these wallets:
-            </p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm + 2 }}>
-              {LIGHTNING_WALLETS.map((w) => (
-                <button
-                  key={w.name}
-                  onClick={() => openURL(w.url)}
-                  style={{
-                    background: colors.surface.card,
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: radius.lg,
-                    padding: `${spacing.md}px ${spacing.base}px`,
-                    display: 'flex', alignItems: 'center', gap: spacing.md,
-                    cursor: 'pointer', width: '100%', textAlign: 'left',
-                    fontFamily: typography.fontFamily,
-                  }}
-                >
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 14, fontWeight: 400, color: colors.text.primary }}>{w.name}</div>
-                    <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted }}>{w.desc}</div>
-                  </div>
-                  <ArrowSquareOut size={14} weight='thin' color={colors.text.muted} />
-                </button>
-              ))}
-            </div>
-            <p style={{ ...body, textAlign: 'center', marginTop: spacing.base, marginBottom: 0 }}>
-              After installing, return here and tap BTC again.
-            </p>
-          </div>
-        </BottomSheet>
+        <LightningWalletModal onClose={() => setWalletModal(false)} />
       )}
     </div>
+  )
+}
+
+// "No Lightning wallet detected" picker. Shared between the AboutView
+// Support-development section and the two-week DonationReminderModal
+// so the wallet recommendations stay in one place. Bottom-sheet
+// shaped; tapping a wallet opens its install URL and dismisses.
+function LightningWalletModal ({ onClose }) {
+  const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
+  const body = { ...typography.body, color: colors.text.secondary, lineHeight: 1.7 }
+  return (
+    <BottomSheet onClose={onClose} zIndex={300}>
+      <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px` }}>
+        <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.xs + 2, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
+          <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
+        </div>
+        <p style={{ ...body, marginBottom: spacing.lg, textAlign: 'left' }}>
+          No Lightning wallet was detected on your device. Bitcoin
+          Lightning is a fast, low-fee payment network built on top of
+          Bitcoin. To send a tip, install one of these wallets:
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm + 2 }}>
+          {LIGHTNING_WALLETS.map((w) => (
+            <button
+              key={w.name}
+              onClick={() => openURL(w.url)}
+              style={{
+                background: colors.surface.card,
+                border: `1px solid ${colors.border}`,
+                borderRadius: radius.lg,
+                padding: `${spacing.md}px ${spacing.base}px`,
+                display: 'flex', alignItems: 'center', gap: spacing.md,
+                cursor: 'pointer', width: '100%', textAlign: 'left',
+                fontFamily: typography.fontFamily,
+              }}
+            >
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 14, fontWeight: 400, color: colors.text.primary }}>{w.name}</div>
+                <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted }}>{w.desc}</div>
+              </div>
+              <ArrowSquareOut size={14} weight='thin' color={colors.text.muted} />
+            </button>
+          ))}
+        </div>
+        <p style={{ ...body, textAlign: 'center', marginTop: spacing.base, marginBottom: 0 }}>
+          After installing, return here and tap BTC again.
+        </p>
+      </div>
+    </BottomSheet>
   )
 }
 
