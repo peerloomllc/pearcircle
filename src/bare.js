@@ -36,6 +36,7 @@ const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
+const { padTripStartTs, tripApplyDecision, shouldReplicateTrip } = require('./lib/tripWire')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -804,9 +805,13 @@ const handlers = {
     // machine. A completed trip (return value's `completed` is set)
     // gets persisted to the local Hyperbee under
     // `trips:{ourKey}:{startTs}` and broadcast as a `trip:completed`
-    // event so the UI / OS-notification layer can react. Per CLAUDE.md
-    // trips are local-only by default; the per-circle autobase doesn't
-    // see them.
+    // event so the UI / OS-notification layer can react.
+    //
+    // Per proposal 2026-05-10, the trip is ALSO appended to each
+    // per-circle autobase where the user has opted in via the
+    // `trips:sharing:{circleId}` toggle. Default is off (no toggle row
+    // present = no sharing); opting in only replicates FUTURE trips,
+    // never backfills.
     try {
       const sp = typeof speed === 'number' ? speed : null
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
@@ -825,6 +830,9 @@ const handlers = {
         }
         await _localDb.put(tripKey, trip)
         send({ event: 'trip:completed', data: trip })
+        replicateTripToOptedInCircles(ourKey, trip).catch((e) =>
+          console.warn('[bare] trip replicate failed', e?.message),
+        )
       }
     } catch (e) { console.warn('[bare] trip step failed', e?.message) }
 
@@ -843,6 +851,139 @@ const handlers = {
     }
     return { trips }
   },
+
+  // Scan the per-circle autobase view for `trip:{pubkey}:*` rows
+  // (proposal 2026-05-10). Returns deleted-tombstone rows filtered out.
+  'trips:listForMember': async ({ circleId, pubkey } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string') throw new Error('pubkey must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) return { trips: [] }
+    const trips = []
+    for await (const { value } of base.view.createReadStream({
+      gt: 'trip:' + pubkey + ':',
+      lt: 'trip:' + pubkey + ':~',
+    })) {
+      if (value && value.deleted !== true) trips.push(value)
+    }
+    return { trips }
+  },
+
+  // Per-circle trip-sharing toggle (proposal 2026-05-10). Local-only;
+  // default off (absent row = false). Toggling affects only FUTURE
+  // trips — no backfill on enable, no auto-tombstone on disable. The
+  // shell prompts the user to delete past shared trips separately if
+  // they want a clean wipe.
+  'trips:sharing:get': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (circleId != null && typeof circleId !== 'string') {
+      throw new Error('circleId must be a string when present')
+    }
+    if (typeof circleId === 'string') {
+      const row = await _localDb.get('trips:sharing:' + circleId)
+      return { enabled: row?.value?.enabled === true }
+    }
+    // No circleId: return all toggles.
+    const map = {}
+    for await (const { key, value } of _localDb.createReadStream({
+      gt: 'trips:sharing:',
+      lt: 'trips:sharing:~',
+    })) {
+      const cid = key.slice('trips:sharing:'.length)
+      map[cid] = value?.enabled === true
+    }
+    return { sharing: map }
+  },
+
+  'trips:sharing:set': async ({ circleId, enabled } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
+    await _localDb.put('trips:sharing:' + circleId, {
+      enabled,
+      enabledAt: enabled ? Date.now() : null,
+      v: 1,
+    })
+    return { ok: true, circleId, enabled }
+  },
+
+  // Delete a trip (proposal 2026-05-10). Scope:
+  //   'local'  → remove from local Hyperbee only; replicated copies survive
+  //   'circle' → write soft-delete tombstone to every per-circle autobase
+  //              currently holding this trip; leave local Hyperbee intact
+  //   'all'    → both of the above
+  // Tombstone shape: signed value with deleted:true, deletedAt:now, no
+  // polyline (polyline is omitted on the wire so the data is actually
+  // wiped from receivers' views).
+  'trips:delete': async ({ startTs, scope = 'all' } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof startTs !== 'number') throw new Error('startTs must be a number')
+    if (scope !== 'local' && scope !== 'circle' && scope !== 'all') {
+      throw new Error("scope must be 'local', 'circle', or 'all'")
+    }
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+
+    if (scope === 'local' || scope === 'all') {
+      await _localDb.del('trips:' + ourKey + ':' + startTs)
+    }
+
+    let circlesTombstoned = 0
+    if (scope === 'circle' || scope === 'all') {
+      const tombstone = signValue({
+        pubkey: ourKey,
+        startTs,
+        deleted: true,
+        deletedAt: Date.now(),
+        v: 1,
+      }, _identity.secretKey)
+      const replicatedKey = 'trip:' + ourKey + ':' + padTripStartTs(startTs)
+      for (const [, base] of _circleBases) {
+        if (!base.writable) continue
+        const existing = await base.view.get(replicatedKey)
+        if (!existing?.value) continue  // never replicated to this circle
+        if (existing.value.deleted === true) continue  // already deleted
+        try {
+          await base.append({ type: 'put', key: replicatedKey, value: tombstone })
+          circlesTombstoned++
+        } catch {
+          // base closed mid-flight, etc.
+        }
+      }
+    }
+
+    return { ok: true, scope, circlesTombstoned }
+  },
+}
+
+// Replicate a freshly-completed trip to every per-circle autobase
+// whose sharing toggle is on. Per proposal 2026-05-10 the toggle is
+// strict opt-in (absent row = off) and only applies to FUTURE trips
+// (this function runs at trip-completion time, never on cold-start
+// catch-up). The wire key is fixed-width zero-padded so lexicographic
+// scans across `trip:{pubkey}:` return chronological order.
+async function replicateTripToOptedInCircles (ourKey, trip) {
+  const signedValue = signValue({
+    pubkey: ourKey,
+    startTs: trip.startTs,
+    endTs: trip.endTs,
+    polyline: trip.polyline,
+    distanceMeters: trip.distanceMeters,
+    durationMs: trip.durationMs,
+    maxSpeedMps: trip.maxSpeedMps,
+    v: 1,
+  }, _identity.secretKey)
+  const key = 'trip:' + ourKey + ':' + padTripStartTs(trip.startTs)
+  for (const [circleId, base] of _circleBases) {
+    if (!base.writable) continue
+    const row = await _localDb.get('trips:sharing:' + circleId)
+    if (!shouldReplicateTrip(row)) continue
+    try {
+      await base.append({ type: 'put', key, value: signedValue })
+    } catch (e) {
+      console.warn('[bare] trip replicate to', circleId, 'failed', e?.message)
+    }
+  }
 }
 
 async function writePresenceToAllCircles (state, expiresAt = null) {
@@ -1263,8 +1404,21 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         }
         continue
       }
-      // Other prefixes (presence, removed) not yet wired — silently
-      // dropped.
+      // `trip:{pubkey}:{startTsPadded}` (proposal 2026-05-10): signed
+      // trip record replicating across opted-in circles. Decision
+      // rules live in src/lib/tripWire.js (sig verify + key/value
+      // cross-check + no-resurrection-of-deleted + no-overwrite-of-
+      // original); we just dispatch. No IPC emit — trip records are
+      // passive history, not real-time notifications. UI pulls via
+      // trips:listForMember on demand.
+      if (op.key.startsWith('trip:')) {
+        const existing = await view.get(op.key)
+        if (tripApplyDecision(op.key, op.value, existing, verifyValue) === 'accept') {
+          await view.put(op.key, op.value)
+        }
+        continue
+      }
+      // Other prefixes not yet wired — silently dropped.
     }
   }
   if (weJustBecameWritable) {

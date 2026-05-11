@@ -92,7 +92,8 @@ JSON-over-newline, dispatched by `method`, identical to PearCal/PearGuard:
 | `places:{circleId}:{id}` | `{ id, name, lat, lon, radiusMeters, createdAt }` |
 | `lastSeen:{circleId}:{pubkey}` | `{ lat, lon, accuracy, ts, battery, isMoving }` |
 | `transitions:{circleId}:{ts}:{pubkey}` | `{ placeId, kind: 'enter'|'exit', ts }` |
-| `trips:{pubkey}:{ts}` | `{ start, end, polyline, distance }` (local-only by default) |
+| `trips:{pubkey}:{ts}` | `{ start, end, polyline, distance }` (local Hyperbee, always written) |
+| `trip:{pubkey}:{startTsPadded}` | per-circle autobase, signed; replicated only to circles where local `trips:sharing:{circleId}.enabled === true`. Proposal 2026-05-10. Soft-delete via `deleted: true` + `deletedAt`; no-resurrection rule. |
 
 ### Invite Link Protocol (provisional)
 
