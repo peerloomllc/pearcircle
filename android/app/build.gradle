@@ -104,15 +104,31 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        release {
+            // Release signing pulls every field from the env (scripts/.env
+            // exports them before the gradle invocation). If any are
+            // missing, leave storeFile unset so the buildTypes.release
+            // block below falls back to debug-signed -- lets engineers
+            // produce unsigned release APKs locally without the keystore.
+            def ksFile = System.getenv("KEYSTORE_FILE") ?: findProperty("KEYSTORE_FILE")
+            def ksPassword = System.getenv("KEYSTORE_PASSWORD") ?: findProperty("KEYSTORE_PASSWORD")
+            def kAlias = System.getenv("KEY_ALIAS") ?: findProperty("KEY_ALIAS")
+            def kPassword = System.getenv("KEY_PASSWORD") ?: findProperty("KEY_PASSWORD")
+            if (ksFile && ksPassword && kAlias && kPassword) {
+                storeFile file(ksFile)
+                storePassword ksPassword
+                keyAlias kAlias
+                keyPassword kPassword
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
+            applicationIdSuffix ".debug"
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release.storeFile ? signingConfigs.release : signingConfigs.debug
             def enableShrinkResources = findProperty('android.enableShrinkResourcesInReleaseBuilds') ?: 'false'
             shrinkResources enableShrinkResources.toBoolean()
             minifyEnabled enableMinifyInReleaseBuilds

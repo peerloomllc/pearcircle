@@ -26,8 +26,18 @@ DONE.md
 # scripts/app.conf is tracked since it's app-config rather than credentials.
 scripts/release.sh
 scripts/ios-appstore.sh
+scripts/frame-android-screenshots.sh
+scripts/assets/
 scripts/.env
 .env
+
+# Store-listing assets and the Zapstore publish manifest live locally.
+# Screenshots, framed bezel composites, store-listing copy, icon and
+# feature-graphic exports are all bulky binary or PR-style content that
+# the release scripts regenerate; no need to bloat the public repo.
+metadata/
+store/
+zapstore.yaml
 
 # Logs / OS junk
 *.log
