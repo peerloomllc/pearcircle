@@ -902,7 +902,7 @@ function CircleDeletedNotice ({ circleName, onDismiss }) {
           onClick={onDismiss}
           style={{
             width: '100%', padding: '12px', borderRadius: radius.md,
-            background: colors.accent, color: colors.text.onPrimary,
+            background: colors.primary, color: colors.text.onPrimary,
             border: 'none', cursor: 'pointer',
             fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
           }}>
@@ -2094,7 +2094,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
                 style={{
                   ...s.durationBtn,
                   ...(targetCircleId === c.circleId
-                    ? { background: colors.surface.elevated, color: colors.accent, borderColor: colors.accent }
+                    ? { background: colors.surface.elevated, color: colors.primary, borderColor: colors.primary }
                     : null),
                 }}
                 onClick={() => setTargetCircleId(c.circleId)}
@@ -3075,9 +3075,9 @@ function CirclesSection ({ active = true, onChanged }) {
                   disabled={!canSave}
                   style={{
                     padding: '8px 14px', borderRadius: radius.md,
-                    background: canSave ? colors.accent : 'transparent',
+                    background: canSave ? colors.primary : 'transparent',
                     color: canSave ? colors.text.onPrimary : colors.text.muted,
-                    border: `1px solid ${canSave ? colors.accent : colors.border}`,
+                    border: `1px solid ${canSave ? colors.primary : colors.border}`,
                     cursor: canSave ? 'pointer' : 'default',
                     fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
                     whiteSpace: 'nowrap',
@@ -5601,10 +5601,10 @@ const s = {
     background: 'transparent', color: colors.text.primary, border: 'none', borderRadius: 6,
     fontSize: 14, textAlign: 'left', cursor: 'pointer',
   },
-  // Active selection uses accent for the text and a faint accent-tinted
-  // surface; the elevated surface var keeps the contrast right in both
-  // themes (slight tint on dark, slight wash on light).
-  menuItemActive: { background: colors.surface.elevated, color: colors.accent, fontWeight: 400 },
+  // Active selection uses primary green for the text on a faint
+  // elevated surface; the elevated surface var keeps the contrast
+  // right in both themes (slight tint on dark, slight wash on light).
+  menuItemActive: { background: colors.surface.elevated, color: colors.primary, fontWeight: 400 },
   menuDivider: { height: 1, background: colors.border, margin: '6px 4px' },
   // QR code background stays white in both themes -- QR scanners require
   // the high-contrast quiet-zone, swapping to dark would break scanning.
