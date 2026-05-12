@@ -57,12 +57,13 @@ function tripApplyDecision (key, incoming, existing, verifyValueFn) {
 }
 
 // Whether the worklet should replicate a freshly-completed trip to a
-// given circle. Strict opt-in: missing row or row.enabled !== true
-// returns false. Future-trips-only is enforced by where this is called
-// (only from the trip-completion path, never during cold-start
+// given circle. Default-on (opt-out): missing row or row.enabled !==
+// false returns true. Future-trips-only is enforced by where this is
+// called (only from the trip-completion path, never during cold-start
 // catch-up).
 function shouldReplicateTrip (sharingRow) {
-  return !!(sharingRow && sharingRow.value && sharingRow.value.enabled === true)
+  if (!sharingRow || !sharingRow.value) return true
+  return sharingRow.value.enabled !== false
 }
 
 // View-layer dedup for the merged trip list shown to the user in
