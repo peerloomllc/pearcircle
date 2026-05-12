@@ -21,10 +21,21 @@ const CACHEABLE_HOST_SUFFIXES = [
 // interceptor tracks a sliding window of recent failures; consumers
 // (App.jsx's offline banner) read it via getOfflineState() and react
 // when the failure rate crosses a threshold.
+// Two gates suppress false positives:
+//   1. Startup grace window — cold-launch tile bursts can fail before
+//      the network stack is fully warm. Failures during this window
+//      are recorded but do not trip the banner.
+//   2. Recent-success gate — if any tile fetch succeeded within the
+//      failure window, the current failures are treated as transient
+//      and ignored (one cached / lightweight tile loading proves the
+//      network path is alive).
 const FAILURE_WINDOW_MS = 10_000
 const FAILURE_THRESHOLD = 3
+const STARTUP_GRACE_MS = 20_000
+const _startTs = Date.now()
 const _recentFailures = []  // array of timestamps
 let _offlineListeners = []
+let _lastSuccessTs = 0
 
 export function installTileFetchInterceptor ({ cache }) {
   const origFetch = window.fetch.bind(window)
@@ -122,6 +133,7 @@ function isCacheableUrl (url) {
 }
 
 function recordFetchSuccess () {
+  _lastSuccessTs = Date.now()
   // A successful fetch indicates we're back online; clear the failure
   // window and notify listeners so the offline banner can dismiss.
   if (_recentFailures.length > 0) {
@@ -137,6 +149,12 @@ function recordFetchFailure () {
     _recentFailures.shift()
   }
   _recentFailures.push(now)
+  // Suppress the banner during cold-start grace window.
+  if (now - _startTs < STARTUP_GRACE_MS) return
+  // Suppress if anything succeeded inside the failure window — a single
+  // good tile fetch proves the network path is alive and the burst we
+  // recorded is just transient (cold-start, brief radio drop, etc.).
+  if (_lastSuccessTs && now - _lastSuccessTs < FAILURE_WINDOW_MS) return
   if (_recentFailures.length >= FAILURE_THRESHOLD) {
     notifyOfflineState(true)
   }

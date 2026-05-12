@@ -336,8 +336,19 @@ const handlers = {
     // tombstone can reach us. If the post-sync circle row carries
     // `deleted: true`, we close the autobase and clean up the namespace
     // we never persisted; nothing lingers on disk.
+    //
+    // discovery.flushed() drives the DHT announce + lookup synchronously
+    // so the existing writer finds us (and we find them) before the
+    // user dismisses the "Joining…" dialog. Without it the joiner
+    // sometimes sits with no peers for tens of seconds and pre-existing
+    // members appear "disconnected" until an app restart kicks the DHT.
     _circleBases.set(circleId, base)
-    joinCircleTopic(circleId, circleKey)
+    const discovery = joinCircleTopic(circleId, circleKey)
+    if (discovery && typeof discovery.flushed === 'function') {
+      try { await discovery.flushed() } catch (e) {
+        console.warn('[bare] discovery.flushed during join failed', e?.message)
+      }
+    }
     try {
       await base.update()
     } catch (e) { console.warn('[bare] base.update during join failed', e?.message) }
@@ -909,10 +920,11 @@ const handlers = {
   },
 
   // Per-circle trip-sharing toggle (proposal 2026-05-10). Local-only;
-  // default off (absent row = false). Toggling affects only FUTURE
-  // trips — no backfill on enable, no auto-tombstone on disable. The
-  // shell prompts the user to delete past shared trips separately if
-  // they want a clean wipe.
+  // default on (absent row = true) so new users start sharing trips
+  // with their circles unless they opt out. Toggling affects only
+  // FUTURE trips — no backfill on enable, no auto-tombstone on disable.
+  // The shell prompts the user to delete past shared trips separately
+  // if they want a clean wipe.
   'trips:sharing:get': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (circleId != null && typeof circleId !== 'string') {
@@ -920,16 +932,17 @@ const handlers = {
     }
     if (typeof circleId === 'string') {
       const row = await _localDb.get('trips:sharing:' + circleId)
-      return { enabled: row?.value?.enabled === true }
+      return { enabled: row?.value?.enabled !== false }
     }
-    // No circleId: return all toggles.
+    // No circleId: return explicit toggles. The UI defaults missing
+    // entries to enabled, matching shouldReplicateTrip's policy.
     const map = {}
     for await (const { key, value } of _localDb.createReadStream({
       gt: 'trips:sharing:',
       lt: 'trips:sharing:~',
     })) {
       const cid = key.slice('trips:sharing:'.length)
-      map[cid] = value?.enabled === true
+      map[cid] = value?.enabled !== false
     }
     return { sharing: map }
   },
@@ -1204,13 +1217,13 @@ async function readProfileForMemberRow (fallbackPubkey) {
 }
 
 function joinCircleTopic (circleId, circleKey) {
-  if (!_swarm) return
+  if (!_swarm) return null
   const topic = topicForCircleKey(circleKey)
   const topicHex = b4a.toString(topic, 'hex')
-  if (_topicToCircle.has(topicHex)) return
+  if (_topicToCircle.has(topicHex)) return null
   _topicToCircle.set(topicHex, circleId)
   if (!_circlePeers.has(circleId)) _circlePeers.set(circleId, new Set())
-  _swarm.join(topic, { server: true, client: true })
+  return _swarm.join(topic, { server: true, client: true })
 }
 
 // Local teardown for a circle (proposal amendment 2026-05-07): leave the

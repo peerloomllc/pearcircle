@@ -971,7 +971,7 @@ function CreateView ({ onClose, onCreated }) {
         <QrImage text={result.invite} />
         <textarea style={s.inviteBox} readOnly value={result.invite} onFocus={(e) => e.target.select()} />
         <ShareButton text={result.invite} />
-        <button style={s.primaryBtn} onClick={finish}>Done</button>
+        <button style={{ ...s.primaryBtn, marginTop: spacing.md }} onClick={finish}>Done</button>
       </div>
     )
   }
@@ -1154,7 +1154,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const [confirmingDeletePlace, setConfirmingDeletePlace] = useState(null) // place object awaiting confirm-sheet decision
   const [deletingPlaceId, setDeletingPlaceId] = useState(null)             // place.id with in-flight place:delete IPC
   const [deleteError, setDeleteError] = useState(null)
-  const [transitionError, setTransitionError] = useState(null)
   const [menuOpen, setMenuOpen] = useState(false)
   // Per-device mute set ('{circleId}:{placeId}'). Source of truth is the
   // RN shell; this is a local cache loaded on mount and updated on toggle.
@@ -1327,25 +1326,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // The AddPlaceForm shows a picker when this list has more than one.
   const writableCircles = activeCircles.filter(c => c.writable)
 
-  const fireTransition = useCallback(async (place, kind) => {
-    setTransitionError(null)
-    try {
-      const seen = myPubkey ? data?.lastSeen?.[myPubkey] : null
-      // Each place carries its own circleId from the merge step, so
-      // transitions land on the right autobase even in "All" mode.
-      await pear.call('geofence:transition', {
-        circleId: place.circleId,
-        placeId: place.id,
-        kind,
-        lat: seen?.lat ?? place.lat,
-        lon: seen?.lon ?? place.lon,
-      })
-      await refresh()
-    } catch (e) {
-      setTransitionError(String(e?.message ?? e))
-    }
-  }, [data, myPubkey, refresh])
-
   const focusMember = useCallback((pubkey) => {
     if (!pubkey) return
     setSelectedPubkey(pubkey)
@@ -1460,7 +1440,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     setPendingPlaceCoords(null)
     setConfirmingDeletePlace(null)
     setDeleteError(null)
-    setTransitionError(null)
   }, [sheetOpen])
 
   const deletePlace = useCallback(async (place) => {
@@ -1847,7 +1826,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             setSheet({
               name: 'trips',
               ownerPubkey: isSelf ? null : selectedPubkey,
-              ownerName: isSelf ? null : (members.find(m => m.pubkey === selectedPubkey)?.displayName || null),
+              ownerName: isSelf ? null : (data.members.find(m => m.value?.pubkey === selectedPubkey)?.value?.displayName || null),
             })
           }}
           onClose={() => setMemberSheetVisible(false)}
@@ -1895,7 +1874,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                 const isMuted = mutedPlaces.has(muteKey)
                 const isDeleting = deletingPlaceId === p.id
                 const focusOn = (e) => {
-                  // Don't trigger if a debug button inside the row was tapped.
+                  // Don't fly the camera if a row-internal button (mute,
+                  // edit, delete) was tapped.
                   if (e.target.closest('button')) return
                   // Imperative call: avoids any state-batching weirdness
                   // around the same-render BottomSheet unmount.
@@ -1956,22 +1936,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                       </div>
                     </div>
                     <div style={s.placeRadiusLine}>{Math.round(p.radiusMeters)}m radius</div>
-                    {placeWritable && (
-                      <div style={s.transitionBtns}>
-                        <button style={s.smallBtn} onClick={() => fireTransition(p, 'enter')}>
-                          Fire enter (debug)
-                        </button>
-                        <button style={s.smallBtn} onClick={() => fireTransition(p, 'exit')}>
-                          Fire exit (debug)
-                        </button>
-                      </div>
-                    )}
                   </li>
                 )
               })}
             </ul>
           )}
-          {transitionError && <p style={s.error}>{transitionError}</p>}
           {deleteError && <p style={s.error}>{deleteError}</p>}
 
           {editingPlace && (
@@ -3621,10 +3590,10 @@ function ThemeToggleSection ({ mode, onChange }) {
 }
 
 // Per-circle trip-sharing toggle list (proposal 2026-05-10). Default
-// off everywhere. Toggling on shows a confirmation surfacing the
-// privacy posture; toggling off is non-destructive (future trips
-// stop replicating, past shared trips remain visible until the user
-// deletes them from the trip detail view).
+// on everywhere (opt-out). Toggling off shows a confirmation surfacing
+// the privacy posture; toggling on is non-destructive (future trips
+// resume replicating, past trips stay private until the user enables
+// sharing for them explicitly).
 function TripsSharingSection ({ active = true }) {
   const [list, setList] = useState([])
   const [sharing, setSharing] = useState({})
@@ -3684,7 +3653,7 @@ function TripsSharingSection ({ active = true }) {
         When on, future trips you take are shared with members of that circle. Past trips remain private until you turn this on. Off any time.
       </p>
       {list.map((c) => {
-        const on = !!sharing[c.circleId]
+        const on = sharing[c.circleId] !== false
         const busy = pendingCircleId === c.circleId
         return (
           <div
@@ -5567,8 +5536,6 @@ const s = {
   lastSeen: { fontSize: typography.micro.fontSize, color: colors.accent, marginTop: spacing.xs, fontFamily: typography.monoFamily },
   lastSeenMuted: { fontSize: typography.micro.fontSize, color: colors.text.muted, marginTop: spacing.xs, fontStyle: 'italic' },
   status: { fontSize: typography.caption.fontSize, color: colors.success, marginTop: spacing.xs, fontWeight: 400 },
-  transitionBtns: { display: 'flex', gap: spacing.sm, marginTop: spacing.sm },
-  smallBtn: { flex: 1, padding: `${spacing.sm}px ${spacing.sm + 2}px`, background: colors.surface.elevated, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.sm + 2, fontSize: typography.micro.fontSize, cursor: 'pointer' },
   mapWrap: { position: 'relative', height: '100%', width: '100%', background: colors.surface.base },
   mapCanvas: { height: '100%', width: '100%' },
   // Attribution stays white-on-translucent-black: it overlays map tiles
