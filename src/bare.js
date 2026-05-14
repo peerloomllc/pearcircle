@@ -112,6 +112,31 @@ let _tripState = newTripState()
 const _emittedTransitionKeys = new Set()
 const _EMITTED_TRANSITION_MAX = 1024
 
+// Same in-session dedup mechanism for `peerTrip:completed` emits on
+// `trip:{pubkey}:{startTsPadded}` appends. Cross-session replay (e.g.
+// worklet restart re-applying historical trips) is gated separately by
+// the PEER_TRIP_FRESHNESS_MS window below so we don't fire days-old
+// notifications on cold boot.
+const _emittedPeerTripKeys = new Set()
+const _EMITTED_PEER_TRIP_MAX = 1024
+// Only fire a peer-trip notification when the trip ended within this
+// window. Bounds the cold-boot replay problem: when the worklet starts
+// and autobase re-applies a peer's entire trip history, only genuinely
+// recent completions break through. 10 min matches the user-intent
+// framing ("they just got home"); older trips remain in trips history,
+// just don't bug anyone.
+const PEER_TRIP_FRESHNESS_MS = 10 * 60 * 1000
+// Don't notify on micro-trips (GPS drift across the cooldown window can
+// log a "trip" with a few meters of distance). Either bound flips the
+// notification on. Trip record itself is always written; this only
+// gates the OS notification.
+const PEER_TRIP_MIN_DISTANCE_M = 500
+const PEER_TRIP_MIN_DURATION_MS = 5 * 60 * 1000
+
+// User pref. Default on; off mutes peer-trip OS notifications entirely.
+// Persisted in _localDb under `tripNotifications`; loaded on init below.
+let _tripNotificationsEnabled = true
+
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
 // on every location:update, computes haversine distances, and fires
@@ -731,6 +756,20 @@ const handlers = {
   'sharing:get': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     return { enabled: _sharingEnabled, expiresAt: _sharingExpiresAt }
+  },
+
+  'tripNotifications:get': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    return { enabled: _tripNotificationsEnabled }
+  },
+
+  'tripNotifications:set': async ({ enabled } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
+    await _localDb.put('tripNotifications', { enabled, setAt: Date.now() })
+    _tripNotificationsEnabled = enabled
+    send({ event: 'tripNotifications:changed', data: { enabled } })
+    return { ok: true, enabled }
   },
 
   'sharing:set': async ({ enabled, expiresAt = null } = {}) => {
@@ -1459,13 +1498,57 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       // trip record replicating across opted-in circles. Decision
       // rules live in src/lib/tripWire.js (sig verify + key/value
       // cross-check + no-resurrection-of-deleted + no-overwrite-of-
-      // original); we just dispatch. No IPC emit — trip records are
-      // passive history, not real-time notifications. UI pulls via
-      // trips:listForMember on demand.
+      // original); we just dispatch. Trip records are passive history
+      // for UI list pulls (trips:listForMember), but fresh, non-self,
+      // above-threshold completions also fire a `peerTrip:completed`
+      // IPC so the shell can post an OS notification (Life360-style
+      // "Jane completed a 12 km trip"). Freshness + in-session dedup
+      // together keep cold-boot autobase replay quiet.
       if (op.key.startsWith('trip:')) {
         const existing = await view.get(op.key)
         if (tripApplyDecision(op.key, op.value, existing, verifyValue) === 'accept') {
           await view.put(op.key, op.value)
+          try {
+            if (
+              _tripNotificationsEnabled &&
+              circleId &&
+              op.value &&
+              op.value.deleted !== true &&
+              typeof op.value.pubkey === 'string' &&
+              typeof op.value.endTs === 'number' &&
+              typeof op.value.distanceMeters === 'number'
+            ) {
+              const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
+              const author = op.value.pubkey
+              const fresh = Date.now() - op.value.endTs <= PEER_TRIP_FRESHNESS_MS
+              const meetsThreshold =
+                op.value.distanceMeters >= PEER_TRIP_MIN_DISTANCE_M ||
+                (typeof op.value.durationMs === 'number' && op.value.durationMs >= PEER_TRIP_MIN_DURATION_MS)
+              if (
+                author !== ourKeyHex &&
+                fresh &&
+                meetsThreshold &&
+                !_emittedPeerTripKeys.has(op.key)
+              ) {
+                if (_emittedPeerTripKeys.size >= _EMITTED_PEER_TRIP_MAX) {
+                  const arr = [..._emittedPeerTripKeys]
+                  _emittedPeerTripKeys.clear()
+                  for (let i = arr.length >> 1; i < arr.length; i++) _emittedPeerTripKeys.add(arr[i])
+                }
+                _emittedPeerTripKeys.add(op.key)
+                const memberRow = await view.get('member:' + author)
+                send({ event: 'peerTrip:completed', data: {
+                  circleId,
+                  authorPubkey: author,
+                  displayName: memberRow?.value?.displayName || author.slice(0, 8),
+                  distanceMeters: op.value.distanceMeters,
+                  durationMs: typeof op.value.durationMs === 'number' ? op.value.durationMs : null,
+                  startTs: typeof op.value.startTs === 'number' ? op.value.startTs : null,
+                  endTs: op.value.endTs,
+                }})
+              }
+            }
+          } catch (e) { console.warn('[bare] peerTrip:completed emit failed', e?.message) }
         }
         continue
       }
@@ -1716,6 +1799,13 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
   } catch {}
   armSharingExpiryTimer()
+
+  // Peer-trip notification toggle. Default on; only flip if the user
+  // explicitly opted out (persisted false). Missing row = default state.
+  try {
+    const row = await _localDb.get('tripNotifications')
+    if (row?.value?.enabled === false) _tripNotificationsEnabled = false
+  } catch {}
 
   _initialized = true
   mark('init:done', { circles: _circleBases.size })

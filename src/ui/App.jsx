@@ -1252,6 +1252,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     if (muted) setSelectedPubkey(null)
   }, [circles, selectedCircleId, selectedPubkey, identity])
 
+  // Auto-zoom flag — pill click handlers set this; the effect after
+  // `data` is built consumes it. Decl here so the click handlers below
+  // can mutate the ref; effect lives further down to avoid a TDZ on
+  // `data`.
+  const pendingCircleAutoZoomRef = useRef(false)
+
   // Pick the active subset based on the current filter.
   const activeCircles = selectedCircleId
     ? circles.filter(c => c.circleId === selectedCircleId)
@@ -1303,6 +1309,22 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     }
     return out
   }, [merged, myPubkey, selfSeen, profile])
+
+  // Auto-zoom to fit the new circle's members when the user picks one
+  // from the floating pill. The pill click handlers set the flag above;
+  // this effect consumes it after `data` has rebuilt for the new filter
+  // (and after the focus-drop effect has had a chance to null out a
+  // now-orphan selectedPubkey). Skipping while a member is focused
+  // leaves the camera on whoever the user is following; clearFocus()
+  // already calls fitAll on its own when they back out. Deep-link
+  // paths (initialFocus → setSelectedCircleId) do not set this flag,
+  // so focusMember's own flyTo isn't fought.
+  useEffect(() => {
+    if (!pendingCircleAutoZoomRef.current) return
+    if (selectedPubkey) return
+    pendingCircleAutoZoomRef.current = false
+    mapApiRef.current?.fitAll()
+  }, [data, selectedPubkey])
 
   const placesById = {}
   for (const p of data.places ?? []) placesById[p.id] = p
@@ -1663,7 +1685,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           {circles.length > 1 && (
             <button
               style={{ ...s.menuItem, ...(selectedCircleId === null ? s.menuItemActive : null) }}
-              onClick={() => { setSelectedCircleId(null); setMenuOpen(false) }}
+              onClick={() => {
+                if (selectedCircleId !== null) pendingCircleAutoZoomRef.current = true
+                setSelectedCircleId(null)
+                setMenuOpen(false)
+              }}
             >
               All circles
             </button>
@@ -1672,7 +1698,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             <div key={c.circleId} style={{ display: 'flex', alignItems: 'stretch', gap: 4 }}>
               <button
                 style={{ ...s.menuItem, ...(selectedCircleId === c.circleId ? s.menuItemActive : null), flex: 1 }}
-                onClick={() => { setSelectedCircleId(c.circleId); setMenuOpen(false) }}
+                onClick={() => {
+                  if (selectedCircleId !== c.circleId) pendingCircleAutoZoomRef.current = true
+                  setSelectedCircleId(c.circleId)
+                  setMenuOpen(false)
+                }}
               >
                 {c.circle?.name ?? '...'}
               </button>
@@ -3529,6 +3559,8 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
         <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
+        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Trip notifications</p>
+        <TripNotificationsSection />
       </Collapsible>
 
       <Collapsible title='Advanced' icon={Wrench} open={advancedOpen} onToggle={() => setAdvancedOpen(v => !v)} maxHeight='1200px'>
@@ -3728,6 +3760,54 @@ function DistanceUnitSection ({ unit, onChange }) {
       <div style={{ display: 'flex', gap: spacing.sm }}>
         {btn('Kilometers', 'km')}
         {btn('Miles', 'miles')}
+      </div>
+    </>
+  )
+}
+
+// Local mute for the "Jane completed a 12 km trip" OS notifications.
+// Worklet is the source of truth (_tripNotificationsEnabled in src/bare.js)
+// and it gates the IPC emit before the shell ever hears about a peer trip,
+// so flipping this off stops notifications immediately even if the WebView
+// stays open. Default on; self-contained state since no other view needs it.
+function TripNotificationsSection () {
+  const [enabled, setEnabled] = useState(true)
+  useEffect(() => {
+    pear.call('tripNotifications:get').then((r) => {
+      if (r && typeof r.enabled === 'boolean') setEnabled(r.enabled)
+    }).catch(() => {})
+    pear.on('tripNotifications:changed', (data) => {
+      if (data && typeof data.enabled === 'boolean') setEnabled(data.enabled)
+    })
+  }, [])
+  const toggle = useCallback(async (value) => {
+    if (value === enabled) return
+    try { await pear.call('tripNotifications:set', { enabled: value }) } catch {}
+    setEnabled(value)
+  }, [enabled])
+  const btn = (label, value) => (
+    <button
+      onClick={() => toggle(value)}
+      style={{
+        flex: 1, padding: '10px', borderRadius: radius.sm,
+        background: enabled === value ? colors.primary : 'transparent',
+        color: enabled === value ? colors.text.onPrimary : colors.text.primary,
+        border: `1px solid ${enabled === value ? colors.primary : colors.border}`,
+        cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+      }}
+    >
+      {label}
+    </button>
+  )
+  return (
+    <>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
+        Notify when a circle member finishes a trip. Trips are still recorded either way.
+      </p>
+      <div style={{ display: 'flex', gap: spacing.sm }}>
+        {btn('On', true)}
+        {btn('Off', false)}
       </div>
     </>
   )
