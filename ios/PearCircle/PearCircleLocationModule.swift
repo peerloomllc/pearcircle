@@ -22,10 +22,23 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
 
   private static let UPDATE_EVENT = "PearCircleLocation:update"
   private static let NETWORK_EVENT = "PearCircleLocation:network:changed"
+  private static let REGION_ENTER_EVENT = "PearCircleLocation:region:enter"
+  private static let REGION_EXIT_EVENT = "PearCircleLocation:region:exit"
   private static let DEBOUNCE_SECONDS: TimeInterval = 2.0
+  // Cold-start launch path: when iOS revives the app from a region
+  // crossing while the user had it force-quit, didEnterRegion can fire
+  // before the JS bundle finishes booting and attaches the
+  // NativeEventEmitter listener. Buffer up to this many events so the
+  // first crossing isn't lost; cap the queue so a runaway scenario
+  // (JS never attaches) can't grow unbounded.
+  private static let REGION_BUFFER_MAX = 64
 
   private var manager: CLLocationManager?
   private var hasListeners = false
+  // FIFO of region events that fired while no JS listener was attached.
+  // Flushed in startObserving when the shell side wires up the
+  // NativeEventEmitter listener.
+  private var bufferedRegionEvents: [(name: String, body: [String: Any])] = []
 
   // Resolver for an in-flight startUpdates() call that's blocked on
   // the user's response to the location-permission dialog. didChange
@@ -66,10 +79,26 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   override static func requiresMainQueueSetup() -> Bool { return true }
 
   override func supportedEvents() -> [String] {
-    return [PearCircleLocationModule.UPDATE_EVENT, PearCircleLocationModule.NETWORK_EVENT]
+    return [
+      PearCircleLocationModule.UPDATE_EVENT,
+      PearCircleLocationModule.NETWORK_EVENT,
+      PearCircleLocationModule.REGION_ENTER_EVENT,
+      PearCircleLocationModule.REGION_EXIT_EVENT,
+    ]
   }
 
-  override func startObserving() { hasListeners = true }
+  override func startObserving() {
+    hasListeners = true
+    // Drain any region events that fired while !hasListeners. Capture
+    // and clear before sending so a re-entrant stopObserving from
+    // inside sendEvent (shouldn't happen, but defensively) doesn't
+    // re-append into the buffer we're iterating.
+    let pending = bufferedRegionEvents
+    bufferedRegionEvents.removeAll()
+    for event in pending {
+      sendEvent(withName: event.name, body: event.body)
+    }
+  }
   override func stopObserving() { hasListeners = false }
 
   // MARK: - JS-exposed API
@@ -171,6 +200,102 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     }
   }
 
+  // Replace the set of CLCircularRegions we monitor with the supplied
+  // list. Apple caps each app at 20 simultaneously-monitored regions
+  // (shared with iBeacon); the caller is expected to enforce the cap
+  // before invoking. Each entry is `{ id: String, lat: Double,
+  // lon: Double, radius: Double }`; radius is in meters. We stop
+  // monitoring any region whose identifier isn't in the new set, then
+  // start fresh monitoring for the new set. CLLocationManager keeps
+  // monitored regions persistent across app launches at the OS level,
+  // so this is the canonical way to reconcile the registered set on
+  // every launch: call setMonitoredRegions with the desired list and
+  // the OS does the diff. Returns the count of regions now registered.
+  @objc func setMonitoredRegions(
+    _ regions: NSArray,
+    resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      let mgr = self.ensureManager()
+      // Apple requires location authorization (when in use is enough
+      // for region monitoring to register, but didEnterRegion only
+      // fires reliably with Always). We still register what we can.
+      let desired: [(id: String, lat: Double, lon: Double, radius: Double)] = regions.compactMap { raw in
+        guard let dict = raw as? [String: Any],
+              let id = dict["id"] as? String,
+              let lat = (dict["lat"] as? NSNumber)?.doubleValue,
+              let lon = (dict["lon"] as? NSNumber)?.doubleValue,
+              let radius = (dict["radius"] as? NSNumber)?.doubleValue,
+              radius > 0 else {
+          return nil
+        }
+        return (id, lat, lon, radius)
+      }
+      let desiredIds = Set(desired.map { $0.id })
+      // Stop monitoring anything that's been dropped from the set or
+      // is a non-circular region (defensive; only CLCircularRegion
+      // entries should exist, but the OS may have leftover types).
+      for region in mgr.monitoredRegions where !desiredIds.contains(region.identifier) {
+        mgr.stopMonitoring(for: region)
+      }
+      // Start (or refresh) monitoring for each desired region. Apple
+      // tolerates startMonitoring on an already-monitored identifier
+      // by replacing the registration, which lets us pick up edits
+      // (radius change, recenter) on the same id without a stop+start
+      // ceremony.
+      let monitoredById: [String: CLRegion] = Dictionary(uniqueKeysWithValues: mgr.monitoredRegions.map { ($0.identifier, $0) })
+      for entry in desired {
+        // If the region exists with identical geometry, leave it
+        // alone to avoid bouncing the OS state (and the brief gap
+        // where neither registration is active).
+        if let existing = monitoredById[entry.id] as? CLCircularRegion,
+           existing.center.latitude == entry.lat,
+           existing.center.longitude == entry.lon,
+           existing.radius == entry.radius {
+          continue
+        }
+        // If geometry changed, stop the old one first so the new
+        // registration doesn't collide.
+        if let existing = monitoredById[entry.id] {
+          mgr.stopMonitoring(for: existing)
+        }
+        let region = CLCircularRegion(
+          center: CLLocationCoordinate2D(latitude: entry.lat, longitude: entry.lon),
+          radius: entry.radius,
+          identifier: entry.id
+        )
+        region.notifyOnEntry = true
+        region.notifyOnExit = true
+        mgr.startMonitoring(for: region)
+      }
+      resolve(["count": mgr.monitoredRegions.count])
+    }
+  }
+
+  // Inspect what CLLocationManager currently has registered. Useful
+  // for tests and debug surfaces, and for reconciling the JS-side
+  // desired set against the OS-side reality.
+  @objc func getMonitoredRegions(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      let mgr = self.ensureManager()
+      var out: [[String: Any]] = []
+      for region in mgr.monitoredRegions {
+        guard let circular = region as? CLCircularRegion else { continue }
+        out.append([
+          "id": circular.identifier,
+          "lat": circular.center.latitude,
+          "lon": circular.center.longitude,
+          "radius": circular.radius,
+        ])
+      }
+      resolve(out)
+    }
+  }
+
   // MARK: - CLLocationManagerDelegate
 
   // iOS 14+ delegate.
@@ -198,6 +323,29 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
     NSLog("PearCircleLocation: didFailWithError %@", error.localizedDescription)
+  }
+
+  // CLCircularRegion enter/exit callbacks. Fires both while the app is
+  // running and when iOS revives the app from a force-quit / terminated
+  // state on a boundary cross. emitOrBufferRegion routes through the
+  // bridge if JS is listening; otherwise queues for the cold-start
+  // flush in startObserving so the first crossing isn't lost while the
+  // RN bundle is still booting.
+  func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
+    emitOrBufferRegion(name: PearCircleLocationModule.REGION_ENTER_EVENT, id: region.identifier)
+  }
+
+  func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
+    emitOrBufferRegion(name: PearCircleLocationModule.REGION_EXIT_EVENT, id: region.identifier)
+  }
+
+  // OS-side failure to start or maintain a region monitor. Usually
+  // means we exceeded the 20-region cap, the user revoked Always
+  // authorization, or the region geometry was invalid. Logged so the
+  // first incident surfaces in device logs; not propagated to JS
+  // because the JS classifier still covers the foreground case.
+  func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
+    NSLog("PearCircleLocation: monitoringDidFailFor %@ -- %@", region?.identifier ?? "<nil>", error.localizedDescription)
   }
 
   // MARK: - Helpers
@@ -239,6 +387,24 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       pendingResolve = resolve
     @unknown default:
       resolve?(false)
+    }
+  }
+
+  private func emitOrBufferRegion(name: String, id: String) {
+    let payload: [String: Any] = [
+      "id": id,
+      "ts": Date().timeIntervalSince1970 * 1000,
+    ]
+    if hasListeners {
+      sendEvent(withName: name, body: payload)
+      return
+    }
+    // No JS listener attached yet (cold-start launch or stopObserving
+    // window). Buffer for the next startObserving flush, with a cap
+    // so a stuck launch can't pin memory.
+    bufferedRegionEvents.append((name: name, body: payload))
+    if bufferedRegionEvents.count > PearCircleLocationModule.REGION_BUFFER_MAX {
+      bufferedRegionEvents.removeFirst(bufferedRegionEvents.count - PearCircleLocationModule.REGION_BUFFER_MAX)
     }
   }
 

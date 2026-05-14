@@ -41,4 +41,29 @@ function classify (distance, radius, prev) {
   return { classification: next, kind: null }
 }
 
-module.exports = { haversineMeters, classify, EARTH_RADIUS_M }
+// Dedup helper for native CLCircularRegion / GeofencingClient events
+// against the JS classifier's running state. When the app is alive AND
+// the OS-level region monitor fires didEnterRegion (or exit), the JS
+// classifier has likely already seen the boundary cross through the
+// regular location:update path and flipped state. Both paths would
+// otherwise race to append a transition, producing duplicate rows.
+//
+// `prev` is the lastClassification value the JS classifier maintains
+// per place ('inside' / 'outside' / null). `kind` is 'enter' or 'exit'
+// from the native event. Returns:
+//   { deduped: true, classification }  // already in target state, skip
+//   { deduped: false, classification } // first observation in target,
+//                                      // caller must append + persist
+//
+// null prev is treated as "no baseline yet"; the native event itself
+// establishes the baseline (deduped: false). This matches the JS
+// classifier's behavior for an unknown-prev observation crossing into
+// the target state.
+function applyRegionEvent (prev, kind) {
+  const target = kind === 'enter' ? 'inside' : kind === 'exit' ? 'outside' : null
+  if (target == null) return { deduped: true, classification: prev, invalid: true }
+  if (prev === target) return { deduped: true, classification: prev }
+  return { deduped: false, classification: target }
+}
+
+module.exports = { haversineMeters, classify, applyRegionEvent, EARTH_RADIUS_M }
