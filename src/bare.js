@@ -819,10 +819,10 @@ const handlers = {
     // event so the UI / OS-notification layer can react.
     //
     // Per proposal 2026-05-10, the trip is ALSO appended to each
-    // per-circle autobase where the user has opted in via the
-    // `trips:sharing:{circleId}` toggle. Default is off (no toggle row
-    // present = no sharing); opting in only replicates FUTURE trips,
-    // never backfills.
+    // per-circle autobase unless the user has opted out via the
+    // `trips:sharing:{circleId}` toggle. Default is on (absent row =
+    // sharing enabled); opting out stops FUTURE trips from replicating,
+    // never tombstones past ones. Policy lives in shouldReplicateTrip.
     try {
       const sp = typeof speed === 'number' ? speed : null
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
@@ -1702,6 +1702,47 @@ async function init ({ dataDir } = {}, attempt = 0) {
       autoAppendMemberRow(circleId).catch(() => {})
     }
   }, 5000)
+
+  // Stationary-device heartbeat. The UI's "Live" indicator (LiveOrAge
+  // in App.jsx, gated on LIVE_THRESHOLD_MS = 60_000) drops within a
+  // minute of the latest lastSeen.ts. On iOS CLLocationManager has
+  // distanceFilter=10 (PearCircleLocationModule.swift) so a foregrounded
+  // but stationary device emits no events for minutes at a time;
+  // Android's FusedLocationProvider is more chatty but can also stall.
+  // Without this, a healthy app with a live swarm connection still
+  // appears "not Live" to peers (and shows peers as not-Live locally)
+  // simply because nobody moved.
+  //
+  // Every HEARTBEAT_CHECK_INTERVAL_MS, if our own lastSeen.ts has aged
+  // past HEARTBEAT_STALE_MS without an organic location:update, re-sign
+  // the most recent position with a fresh ts and append to every
+  // writable circle. Same shape as a real location:update — peers'
+  // verifyValue + apply branch accept it identically. We skip
+  // checkPlaceTransitions because the lat/lon hasn't changed, so no
+  // geofence could fire.
+  const HEARTBEAT_CHECK_INTERVAL_MS = 15_000
+  const HEARTBEAT_STALE_MS = 30_000
+  setInterval(async () => {
+    if (!_initialized || !_sharingEnabled || !_selfLastSeen) return
+    if (Date.now() - _selfLastSeen.ts < HEARTBEAT_STALE_MS) return
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const refreshed = signValue({
+      pubkey: ourKey,
+      lat: _selfLastSeen.lat,
+      lon: _selfLastSeen.lon,
+      accuracy: _selfLastSeen.accuracy ?? null,
+      ts: Date.now(),
+      speed: _selfLastSeen.speed ?? null,
+      battery: _selfLastSeen.battery ?? null,
+      isCharging: _selfLastSeen.isCharging ?? null,
+      v: 1,
+    }, _identity.secretKey)
+    _selfLastSeen = refreshed
+    for (const [, base] of _circleBases) {
+      if (!base.writable) continue
+      try { await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value: refreshed }) } catch {}
+    }
+  }, HEARTBEAT_CHECK_INTERVAL_MS)
 
   // Load the persisted sharing state (default visible). If the user
   // muted-with-expiry and the app was closed past the expiry, treat
