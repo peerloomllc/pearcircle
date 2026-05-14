@@ -10,6 +10,9 @@ import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSv
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
 import { subscribeOfflineState } from './lib/tileFetch.js'
+import appConfig from '../../app.json'
+
+const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
 import { downloadRegion, estimateTilesInBbox } from './lib/regionDownload.js'
 
 // Steps for the post-onboarding spotlight tour. Anchors resolve in
@@ -4366,6 +4369,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
   // The effect re-runs whenever the prop changes — i.e., every time
   // setSheet({name:'about', expand:'...'}) lands a new value.
   const [howOpen, setHowOpen] = useState(false)
+  const [tutorialOpen, setTutorialOpen] = useState(false)
   const [supportOpen, setSupportOpen] = useState(false)
   const [bitcoinOpen, setBitcoinOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
@@ -4445,6 +4449,18 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </button>
       </Collapsible>
 
+      {onReplayOnboarding && (
+        <Collapsible title='Tutorial' icon={BookOpen} open={tutorialOpen} onToggle={() => setTutorialOpen(v => !v)}>
+          <p style={body}>
+            Replay the welcome tour to revisit how the map, circles,
+            places, and trips work.
+          </p>
+          <button onClick={() => { onReplayOnboarding(); onClose() }} style={pillBtn}>
+            <BookOpen size={16} weight='thin' /> Replay Tutorial
+          </button>
+        </Collapsible>
+      )}
+
       {!isIOS && (
         <Collapsible title='Support development' icon={Lightning} open={supportOpen} onToggle={() => setSupportOpen(v => !v)}>
           <p style={body}>
@@ -4495,23 +4511,8 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
       </Collapsible>
 
       <div style={{ textAlign: 'center', fontSize: 11, fontWeight: 300, color: colors.text.muted, paddingTop: spacing.base, paddingBottom: spacing.xs, fontFamily: typography.fontFamily }}>
-        v0.1.0
+        v{APP_VERSION}
       </div>
-
-      {onReplayOnboarding && (
-        <button
-          onClick={() => { onReplayOnboarding(); onClose() }}
-          style={{
-            background: 'none', border: 'none',
-            color: colors.text.muted,
-            fontSize: 12, fontWeight: 300, fontFamily: typography.fontFamily,
-            cursor: 'pointer', padding: spacing.xs,
-            alignSelf: 'center',
-          }}
-        >
-          Replay welcome tour
-        </button>
-      )}
 
       {walletModal && (
         <LightningWalletModal onClose={() => setWalletModal(false)} />
