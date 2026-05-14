@@ -62,6 +62,25 @@ const DONATE_FIRST_LAUNCH_KEY = 'pc:donateReminder:firstLaunch'
 const DONATE_SHOWN_KEY = 'pc:donateReminder:shown'
 const _mutes = new Set<string>()
 let _ourPubkey: string | null = null
+// Cached locally so the peerTrip:completed hot path doesn't round-trip
+// to AsyncStorage / the worklet. Seeded on boot from the same sources
+// the WebView reads (shell:distanceUnit AsyncStorage + worklet
+// tripNotifications:get), refreshed via the IPC set handlers / event.
+let _distanceUnitPref: 'km' | 'miles' = 'km'
+let _tripNotificationsEnabled = true
+
+const METERS_PER_MILE = 1609.344
+function formatTripDistance(meters: number, unit: 'km' | 'miles'): string {
+  if (!Number.isFinite(meters) || meters < 0) return ''
+  if (unit === 'miles') {
+    const miles = meters / METERS_PER_MILE
+    if (miles < 0.1) return `${(miles * 5280).toFixed(0)} ft`
+    return miles < 10 ? `${miles.toFixed(1)} mi` : `${miles.toFixed(0)} mi`
+  }
+  const km = meters / 1000
+  if (km < 0.1) return `${meters.toFixed(0)} m`
+  return km < 10 ? `${km.toFixed(1)} km` : `${km.toFixed(0)} km`
+}
 
 const muteKey = (circleId: string, placeId: string) => circleId + ':' + placeId
 
@@ -94,6 +113,14 @@ async function ensureNotifications() {
       description: 'Notifications when circle members arrive at or leave Places',
       lightColor: '#0E413A',
     })
+    // Separate channel so users (and the OS) can mute trip notifications
+    // independently of geofence ones from the system notification settings.
+    await Notifications.setNotificationChannelAsync('trip', {
+      name: 'Trip completions',
+      importance: Notifications.AndroidImportance.DEFAULT,
+      description: 'Notifications when circle members finish a trip',
+      lightColor: '#0E413A',
+    })
   }
   const settings = await Notifications.getPermissionsAsync()
   if (settings.status !== 'granted') {
@@ -109,6 +136,35 @@ async function ensureNotifications() {
 // on pubkey + kind + placeName within a short TTL collapses the burst.
 const NOTIF_DEDUP_TTL_MS = 10_000
 const _recentNotifications = new Map<string, number>()
+
+async function firePeerTripNotification(payload: any) {
+  if (!payload) return
+  if (!_tripNotificationsEnabled) return
+  const { authorPubkey, displayName, distanceMeters } = payload
+  if (typeof authorPubkey !== 'string') return
+  // Defense in depth: worklet already filters self, but if our pubkey
+  // arrives here (e.g. an old worklet build) drop instead of bugging
+  // the user about their own trip.
+  if (_ourPubkey && authorPubkey === _ourPubkey) return
+  if (typeof distanceMeters !== 'number' || !Number.isFinite(distanceMeters)) return
+  const distanceStr = formatTripDistance(distanceMeters, _distanceUnitPref)
+  if (!distanceStr) return
+  const name = (typeof displayName === 'string' && displayName.length > 0)
+    ? displayName
+    : authorPubkey.slice(0, 8)
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'PearCircle',
+        body: `${name} completed a ${distanceStr} trip`,
+        data: { kind: 'peerTrip', authorPubkey, circleId: payload.circleId ?? null },
+      },
+      trigger: Platform.OS === 'android' ? { channelId: 'trip' } : null,
+    })
+  } catch (e: any) {
+    console.warn('fire peer trip notification failed: ' + e?.message)
+  }
+}
 
 async function fireTransitionNotification(payload: any) {
   if (!payload || !payload.transition) return
@@ -386,6 +442,15 @@ export default function Index() {
     // Geofence transitions land here; fire OS notification if it's a peer
     // (not us) and the place isn't muted on this device.
     onEvent('transition:applied', (data) => { fireTransitionNotification(data) })
+    // Trip-completion notifications for peers in opted-in trip-sharing
+    // circles. The worklet already filters self, freshness, and the
+    // distance/duration threshold; the shell formats with the user's
+    // distance-unit preference and gates on the local mute toggle.
+    onEvent('peerTrip:completed', (data) => { firePeerTripNotification(data) })
+    onEvent('tripNotifications:changed', (data) => {
+      if (data && typeof data.enabled === 'boolean') _tripNotificationsEnabled = data.enabled
+      emitEvent('tripNotifications:changed', data)
+    })
 
     // Notification setup runs in parallel with worklet startup; it's
     // independent and either order is fine. We stash the promise so the
@@ -398,6 +463,13 @@ export default function Index() {
     // (Android 14+ rejects FGS type=location without runtime grant).
     // Resolving the notifications grant first eliminates the race.
     loadMutes().catch(() => {})
+    // Seed the distance-unit cache for firePeerTripNotification. Same
+    // value the WebView hydrates from shell:distanceUnit:get; reading
+    // straight from AsyncStorage avoids a round-trip and is safe before
+    // the worklet is ready.
+    AsyncStorage.getItem(DISTANCE_UNIT_KEY).then((raw) => {
+      _distanceUnitPref = raw === 'miles' ? 'miles' : 'km'
+    }).catch(() => {})
     notifSetupReadyRef.current = ensureNotifications().catch((e) => {
       console.warn('notif setup failed', e)
     })
@@ -684,6 +756,7 @@ export default function Index() {
       }
       try {
         await AsyncStorage.setItem(DISTANCE_UNIT_KEY, unit)
+        _distanceUnitPref = unit
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
