@@ -46,10 +46,13 @@ const FUTURE_TS_TOLERANCE_MS = 5 * 60 * 1000
 // which is ~40KB after base64 inflation. We leave a small headroom.
 // Upper bound for any avatar payload (base64 portion only — the
 // data URL prefix is free). UI enforces stricter per-format caps:
-// ~42KB for static formats (compressed JPEG) and up to this 500KB
+// ~150KB for static formats (256x256 JPEG) and up to this 1MB
 // ceiling for animated GIF/WebP that we store raw to preserve
-// animation. Pattern matches PearGuard's MAX_ANIMATED_BASE64.
-const AVATAR_MAX_BASE64 = 500_000
+// animation. Generous enough that common user-picked GIFs
+// (400-700KB raw → ~530-930KB base64) make it through. Defensive
+// upper bound vs. malicious peers sending oversized avatars to
+// blow up replication bandwidth.
+const AVATAR_MAX_BASE64 = 1_000_000
 
 // Cold-start instrumentation. _bootTs anchors all timing relative to
 // the moment Bare loaded this script; mark() emits a tagged console

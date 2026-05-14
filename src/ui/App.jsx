@@ -3350,7 +3350,7 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
       // frame, so there's no useful fallback when oversized.
       if (isAnimated) {
         if (b64Len > cap) {
-          setError('Animated avatar is too large. Try one under ~375KB.')
+          setError('Animated avatar is too large. Try one under ~750KB.')
           return
         }
         await commitAvatar(dataUrl)
@@ -4582,15 +4582,20 @@ function formatRemaining (ms) {
 }
 
 // Two caps mirror PearGuard's pattern:
-// - Static formats (JPEG/PNG that's not APNG): ~42KB after compression
-//   to a 96x96 JPEG. Replication-cheap.
-// - Animated formats (GIF, WebP that may be animated): up to ~500KB
-//   stored raw to preserve animation, since canvas re-encoding would
-//   flatten to a single frame.
-// Bare's cap is the larger 500KB ceiling; the UI enforces the
-// stricter per-format budget below.
-const AVATAR_STATIC_MAX_B64 = 42000
-const AVATAR_ANIMATED_MAX_B64 = 500_000
+// - Static formats (JPEG/PNG that's not APNG): up to ~150KB after
+//   compression to a 256x256 JPEG. Matches PearGuard's static
+//   compression (256x256 @ 0.8). The byte cap is a defensive ceiling
+//   that's rarely hit at this size/quality; the quality ladder kicks
+//   in for unusually high-detail images.
+// - Animated formats (GIF, WebP that may be animated): up to ~1MB
+//   base64 (~750KB raw) stored raw to preserve animation. Canvas
+//   re-encoding would flatten to a single frame, so there's no
+//   useful fallback when oversized. Generous so common user-picked
+//   GIFs (often 400-700KB raw) make it through without being rejected.
+// Bare's cap is the matching 1MB ceiling; the UI enforces the
+// per-format budget below.
+const AVATAR_STATIC_MAX_B64 = 150_000
+const AVATAR_ANIMATED_MAX_B64 = 1_000_000
 const ANIMATED_MIMES = ['image/gif', 'image/webp']
 // Legacy name retained for the canvas compression helper that still
 // targets the static cap.
@@ -4621,14 +4626,14 @@ function readFileDataUrl (file) {
   })
 }
 
-// Center-square-cover crop to 96x96 then JPEG-compress. Reduces quality
+// Center-square-cover crop to 256x256 then JPEG-compress. Reduces quality
 // in steps if the encoded result is over the byte budget; gives up at
 // quality 0.4 and lets the caller surface a friendly error.
 function compressToAvatar (dataUrl) {
   return new Promise((resolve, reject) => {
     const img = new Image()
     img.onload = () => {
-      const size = 96
+      const size = 256
       const canvas = document.createElement('canvas')
       canvas.width = size
       canvas.height = size
