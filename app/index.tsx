@@ -487,17 +487,24 @@ export default function Index() {
     // through addNotificationResponseReceivedListener. Both deliver via
     // deliverNotificationFocus, which mirrors the deeplink pending-flush
     // pattern so a tap that lands before the WebView is ready isn't lost.
-    Notifications.getLastNotificationResponseAsync().then((resp) => {
-      const data = resp?.notification?.request?.content?.data as any
-      if (data?.kind === 'transition' && typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
+    // Two notification kinds carry focus-routing payloads:
+    //   - transition: { kind: 'transition', circleId, pubkey } from geofence enter/exit
+    //   - peerTrip:   { kind: 'peerTrip', circleId, authorPubkey } from trip-completion
+    // Both resolve to the same WebView event so the UI can switch circle
+    // filter and focus the member uniformly.
+    const routeNotificationData = (data: any) => {
+      if (!data) return
+      if (data.kind === 'transition' && typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
         deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
+      } else if (data.kind === 'peerTrip' && typeof data.circleId === 'string' && typeof data.authorPubkey === 'string') {
+        deliverNotificationFocus({ circleId: data.circleId, pubkey: data.authorPubkey })
       }
+    }
+    Notifications.getLastNotificationResponseAsync().then((resp) => {
+      routeNotificationData(resp?.notification?.request?.content?.data as any)
     }).catch(() => {})
     const notifSub = Notifications.addNotificationResponseReceivedListener((resp) => {
-      const data = resp?.notification?.request?.content?.data as any
-      if (data?.kind === 'transition' && typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
-        deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
-      }
+      routeNotificationData(resp?.notification?.request?.content?.data as any)
     })
 
     // Hardware-back / back-gesture handling. We always consume the event

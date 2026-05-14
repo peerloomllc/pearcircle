@@ -1231,8 +1231,13 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   }, [mutedPlaces])
 
   // If a circle the user filtered to gets removed (left), drop the filter.
+  // Guard against cold-start: when circles haven't loaded yet (refresh is
+  // async) the array is empty and would falsely match "circle was removed".
+  // Notification-tap routes set selectedCircleId before circles arrive, so
+  // dropping it here would lose the requested filter.
   useEffect(() => {
     if (!selectedCircleId) return
+    if (circles.length === 0) return
     if (!circles.some(c => c.circleId === selectedCircleId)) setSelectedCircleId(null)
   }, [circles, selectedCircleId])
 
@@ -1372,20 +1377,50 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // The AddPlaceForm shows a picker when this list has more than one.
   const writableCircles = activeCircles.filter(c => c.writable)
 
-  const focusMember = useCallback((pubkey) => {
+  // When focusMember runs but the peer's lastSeen hasn't replicated yet
+  // (typically cold-start notification tap before the first lastSeen
+  // append arrives), the flyTo is silently skipped. Stash the pubkey so
+  // the effect below can finish the flyTo when data.lastSeen catches up.
+  // Cleared on a successful immediate flyTo, on focus change, or after
+  // a one-shot retry budget elapses.
+  const pendingFlyForPubkeyRef = useRef(null)
+  // openSheet defaults to true to preserve the member-list-row-tap UX
+  // (tapping a row asks for member detail). Notification-tap routing
+  // passes openSheet=false so the user lands at the primary-focus state
+  // (avatar centered + top bar) without the sheet covering the map.
+  const focusMember = useCallback((pubkey, { openSheet = true } = {}) => {
     if (!pubkey) return
     setSelectedPubkey(pubkey)
-    setMemberSheetVisible(true)
+    setMemberSheetVisible(openSheet)
     setMenuOpen(false)
     setSheetOpen(false)
     const seen = data.lastSeen?.[pubkey]
     if (seen) {
       justFocusedRef.current = true
+      pendingFlyForPubkeyRef.current = null
       mapApiRef.current?.flyTo({
         center: [seen.lon, seen.lat], zoom: 16, duration: 1100,
       })
+    } else {
+      pendingFlyForPubkeyRef.current = pubkey
     }
   }, [data])
+
+  // Cold-start notification-tap retry. Watches data.lastSeen for the
+  // pending pubkey and flies once it lands. Cleared when the user
+  // changes focus or clears focus.
+  useEffect(() => {
+    const pending = pendingFlyForPubkeyRef.current
+    if (!pending) return
+    if (pending !== selectedPubkey) { pendingFlyForPubkeyRef.current = null; return }
+    const seen = data.lastSeen?.[pending]
+    if (!seen) return
+    pendingFlyForPubkeyRef.current = null
+    justFocusedRef.current = true
+    mapApiRef.current?.flyTo({
+      center: [seen.lon, seen.lat], zoom: 16, duration: 1100,
+    })
+  }, [data, selectedPubkey])
 
   // Two-stage pin / edge-indicator tap (user TODO 2026-05-08): the first
   // tap on an unfocused pin is focus-only (camera flyTo + top-bar swap)
@@ -1458,7 +1493,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     if (initialFocus.seq === lastAppliedFocusSeq.current) return
     lastAppliedFocusSeq.current = initialFocus.seq ?? null
     if (initialFocus.circleId) setSelectedCircleId(initialFocus.circleId)
-    focusMember(initialFocus.pubkey)
+    focusMember(initialFocus.pubkey, { openSheet: false })
   }, [initialFocus, focusMember])
 
   // Long-press on the map opens the add-place form pre-filled with
