@@ -1,4 +1,4 @@
-const { haversineMeters, classify } = require('../src/lib/geofence')
+const { haversineMeters, classify, applyRegionEvent } = require('../src/lib/geofence')
 
 describe('haversineMeters', () => {
   test('zero distance for identical points', () => {
@@ -78,5 +78,50 @@ describe('classify state machine', () => {
       expect(r.kind).toBe(p.expectKind)
       state = r.classification
     }
+  })
+})
+
+describe('applyRegionEvent (native enter/exit dedup)', () => {
+  test('enter from outside flips classification and is not deduped', () => {
+    expect(applyRegionEvent('outside', 'enter')).toEqual({ deduped: false, classification: 'inside' })
+  })
+
+  test('exit from inside flips classification and is not deduped', () => {
+    expect(applyRegionEvent('inside', 'exit')).toEqual({ deduped: false, classification: 'outside' })
+  })
+
+  test('enter while already inside is deduped (no double-write)', () => {
+    expect(applyRegionEvent('inside', 'enter')).toEqual({ deduped: true, classification: 'inside' })
+  })
+
+  test('exit while already outside is deduped (no double-write)', () => {
+    expect(applyRegionEvent('outside', 'exit')).toEqual({ deduped: true, classification: 'outside' })
+  })
+
+  test('enter with null prev establishes baseline and writes', () => {
+    expect(applyRegionEvent(null, 'enter')).toEqual({ deduped: false, classification: 'inside' })
+  })
+
+  test('exit with null prev establishes baseline and writes', () => {
+    expect(applyRegionEvent(null, 'exit')).toEqual({ deduped: false, classification: 'outside' })
+  })
+
+  test('unknown kind is treated as invalid and deduped (no write)', () => {
+    const r = applyRegionEvent('outside', 'wat')
+    expect(r.deduped).toBe(true)
+    expect(r.invalid).toBe(true)
+  })
+
+  test('race between JS classifier and native event lands one write', () => {
+    // Simulates: JS classifier sees the boundary cross first via
+    // location:update, flips state to 'inside'. Native didEnterRegion
+    // fires shortly after with the same observation. The second call
+    // must dedup.
+    let state = 'outside'
+    const first = applyRegionEvent(state, 'enter')
+    state = first.classification
+    const second = applyRegionEvent(state, 'enter')
+    expect(first.deduped).toBe(false)
+    expect(second.deduped).toBe(true)
   })
 })

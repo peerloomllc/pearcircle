@@ -225,6 +225,16 @@ let _nextId = 1
 const _pending = new Map<number, (msg: any) => void>()
 const _eventHandlers = new Map<string, ((data: any) => void)[]>()
 let _locationListenerSet = false
+// Region events that fired before the worklet finished booting. iOS can
+// revive the app from a force-quit on a region crossing, and the native
+// PearCircleLocationModule emits the event as soon as the
+// NativeEventEmitter listener attaches -- which the shell wires up in
+// ensureLocationListener, well before _worklet exists. We buffer the
+// IPC messages here and flush them once startWorklet completes so the
+// cold-start transition isn't lost. Plain location:update events are
+// not buffered: they keep arriving and one near-immediate update is
+// enough; the region event is the one-shot signal that matters.
+let _pendingRegionEvents: object[] = []
 
 function ensureLocationListener() {
   if (_locationListenerSet) return
@@ -243,6 +253,21 @@ function ensureLocationListener() {
   // Hyperswarm to re-announce on the new network.
   emitter.addListener('PearCircleLocation:network:changed', (data: any) => {
     sendToWorklet({ method: 'network:changed', args: data })
+  })
+  // CLCircularRegion enter/exit events from the iOS native side. These
+  // fire while the app is alive AND on cold-start when iOS revives the
+  // process for a boundary cross after a force-quit. If the worklet
+  // hasn't started yet (cold-start case), buffer for replay once
+  // startWorklet finishes so the first crossing isn't lost.
+  emitter.addListener('PearCircleLocation:region:enter', (data: any) => {
+    const msg = { method: 'region:enter', args: data }
+    if (_worklet) sendToWorklet(msg)
+    else _pendingRegionEvents.push(msg)
+  })
+  emitter.addListener('PearCircleLocation:region:exit', (data: any) => {
+    const msg = { method: 'region:exit', args: data }
+    if (_worklet) sendToWorklet(msg)
+    else _pendingRegionEvents.push(msg)
   })
   _locationListenerSet = true
 }
@@ -316,6 +341,16 @@ async function startWorklet() {
   const docDir = FileSystem.documentDirectory!
   const dataDir = docDir.replace(/^file:\/\//, '').replace(/\/$/, '')
   await call('init', { dataDir })
+  // Drain region events that fired before the worklet existed (cold-
+  // start from a force-quit + boundary cross). Replay in FIFO order
+  // after init so the worklet's handler sees a fully initialized
+  // state. Plain field assignment + length=0 in case the listener
+  // appended during the await above.
+  if (_pendingRegionEvents.length > 0) {
+    const drain = _pendingRegionEvents
+    _pendingRegionEvents = []
+    for (const msg of drain) sendToWorklet(msg)
+  }
 }
 
 function buildHtml(jsBundle: string) {
@@ -432,6 +467,19 @@ export default function Index() {
     })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
+    // Worklet asks the shell to reconcile the iOS CLCircularRegion set
+    // with its current places. Phase 1 is iOS-only; Android no-ops
+    // here (Phase 2 wires GeofencingClient through the same event
+    // shape). data.regions is already capped to <=20 by the worklet
+    // since that's Apple's hard limit. Failure is non-fatal: the JS
+    // classifier still covers the foreground / backgrounded case
+    // through location:update; this path only adds wake-from-killed.
+    onEvent('regions:set', async (data) => {
+      if (Platform.OS !== 'ios' || !PearCircleLocation?.setMonitoredRegions) return
+      const regions = Array.isArray(data?.regions) ? data.regions : []
+      try { await PearCircleLocation.setMonitoredRegions(regions) }
+      catch (e: any) { console.warn('setMonitoredRegions failed', e?.message ?? String(e)) }
+    })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
     onEvent('sharing:changed', (data) => emitEvent('sharing:changed', data))
     // Owner tear-down notice (proposal amendment 2026-05-07). The worklet

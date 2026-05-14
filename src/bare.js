@@ -33,7 +33,7 @@ const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel } = require('./pair')
 const { signValue, verifyValue } = require('./lib/sign')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
-const { haversineMeters, classify } = require('./lib/geofence')
+const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
@@ -161,10 +161,52 @@ function trackPlace (circleId, place) {
     // spurious enter just because the user relocated a Place.
     lastClassification: existing?.lastClassification ?? null,
   })
+  schedulePushRegionsToShell()
 }
 
 function untrackPlace (circleId, placeId) {
   _circlePlaces.delete(circleId + '|' + placeId)
+  schedulePushRegionsToShell()
+}
+
+// CLCircularRegion reconciliation. Apple caps each app at 20
+// simultaneously-monitored regions; we send up to that many on every
+// place-set change so the iOS-side OS state stays in sync. Phase 1
+// picks the first 20 by insertion order; Phase 3 will rotate based on
+// distance to the user once a real >20-place user complains. The
+// shell side no-ops on Android until Phase 2 wires GeofencingClient.
+//
+// Debounced via setTimeout because trackPlace fires repeatedly during
+// circle sync / initial apply -- coalescing avoids 10+ native calls
+// per second while a circle hydrates.
+const REGIONS_PUSH_DEBOUNCE_MS = 200
+const REGIONS_HARD_CAP = 20
+let _regionsPushTimer = null
+function schedulePushRegionsToShell () {
+  if (_regionsPushTimer) return
+  _regionsPushTimer = setTimeout(() => {
+    _regionsPushTimer = null
+    pushRegionsToShell()
+  }, REGIONS_PUSH_DEBOUNCE_MS)
+}
+function pushRegionsToShell () {
+  const regions = []
+  for (const state of _circlePlaces.values()) {
+    if (regions.length >= REGIONS_HARD_CAP) break
+    if (!Number.isFinite(state.lat) || !Number.isFinite(state.lon)) continue
+    if (!Number.isFinite(state.radiusMeters) || state.radiusMeters <= 0) continue
+    regions.push({
+      // Compose circleId into the id so the shell-side enter/exit
+      // handler can route back to the right autobase without an
+      // extra lookup. region:enter/exit on the worklet side splits
+      // this back into (circleId, placeId).
+      id: state.circleId + '|' + state.placeId,
+      lat: state.lat,
+      lon: state.lon,
+      radius: state.radiusMeters,
+    })
+  }
+  send({ event: 'regions:set', data: { regions } })
 }
 
 // Soft-delete tombstone (proposal amended 2026-05-05). A place row
@@ -892,6 +934,28 @@ const handlers = {
     return { ok: true, written, pubkey: ourKey }
   },
 
+  // CLCircularRegion enter/exit, delivered from the iOS native module
+  // via the shell. id is "{circleId}|{placeId}" -- the worklet packs
+  // both into a single CLRegion.identifier in pushRegionsToShell so the
+  // shell can route the callback back to the right autobase without an
+  // extra lookup. Phase 1 is iOS-only; Phase 2 will route Android
+  // GeofencingClient through the same path.
+  //
+  // Dedup is via _circlePlaces[].lastClassification: if the JS
+  // classifier already saw the user inside (foreground / backgrounded
+  // location:update path) it will have flipped state to 'inside'; a
+  // duplicate native enter is a no-op. Same for outside / exit. This
+  // is correctness-critical for the case where the app was alive AND
+  // iOS fired didEnterRegion -- both paths race to write the same
+  // transition; the classification flip is the serialization point.
+  'region:enter': async ({ id, ts } = {}) => {
+    return await handleRegionEvent('enter', id, ts)
+  },
+
+  'region:exit': async ({ id, ts } = {}) => {
+    return await handleRegionEvent('exit', id, ts)
+  },
+
   'trips:list': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
@@ -1157,6 +1221,35 @@ async function appendLastSeen (base, lat, lon, accuracy, ts, battery = null, isC
     v: 1,
   }, _identity.secretKey)
   await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
+}
+
+// Shared body for region:enter / region:exit IPC handlers. Splits the
+// composite "{circleId}|{placeId}" id back into its parts, runs the
+// applyRegionEvent dedup against the in-process geofence state, and
+// appends a transition if the cross is new. Reasons returned to the
+// caller are useful in tests; the shell discards them.
+async function handleRegionEvent (kind, id, ts) {
+  if (!_initialized) return { ok: false, reason: 'not_initialized' }
+  if (!_sharingEnabled) return { ok: false, reason: 'sharing_disabled' }
+  if (typeof id !== 'string') return { ok: false, reason: 'invalid_id' }
+  const sep = id.indexOf('|')
+  if (sep < 0) return { ok: false, reason: 'invalid_id_shape' }
+  const circleId = id.slice(0, sep)
+  const placeId = id.slice(sep + 1)
+  const state = _circlePlaces.get(id)
+  if (!state) return { ok: false, reason: 'unknown_place' }
+  const result = applyRegionEvent(state.lastClassification, kind)
+  if (result.deduped) return { ok: true, deduped: true }
+  state.lastClassification = result.classification
+  const base = _circleBases.get(circleId)
+  if (!base || !base.writable) return { ok: false, reason: 'no_base' }
+  const stamp = typeof ts === 'number' ? ts : Date.now()
+  try {
+    await appendTransition(base, placeId, kind, stamp)
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e?.message }
+  }
 }
 
 async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, isCharging = null) {
@@ -1853,6 +1946,12 @@ async function init ({ dataDir } = {}, attempt = 0) {
 
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
+  // Reconcile iOS CLCircularRegion state once init completes. Even
+  // when zero places exist, this clears any stale OS-side regions
+  // left over from a prior install. trackPlace calls during apply
+  // also fire scheduled pushes via the debouncer, so this final call
+  // is mostly a "ensure-at-least-once" guarantee.
+  schedulePushRegionsToShell()
   // Phase-4 device verification side-channel: ship the buffered
   // cold-start trace to the shell so it can write it to
   // FileSystem.documentDirectory/coldstart.log. On a real iPhone the
