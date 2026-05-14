@@ -4754,8 +4754,8 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
   const openDirections = async () => {
     if (typeof seen?.lat !== 'number' || typeof seen?.lon !== 'number') return
     const label = encodeURIComponent(member.displayName || 'destination')
-    // Universal geo: URI; Android resolves it to the default maps app.
-    // iOS support comes when shell:openUrl learns to swap to maps:// on Apple.
+    // Universal geo: URI; the shell rewrites it to an Apple Maps
+    // universal link on iOS (where geo: has no system handler).
     const url = `geo:${seen.lat},${seen.lon}?q=${seen.lat},${seen.lon}(${label})`
     try { await pear.call('shell:openUrl', { url }) } catch {}
   }

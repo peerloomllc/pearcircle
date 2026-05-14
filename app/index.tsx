@@ -932,8 +932,36 @@ export default function Index() {
         respond(msg.id, { ok: false, error: 'url must be a non-empty string' })
         return
       }
+      let target = url
+      // iOS doesn't register Apple Maps for the geo: scheme — geo: is
+      // a Google convention. Handing geo: to Linking.openURL on iOS
+      // either fails outright (no registered handler) or gets hijacked
+      // by whatever app claims it, most commonly Google Earth. Rewrite
+      // to an Apple Maps universal link so directions land in Apple
+      // Maps deterministically; no LSApplicationQueriesSchemes entry
+      // needed because https://maps.apple.com resolves to the system
+      // app natively. Android keeps the geo: URI so it goes through
+      // the user's default maps app picker.
+      if (Platform.OS === 'ios' && url.startsWith('geo:')) {
+        const m = /^geo:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)(?:\?(.*))?$/.exec(url)
+        if (m) {
+          const lat = Number(m[1])
+          const lon = Number(m[2])
+          if (Number.isFinite(lat) && Number.isFinite(lon)) {
+            const params = new URLSearchParams()
+            params.set('daddr', `${lat},${lon}`)
+            params.set('dirflg', 'd')
+            const labelMatch = m[3] ? /q=[^()&]+\(([^)]+)\)/.exec(m[3]) : null
+            if (labelMatch) {
+              try { params.set('q', decodeURIComponent(labelMatch[1])) }
+              catch { params.set('q', labelMatch[1]) }
+            }
+            target = `https://maps.apple.com/?${params.toString()}`
+          }
+        }
+      }
       try {
-        await Linking.openURL(url)
+        await Linking.openURL(target)
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
