@@ -1135,7 +1135,11 @@ function mergeCircleSnapshots (circles) {
 function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
-  const [peerCount, setPeerCount] = useState(0)
+  // peerCount used to be a separate piece of state, summed across every
+  // circle's peersByCircle entry — which double-counted a peer in N
+  // circles and never narrowed to the active filter. It's now derived
+  // from `connectedPubkeys` further down so the pill stays in sync with
+  // the green dots on the pins.
   // Per-circle peer pubkey sets (Hyperswarm-level). Filtered to the
   // active-circle subset and unioned for the map's online-dot indicator
   // and any future "live link" affordance. Refreshed on the same cadence
@@ -1181,11 +1185,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       // poison the home view.
       setCircles((all?.circles ?? []).filter((c) => !c.error && !c.circle?.deleted))
       setSelfSeen(all?.selfLastSeen ?? null)
-      const sets = peersResp?.peers ?? {}
-      let total = 0
-      for (const k of Object.keys(sets)) total += sets[k]?.length ?? 0
-      setPeerCount(total)
-      setPeersByCircle(sets)
+      setPeersByCircle(peersResp?.peers ?? {})
     } catch {}
   }, [])
 
@@ -1264,16 +1264,37 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     : circles
   const merged = mergeCircleSnapshots(activeCircles)
 
-  // Union of pubkeys currently connected via Hyperswarm in any of the
-  // active circles. Drives the green online-dot indicator on pin avatars.
+  // Pubkeys we currently have a Hyperswarm connection with, restricted
+  // to members of the active circles. Drives the green online-dot
+  // indicator on pin avatars.
+  //
+  // We take the UNION of `peersByCircle` across every circle and then
+  // INTERSECT with the active circles' member lists, rather than just
+  // reading `peersByCircle[activeCircle]` directly. Why: when two
+  // peers share more than one circle, Hyperswarm gives them ONE
+  // underlying connection and the announce side often sees an empty
+  // or partial `info.topics` list. So our worklet may have tracked
+  // the peer under only one of the shared circles' topic sets even
+  // though the live connection covers all of them. The
+  // union-then-intersect recovers the truth: "connected to this peer
+  // AND they're a member of the circle I'm viewing."
   const connectedPubkeys = useMemo(() => {
-    const set = new Set()
-    for (const c of activeCircles) {
-      const arr = peersByCircle?.[c.circleId]
-      if (!arr) continue
-      for (const pk of arr) set.add(pk)
+    const anywhereConnected = new Set()
+    for (const cid in peersByCircle ?? {}) {
+      for (const pk of peersByCircle[cid] ?? []) anywhereConnected.add(pk)
     }
-    return set
+    const activeMembers = new Set()
+    for (const c of activeCircles) {
+      for (const m of c.members ?? []) {
+        const pk = m.value?.pubkey
+        if (pk) activeMembers.add(pk)
+      }
+    }
+    const out = new Set()
+    for (const pk of anywhereConnected) {
+      if (activeMembers.has(pk)) out.add(pk)
+    }
+    return out
   }, [activeCircles, peersByCircle])
 
   // Inject self into the map even when the user has no circles yet
@@ -1659,8 +1680,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             <CaretDown size={11} weight='thin' />
           </span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, marginLeft: 4, color: colors.text.secondary }}>
-            <span style={{ width: 6, height: 6, borderRadius: '50%', background: peerCount > 0 ? colors.success : colors.text.muted }} />
-            <span style={{ fontSize: 12 }}>{peerCount}</span>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: connectedPubkeys.size > 0 ? colors.success : colors.text.muted }} />
+            <span style={{ fontSize: 12 }}>{connectedPubkeys.size}</span>
           </span>
         </button>
 
