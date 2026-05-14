@@ -259,6 +259,30 @@ export function App () {
   const [permissionStatus, setPermissionStatus] = useState('always')
   const [primingVisible, setPrimingVisible] = useState(false)
   const [bannerDismissed, setBannerDismissed] = useState(false)
+  // Android Doze battery-optimization exemption. supported=null while
+  // we probe (avoids a banner-flash on cold start); supported=false on
+  // iOS and pre-Doze Android (banner + onboarding step suppress).
+  // exempt=true means the OS won't pause our foreground service during
+  // long idle. Re-probed when the app returns to foreground so the user
+  // dismissing the system dialog (which leaves the activity intact)
+  // updates the UI without a full mount. batteryBannerDismissed is
+  // per-session, mirroring the iOS permission banner.
+  const [battery, setBattery] = useState({ supported: null, exempt: false })
+  const [batteryBannerDismissed, setBatteryBannerDismissed] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const r = await pear.call('shell:battery:isExempt')
+        if (!cancelled) setBattery({ supported: !!r?.supported, exempt: !!r?.exempt })
+      } catch {
+        if (!cancelled) setBattery({ supported: false, exempt: false })
+      }
+    }
+    refresh()
+    pear.on('app:state', ({ state }) => { if (state === 'active') refresh() })
+    return () => { cancelled = true }
+  }, [])
   // Two-week donation reminder (PearCal/PearGuard parity). Skipped on
   // iOS per App Store guideline 3.1.1; on Android, set true at mount
   // when the shell reports {shown:false, elapsedMs >= 14 days}.
@@ -328,16 +352,21 @@ export function App () {
       permissionStatus !== 'unknown' &&
       permissionStatus !== 'notDetermined' &&
       !bannerDismissed
+    const batteryBannerShowing =
+      battery.supported === true &&
+      !battery.exempt &&
+      !batteryBannerDismissed
     const overlayShowing =
       !!sheet ||
       primingVisible ||
       donateReminderVisible ||
       (onboardingLoaded && !onboardingComplete) ||
       tourPending ||
-      bannerShowing
+      bannerShowing ||
+      batteryBannerShowing
     const style = overlayShowing ? 'light' : 'dark'
     pear.call('shell:statusBar:set', { style }).catch(() => {})
-  }, [sheet, primingVisible, donateReminderVisible, onboardingLoaded, onboardingComplete, tourPending, permissionStatus, bannerDismissed])
+  }, [sheet, primingVisible, donateReminderVisible, onboardingLoaded, onboardingComplete, tourPending, permissionStatus, bannerDismissed, battery.supported, battery.exempt, batteryBannerDismissed])
   const persistOnboarding = useCallback(async (patch) => {
     try { await pear.call('shell:onboarding:set', patch) } catch {}
   }, [])
@@ -512,6 +541,10 @@ export function App () {
         permissionStatus={permissionStatus}
         bannerDismissed={bannerDismissed}
         onPermissionBannerDismiss={() => setBannerDismissed(true)}
+        battery={battery}
+        batteryBannerDismissed={batteryBannerDismissed}
+        onBatteryBannerDismiss={() => setBatteryBannerDismissed(true)}
+        onOpenBatteryAdvanced={() => setSheet({ name: 'settings', expand: 'battery' })}
         tourActive={onboardingLoaded && onboardingComplete && tourPending && !sheet}
       />
       <SheetContainer open={sheet?.name === 'settings'}>
@@ -526,6 +559,8 @@ export function App () {
           setDistanceUnit={setDistanceUnitAndPersist}
           themeMode={themeMode}
           setThemeMode={setThemeModeAndPersist}
+          battery={battery}
+          initialExpand={sheet?.name === 'settings' ? sheet.expand : null}
           onClose={closeSheet}
           onSaved={refresh}
         />
@@ -666,6 +701,7 @@ export function App () {
       {onboardingLoaded && !onboardingComplete && (
         <OnboardingFlow
           profile={profile}
+          battery={battery}
           onCreate={() => setSheet({ name: 'create' })}
           onJoin={() => setSheet({ name: 'join' })}
           onComplete={() => {
@@ -855,6 +891,57 @@ function PermissionBanner ({ status, onOpenSettings, onDismiss }) {
       <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
         <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{headline}</div>
         <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>{body}</div>
+        <button
+          onClick={onOpenSettings}
+          style={{
+            display: 'inline-block',
+            marginTop: spacing.sm,
+            padding: '6px 14px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.sm,
+            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+            cursor: 'pointer',
+          }}
+        >
+          Open Settings
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Android-only banner shown at the top of the map when Doze battery
+// optimization is still on for PearCircle. Tapping the action opens
+// the in-app Settings sheet with the Advanced section pre-expanded,
+// where the existing "Disable battery optimization" button fires the
+// system dialog. Routing through the in-app surface (vs deep-linking
+// straight to the OS dialog) teaches the user where the toggle lives
+// for future re-enables and keeps the recovery path discoverable
+// after dismissal.
+function BatteryOptBanner ({ onOpenSettings, onDismiss }) {
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+    }}>
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+          right: spacing.sm,
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
+        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>Battery optimization is on</div>
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+          Android may pause background sharing during long idle. Turn it off for PearCircle to keep your circle in sync.
+        </div>
         <button
           onClick={onOpenSettings}
           style={{
@@ -1135,7 +1222,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, tourActive = false }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   // peerCount used to be a separate piece of state, summed across every
@@ -1607,6 +1694,18 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           status={permissionStatus}
           onOpenSettings={() => { pear.call('shell:openSettings').catch(() => {}) }}
           onDismiss={onPermissionBannerDismiss}
+        />
+      )}
+
+      {/* Android Doze nudge banner. Mutually exclusive with the iOS
+          permission banner in practice (battery.supported is false on
+          iOS, permissionStatus is 'always' on Android), so they don't
+          stack. Suppressed during the tour for the same reason as the
+          iOS banner. */}
+      {battery.supported === true && !battery.exempt && !batteryBannerDismissed && !tourActive && (
+        <BatteryOptBanner
+          onOpenSettings={onOpenBatteryAdvanced}
+          onDismiss={onBatteryBannerDismiss}
         />
       )}
 
@@ -3260,7 +3359,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, onClose, onSaved }) {
+function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -3271,11 +3370,6 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
   const [savedAt, setSavedAt] = useState(null)
   const [sharingError, setSharingError] = useState(null)
   const [togglingSharing, setTogglingSharing] = useState(false)
-  // Battery-optimization state. supported=null means we haven't
-  // queried yet; supported=false means iOS / pre-Doze and the row
-  // hides. exempt=true means the OS won't pause our foreground
-  // service during idle.
-  const [battery, setBattery] = useState({ supported: null, exempt: false })
   const [batteryError, setBatteryError] = useState(null)
   // Collapsible state for the secondary settings groups. Closed by
   // default so first open of Settings is profile + sharing only;
@@ -3285,6 +3379,22 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
   const [tripSharingOpen, setTripSharingOpen] = useState(false)
   const [displayOpen, setDisplayOpen] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  // Battery banner / onboarding deep-link signal: when the sheet opens
+  // with initialExpand='battery', auto-expand Advanced and scroll the
+  // section into view so the user lands on the toggle instead of the
+  // top of Settings. Ref keeps it one-shot per sheet open.
+  const advancedRef = useRef(null)
+  const handledInitialExpandRef = useRef(null)
+  useEffect(() => {
+    if (!active) { handledInitialExpandRef.current = null; return }
+    if (initialExpand === 'battery' && handledInitialExpandRef.current !== initialExpand) {
+      handledInitialExpandRef.current = initialExpand
+      setAdvancedOpen(true)
+      requestAnimationFrame(() => {
+        try { advancedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
+      })
+    }
+  }, [active, initialExpand])
   // Re-render once a second while a mute has an active expiresAt so
   // the countdown ticks. Stops once the expiry passes.
   const [, setNowTick] = useState(0)
@@ -3294,24 +3404,6 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
     return () => clearInterval(id)
   }, [sharing.enabled, sharing.expiresAt])
   const fileRef = useRef(null)
-
-  // Query battery exemption on mount and on app:state=active so the
-  // row updates after the user dismisses the system dialog without
-  // the activity being torn down.
-  useEffect(() => {
-    let cancelled = false
-    const refresh = async () => {
-      try {
-        const r = await pear.call('shell:battery:isExempt')
-        if (!cancelled) setBattery({ supported: !!r?.supported, exempt: !!r?.exempt })
-      } catch {
-        if (!cancelled) setBattery({ supported: false, exempt: false })
-      }
-    }
-    refresh()
-    pear.on('app:state', ({ state }) => { if (state === 'active') refresh() })
-    return () => { cancelled = true }
-  }, [])
 
   const requestBatteryExempt = async () => {
     setBatteryError(null)
@@ -3622,7 +3714,7 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
         <TripNotificationsSection />
       </Collapsible>
 
-      <Collapsible title='Advanced' icon={Wrench} open={advancedOpen} onToggle={() => setAdvancedOpen(v => !v)} maxHeight='1200px'>
+      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={advancedOpen} onToggle={() => setAdvancedOpen(v => !v)} maxHeight='1200px'>
         {battery.supported && (
           <div style={{ marginBottom: spacing.lg }}>
             <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Battery optimization</p>
@@ -3639,7 +3731,7 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
                   your phone wakes. Disabling this for PearCircle keeps sharing
                   reliable but uses slightly more battery.
                 </p>
-                <button style={s.secondaryBtn} onClick={requestBatteryExempt}>
+                <button style={{ ...s.primaryBtn, marginTop: spacing.sm }} onClick={requestBatteryExempt}>
                   Disable battery optimization
                 </button>
               </>
