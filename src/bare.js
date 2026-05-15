@@ -93,9 +93,16 @@ const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
-let _sharingEnabled = true        // local privacy/battery toggle; when false location:update is dropped. Persisted in _localDb under `sharing`. Loaded on init.
-let _sharingExpiresAt = null      // ms timestamp. While _sharingEnabled is false and expiresAt is in the future, mute is "until then"; once now > expiresAt, the worklet auto-resumes (writes a fresh visible presence row + restarts the local toggle). null means indefinite mute (manual resume only).
-let _sharingExpiryTimer = null    // setTimeout handle for the pending auto-resume, cleared whenever sharing:set is called again or auto-resume fires.
+// Per-circle sharing state. circleId → { enabled, expiresAt, expiryTimer }.
+// Missing entry = enabled (default-on). Persisted as one Hyperbee row per
+// circle under `sharing:{circleId}`. Loaded on init; pre-2026-05-14 global
+// `sharing` row is migrated and removed in loadPersistedSharing().
+//
+// expiresAt: ms timestamp for a time-bounded pause. While enabled is false
+// and expiresAt is in the future, the worklet auto-resumes when the timer
+// fires (writes a fresh `visible` presence row to that circle and clears
+// the disabled entry). null expiresAt with enabled=false = indefinite mute.
+const _circleSharing = new Map()
 // In-process trip-detection state. Lives only in memory; if the worklet
 // dies mid-trip the in-flight polyline is lost. v1 doesn't persist
 // every checkpoint to disk -- the cost would dominate the budget for
@@ -798,9 +805,24 @@ const handlers = {
     return { peers: out }
   },
 
-  'sharing:get': async () => {
+  // Per-circle sharing read. With circleId: returns the explicit state
+  // for that circle (defaults applied). Without: returns the full map
+  // plus an `anyEnabled` summary the shell uses for FGS lifecycle.
+  'sharing:get': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
-    return { enabled: _sharingEnabled, expiresAt: _sharingExpiresAt }
+    if (circleId != null && typeof circleId !== 'string') {
+      throw new Error('circleId must be a string when present')
+    }
+    if (typeof circleId === 'string') {
+      const s = getCircleSharing(circleId)
+      return { circleId, enabled: s.enabled, expiresAt: s.expiresAt }
+    }
+    const sharing = {}
+    for (const cid of _circleBases.keys()) {
+      const s = getCircleSharing(cid)
+      sharing[cid] = { enabled: s.enabled, expiresAt: s.expiresAt }
+    }
+    return { sharing, anyEnabled: anyCircleEnabled() }
   },
 
   'tripNotifications:get': async () => {
@@ -817,38 +839,38 @@ const handlers = {
     return { ok: true, enabled }
   },
 
-  'sharing:set': async ({ enabled, expiresAt = null } = {}) => {
+  'sharing:set': async ({ circleId, enabled, expiresAt = null } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
     if (expiresAt != null && (typeof expiresAt !== 'number' || expiresAt <= Date.now())) {
       throw new Error('expiresAt must be a future ms timestamp')
     }
+    if (!_circleBases.has(circleId)) throw new Error('unknown circleId')
     // Resume always clears any pending expiry; mute keeps the caller's
     // expiresAt (null = indefinite) and arms the auto-resume timer.
     const effectiveExpiresAt = enabled ? null : expiresAt
-    await _localDb.put('sharing', { enabled, expiresAt: effectiveExpiresAt, setAt: Date.now() })
-    _sharingEnabled = enabled
-    _sharingExpiresAt = effectiveExpiresAt
-    armSharingExpiryTimer()
-    // Replicate the presence transition (proposal §3 / §4): every
-    // current circle gets a signed `presence:{ourKey}` row so other
-    // members can distinguish "muted" from "stale lastSeen". The
-    // expiresAt rides on the row so a peer whose app is running can
-    // surface a countdown, and an expired mute reads as visible even
-    // if the muting peer's app died before writing the resume.
-    await writePresenceToAllCircles(enabled ? 'visible' : 'muted', effectiveExpiresAt)
-    send({ event: 'sharing:changed', data: { enabled, expiresAt: effectiveExpiresAt } })
-    return { ok: true, enabled, expiresAt: effectiveExpiresAt }
+    await persistCircleSharing(circleId, enabled, effectiveExpiresAt)
+    armCircleExpiryTimer(circleId)
+    // Presence write to THIS circle only (proposal §3 / §4): a signed
+    // `presence:{ourKey}` row so other members can distinguish "muted"
+    // from "stale lastSeen". expiresAt rides on the row so a peer whose
+    // app is running can surface a countdown, and an expired mute reads
+    // as visible even if the muting peer's app died before resume.
+    await writePresenceToCircle(circleId, enabled ? 'visible' : 'muted', effectiveExpiresAt)
+    const anyEnabled = anyCircleEnabled()
+    send({ event: 'sharing:changed', data: { circleId, enabled, expiresAt: effectiveExpiresAt, anyEnabled } })
+    return { ok: true, circleId, enabled, expiresAt: effectiveExpiresAt, anyEnabled }
   },
 
   'location:update': async ({ lat, lon, accuracy, ts, speed, battery, isCharging } = {}) => {
     if (!_initialized) return { ok: false, reason: 'not_initialized' }
-    // Sharing toggle gate: when off, drop location updates entirely.
-    // The native foreground service is also stopped by the shell, so
-    // typically nothing reaches this path while disabled — but the
-    // service can take a moment to wind down, and the worklet may
-    // still receive a queued event during that window.
-    if (!_sharingEnabled) return { ok: false, reason: 'sharing_disabled' }
+    // Per-circle sharing gate: if EVERY circle is muted, drop the update.
+    // The shell-side FGS lifecycle stops the foreground service in this
+    // state, but a queued native event can still slip through during the
+    // wind-down window. Partial mute (some circles on, some off) falls
+    // through; the per-base write loop below skips muted circles.
+    if (!anyCircleEnabled()) return { ok: false, reason: 'sharing_disabled' }
     if (typeof lat !== 'number' || typeof lon !== 'number') {
       return { ok: false, reason: 'invalid_coords' }
     }
@@ -878,6 +900,10 @@ const handlers = {
     let written = 0
     for (const [circleId, base] of _circleBases) {
       if (!base.writable) continue
+      // Per-circle mute: skip writes to muted circles. Local geofence
+      // classification + trip detection below still run so the user
+      // sees their own arrivals/trips.
+      if (!getCircleSharing(circleId).enabled) continue
       try {
         await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
         written++
@@ -1133,6 +1159,10 @@ async function replicateTripToOptedInCircles (ourKey, trip) {
   const key = 'trip:' + ourKey + ':' + padTripStartTs(trip.startTs)
   for (const [circleId, base] of _circleBases) {
     if (!base.writable) continue
+    // If location sharing is muted for this circle, trips are too:
+    // sharing your route is strictly more revealing than sharing
+    // presence, so the stricter gate wins.
+    if (!getCircleSharing(circleId).enabled) continue
     const row = await _localDb.get('trips:sharing:' + circleId)
     if (!shouldReplicateTrip(row)) continue
     try {
@@ -1143,49 +1173,122 @@ async function replicateTripToOptedInCircles (ourKey, trip) {
   }
 }
 
-async function writePresenceToAllCircles (state, expiresAt = null) {
+async function writePresenceToCircle (circleId, state, expiresAt = null) {
+  const base = _circleBases.get(circleId)
+  if (!base || !base.writable) return
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const payload = { pubkey: ourKey, state, setAt: Date.now(), v: 1 }
   if (typeof expiresAt === 'number') payload.expiresAt = expiresAt
   const value = signValue(payload, _identity.secretKey)
-  for (const [, base] of _circleBases) {
-    if (!base.writable) continue
-    try {
-      await base.append({ type: 'put', key: 'presence:' + ourKey, value })
-    } catch {
-      // base closed mid-flight, etc.
-    }
+  try {
+    await base.append({ type: 'put', key: 'presence:' + ourKey, value })
+  } catch {
+    // base closed mid-flight, etc.
   }
 }
 
-// Schedule (or cancel) the auto-resume timer based on the current
-// _sharingExpiresAt. Called from sharing:set and on init. Idempotent:
-// always clears any pending timer first.
-function armSharingExpiryTimer () {
-  if (_sharingExpiryTimer) {
-    clearTimeout(_sharingExpiryTimer)
-    _sharingExpiryTimer = null
+// Per-circle sharing helpers. _circleSharing stores explicit entries
+// only; missing key means "enabled with no expiry" (default-on).
+function getCircleSharing (circleId) {
+  const s = _circleSharing.get(circleId)
+  if (!s) return { enabled: true, expiresAt: null }
+  return { enabled: s.enabled, expiresAt: s.expiresAt }
+}
+
+function anyCircleEnabled () {
+  // Zero circles → treat as enabled so the FGS keeps running for trip
+  // detection and so a freshly-mounted circle picks up locations
+  // immediately. Otherwise, any non-muted circle keeps the FGS alive.
+  if (_circleBases.size === 0) return true
+  for (const cid of _circleBases.keys()) {
+    if (getCircleSharing(cid).enabled) return true
   }
-  if (_sharingEnabled || !_sharingExpiresAt) return
-  const ms = _sharingExpiresAt - Date.now()
-  if (ms <= 0) {
-    // Already expired (clock jump or worklet sleep). Fire immediately.
-    autoResumeSharing().catch(() => {})
+  return false
+}
+
+async function persistCircleSharing (circleId, enabled, expiresAt) {
+  if (enabled) {
+    // Resume: drop the explicit row so default-on (absent) wins. Keeps
+    // the local DB tidy and means cross-version reads always agree.
+    _circleSharing.delete(circleId)
+    await _localDb.del('sharing:' + circleId).catch(() => {})
     return
   }
-  _sharingExpiryTimer = setTimeout(() => {
-    _sharingExpiryTimer = null
-    autoResumeSharing().catch(() => {})
+  const entry = _circleSharing.get(circleId) ?? { enabled: true, expiresAt: null, expiryTimer: null }
+  entry.enabled = false
+  entry.expiresAt = expiresAt
+  _circleSharing.set(circleId, entry)
+  await _localDb.put('sharing:' + circleId, {
+    enabled: false,
+    expiresAt,
+    setAt: Date.now(),
+    v: 1,
+  })
+}
+
+// Schedule (or cancel) the auto-resume timer for one circle. Called
+// from sharing:set and on init. Idempotent: always clears the pending
+// timer for that circle first.
+function armCircleExpiryTimer (circleId) {
+  const entry = _circleSharing.get(circleId)
+  if (entry?.expiryTimer) {
+    clearTimeout(entry.expiryTimer)
+    entry.expiryTimer = null
+  }
+  if (!entry || entry.enabled || !entry.expiresAt) return
+  const ms = entry.expiresAt - Date.now()
+  if (ms <= 0) {
+    // Already expired (clock jump or worklet sleep). Fire immediately.
+    autoResumeCircleSharing(circleId).catch(() => {})
+    return
+  }
+  entry.expiryTimer = setTimeout(() => {
+    entry.expiryTimer = null
+    autoResumeCircleSharing(circleId).catch(() => {})
   }, ms)
 }
 
-async function autoResumeSharing () {
-  if (_sharingEnabled) return
-  await _localDb.put('sharing', { enabled: true, expiresAt: null, setAt: Date.now() })
-  _sharingEnabled = true
-  _sharingExpiresAt = null
-  await writePresenceToAllCircles('visible', null)
-  send({ event: 'sharing:changed', data: { enabled: true, expiresAt: null, auto: true } })
+async function autoResumeCircleSharing (circleId) {
+  const entry = _circleSharing.get(circleId)
+  if (!entry || entry.enabled) return
+  await persistCircleSharing(circleId, true, null)
+  await writePresenceToCircle(circleId, 'visible', null)
+  send({
+    event: 'sharing:changed',
+    data: { circleId, enabled: true, expiresAt: null, auto: true, anyEnabled: anyCircleEnabled() },
+  })
+}
+
+// Load all `sharing:{circleId}` rows into _circleSharing. Also migrates
+// the legacy global `sharing` row (pre-2026-05-14): if found with
+// enabled=false, fan out to every mounted circle so an existing mute
+// survives the upgrade, then delete the legacy row.
+async function loadPersistedSharing () {
+  for await (const { key, value } of _localDb.createReadStream({
+    gt: 'sharing:', lt: 'sharing:~',
+  })) {
+    // Defensive: the `trips:sharing:` prefix shares the same root path
+    // but lives outside this range because 't' > ':'. Skip anyway in
+    // case future keys collide.
+    if (key.startsWith('trips:sharing:')) continue
+    if (!value || value.enabled !== false) continue
+    const circleId = key.slice('sharing:'.length)
+    _circleSharing.set(circleId, {
+      enabled: false,
+      expiresAt: typeof value.expiresAt === 'number' ? value.expiresAt : null,
+      expiryTimer: null,
+    })
+  }
+  const legacy = await _localDb.get('sharing').catch(() => null)
+  if (legacy?.value && legacy.value.enabled === false) {
+    const exp = typeof legacy.value.expiresAt === 'number' ? legacy.value.expiresAt : null
+    for (const cid of _circleBases.keys()) {
+      if (_circleSharing.has(cid)) continue  // explicit per-circle row already takes precedence
+      await persistCircleSharing(cid, false, exp)
+    }
+  }
+  if (legacy) await _localDb.del('sharing').catch(() => {})
+  for (const cid of _circleSharing.keys()) armCircleExpiryTimer(cid)
 }
 
 async function appendTransition (base, placeId, kind, ts) {
@@ -1230,7 +1333,6 @@ async function appendLastSeen (base, lat, lon, accuracy, ts, battery = null, isC
 // caller are useful in tests; the shell discards them.
 async function handleRegionEvent (kind, id, ts) {
   if (!_initialized) return { ok: false, reason: 'not_initialized' }
-  if (!_sharingEnabled) return { ok: false, reason: 'sharing_disabled' }
   if (typeof id !== 'string') return { ok: false, reason: 'invalid_id' }
   const sep = id.indexOf('|')
   if (sep < 0) return { ok: false, reason: 'invalid_id_shape' }
@@ -1241,6 +1343,10 @@ async function handleRegionEvent (kind, id, ts) {
   const result = applyRegionEvent(state.lastClassification, kind)
   if (result.deduped) return { ok: true, deduped: true }
   state.lastClassification = result.classification
+  // Per-circle mute: still update the dedup classifier above so a
+  // later resume doesn't replay the boundary cross, but suppress the
+  // autobase append for muted circles.
+  if (!getCircleSharing(circleId).enabled) return { ok: false, reason: 'sharing_disabled' }
   const base = _circleBases.get(circleId)
   if (!base || !base.writable) return { ok: false, reason: 'no_base' }
   const stamp = typeof ts === 'number' ? ts : Date.now()
@@ -1260,6 +1366,10 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
     const result = classify(dist, state.radiusMeters, state.lastClassification)
     state.lastClassification = result.classification
     if (!result.kind) continue
+    // Per-circle mute: still flip the classifier above (so a later
+    // resume doesn't re-fire the entry/exit), but skip the autobase
+    // append. Peers in muted circles don't see this transition.
+    if (!getCircleSharing(state.circleId).enabled) continue
     try {
       await appendTransition(base, state.placeId, result.kind, ts)
       // Pass battery so the post-transition lastSeen write stays byte-
@@ -1389,6 +1499,13 @@ async function tearDownCircleLocally (circleId) {
   for (const key of Array.from(_circlePlaces.keys())) {
     if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
   }
+  // Clear per-circle sharing state so a fresh re-join starts on the
+  // default (enabled) and any pending auto-resume timer doesn't fire
+  // against a torn-down base.
+  const sharingEntry = _circleSharing.get(circleId)
+  if (sharingEntry?.expiryTimer) clearTimeout(sharingEntry.expiryTimer)
+  _circleSharing.delete(circleId)
+  await _localDb.del('sharing:' + circleId).catch(() => {})
   await _localDb.del('circles:joined:' + circleId).catch(() => {})
 }
 
@@ -1902,7 +2019,8 @@ async function init ({ dataDir } = {}, attempt = 0) {
   const HEARTBEAT_CHECK_INTERVAL_MS = 15_000
   const HEARTBEAT_STALE_MS = 30_000
   setInterval(async () => {
-    if (!_initialized || !_sharingEnabled || !_selfLastSeen) return
+    if (!_initialized || !_selfLastSeen) return
+    if (!anyCircleEnabled()) return
     if (Date.now() - _selfLastSeen.ts < HEARTBEAT_STALE_MS) return
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     const refreshed = signValue({
@@ -1917,25 +2035,19 @@ async function init ({ dataDir } = {}, attempt = 0) {
       v: 1,
     }, _identity.secretKey)
     _selfLastSeen = refreshed
-    for (const [, base] of _circleBases) {
+    for (const [circleId, base] of _circleBases) {
       if (!base.writable) continue
+      if (!getCircleSharing(circleId).enabled) continue
       try { await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value: refreshed }) } catch {}
     }
   }, HEARTBEAT_CHECK_INTERVAL_MS)
 
-  // Load the persisted sharing state (default visible). If the user
-  // muted-with-expiry and the app was closed past the expiry, treat
-  // it as already-resumed. armSharingExpiryTimer schedules the
-  // auto-resume for any future expiresAt.
-  try {
-    const row = await _localDb.get('sharing')
-    if (row?.value?.enabled === false) {
-      const exp = typeof row.value.expiresAt === 'number' ? row.value.expiresAt : null
-      _sharingEnabled = false
-      _sharingExpiresAt = exp
-    }
-  } catch {}
-  armSharingExpiryTimer()
+  // Load per-circle sharing state (default visible per circle). Mutes
+  // with expired timestamps fire immediately via armCircleExpiryTimer.
+  // Also migrates and clears any legacy global `sharing` row.
+  try { await loadPersistedSharing() } catch (e) {
+    console.warn('[bare] loadPersistedSharing failed', e?.message)
+  }
 
   // Peer-trip notification toggle. Default on; only flip if the user
   // explicitly opted out (persisted false). Missing row = default state.
@@ -1965,8 +2077,10 @@ async function init ({ dataDir } = {}, attempt = 0) {
     event: 'ready',
     data: {
       publicKey: b4a.toString(_identity.publicKey, 'hex'),
-      sharingEnabled: _sharingEnabled,
-      sharingExpiresAt: _sharingExpiresAt,
+      // Shell uses anyEnabled to decide whether to start the foreground
+      // location service on cold start; if every circle is muted, skip
+      // the FGS until the user resumes sharing.
+      sharingAnyEnabled: anyCircleEnabled(),
     },
   })
 }
