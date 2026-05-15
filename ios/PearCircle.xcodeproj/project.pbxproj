@@ -13,6 +13,8 @@
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 		AAAA00000000000000000A02 /* PearCircleLocationModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000A01 /* PearCircleLocationModule.swift */; };
 		AAAA00000000000000000B02 /* PearCircleLocationModule.m in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000B01 /* PearCircleLocationModule.m */; };
+		AAAA00000000000000000C02 /* arrive.wav in Resources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000C01 /* arrive.wav */; };
+		AAAA00000000000000000D02 /* leave.wav in Resources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000D01 /* leave.wav */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +28,8 @@
 		F11748442D0722820044C1D9 /* PearCircle-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "PearCircle-Bridging-Header.h"; path = "PearCircle/PearCircle-Bridging-Header.h"; sourceTree = "<group>"; };
 		AAAA00000000000000000A01 /* PearCircleLocationModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PearCircleLocationModule.swift; path = PearCircle/PearCircleLocationModule.swift; sourceTree = "<group>"; };
 		AAAA00000000000000000B01 /* PearCircleLocationModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = PearCircleLocationModule.m; path = PearCircle/PearCircleLocationModule.m; sourceTree = "<group>"; };
+		AAAA00000000000000000C01 /* arrive.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = arrive.wav; path = PearCircle/arrive.wav; sourceTree = "<group>"; };
+		AAAA00000000000000000D01 /* leave.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = leave.wav; path = PearCircle/leave.wav; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -50,6 +54,8 @@
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
 				AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */,
+				AAAA00000000000000000C01 /* arrive.wav */,
+				AAAA00000000000000000D01 /* leave.wav */,
 			);
 			name = PearCircle;
 			sourceTree = "<group>";
@@ -161,6 +167,8 @@
 				BB2F792D24A3F905000567C9 /* Expo.plist in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
+				AAAA00000000000000000C02 /* arrive.wav in Resources */,
+				AAAA00000000000000000D02 /* leave.wav in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
