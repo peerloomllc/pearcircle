@@ -17,26 +17,6 @@ const CACHEABLE_HOST_SUFFIXES = [
   'protomaps.com',
 ]
 
-// Tile-fetch failure tracker for the reactive offline banner. The
-// interceptor tracks a sliding window of recent failures; consumers
-// (App.jsx's offline banner) read it via getOfflineState() and react
-// when the failure rate crosses a threshold.
-// Two gates suppress false positives:
-//   1. Startup grace window — cold-launch tile bursts can fail before
-//      the network stack is fully warm. Failures during this window
-//      are recorded but do not trip the banner.
-//   2. Recent-success gate — if any tile fetch succeeded within the
-//      failure window, the current failures are treated as transient
-//      and ignored (one cached / lightweight tile loading proves the
-//      network path is alive).
-const FAILURE_WINDOW_MS = 10_000
-const FAILURE_THRESHOLD = 3
-const STARTUP_GRACE_MS = 20_000
-const _startTs = Date.now()
-const _recentFailures = []  // array of timestamps
-let _offlineListeners = []
-let _lastSuccessTs = 0
-
 export function installTileFetchInterceptor ({ cache }) {
   const origFetch = window.fetch.bind(window)
   // Expose the unwrapped fetch so the region downloader can fetch tiles
@@ -66,30 +46,21 @@ export function installTileFetchInterceptor ({ cache }) {
     // Cache miss -> real fetch, store a clone if successful, return
     // the original to the caller. Storage runs out of band so
     // MapLibre doesn't pay for the IDB write.
-    try {
-      const res = await origFetch(input, init)
-      if (res.ok || res.status === 206) {
-        recordFetchSuccess()
-        const clone = res.clone()
-        const contentRange = res.headers.get('content-range') || ''
-        const status = res.status
-        clone.blob().then((blob) => {
-          const ct = res.headers.get('content-type') || ''
-          cache.put(cacheKey, blob, {
-            contentType: ct,
-            contentRange,
-            status,
-          }).catch(() => {})
+    const res = await origFetch(input, init)
+    if (res.ok || res.status === 206) {
+      const clone = res.clone()
+      const contentRange = res.headers.get('content-range') || ''
+      const status = res.status
+      clone.blob().then((blob) => {
+        const ct = res.headers.get('content-type') || ''
+        cache.put(cacheKey, blob, {
+          contentType: ct,
+          contentRange,
+          status,
         }).catch(() => {})
-      }
-      return res
-    } catch (err) {
-      // Network failure on a tile fetch. Track it for the offline
-      // banner heuristic and rethrow so MapLibre handles its own
-      // retry / error state as usual.
-      recordFetchFailure()
-      throw err
+      }).catch(() => {})
     }
+    return res
   }
 }
 
@@ -132,53 +103,3 @@ function isCacheableUrl (url) {
   return false
 }
 
-function recordFetchSuccess () {
-  _lastSuccessTs = Date.now()
-  // A successful fetch indicates we're back online; clear the failure
-  // window and notify listeners so the offline banner can dismiss.
-  if (_recentFailures.length > 0) {
-    _recentFailures.length = 0
-    notifyOfflineState(false)
-  }
-}
-
-function recordFetchFailure () {
-  const now = Date.now()
-  // Prune entries outside the window.
-  while (_recentFailures.length > 0 && now - _recentFailures[0] > FAILURE_WINDOW_MS) {
-    _recentFailures.shift()
-  }
-  _recentFailures.push(now)
-  // Suppress the banner during cold-start grace window.
-  if (now - _startTs < STARTUP_GRACE_MS) return
-  // Suppress if anything succeeded inside the failure window — a single
-  // good tile fetch proves the network path is alive and the burst we
-  // recorded is just transient (cold-start, brief radio drop, etc.).
-  if (_lastSuccessTs && now - _lastSuccessTs < FAILURE_WINDOW_MS) return
-  if (_recentFailures.length >= FAILURE_THRESHOLD) {
-    notifyOfflineState(true)
-  }
-}
-
-let _lastOfflineState = false
-function notifyOfflineState (offline) {
-  if (offline === _lastOfflineState) return
-  _lastOfflineState = offline
-  for (const fn of _offlineListeners) {
-    try { fn(offline) } catch {}
-  }
-}
-
-export function subscribeOfflineState (fn) {
-  _offlineListeners.push(fn)
-  // Fire current state on subscribe so the consumer can render
-  // immediately without waiting for the next failure event.
-  try { fn(_lastOfflineState) } catch {}
-  return () => {
-    _offlineListeners = _offlineListeners.filter((f) => f !== fn)
-  }
-}
-
-export function getOfflineState () {
-  return _lastOfflineState
-}

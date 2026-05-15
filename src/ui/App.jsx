@@ -9,7 +9,6 @@ import { motionState } from '../lib/motion.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
-import { subscribeOfflineState } from './lib/tileFetch.js'
 import appConfig from '../../app.json'
 
 const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
@@ -330,14 +329,6 @@ export function App () {
   const [onboardingComplete, setOnboardingComplete] = useState(true)
   const [tourPending, setTourPending] = useState(false)
   const [onboardingLoaded, setOnboardingLoaded] = useState(false)
-  // Offline tile-fetch state. tileFetch.js publishes via subscribeOfflineState
-  // when MapLibre's tile requests fail repeatedly (sliding window in the
-  // interceptor); we render a discovery banner pointing at Settings so
-  // the user knows offline-tile management exists.
-  const [tilesOffline, setTilesOffline] = useState(false)
-  const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false)
-  useEffect(() => subscribeOfflineState(setTilesOffline), [])
-
   // Status bar icon tint: light (white) icons on dark surfaces, dark
   // icons on the bare map view. The bare map area is the only place
   // where the status bar sits over a light background; every other
@@ -651,49 +642,6 @@ export function App () {
             setSheet({ name: 'about', expand: 'support' })
           }}
         />
-      )}
-      {/* Offline-tile discovery banner. Surfaces only after MapLibre's
-          tile fetches have failed enough times to flip the offline flag
-          (tileFetch.js's sliding-window heuristic). Routes the user
-          into Settings -> Map tiles where Clear / Download live. Hidden
-          while any sheet is open since they're already in nav, and
-          dismissible per session so it doesn't nag. */}
-      {tilesOffline && !offlineBannerDismissed && !sheet && (
-        <div
-          role='button'
-          onClick={() => { setOfflineBannerDismissed(true); setSheet({ name: 'settings' }) }}
-          style={{
-            position: 'absolute',
-            left: 16, right: 16,
-            bottom: `calc(env(safe-area-inset-bottom, 0px) + 76px)`,
-            zIndex: 60,
-            display: 'flex', alignItems: 'center', gap: 12,
-            padding: '12px 14px',
-            background: 'rgba(26,26,26,0.95)',
-            border: `1px solid ${colors.border}`,
-            borderRadius: 10,
-            color: colors.text.primary,
-            fontFamily: typography.fontFamily,
-            fontSize: 13, fontWeight: 400,
-            cursor: 'pointer',
-            boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
-          }}
-        >
-          <div style={{ flex: 1 }}>
-            <div>Map tiles unavailable</div>
-            <div style={{ ...typography.caption, color: colors.text.muted, marginTop: 2 }}>
-              Tap to manage offline tiles in Settings.
-            </div>
-          </div>
-          <button
-            onClick={(e) => { e.stopPropagation(); setOfflineBannerDismissed(true) }}
-            aria-label='Dismiss'
-            style={{
-              background: 'transparent', border: 'none', color: colors.text.secondary,
-              fontSize: 20, cursor: 'pointer', padding: '0 4px', lineHeight: 1,
-            }}
-          >×</button>
-        </div>
       )}
       {/* First-run onboarding (welcome → name → create/join). Gated on
           the hydrated AsyncStorage flag so we don't flash on cold start
