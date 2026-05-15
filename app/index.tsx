@@ -107,12 +107,29 @@ async function setMute(circleId: string, placeId: string, muted: boolean) {
 
 async function ensureNotifications() {
   if (Platform.OS === 'android') {
-    await Notifications.setNotificationChannelAsync('geofence', {
-      name: 'Place transitions',
+    // Custom transition sounds (ElevenLabs-generated chimes; arrive
+    // ascends, leave descends). Android binds a sound to the channel
+    // at creation time and ignores subsequent changes, so each
+    // direction needs its own channel. The `sound` value is the
+    // resource name without extension, resolved against res/raw/.
+    await Notifications.setNotificationChannelAsync('geofence_arrive', {
+      name: 'Place arrivals',
       importance: Notifications.AndroidImportance.HIGH,
-      description: 'Notifications when circle members arrive at or leave Places',
+      description: 'Notifications when circle members arrive at a Place',
       lightColor: '#0E413A',
+      sound: 'arrive',
     })
+    await Notifications.setNotificationChannelAsync('geofence_leave', {
+      name: 'Place departures',
+      importance: Notifications.AndroidImportance.HIGH,
+      description: 'Notifications when circle members leave a Place',
+      lightColor: '#0E413A',
+      sound: 'leave',
+    })
+    // Remove the legacy single-channel id from pre-sounds installs so
+    // the OS app-info page stops showing a leftover row. Safe no-op
+    // when the channel was never created on this device.
+    try { await Notifications.deleteNotificationChannelAsync('geofence') } catch {}
     // Separate channel so users (and the OS) can mute trip notifications
     // independently of geofence ones from the system notification settings.
     await Notifications.setNotificationChannelAsync('trip', {
@@ -185,7 +202,13 @@ async function fireTransitionNotification(payload: any) {
   for (const [k, ts] of _recentNotifications) {
     if (ts < cutoff) _recentNotifications.delete(k)
   }
-  const verb = transition.kind === 'enter' ? 'arrived at' : 'left'
+  const isArrival = transition.kind === 'enter'
+  const verb = isArrival ? 'arrived at' : 'left'
+  // Direction-specific sound (Android: per-channel binding;
+  // iOS: per-notification content.sound). Filenames are the exact
+  // resources bundled into ios/PearCircle/ and android/.../res/raw/.
+  const channelId = isArrival ? 'geofence_arrive' : 'geofence_leave'
+  const soundFile = isArrival ? 'arrive.wav' : 'leave.wav'
   try {
     await Notifications.scheduleNotificationAsync({
       content: {
@@ -195,13 +218,17 @@ async function fireTransitionNotification(payload: any) {
         // fields and delivers a notification:focus event to the WebView,
         // which sets the circle filter + focuses the member.
         data: { kind: 'transition', circleId, pubkey: transition.pubkey },
+        // iOS reads the sound off the content; Android ignores this
+        // and uses the channel-bound sound, which is why we have two
+        // channels above.
+        sound: Platform.OS === 'ios' ? soundFile : undefined,
       },
       // expo-notifications 0.32 ignores content.channelId on Android when
       // trigger is null (see build/scheduleNotificationAsync.js:109-119 -
       // the channel-trigger fallback only reads channelId off the trigger
       // object), so the OS routes to its fallback channel. Putting the
       // channelId on the trigger fires immediately on the named channel.
-      trigger: Platform.OS === 'android' ? { channelId: 'geofence' } : null,
+      trigger: Platform.OS === 'android' ? { channelId } : null,
     })
   } catch (e: any) {
     console.warn('fire transition notification failed: ' + e?.message)
