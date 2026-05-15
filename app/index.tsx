@@ -481,7 +481,22 @@ export default function Index() {
       catch (e: any) { console.warn('setMonitoredRegions failed', e?.message ?? String(e)) }
     })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
-    onEvent('sharing:changed', (data) => emitEvent('sharing:changed', data))
+    onEvent('sharing:changed', async (data) => {
+      emitEvent('sharing:changed', data)
+      // FGS lifecycle: when every circle is muted, stop the native
+      // foreground location service so the persistent notification
+      // disappears and the OS can reclaim the wake-locks. Resume when
+      // any circle flips back on. Worklet computes anyEnabled for us
+      // (including the zero-circles-default-on case).
+      if (typeof data?.anyEnabled !== 'boolean') return
+      if (Platform.OS !== 'ios' && Platform.OS !== 'android') return
+      try {
+        if (data.anyEnabled) await PearCircleLocation?.startUpdates?.()
+        else await PearCircleLocation?.stopUpdates?.()
+      } catch (e: any) {
+        console.warn('FGS toggle on sharing:changed failed', e?.message ?? String(e))
+      }
+    })
     // Owner tear-down notice (proposal amendment 2026-05-07). The worklet
     // suppresses this on the owner's own device, so we only see it when
     // a peer's circle has been deleted by its owner. UI surfaces a
@@ -606,10 +621,11 @@ export default function Index() {
 
     ensureLocationListener()
 
-    // Auto-start the foreground service unless the worklet's persisted
-    // sharing toggle says otherwise. The worklet emits its current
-    // `sharingEnabled` on the `ready` event, before any user
-    // interaction. We listen once and start (or skip) accordingly.
+    // Auto-start the foreground service unless every circle is muted.
+    // The worklet emits `sharingAnyEnabled` on the `ready` event before
+    // any user interaction (zero-circles defaults to true). We listen
+    // once and start (or skip) accordingly. The shell also reacts to
+    // later `sharing:changed` events to start/stop on user toggles.
     //
     // On iOS we gate the FIRST startUpdates behind a priming screen:
     // before the system dialog fires (which can only happen once per
@@ -620,7 +636,7 @@ export default function Index() {
     // Android skips the priming (no equivalent permission tier) and
     // the existing FusedLocation runtime-permission flow handles itself.
     const onReadyOnce = async (data: any) => {
-      if (data?.sharingEnabled === false) return
+      if (data?.sharingAnyEnabled === false) return
       if (Platform.OS === 'ios') {
         try {
           const status: string = await PearCircleLocation.getAuthorizationStatus?.()
@@ -709,8 +725,8 @@ export default function Index() {
     if (msg.method === 'shell:location:stop') {
       // Stop the native foreground location service. The service's
       // persistent notification disappears and no further callbacks
-      // reach the worklet. Worklet-side `_sharingEnabled` is the
-      // belt-and-suspenders gate for any in-flight events.
+      // reach the worklet. Worklet-side per-circle gates are the
+      // belt-and-suspenders for any in-flight events.
       try {
         await PearCircleLocation?.stopUpdates?.()
         respond(msg.id, { ok: true })

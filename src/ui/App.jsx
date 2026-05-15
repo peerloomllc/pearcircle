@@ -216,11 +216,44 @@ function ensureMapLibreCss () {
 // without rebuilding the app.
 const DEFAULT_TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
 
+// Sharing state helpers. Worklet returns either:
+//   { sharing: { [circleId]: { enabled, expiresAt } }, anyEnabled }
+// or (legacy shape we still tolerate) the per-circle object directly.
+function toSharingState (resp) {
+  const raw = resp?.sharing && typeof resp.sharing === 'object' ? resp.sharing : {}
+  const map = {}
+  for (const [cid, v] of Object.entries(raw)) {
+    map[cid] = {
+      enabled: v?.enabled !== false,
+      expiresAt: typeof v?.expiresAt === 'number' ? v.expiresAt : null,
+    }
+  }
+  return {
+    map,
+    anyEnabled: resp?.anyEnabled !== false,
+    anyPaused: anyPausedFrom(map),
+  }
+}
+function anyPausedFrom (map) {
+  for (const v of Object.values(map)) if (v && v.enabled === false) return true
+  return false
+}
+function getCircleSharing (state, circleId) {
+  return state.map[circleId] ?? { enabled: true, expiresAt: null }
+}
+
 export function App () {
   const [view, setView] = useState({ name: 'home' })
   const [identity, setIdentity] = useState(null)
   const [profile, setProfile] = useState(null)
-  const [sharing, setSharing] = useState({ enabled: true, expiresAt: null })
+  // Per-circle sharing state. Shape: { map, anyEnabled, anyPaused }.
+  //   map[circleId] = { enabled, expiresAt }
+  //   anyEnabled  - at least one circle is sharing
+  //   anyPaused   - at least one circle is muted (drives the red dot
+  //                 on the settings gear)
+  // Missing circle in the map reads as "enabled, no expiry" so newly
+  // mounted circles render correctly before refresh fires.
+  const [sharing, setSharing] = useState({ map: {}, anyEnabled: true, anyPaused: false })
   // Sheet stack overlays the home view rather than navigating to a
   // full-page route. Shape: null | { name, ...data }. Names so far:
   //   settings | about | create | join | invite
@@ -375,14 +408,11 @@ export function App () {
     const [id, pr, sh] = await Promise.all([
       pear.call('identity:get'),
       pear.call('profile:get'),
-      pear.call('sharing:get').catch(() => ({ enabled: true, expiresAt: null })),
+      pear.call('sharing:get').catch(() => ({ sharing: {}, anyEnabled: true })),
     ])
     setIdentity(id)
     setProfile(pr ?? null)
-    setSharing({
-      enabled: sh?.enabled !== false,
-      expiresAt: typeof sh?.expiresAt === 'number' ? sh.expiresAt : null,
-    })
+    setSharing(toSharingState(sh))
   }, [])
 
   useEffect(() => {
@@ -406,10 +436,23 @@ export function App () {
       setOnboardingLoaded(true)
     }).catch(() => { setOnboardingLoaded(true) })
     pear.on('ready', refresh)
-    pear.on('sharing:changed', ({ enabled, expiresAt }) => {
-      setSharing({
-        enabled: enabled !== false,
-        expiresAt: typeof expiresAt === 'number' ? expiresAt : null,
+    pear.on('sharing:changed', ({ circleId, enabled, expiresAt, anyEnabled }) => {
+      // Merge the per-circle update into the local map without losing
+      // sibling circles' state. anyEnabled rides on the event from the
+      // worklet so we don't have to recompute against stale state.
+      setSharing((prev) => {
+        const map = { ...prev.map }
+        if (typeof circleId === 'string') {
+          map[circleId] = {
+            enabled: enabled !== false,
+            expiresAt: typeof expiresAt === 'number' ? expiresAt : null,
+          }
+        }
+        return {
+          map,
+          anyEnabled: anyEnabled !== false,
+          anyPaused: anyPausedFrom(map),
+        }
       })
     })
     // iOS Always-location priming flow. Shell sends `permission:prime`
@@ -500,18 +543,14 @@ export function App () {
     refresh()
   }, [refresh])
 
-  // Single place that flips the sharing toggle: persist in worklet,
-  // start/stop the native foreground service. UI subscribers see the
-  // sharing:changed event and re-render. Errors surface to the caller
-  // so the ProfileView toggle can show them. expiresAt is a future ms
-  // timestamp for time-bounded mute; null/omitted = indefinite.
-  const setSharingEnabled = useCallback(async (enabled, expiresAt = null) => {
-    await pear.call('sharing:set', { enabled, expiresAt })
-    if (enabled) {
-      await pear.call('shell:location:start').catch(() => null)
-    } else {
-      await pear.call('shell:location:stop').catch(() => null)
-    }
+  // Flip the sharing toggle for a single circle. UI subscribers see
+  // the sharing:changed event and re-render. The shell listens for the
+  // same event and starts/stops the native foreground location service
+  // when `anyEnabled` flips, so UI no longer toggles FGS directly.
+  // expiresAt is a future ms timestamp for time-bounded mute;
+  // null/omitted = indefinite.
+  const setSharingForCircle = useCallback(async (circleId, enabled, expiresAt = null) => {
+    await pear.call('sharing:set', { circleId, enabled, expiresAt })
   }, [])
 
   // All non-home views live as sheets now. The home (map) view is the
@@ -532,7 +571,7 @@ export function App () {
         key={view.selectCircle ?? 'all'}
         identity={identity}
         profile={profile}
-        sharing={sharing.enabled}
+        sharing={!sharing.anyPaused}
         tileStyleUrl={tileStyleUrl}
         setView={setView}
         setSheet={setSheet}
@@ -552,7 +591,7 @@ export function App () {
           active={sheet?.name === 'settings'}
           profile={profile}
           sharing={sharing}
-          setSharing={setSharingEnabled}
+          setSharingForCircle={setSharingForCircle}
           tileStyleUrl={tileStyleUrl}
           setTileStyleUrl={setTileStyleUrlAndPersist}
           distanceUnit={distanceUnit}
@@ -3359,7 +3398,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved }) {
+function ProfileView ({ active = true, profile, sharing, setSharingForCircle, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -3368,8 +3407,6 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
   const [photoSaving, setPhotoSaving] = useState(false)
   const [error, setError] = useState(null)
   const [savedAt, setSavedAt] = useState(null)
-  const [sharingError, setSharingError] = useState(null)
-  const [togglingSharing, setTogglingSharing] = useState(false)
   const [batteryError, setBatteryError] = useState(null)
   // Collapsible state for the secondary settings groups. Closed by
   // default so first open of Settings is profile + sharing only;
@@ -3395,14 +3432,6 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
       })
     }
   }, [active, initialExpand])
-  // Re-render once a second while a mute has an active expiresAt so
-  // the countdown ticks. Stops once the expiry passes.
-  const [, setNowTick] = useState(0)
-  useEffect(() => {
-    if (sharing.enabled || !sharing.expiresAt) return
-    const id = setInterval(() => setNowTick(t => t + 1), 1000)
-    return () => clearInterval(id)
-  }, [sharing.enabled, sharing.expiresAt])
   const fileRef = useRef(null)
 
   const requestBatteryExempt = async () => {
@@ -3413,28 +3442,6 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
     } catch (e) {
       setBatteryError(String(e?.message ?? e))
     }
-  }
-
-  const stopSharing = async (durationMs) => {
-    setSharingError(null)
-    setTogglingSharing(true)
-    try {
-      const expiresAt = typeof durationMs === 'number' ? Date.now() + durationMs : null
-      await setSharing(false, expiresAt)
-    } catch (e) {
-      setSharingError(String(e?.message ?? e))
-    }
-    setTogglingSharing(false)
-  }
-  const resumeSharing = async () => {
-    setSharingError(null)
-    setTogglingSharing(true)
-    try {
-      await setSharing(true, null)
-    } catch (e) {
-      setSharingError(String(e?.message ?? e))
-    }
-    setTogglingSharing(false)
   }
 
   // Avatar saves immediately on pick or remove (PearCal flow). Local
@@ -3616,86 +3623,7 @@ function ProfileView ({ active = true, profile, sharing, setSharing, tileStyleUr
           slots into the page visually as a peer of the collapsibles
           below, but keeps the controls always-visible -- toggling
           sharing is the most safety-critical action in the app. */}
-      <div style={{
-        background: colors.surface.elevated,
-        borderRadius: radius.lg,
-        marginBottom: spacing.sm + 2,
-        overflow: 'hidden',
-      }}>
-        <div style={{
-          padding: `${spacing.md}px ${spacing.base}px`,
-          fontSize: 14, fontWeight: 400, color: colors.text.primary,
-          fontFamily: typography.fontFamily,
-          textAlign: 'center',
-        }}>
-          Location sharing
-        </div>
-        <div style={{ padding: `0 ${spacing.base}px ${spacing.base}px` }}>
-          {sharing.enabled ? (
-            <>
-              <p style={{ ...s.muted, marginTop: 0 }}>
-                Your location is being shared with the circles you're in.
-              </p>
-              <button
-                style={{
-                  width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`,
-                  background: 'transparent', color: colors.error,
-                  border: `1px solid ${colors.error}`, borderRadius: radius.lg,
-                  fontSize: typography.subheading.fontSize, fontWeight: 400,
-                  fontFamily: typography.fontFamily,
-                  cursor: togglingSharing ? 'default' : 'pointer',
-                  opacity: togglingSharing ? 0.5 : 1,
-                }}
-                disabled={togglingSharing}
-                onClick={() => stopSharing(null)}
-              >
-                {togglingSharing ? 'Stopping...' : 'Stop sharing'}
-              </button>
-              <p style={{ ...s.muted, marginTop: spacing.base, marginBottom: spacing.xs + 2 }}>Or pause briefly:</p>
-              <div style={{ display: 'flex', gap: spacing.sm }}>
-                {[
-                  { label: '15 min', ms: 15 * 60_000 },
-                  { label: '1 hour', ms: 60 * 60_000 },
-                  { label: '4 hours', ms: 4 * 60 * 60_000 },
-                ].map(({ label, ms }) => (
-                  <button
-                    key={label}
-                    disabled={togglingSharing}
-                    onClick={() => stopSharing(ms)}
-                    style={{
-                      flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`,
-                      // Inset surface against the elevated card -- darker
-                      // than card in dark mode, lighter than card in light
-                      // mode. Bright border (text.secondary) for definition
-                      // either way.
-                      background: colors.surface.input, color: colors.text.primary,
-                      border: `1px solid ${colors.text.secondary}`, borderRadius: radius.md,
-                      fontSize: typography.body.fontSize, fontWeight: 400,
-                      fontFamily: typography.fontFamily,
-                      cursor: togglingSharing ? 'default' : 'pointer',
-                      opacity: togglingSharing ? 0.5 : 1,
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </>
-          ) : (
-            <>
-              <p style={{ ...s.muted, marginTop: 0 }}>
-                {sharing.expiresAt
-                  ? `Sharing paused. Resumes in ${formatRemaining(sharing.expiresAt - Date.now())}.`
-                  : 'Sharing is paused. Other members see your last known location until you resume.'}
-              </p>
-              <button style={{ ...s.primaryBtn, fontFamily: typography.fontFamily }} disabled={togglingSharing} onClick={resumeSharing}>
-                {togglingSharing ? 'Resuming...' : 'Resume sharing'}
-              </button>
-            </>
-          )}
-          {sharingError && <p style={s.error}>{sharingError}</p>}
-        </div>
-      </div>
+      <LocationSharingSection active={active} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
 
       <Collapsible title='Circles' icon={UsersThree} open={circlesOpen} onToggle={() => setCirclesOpen(v => !v)} maxHeight='1200px'>
         <CirclesSection active={active && circlesOpen} onChanged={onSaved} />
@@ -3768,6 +3696,228 @@ function ThemeToggleSection ({ mode, onChange }) {
     <div style={{ display: 'flex', gap: spacing.sm }}>
       {btn('Dark', 'dark')}
       {btn('Light', 'light')}
+    </div>
+  )
+}
+
+// Per-circle location sharing controls. Pause durations are
+// 1h / 4h / 8h / 24h; an indefinite Stop is also available. State is
+// fed in from App via `sharing` (the worklet drives the source of
+// truth) so updates land in this component automatically via the
+// sharing:changed event.
+function LocationSharingSection ({ active = true, sharing, setSharingForCircle, s }) {
+  const [list, setList] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [pendingCircleId, setPendingCircleId] = useState(null)
+  const [expandedCircleId, setExpandedCircleId] = useState(null)
+  const [errorByCircle, setErrorByCircle] = useState({})
+
+  // Drive a one-second tick so the "Paused, resumes in 1h 23m" line
+  // counts down live. Only spins while at least one circle is paused
+  // with an expiresAt; the effect rearms when that condition flips.
+  const [, setNowTick] = useState(0)
+  const anyTickable = useMemo(() => {
+    return list.some((c) => {
+      const st = getCircleSharing(sharing, c.circleId)
+      return !st.enabled && typeof st.expiresAt === 'number'
+    })
+  }, [list, sharing])
+  useEffect(() => {
+    if (!anyTickable) return
+    const id = setInterval(() => setNowTick((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [anyTickable])
+
+  const refresh = useCallback(async () => {
+    try {
+      const snap = await pear.call('circles:getAll')
+      const next = (snap?.circles ?? [])
+        .filter((c) => !c.error && !c.circle?.deleted)
+        .map((c) => ({ circleId: c.circleId, name: c.circle?.name ?? '...' }))
+      setList(next)
+    } catch {
+      // Empty list keeps the section in its "no circles yet" copy.
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+  useEffect(() => { if (active) refresh() }, [active, refresh])
+
+  const apply = async (circleId, enabled, expiresAt = null) => {
+    setPendingCircleId(circleId)
+    setErrorByCircle((prev) => ({ ...prev, [circleId]: null }))
+    try {
+      await setSharingForCircle(circleId, enabled, expiresAt)
+      setExpandedCircleId(null)
+    } catch (e) {
+      setErrorByCircle((prev) => ({ ...prev, [circleId]: String(e?.message ?? e) }))
+    } finally {
+      setPendingCircleId(null)
+    }
+  }
+
+  return (
+    <div style={{
+      background: colors.surface.elevated,
+      borderRadius: radius.lg,
+      marginBottom: spacing.sm + 2,
+      overflow: 'hidden',
+    }}>
+      <div style={{
+        padding: `${spacing.md}px ${spacing.base}px`,
+        fontSize: 14, fontWeight: 400, color: colors.text.primary,
+        fontFamily: typography.fontFamily,
+        textAlign: 'center',
+      }}>
+        Location sharing
+      </div>
+      <div style={{ padding: `0 ${spacing.base}px ${spacing.base}px` }}>
+        {loading ? (
+          <p style={{ ...s.muted, marginTop: 0 }}>Loading…</p>
+        ) : list.length === 0 ? (
+          <p style={{ ...s.muted, marginTop: 0 }}>
+            Join or create a circle to start sharing your location.
+          </p>
+        ) : (
+          list.map((c, idx) => {
+            const st = getCircleSharing(sharing, c.circleId)
+            const isPending = pendingCircleId === c.circleId
+            const expanded = expandedCircleId === c.circleId
+            const err = errorByCircle[c.circleId]
+            const last = idx === list.length - 1
+            return (
+              <CircleSharingRow
+                key={c.circleId}
+                circle={c}
+                state={st}
+                isPending={isPending}
+                expanded={expanded}
+                error={err}
+                isLast={last}
+                onExpand={() => setExpandedCircleId(expanded ? null : c.circleId)}
+                onPause={(ms) => apply(c.circleId, false, ms ? Date.now() + ms : null)}
+                onResume={() => apply(c.circleId, true, null)}
+              />
+            )
+          })
+        )}
+      </div>
+    </div>
+  )
+}
+
+const PAUSE_DURATIONS = [
+  { label: '1 hour', ms: 60 * 60_000 },
+  { label: '4 hours', ms: 4 * 60 * 60_000 },
+  { label: '8 hours', ms: 8 * 60 * 60_000 },
+  { label: '24 hours', ms: 24 * 60 * 60_000 },
+]
+
+function CircleSharingRow ({ circle, state, isPending, expanded, error, isLast, onExpand, onPause, onResume }) {
+  const paused = !state.enabled
+  const remainingMs = paused && typeof state.expiresAt === 'number' ? state.expiresAt - Date.now() : null
+  const subText = paused
+    ? (remainingMs && remainingMs > 0
+        ? `Paused. Resumes in ${formatRemaining(remainingMs)}.`
+        : 'Stopped. Other members see your last known location.')
+    : 'Sharing your live location with this circle.'
+  return (
+    <div style={{
+      padding: `${spacing.sm + 2}px 0`,
+      borderBottom: isLast ? 'none' : `1px solid ${colors.divider}`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.sm }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{
+            ...typography.body, color: colors.text.primary,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {circle.name}
+          </div>
+          <div style={{
+            ...typography.caption,
+            color: paused ? colors.error : colors.text.secondary,
+            marginTop: 2,
+          }}>
+            {subText}
+          </div>
+        </div>
+        {paused ? (
+          <button
+            onClick={onResume}
+            disabled={isPending}
+            style={{
+              padding: '8px 14px', borderRadius: radius.sm,
+              background: colors.primary, color: colors.text.onPrimary,
+              border: `1px solid ${colors.primary}`,
+              fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 13,
+              cursor: isPending ? 'default' : 'pointer',
+              opacity: isPending ? 0.5 : 1,
+            }}
+          >
+            {isPending ? 'Resuming…' : 'Resume'}
+          </button>
+        ) : (
+          <button
+            onClick={onExpand}
+            disabled={isPending}
+            style={{
+              padding: '8px 14px', borderRadius: radius.sm,
+              background: expanded ? colors.surface.input : 'transparent',
+              color: colors.text.primary,
+              border: `1px solid ${colors.border}`,
+              fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 13,
+              cursor: isPending ? 'default' : 'pointer',
+              opacity: isPending ? 0.5 : 1,
+            }}
+          >
+            {isPending ? 'Pausing…' : 'Pause'}
+          </button>
+        )}
+      </div>
+      {expanded && !paused && (
+        <div style={{ marginTop: spacing.sm }}>
+          <div style={{ display: 'flex', gap: spacing.xs + 2, flexWrap: 'wrap' }}>
+            {PAUSE_DURATIONS.map(({ label, ms }) => (
+              <button
+                key={label}
+                onClick={() => onPause(ms)}
+                disabled={isPending}
+                style={{
+                  flex: '1 1 0', minWidth: 64,
+                  padding: `${spacing.sm + 2}px ${spacing.sm}px`,
+                  background: colors.surface.input, color: colors.text.primary,
+                  border: `1px solid ${colors.text.secondary}`, borderRadius: radius.md,
+                  fontSize: typography.body.fontSize, fontWeight: 400,
+                  fontFamily: typography.fontFamily,
+                  cursor: isPending ? 'default' : 'pointer',
+                  opacity: isPending ? 0.5 : 1,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => onPause(null)}
+            disabled={isPending}
+            style={{
+              width: '100%', marginTop: spacing.sm,
+              padding: `${spacing.md}px ${spacing.base}px`,
+              background: 'transparent', color: colors.error,
+              border: `1px solid ${colors.error}`, borderRadius: radius.md,
+              fontSize: 13, fontWeight: 400, fontFamily: typography.fontFamily,
+              cursor: isPending ? 'default' : 'pointer',
+              opacity: isPending ? 0.5 : 1,
+            }}
+          >
+            Stop sharing indefinitely
+          </button>
+        </div>
+      )}
+      {error && (
+        <p style={{ ...typography.caption, color: colors.error, marginTop: spacing.xs, marginBottom: 0 }}>{error}</p>
+      )}
     </div>
   )
 }
