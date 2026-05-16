@@ -354,12 +354,20 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     if let m = manager { return m }
     let m = CLLocationManager()
     m.delegate = self
-    m.desiredAccuracy = kCLLocationAccuracyBest
-    // 10m matches Android's effective cadence (FusedLocationProvider
-    // 5-10s with HIGH_ACCURACY priority). Tighter values burn battery
-    // for sub-block precision the geofence layer doesn't need.
+    // NearestTenMeters keeps the radio in a much lower-power mode than
+    // Best (which pins the GPS chip on). 10m is plenty for friend-on-
+    // a-map rendering, trip polylines, and the geofence layer (region
+    // monitoring runs on its own OS-managed pipeline and is unaffected
+    // by this knob).
+    m.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
     m.distanceFilter = 10
-    m.pausesLocationUpdatesAutomatically = false
+    // Let iOS pause delivery when the device is stationary; it resumes
+    // automatically on detected motion. The worklet's 15s heartbeat
+    // (HEARTBEAT_CHECK_INTERVAL_MS in bare.js) re-signs the last
+    // position so peers still see "Live" while paused. Was previously
+    // false; that combined with Best accuracy kept the GPS chip hot
+    // 24/7 and was the dominant battery drain reported by users.
+    m.pausesLocationUpdatesAutomatically = true
     // allowsBackgroundLocationUpdates needs UIBackgroundModes "location"
     // in Info.plist (set) and Always authorization at runtime; iOS
     // silently ignores the flag otherwise.
