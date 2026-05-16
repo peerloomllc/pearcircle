@@ -36,6 +36,7 @@ const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
+const { nextEmittedMode } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 
 // Reject values stamped more than 5 minutes in the future against the local
@@ -110,6 +111,14 @@ const _circleSharing = new Map()
 // also kills the active drive use case. See proposal-deferred slice 2
 // if this ever needs to survive crashes.
 let _tripState = newTripState()
+
+// Adaptive iOS location mode (proposal 2026-05-16). When enabled, the
+// worklet drives the native CLLocationManager between SLC-only ("idle")
+// and SLC+continuous ("tracking") based on trip-detection phase. Flip
+// to false to pin the native side at "tracking" so behavior matches
+// pre-adaptive without removing the driver wiring.
+const ADAPTIVE_LOCATION_MODE_ENABLED = true
+let _lastAdaptiveMode = null   // null until the first emission; mirrors what the shell last received
 
 // Suppress duplicate `transition:applied` IPC emits when autobase
 // re-applies the same op (indexer reorganization on writer-add or
@@ -937,6 +946,14 @@ const handlers = {
       const sp = typeof speed === 'number' ? speed : null
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
       _tripState = r.state
+      // Adaptive iOS location mode driver. Re-evaluate desired mode on
+      // every step; emit only on actual change. Shell ignores the event
+      // on non-iOS platforms so it's safe to fire unconditionally.
+      const nextMode = nextEmittedMode(_lastAdaptiveMode, _tripState.phase, ADAPTIVE_LOCATION_MODE_ENABLED)
+      if (nextMode != null) {
+        _lastAdaptiveMode = nextMode
+        send({ event: 'location:mode:set', data: { mode: nextMode } })
+      }
       if (r.completed) {
         const tripKey = 'trips:' + ourKey + ':' + r.completed.startTs
         const trip = {
