@@ -507,6 +507,18 @@ export default function Index() {
       try { await PearCircleLocation.setMonitoredRegions(regions) }
       catch (e: any) { console.warn('setMonitoredRegions failed', e?.message ?? String(e)) }
     })
+    // Adaptive location mode (proposal 2026-05-16). Worklet asks the
+    // native CLLocationManager to switch between SLC-only ("idle") and
+    // SLC+continuous ("tracking") based on trip-detection phase. iOS
+    // only; Android FusedLocationProvider has its own knobs and is
+    // tracked separately.
+    onEvent('location:mode:set', async (data) => {
+      if (Platform.OS !== 'ios' || !PearCircleLocation?.setMode) return
+      const mode = data?.mode
+      if (mode !== 'idle' && mode !== 'tracking') return
+      try { await PearCircleLocation.setMode(mode) }
+      catch (e: any) { console.warn('setMode failed', e?.message ?? String(e)) }
+    })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
     onEvent('sharing:changed', async (data) => {
       emitEvent('sharing:changed', data)

@@ -35,6 +35,13 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
 
   private var manager: CLLocationManager?
   private var hasListeners = false
+  // Adaptive location mode (proposal 2026-05-16). Worklet drives this
+  // via setMode("idle" | "tracking"). Both modes leave the SLC
+  // subscription on so iOS keeps waking us for ~500m cell-tower moves
+  // even when continuous delivery is stopped. Default "tracking" keeps
+  // behavior identical to pre-adaptive until the worklet's first
+  // setMode call lands.
+  private var currentMode: String = "tracking"
   // FIFO of region events that fired while no JS listener was attached.
   // Flushed in startObserving when the shell side wires up the
   // NativeEventEmitter listener.
@@ -148,7 +155,11 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     reject: @escaping RCTPromiseRejectBlock
   ) {
     DispatchQueue.main.async {
+      // Stop BOTH continuous and SLC. The FGS-lifecycle caller (mute
+      // every circle) wants the radio fully idle; leaving SLC on would
+      // still wake the worklet for nothing.
       self.manager?.stopUpdatingLocation()
+      self.manager?.stopMonitoringSignificantLocationChanges()
       resolve(true)
     }
   }
@@ -378,7 +389,48 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   }
 
   private func startUpdatesNow(_ mgr: CLLocationManager) {
-    mgr.startUpdatingLocation()
+    // SLC runs in BOTH adaptive modes (proposal 2026-05-16). It's the
+    // steady-state subscription that keeps the worklet alive on cell-
+    // tower transitions while continuous delivery is stopped. Cheap
+    // (<1% battery) and required for "idle" mode to deliver anything.
+    mgr.startMonitoringSignificantLocationChanges()
+    if currentMode == "tracking" {
+      mgr.startUpdatingLocation()
+    }
+  }
+
+  // Apply a worklet-requested mode change. "idle" stops continuous
+  // delivery and leaves SLC running; "tracking" adds continuous back
+  // on top. Idempotent — repeat calls to the same mode are no-ops.
+  // Called via the location:mode:set IPC route in app/index.tsx.
+  @objc func setMode(
+    _ mode: NSString,
+    resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      let m = mode as String
+      guard m == "idle" || m == "tracking" else {
+        resolve(false)
+        return
+      }
+      if m == self.currentMode {
+        resolve(true)
+        return
+      }
+      self.currentMode = m
+      guard let mgr = self.manager else {
+        // startUpdates not called yet; mode will apply on next start.
+        resolve(true)
+        return
+      }
+      if m == "tracking" {
+        mgr.startUpdatingLocation()
+      } else {
+        mgr.stopUpdatingLocation()
+      }
+      resolve(true)
+    }
   }
 
   private func handleAuthChange(manager: CLLocationManager, status: CLAuthorizationStatus) {
