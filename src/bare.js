@@ -38,6 +38,7 @@ const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
+const { TRIP_RETENTION_MS, tripIsExpired } = require('./lib/tripRetention')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -1165,6 +1166,48 @@ const handlers = {
   },
 }
 
+// Worklet-side trip retention sweep (proposal 2026-05-10 follow-up).
+// Drops trip records older than TRIP_RETENTION_MS from both surfaces:
+//   - Local Hyperbee trips:{pubkey}:{ts}     (self-only by design)
+//   - Per-circle autobase trip:{pubkey}:{padded} view (all members)
+// View deletes are local-only (Hyperbee on top of the autobase log);
+// they don't replicate, so each peer prunes its own copy independently.
+// Re-replication of expired records is blocked by the apply-branch
+// filter so the bound holds across reboots. Returns counts for logging.
+async function pruneOldTrips () {
+  if (!_initialized || !_localDb) return { localDeleted: 0, viewDeleted: 0 }
+  const now = Date.now()
+  let localDeleted = 0
+  let viewDeleted = 0
+  try {
+    const toDelete = []
+    for await (const { key, value } of _localDb.createReadStream({
+      gt: 'trips:',
+      lt: 'trips:~',
+    })) {
+      if (tripIsExpired(value, now)) toDelete.push(key)
+    }
+    for (const k of toDelete) {
+      try { await _localDb.del(k); localDeleted++ } catch {}
+    }
+  } catch (e) { console.warn('[bare] pruneOldTrips local scan failed', e?.message) }
+  for (const [, base] of _circleBases) {
+    try {
+      const toDelete = []
+      for await (const { key, value } of base.view.createReadStream({
+        gt: 'trip:',
+        lt: 'trip:~',
+      })) {
+        if (tripIsExpired(value, now)) toDelete.push(key)
+      }
+      for (const k of toDelete) {
+        try { await base.view.del(k); viewDeleted++ } catch {}
+      }
+    } catch (e) { console.warn('[bare] pruneOldTrips view scan failed', e?.message) }
+  }
+  return { localDeleted, viewDeleted }
+}
+
 // Replicate a freshly-completed trip to every per-circle autobase
 // whose sharing toggle is on. Per proposal 2026-05-10 the toggle is
 // strict opt-in (absent row = off) and only applies to FUTURE trips
@@ -1754,6 +1797,12 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       if (op.key.startsWith('trip:')) {
         const existing = await view.get(op.key)
         if (tripApplyDecision(op.key, op.value, existing, verifyValue) === 'accept') {
+          // Retention gate: don't store trip records older than the
+          // 14-day window. A late-syncing peer's stale trip log would
+          // otherwise blow back the bound that pruneOldTrips() just
+          // freed. tripIsExpired tolerates malformed records (keeps
+          // them) so a missing endTs doesn't silently drop data.
+          if (tripIsExpired(op.value, Date.now())) continue
           await view.put(op.key, op.value)
           try {
             if (
@@ -2092,6 +2141,20 @@ async function init ({ dataDir } = {}, attempt = 0) {
 
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
+
+  // Trip retention sweep. Run once on boot to claw back space from
+  // anything that aged past the cutoff while the worklet was down,
+  // then on a 6h cadence. Fire-and-forget; failures are logged inside
+  // pruneOldTrips and never block the boot path. Cheap (read-stream
+  // + a handful of deletes per circle) so a fixed cadence beats
+  // anything cleverer.
+  const TRIP_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
+  pruneOldTrips().then((r) => mark('trip:prune:boot', r))
+    .catch((e) => console.warn('[bare] pruneOldTrips boot failed', e?.message))
+  setInterval(() => {
+    pruneOldTrips().then((r) => mark('trip:prune:interval', r))
+      .catch((e) => console.warn('[bare] pruneOldTrips interval failed', e?.message))
+  }, TRIP_PRUNE_INTERVAL_MS)
   // Reconcile iOS CLCircularRegion state once init completes. Even
   // when zero places exist, this clears any stale OS-side regions
   // left over from a prior install. trackPlace calls during apply
