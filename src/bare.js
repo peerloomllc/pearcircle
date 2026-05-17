@@ -95,6 +95,15 @@ const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
+// Proposal 2026-05-17: tracks whether _selfLastSeen is a cold-boot
+// preload (lat/lon potentially many hours old even though we'll
+// republish with a fresh ts via heartbeat). Set true in init after
+// the preload pass; cleared on the first organic location:update for
+// this worklet process. When true, heartbeats include `stale: true`
+// on the signed value so peers can render the cold-boot peer as
+// "Reconnecting" instead of misrepresenting them as "Live" at a
+// possibly-stale position.
+let _selfPositionIsStale = false
 // Per-circle sharing state. circleId → { enabled, expiresAt, expiryTimer }.
 // Missing entry = enabled (default-on). Persisted as one Hyperbee row per
 // circle under `sharing:{circleId}`. Loaded on init; pre-2026-05-14 global
@@ -915,6 +924,11 @@ const handlers = {
       v: 1,
     }, _identity.secretKey)
     _selfLastSeen = value
+    // We have ground truth from the native location module — drop the
+    // cold-boot stale flag if set, so the next heartbeat emits an
+    // honest "Live" (no `stale` field) rather than keeping us pinned
+    // at "Reconnecting" on peers' screens. Idempotent when already false.
+    _selfPositionIsStale = false
 
     let written = 0
     for (const [circleId, base] of _circleBases) {
@@ -2115,6 +2129,11 @@ async function init ({ dataDir } = {}, attempt = 0) {
       speed: _selfLastSeen.speed ?? null,
       battery: _selfLastSeen.battery ?? null,
       isCharging: _selfLastSeen.isCharging ?? null,
+      // Proposal 2026-05-17: when the position came from the cold-boot
+      // preload and no real GPS fix has arrived yet, flag this
+      // heartbeat as stale so peers render "Reconnecting" instead of
+      // misrepresenting a possibly-hours-old position as "Live".
+      ...(_selfPositionIsStale ? { stale: true } : {}),
       v: 1,
     }, _identity.secretKey)
     _selfLastSeen = refreshed
@@ -2159,6 +2178,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
     if (newest) {
       _selfLastSeen = newest
+      _selfPositionIsStale = true
       mark('coldboot:selfLastSeen:preloaded', { ageMs: Date.now() - newest.ts })
     }
   } catch (e) {
