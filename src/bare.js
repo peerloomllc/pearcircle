@@ -130,6 +130,15 @@ let _lastAdaptiveMode = null   // null until the first emission; mirrors what th
 // sessions; eviction is FIFO-on-overflow.
 const _emittedTransitionKeys = new Set()
 const _EMITTED_TRANSITION_MAX = 1024
+// Cross-session freshness gate. The in-session dedup above only catches
+// re-applies within a single worklet run; on cold boot (or after force-
+// quit), the autobase indexer replays every historical transition op
+// through the apply pass and the dedup set is empty. Without this gate,
+// a user who hadn't opened the app in a day would get a notification
+// for every peer arrival/departure that landed during the offline
+// window. Real-time crossings carry a near-now ts and are unaffected.
+// 10min matches the peer-trip path's window for the same reason.
+const TRANSITION_FRESHNESS_MS = 10 * 60 * 1000
 
 // Same in-session dedup mechanism for `peerTrip:completed` emits on
 // `trip:{pubkey}:{startTsPadded}` appends. Cross-session replay (e.g.
@@ -1706,8 +1715,16 @@ async function applyCircleNodes (nodes, view, base, circleId) {
             for (let i = arr.length >> 1; i < arr.length; i++) _emittedTransitionKeys.add(arr[i])
           }
           _emittedTransitionKeys.add(op.key)
+          // Cross-session freshness gate. The incoming.ts is the
+          // signed timestamp at which the geofence crossing happened;
+          // historical replays on cold boot carry old values and get
+          // filtered here. Non-numeric ts (defensive) is treated as
+          // stale.
+          const fresh =
+            typeof incoming.ts === 'number' &&
+            Date.now() - incoming.ts <= TRANSITION_FRESHNESS_MS
           try {
-            if (circleId) {
+            if (fresh && circleId) {
               const memberRow = await view.get('member:' + incoming.pubkey)
               const placeRow = await view.get('place:' + incoming.placeId)
               const placeDeleted = !!(placeRow?.value && isDeleted(placeRow.value))
