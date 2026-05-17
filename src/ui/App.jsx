@@ -6,6 +6,7 @@ import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
+import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
@@ -5063,7 +5064,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
       <h3 style={{ ...typography.caption, color: colors.text.secondary, margin: `${spacing.base}px 0 ${spacing.sm}px`, textTransform: 'uppercase', letterSpacing: 0.5 }}>Last seen</h3>
       {seen ? (
         <div style={{ ...typography.body, color: colors.text.primary, lineHeight: 1.6 }}>
-          <div>{formatAbsoluteTime(seen.ts)} · <LiveOrAge ts={seen.ts} /></div>
+          <div>{formatAbsoluteTime(seen.ts)} · <LiveOrAge ts={seen.ts} stale={seen.stale} /></div>
           {geoLabel && <div style={{ color: colors.text.secondary }}>near {geoLabel}</div>}
           {Number.isFinite(seen.accuracy) && (
             <div style={{ ...typography.caption, color: colors.text.muted }}>±{Math.round(seen.accuracy)} m accuracy</div>
@@ -5745,7 +5746,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
           ) : seen ? (
             <div style={s.lastSeen}>
               {geoLabel ? 'near ' + geoLabel + ' · ' : ''}
-              <LiveOrAge ts={seen.ts} />
+              <LiveOrAge ts={seen.ts} stale={seen.stale} />
             </div>
           ) : (
             <div style={s.lastSeenMuted}>no location yet</div>
@@ -5885,15 +5886,28 @@ function ageLabel (ts) {
 // "Live" pill while ts is fresh, then falls back to coarser "Xm ago".
 // Used for lastSeen freshness; transitions keep ageLabel since they're
 // past events and "Live" wouldn't be the right framing.
-const LIVE_THRESHOLD_MS = 60_000
-function LiveOrAge ({ ts, prefix = 'updated ' }) {
-  if (typeof ts !== 'number') return null
-  const fresh = (Date.now() - ts) < LIVE_THRESHOLD_MS
-  if (fresh) {
+function LiveOrAge ({ ts, stale, prefix = 'updated ' }) {
+  // Three-way per proposal 2026-05-17. The pure helper handles the
+  // classification; this component owns rendering. "Reconnecting"
+  // shows when the peer is online (fresh ts via heartbeat) but their
+  // position is a cold-boot preload that hasn't been confirmed by a
+  // fresh GPS fix yet — so we don't lie by calling them "Live" at a
+  // potentially-stale location.
+  const status = liveStatus(ts, stale)
+  if (status === null) return null
+  if (status === 'live') {
     return (
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
         <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#7ec77a', display: 'inline-block' }} />
         Live
+      </span>
+    )
+  }
+  if (status === 'reconnecting') {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+        <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#e0b76a', display: 'inline-block' }} />
+        Reconnecting
       </span>
     )
   }
