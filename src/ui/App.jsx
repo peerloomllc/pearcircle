@@ -1379,6 +1379,32 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     return out
   }, [activeCircles, peersByCircle])
 
+  // Cold-boot syncing pill (proposal-deferred Phase 2 from the storage/
+  // sync session). The autobase apply pass on cold boot replays
+  // historical entries from connected peers and the view's lastSeen.ts
+  // walks forward over tens of seconds; during that window the UI shows
+  // stale-looking data even though replication is actively in progress.
+  // The pill says "Syncing with peers..." while the most plausible
+  // explanation for stale data is in-flight catch-up: mounted recently,
+  // peers are actually connected, but every connected peer's lastSeen
+  // is older than the freshness threshold. It auto-hides as soon as
+  // any peer's data freshens (catch-up succeeded), and times out after
+  // SYNC_PILL_WINDOW_MS regardless so it can't get stuck on.
+  const SYNC_PILL_WINDOW_MS = 30_000
+  const SYNC_STALE_THRESHOLD_MS = 5 * 60 * 1000
+  const mountTsRef = useRef(Date.now())
+  const [pillTick, setPillTick] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (Date.now() - mountTsRef.current > SYNC_PILL_WINDOW_MS) {
+        clearInterval(id)
+        return
+      }
+      setPillTick((t) => t + 1)
+    }, 1000)
+    return () => clearInterval(id)
+  }, [])
+
   // Inject self into the map even when the user has no circles yet
   // (zero-circle empty state) or hasn't appeared in any circle's lastSeen
   // yet, so the map is never blank.
@@ -1412,6 +1438,33 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     }
     return out
   }, [merged, myPubkey, selfSeen, profile])
+
+  // Companion banner suppressed? Pill is suppressed when either the
+  // permission or battery banner is showing — both occupy the same
+  // top-of-screen slot and stacking them looks busy. Both banner
+  // conditions hold for chronic states (denied permission, doze
+  // optimization on) while the pill is transient cold-boot only, so
+  // suppressing the pill is the right tradeoff.
+  const permissionBannerShowing =
+    permissionStatus !== 'always' && permissionStatus !== 'unknown' &&
+    permissionStatus !== 'notDetermined' && !bannerDismissed && !tourActive
+  const batteryBannerShowing =
+    battery.supported === true && !battery.exempt &&
+    !batteryBannerDismissed && !tourActive
+  const showSyncingPill = useMemo(() => {
+    if (Date.now() - mountTsRef.current > SYNC_PILL_WINDOW_MS) return false
+    if (permissionBannerShowing || batteryBannerShowing) return false
+    if (connectedPubkeys.size === 0) return false
+    const now = Date.now()
+    for (const pk of connectedPubkeys) {
+      const seen = data.lastSeen?.[pk]
+      if (seen?.ts && now - seen.ts < SYNC_STALE_THRESHOLD_MS) return false
+    }
+    return true
+  // pillTick forces re-eval against the elapsed-time / now-stale checks
+  // since the underlying lastSeen.ts comparison is time-based.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectedPubkeys, data, permissionBannerShowing, batteryBannerShowing, pillTick])
 
   // Auto-zoom to fit the new circle's members when the user picks one
   // from the floating pill. The pill click handlers set the flag above;
@@ -1694,6 +1747,39 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           onOpenSettings={onOpenBatteryAdvanced}
           onDismiss={onBatteryBannerDismiss}
         />
+      )}
+
+      {/* Cold-boot sync indicator. Slim pill, centered, sits just below
+          the floating circle pill (which is at safe-area + 12 with a
+          ~44px height). Visibility is gated by showSyncingPill — see
+          the memo where it's defined for the conditions. Not
+          dismissible; times out on its own. Lower z-index than the
+          floating pill's dropdown menu so an opened menu covers it
+          cleanly. */}
+      {showSyncingPill && (
+        <div
+          aria-live='polite'
+          style={{
+            position: 'absolute',
+            top: `calc(env(safe-area-inset-top, 24px) + 60px)`,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 15,
+            padding: `${spacing.xs}px ${spacing.md}px`,
+            background: 'rgba(26,26,26,0.92)',
+            border: `1px solid ${colorsRaw.border}`,
+            borderRadius: 999,
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            ...typography.caption,
+            color: colorsRaw.text.primary,
+            pointerEvents: 'none',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          Syncing with peers...
+        </div>
       )}
 
       {/* Slide-down member-focus top bar. Always mounted so the slide
