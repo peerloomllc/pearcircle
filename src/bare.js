@@ -2132,6 +2132,39 @@ async function init ({ dataDir } = {}, attempt = 0) {
     console.warn('[bare] loadPersistedSharing failed', e?.message)
   }
 
+  // Cold-boot self-position preload. Before this lands, _selfLastSeen
+  // is null until the FIRST location:update arrives (which waits on
+  // GPS warm-up — can be 30s+ after launch, especially on iOS in SLC-
+  // only mode or after location services were suspended for hours).
+  // During that window peers see our 24h-old lastSeen.ts and render
+  // us as "not Live", even though we just opened the app. Loading the
+  // most recent lastSeen we previously wrote from any writable circle
+  // unblocks the heartbeat: its next tick (≤15s) sees ts > stale and
+  // publishes a refreshed value, so peers see "Live" within ~15s
+  // instead of waiting for GPS. Side effect: if the user moved while
+  // closed, peers briefly see them at the old position until the
+  // organic location:update arrives. Acceptable — the alternative is
+  // "not Live for a minute or more after open" which users report as
+  // worse than "stale-by-a-minute".
+  try {
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    let newest = null
+    for (const [, base] of _circleBases) {
+      if (!base.writable) continue
+      const row = await base.view.get('lastSeen:' + ourKey).catch(() => null)
+      const v = row?.value
+      if (v && typeof v.ts === 'number' && (!newest || v.ts > newest.ts)) {
+        newest = v
+      }
+    }
+    if (newest) {
+      _selfLastSeen = newest
+      mark('coldboot:selfLastSeen:preloaded', { ageMs: Date.now() - newest.ts })
+    }
+  } catch (e) {
+    console.warn('[bare] selfLastSeen preload failed', e?.message)
+  }
+
   // Peer-trip notification toggle. Default on; only flip if the user
   // explicitly opted out (persisted false). Missing row = default state.
   try {
