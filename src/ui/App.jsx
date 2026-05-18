@@ -1380,32 +1380,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     return out
   }, [activeCircles, peersByCircle])
 
-  // Cold-boot syncing pill (proposal-deferred Phase 2 from the storage/
-  // sync session). The autobase apply pass on cold boot replays
-  // historical entries from connected peers and the view's lastSeen.ts
-  // walks forward over tens of seconds; during that window the UI shows
-  // stale-looking data even though replication is actively in progress.
-  // The pill says "Syncing with peers..." while the most plausible
-  // explanation for stale data is in-flight catch-up: mounted recently,
-  // peers are actually connected, but every connected peer's lastSeen
-  // is older than the freshness threshold. It auto-hides as soon as
-  // any peer's data freshens (catch-up succeeded), and times out after
-  // SYNC_PILL_WINDOW_MS regardless so it can't get stuck on.
-  const SYNC_PILL_WINDOW_MS = 30_000
-  const SYNC_STALE_THRESHOLD_MS = 5 * 60 * 1000
-  const mountTsRef = useRef(Date.now())
-  const [pillTick, setPillTick] = useState(0)
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (Date.now() - mountTsRef.current > SYNC_PILL_WINDOW_MS) {
-        clearInterval(id)
-        return
-      }
-      setPillTick((t) => t + 1)
-    }, 1000)
-    return () => clearInterval(id)
-  }, [])
-
   // Inject self into the map even when the user has no circles yet
   // (zero-circle empty state) or hasn't appeared in any circle's lastSeen
   // yet, so the map is never blank.
@@ -1439,33 +1413,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     }
     return out
   }, [merged, myPubkey, selfSeen, profile])
-
-  // Companion banner suppressed? Pill is suppressed when either the
-  // permission or battery banner is showing — both occupy the same
-  // top-of-screen slot and stacking them looks busy. Both banner
-  // conditions hold for chronic states (denied permission, doze
-  // optimization on) while the pill is transient cold-boot only, so
-  // suppressing the pill is the right tradeoff.
-  const permissionBannerShowing =
-    permissionStatus !== 'always' && permissionStatus !== 'unknown' &&
-    permissionStatus !== 'notDetermined' && !bannerDismissed && !tourActive
-  const batteryBannerShowing =
-    battery.supported === true && !battery.exempt &&
-    !batteryBannerDismissed && !tourActive
-  const showSyncingPill = useMemo(() => {
-    if (Date.now() - mountTsRef.current > SYNC_PILL_WINDOW_MS) return false
-    if (permissionBannerShowing || batteryBannerShowing) return false
-    if (connectedPubkeys.size === 0) return false
-    const now = Date.now()
-    for (const pk of connectedPubkeys) {
-      const seen = data.lastSeen?.[pk]
-      if (seen?.ts && now - seen.ts < SYNC_STALE_THRESHOLD_MS) return false
-    }
-    return true
-  // pillTick forces re-eval against the elapsed-time / now-stale checks
-  // since the underlying lastSeen.ts comparison is time-based.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectedPubkeys, data, permissionBannerShowing, batteryBannerShowing, pillTick])
 
   // Auto-zoom to fit the new circle's members when the user picks one
   // from the floating pill. The pill click handlers set the flag above;
@@ -1750,38 +1697,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         />
       )}
 
-      {/* Cold-boot sync indicator. Slim pill, centered, sits just below
-          the floating circle pill (which is at safe-area + 12 with a
-          ~44px height). Visibility is gated by showSyncingPill — see
-          the memo where it's defined for the conditions. Not
-          dismissible; times out on its own. Lower z-index than the
-          floating pill's dropdown menu so an opened menu covers it
-          cleanly. */}
-      {showSyncingPill && (
-        <div
-          aria-live='polite'
-          style={{
-            position: 'absolute',
-            top: `calc(env(safe-area-inset-top, 24px) + 60px)`,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            zIndex: 15,
-            padding: `${spacing.xs}px ${spacing.md}px`,
-            background: 'rgba(26,26,26,0.92)',
-            border: `1px solid ${colorsRaw.border}`,
-            borderRadius: 999,
-            backdropFilter: 'blur(8px)',
-            WebkitBackdropFilter: 'blur(8px)',
-            ...typography.caption,
-            color: colorsRaw.text.primary,
-            pointerEvents: 'none',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          Syncing with peers...
-        </div>
-      )}
 
       {/* Slide-down member-focus top bar. Always mounted so the slide
           animation has content; hidden above the viewport when no member
@@ -2082,6 +1997,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           transitions={data.transitions}
           placesById={placesById}
           isSelf={selectedPubkey === myPubkey}
+          connected={connectedPubkeys.has(selectedPubkey)}
           onOpenTrips={() => {
             setMemberSheetVisible(false)
             const isSelf = selectedPubkey === myPubkey
@@ -2117,6 +2033,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                     isPaused={isPaused}
                     transition={t}
                     transitionPlaceName={tPlaceName}
+                    connected={connectedPubkeys.has(pubkey)}
+                    isSelf={pubkey === myPubkey}
                     onFocus={focusMember}
                   />
                 )
@@ -4987,7 +4905,7 @@ function initialsFor (label) {
 // places list. Closing only hides the sheet; the focus state lives on
 // the parent so the user can re-open via tap-on-focus-bar without
 // re-flying the map.
-function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, onOpenTrips, onClose }) {
+function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, onOpenTrips, onClose }) {
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
   // Whether this member has any trips visible to us. Async-probed
@@ -5068,6 +4986,12 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
           {geoLabel && <div style={{ color: colors.text.secondary }}>near {geoLabel}</div>}
           {Number.isFinite(seen.accuracy) && (
             <div style={{ ...typography.caption, color: colors.text.muted }}>±{Math.round(seen.accuracy)} m accuracy</div>
+          )}
+          {!isSelf && (
+            <div style={{ ...typography.caption, color: colors.text.secondary, display: 'flex', alignItems: 'center', gap: 6, marginTop: spacing.xs }}>
+              <ConnectionDot connected={connected} />
+              {connected ? 'In contact' : 'Not in contact'}
+            </div>
           )}
         </div>
       ) : (
@@ -5706,7 +5630,7 @@ function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive =
 // Single member row in the bottom sheet's roster. Pulled out as its
 // own component so the useReverseGeocode hook has a stable call site
 // per row (otherwise hook ordering would shift with the members list).
-function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, onFocus }) {
+function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, connected, isSelf, onFocus }) {
   const pubkey = member.value?.pubkey ?? ''
   const displayName = member.value?.displayName ?? short(pubkey)
   const focusable = !!seen && !isPaused
@@ -5731,6 +5655,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
               <div style={{ ...s.memberName, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
+              {!isSelf && <ConnectionDot connected={connected} />}
               {!isPaused && <MotionGlyph speed={seen?.speed} size={14} />}
             </div>
             {!isPaused && <BatteryBadge level={seen?.battery} charging={!!seen?.isCharging} />}
@@ -5745,8 +5670,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
             </div>
           ) : seen ? (
             <div style={s.lastSeen}>
-              {geoLabel ? 'near ' + geoLabel + ' · ' : ''}
-              <LiveOrAge ts={seen.ts} stale={seen.stale} />
+              {geoLabel ? 'near ' + geoLabel : 'no place yet'}
             </div>
           ) : (
             <div style={s.lastSeenMuted}>no location yet</div>
@@ -5754,6 +5678,28 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, o
         </div>
       </div>
     </li>
+  )
+}
+
+// Tiny inline dot for the Hyperswarm connection state of a non-self
+// peer. Green when we're in a live swarm session with this pubkey on
+// any circle; muted otherwise. Driven by `peersByCircle` upstream
+// (proposal 2026-05-17-swarm-live-signal). Hover/long-press hint via
+// the title attribute. Uses colorsRaw because this is a styled inline
+// SVG-ish element, not a CSS-var context.
+function ConnectionDot ({ connected }) {
+  return (
+    <span
+      title={connected ? 'In contact' : 'Not in contact'}
+      style={{
+        display: 'inline-block',
+        width: 8,
+        height: 8,
+        borderRadius: 4,
+        background: connected ? colorsRaw.success : colorsRaw.text.muted,
+        flexShrink: 0,
+      }}
+    />
   )
 }
 
