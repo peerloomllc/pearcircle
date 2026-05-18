@@ -9,7 +9,7 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "bundleIdentifier": "com.pearcircle",
-      "buildNumber": "1",
+      "buildNumber": "14",
       "infoPlist": {
         "NSCameraUsageDescription": "Used to scan circle invite QR codes and set your profile photo",
         "NSPhotoLibraryUsageDescription": "Used to set your profile photo",
@@ -61,7 +61,7 @@
           ]
         }
       ],
-      "versionCode": 1
+      "versionCode": 1000004
     },
     "plugins": [
       [
@@ -91,6 +91,6 @@
       "./assets/bare-universal.bundle",
       "./assets/bare-ios.bundle"
     ],
-    "version": "0.1.0"
+    "version": "1.0.4"
   }
 }
