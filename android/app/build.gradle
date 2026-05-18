@@ -92,8 +92,16 @@ android {
         applicationId 'com.pearcircle'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "0.1.0"
+        // Version is sourced from the release pipeline. release.sh exports
+        // APP_VERSION (e.g. "1.0.4") and APP_VERSION_CODE (e.g. 1000004) as
+        // env vars before invoking `./gradlew assembleRelease`. Falls back
+        // to project properties (-PAPP_VERSION=...) and then to the
+        // scaffolded defaults so a bare `./gradlew assembleDebug` from a dev
+        // machine still works without the release env in scope.
+        def resolvedAppVersion = System.getenv("APP_VERSION") ?: project.findProperty("APP_VERSION") ?: "0.1.0"
+        def resolvedAppVersionCode = (System.getenv("APP_VERSION_CODE") ?: project.findProperty("APP_VERSION_CODE") ?: "1").toString().toInteger()
+        versionCode resolvedAppVersionCode
+        versionName resolvedAppVersion
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
     }
