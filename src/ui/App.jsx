@@ -1841,7 +1841,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               All circles
             </button>
           )}
-          {circles.map((c) => (
+          {[...circles].sort((a, b) => byName(a.circle?.name, b.circle?.name)).map((c) => (
             <div key={c.circleId} style={{ display: 'flex', alignItems: 'stretch', gap: 4 }}>
               <button
                 style={{ ...s.menuItem, ...(selectedCircleId === c.circleId ? s.menuItemActive : null), flex: 1 }}
@@ -2018,7 +2018,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             <p style={s.muted}>No members visible yet. Waiting for sync...</p>
           ) : (
             <ul style={s.memberList}>
-              {data.members.map(m => {
+              {[...data.members].sort((a, b) => byName(a.value?.displayName, b.value?.displayName)).map(m => {
                 const pubkey = m.value?.pubkey ?? ''
                 const seen = data.lastSeen?.[pubkey]
                 const pres = data.presence?.[pubkey]
@@ -2268,7 +2268,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
         <>
           <label style={s.label}>Add to circle</label>
           <div style={s.durationRow}>
-            {circles.map(c => (
+            {[...circles].sort((a, b) => byName(a.circle?.name, b.circle?.name)).map(c => (
               <button
                 key={c.circleId}
                 style={{
@@ -3220,7 +3220,7 @@ function CirclesSection ({ active = true, onChanged }) {
         Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy.
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
-        {list.map(c => {
+        {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
           const isPending = pending === c.circleId
           const isEditing = editingId === c.circleId
           if (isEditing) {
@@ -3732,12 +3732,12 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
             Join or create a circle to start sharing your location.
           </p>
         ) : (
-          list.map((c, idx) => {
+          [...list].sort((a, b) => byName(a.name, b.name)).map((c, idx, sorted) => {
             const st = getCircleSharing(sharing, c.circleId)
             const isPending = pendingCircleId === c.circleId
             const expanded = expandedCircleId === c.circleId
             const err = errorByCircle[c.circleId]
-            const last = idx === list.length - 1
+            const last = idx === sorted.length - 1
             return (
               <CircleSharingRow
                 key={c.circleId}
@@ -3938,7 +3938,7 @@ function TripsSharingSection ({ active = true }) {
       <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, fontWeight: 400 }}>
         When on, future trips you take are shared with members of that circle. Past trips remain private until you turn this on. Off any time.
       </p>
-      {list.map((c) => {
+      {[...list].sort((a, b) => byName(a.name, b.name)).map((c) => {
         const on = sharing[c.circleId] !== false
         const busy = pendingCircleId === c.circleId
         return (
@@ -5856,6 +5856,23 @@ function short (s) {
   if (!s || typeof s !== 'string') return '...'
   if (s.length <= 12) return s
   return s.slice(0, 8) + '...' + s.slice(-4)
+}
+
+// Case-insensitive comparator for sorting user-named entities
+// (circles, members) alphabetically in the UI. Uses toLowerCase()
+// instead of localeCompare's `sensitivity` option because the
+// Android System WebView Intl.Collator implementation silently
+// ignores the option in some builds, leaving uppercase letters
+// sorted before lowercase (Hal, Pixel, iPhone instead of Hal,
+// iPhone, Pixel). toLowerCase + plain < / > works everywhere.
+// Treats null/undefined as empty string so missing names land at
+// the top deterministically rather than throwing.
+function byName (a, b) {
+  const aL = (a ?? '').toLowerCase()
+  const bL = (b ?? '').toLowerCase()
+  if (aL < bL) return -1
+  if (aL > bL) return 1
+  return 0
 }
 
 const s = {
