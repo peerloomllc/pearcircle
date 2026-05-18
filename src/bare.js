@@ -30,7 +30,8 @@ const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
-const { setupPairChannel } = require('./pair')
+const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
+const Protomux = require('protomux')
 const { signValue, verifyValue } = require('./lib/sign')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
@@ -94,6 +95,14 @@ let _initialized = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+// Active Hyperswarm connections (post-handshake, pre-close). Tracked so
+// circle:join can open the pair channel for a newly-added circle on
+// every live connection. Hyperswarm reuses one connection per peer
+// pair regardless of how many topics they share, so a connection
+// established before a circle existed has no pair channel for that
+// circle unless we open it explicitly post-hoc.
+// Proposal 2026-05-18-pair-channel-on-circle-add.
+const _activeConns = new Set()
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
 // Per-circle sharing state. circleId → { enabled, expiresAt, expiryTimer }.
 // Missing entry = enabled (default-on). Persisted as one Hyperbee row per
@@ -439,6 +448,7 @@ const handlers = {
     // sometimes sits with no peers for tens of seconds and pre-existing
     // members appear "disconnected" until an app restart kicks the DHT.
     _circleBases.set(circleId, base)
+    openPairChannelsForCircle(circleId, base)
     const discovery = joinCircleTopic(circleId, circleKey)
     if (discovery && typeof discovery.flushed === 'function') {
       try { await discovery.flushed() } catch (e) {
@@ -1896,7 +1906,69 @@ async function mountCircleAutobase (circleId, bootstrapHex) {
   })
   await base.ready()
   _circleBases.set(circleId, base)
+  openPairChannelsForCircle(circleId, base)
   return base
+}
+
+// Open pair channels for a newly-added circle on every currently-live
+// swarm connection (joiner-initiated path). The owner side does NOT
+// call this from circle:create — instead the owner relies on the
+// protomux pair() callback registered at conn-open time to lazily
+// match an incoming open from the joiner. See registerPairNotify
+// below. Calling this on the joiner side creates the channel on the
+// joiner's mux and sends an OPEN frame; the owner's pair() notify
+// catches it and creates the matching channel, letting the handshake
+// complete.
+// Proposal 2026-05-18-pair-channel-on-circle-add.
+function openPairChannelsForCircle (circleId, base) {
+  let opened = 0
+  for (const conn of _activeConns) {
+    const ch = setupPairChannel({
+      conn,
+      circleId,
+      base,
+      onWriterAdded: (writerKey) => {
+        send({ event: 'circle:writer:added', data: { circleId, writerKey } })
+      },
+      mark,
+    })
+    if (ch) opened++
+  }
+  mark('pair:open-for-circle', { circleId: circleId.slice(0, 8), conns: _activeConns.size, opened, writable: !!base.writable })
+}
+
+// Register a protomux pair() notify on every conn so an OPEN frame
+// from a peer for ANY circle id we know about gets a matching
+// channel created lazily. Protomux behavior: when a remote opens a
+// (protocol, id) without a local channel pending, the open is queued
+// on info.incoming and _requestSession awaits our notify; if notify
+// creates a matching channel during the await, the create call grabs
+// the queued incoming entry and onopen fires on both sides; if not,
+// protomux rejects the open. This is the canonical mechanism for
+// "owner doesn't know a joiner is coming". Called from
+// onSwarmConnection.
+function registerPairNotify (conn) {
+  const mux = Protomux.from(conn)
+  mux.pair({ protocol: PAIR_PROTOCOL, id: null }, async (id) => {
+    if (!id) return
+    let circleIdStr
+    try { circleIdStr = b4a.toString(id) } catch { return }
+    const base = _circleBases.get(circleIdStr)
+    if (!base) {
+      mark('pair:remote-open-no-base', { cid: circleIdStr.slice(0, 8) })
+      return
+    }
+    mark('pair:remote-open-matched', { cid: circleIdStr.slice(0, 8), writable: !!base.writable })
+    setupPairChannel({
+      conn,
+      circleId: circleIdStr,
+      base,
+      onWriterAdded: (writerKey) => {
+        send({ event: 'circle:writer:added', data: { circleId: circleIdStr, writerKey } })
+      },
+      mark,
+    })
+  })
 }
 
 function onSwarmConnection (conn, info) {
@@ -1904,6 +1976,8 @@ function onSwarmConnection (conn, info) {
   // emit peer:connected — UI typically calls circle:get right after that
   // event and we want the view to be fresh.
   _store.replicate(conn)
+  _activeConns.add(conn)
+  registerPairNotify(conn)
 
   const remotePublicKey = b4a.toString(info.publicKey, 'hex')
 
@@ -1920,6 +1994,7 @@ function onSwarmConnection (conn, info) {
       onWriterAdded: (writerKey) => {
         send({ event: 'circle:writer:added', data: { circleId, writerKey } })
       },
+      mark,
     })
   }
 
@@ -1950,6 +2025,7 @@ function onSwarmConnection (conn, info) {
     send({ event: 'peer:connected', data: { circleId, remotePublicKey } })
   }
   conn.on('close', () => {
+    _activeConns.delete(conn)
     for (const circleId of matchedCircleIds) {
       const peers = _circlePeers.get(circleId)
       if (peers) peers.delete(remotePublicKey)
