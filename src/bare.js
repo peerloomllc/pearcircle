@@ -95,15 +95,6 @@ const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
-// Proposal 2026-05-17: tracks whether _selfLastSeen is a cold-boot
-// preload (lat/lon potentially many hours old even though we'll
-// republish with a fresh ts via heartbeat). Set true in init after
-// the preload pass; cleared on the first organic location:update for
-// this worklet process. When true, heartbeats include `stale: true`
-// on the signed value so peers can render the cold-boot peer as
-// "Reconnecting" instead of misrepresenting them as "Live" at a
-// possibly-stale position.
-let _selfPositionIsStale = false
 // Per-circle sharing state. circleId → { enabled, expiresAt, expiryTimer }.
 // Missing entry = enabled (default-on). Persisted as one Hyperbee row per
 // circle under `sharing:{circleId}`. Loaded on init; pre-2026-05-14 global
@@ -924,11 +915,6 @@ const handlers = {
       v: 1,
     }, _identity.secretKey)
     _selfLastSeen = value
-    // We have ground truth from the native location module — drop the
-    // cold-boot stale flag if set, so the next heartbeat emits an
-    // honest "Live" (no `stale` field) rather than keeping us pinned
-    // at "Reconnecting" on peers' screens. Idempotent when already false.
-    _selfPositionIsStale = false
 
     let written = 0
     for (const [circleId, base] of _circleBases) {
@@ -2096,54 +2082,6 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
   }, 5000)
 
-  // Stationary-device heartbeat. The UI's "Live" indicator (LiveOrAge
-  // in App.jsx, gated on LIVE_THRESHOLD_MS = 60_000) drops within a
-  // minute of the latest lastSeen.ts. On iOS CLLocationManager has
-  // distanceFilter=10 (PearCircleLocationModule.swift) so a foregrounded
-  // but stationary device emits no events for minutes at a time;
-  // Android's FusedLocationProvider is more chatty but can also stall.
-  // Without this, a healthy app with a live swarm connection still
-  // appears "not Live" to peers (and shows peers as not-Live locally)
-  // simply because nobody moved.
-  //
-  // Every HEARTBEAT_CHECK_INTERVAL_MS, if our own lastSeen.ts has aged
-  // past HEARTBEAT_STALE_MS without an organic location:update, re-sign
-  // the most recent position with a fresh ts and append to every
-  // writable circle. Same shape as a real location:update — peers'
-  // verifyValue + apply branch accept it identically. We skip
-  // checkPlaceTransitions because the lat/lon hasn't changed, so no
-  // geofence could fire.
-  const HEARTBEAT_CHECK_INTERVAL_MS = 15_000
-  const HEARTBEAT_STALE_MS = 30_000
-  setInterval(async () => {
-    if (!_initialized || !_selfLastSeen) return
-    if (!anyCircleEnabled()) return
-    if (Date.now() - _selfLastSeen.ts < HEARTBEAT_STALE_MS) return
-    const ourKey = b4a.toString(_identity.publicKey, 'hex')
-    const refreshed = signValue({
-      pubkey: ourKey,
-      lat: _selfLastSeen.lat,
-      lon: _selfLastSeen.lon,
-      accuracy: _selfLastSeen.accuracy ?? null,
-      ts: Date.now(),
-      speed: _selfLastSeen.speed ?? null,
-      battery: _selfLastSeen.battery ?? null,
-      isCharging: _selfLastSeen.isCharging ?? null,
-      // Proposal 2026-05-17: when the position came from the cold-boot
-      // preload and no real GPS fix has arrived yet, flag this
-      // heartbeat as stale so peers render "Reconnecting" instead of
-      // misrepresenting a possibly-hours-old position as "Live".
-      ...(_selfPositionIsStale ? { stale: true } : {}),
-      v: 1,
-    }, _identity.secretKey)
-    _selfLastSeen = refreshed
-    for (const [circleId, base] of _circleBases) {
-      if (!base.writable) continue
-      if (!getCircleSharing(circleId).enabled) continue
-      try { await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value: refreshed }) } catch {}
-    }
-  }, HEARTBEAT_CHECK_INTERVAL_MS)
-
   // Load per-circle sharing state (default visible per circle). Mutes
   // with expired timestamps fire immediately via armCircleExpiryTimer.
   // Also migrates and clears any legacy global `sharing` row.
@@ -2151,20 +2089,14 @@ async function init ({ dataDir } = {}, attempt = 0) {
     console.warn('[bare] loadPersistedSharing failed', e?.message)
   }
 
-  // Cold-boot self-position preload. Before this lands, _selfLastSeen
-  // is null until the FIRST location:update arrives (which waits on
-  // GPS warm-up — can be 30s+ after launch, especially on iOS in SLC-
-  // only mode or after location services were suspended for hours).
-  // During that window peers see our 24h-old lastSeen.ts and render
-  // us as "not Live", even though we just opened the app. Loading the
-  // most recent lastSeen we previously wrote from any writable circle
-  // unblocks the heartbeat: its next tick (≤15s) sees ts > stale and
-  // publishes a refreshed value, so peers see "Live" within ~15s
-  // instead of waiting for GPS. Side effect: if the user moved while
-  // closed, peers briefly see them at the old position until the
-  // organic location:update arrives. Acceptable — the alternative is
-  // "not Live for a minute or more after open" which users report as
-  // worse than "stale-by-a-minute".
+  // Cold-boot self-position preload. Loads the most recent lastSeen
+  // we previously wrote into any writable circle so the home-screen
+  // empty-state and the self pin have something to render before the
+  // first organic location:update arrives. Local-only: nothing is
+  // republished from this value — peers see our position freshness
+  // through their swarm-connected dot plus our actual location writes
+  // (proposal 2026-05-17-swarm-live-signal). The heartbeat republish
+  // that motivated this preload's earlier incarnation is gone.
   try {
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     let newest = null
@@ -2178,7 +2110,6 @@ async function init ({ dataDir } = {}, attempt = 0) {
     }
     if (newest) {
       _selfLastSeen = newest
-      _selfPositionIsStale = true
       mark('coldboot:selfLastSeen:preloaded', { ageMs: Date.now() - newest.ts })
     }
   } catch (e) {
