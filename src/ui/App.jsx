@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
@@ -3365,6 +3365,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   // default so first open of Settings is profile + sharing only;
   // user expands what they need. Persists across sheet open/close
   // (SheetContainer keeps the component mounted).
+  const [locationSharingOpen, setLocationSharingOpen] = useState(false)
   const [circlesOpen, setCirclesOpen] = useState(false)
   const [tripSharingOpen, setTripSharingOpen] = useState(false)
   const [displayOpen, setDisplayOpen] = useState(false)
@@ -3572,11 +3573,9 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
 
-      {/* Static (non-collapsible) card. Matches Collapsible chrome so it
-          slots into the page visually as a peer of the collapsibles
-          below, but keeps the controls always-visible -- toggling
-          sharing is the most safety-critical action in the app. */}
-      <LocationSharingSection active={active} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
+      <Collapsible title='Location sharing' icon={Broadcast} open={locationSharingOpen} onToggle={() => setLocationSharingOpen(v => !v)} maxHeight='1200px'>
+        <LocationSharingSection active={active && locationSharingOpen} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
+      </Collapsible>
 
       <Collapsible title='Circles' icon={UsersThree} open={circlesOpen} onToggle={() => setCirclesOpen(v => !v)} maxHeight='1200px'>
         <CirclesSection active={active && circlesOpen} onChanged={onSaved} />
@@ -3709,53 +3708,41 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
     }
   }
 
+  // Chrome (background, border radius, title) is supplied by the
+  // surrounding Collapsible in ProfileView. This component just
+  // renders the per-circle pause/resume rows.
   return (
-    <div style={{
-      background: colors.surface.elevated,
-      borderRadius: radius.lg,
-      marginBottom: spacing.sm + 2,
-      overflow: 'hidden',
-    }}>
-      <div style={{
-        padding: `${spacing.md}px ${spacing.base}px`,
-        fontSize: 14, fontWeight: 400, color: colors.text.primary,
-        fontFamily: typography.fontFamily,
-        textAlign: 'center',
-      }}>
-        Location sharing
-      </div>
-      <div style={{ padding: `0 ${spacing.base}px ${spacing.base}px` }}>
-        {loading ? (
-          <p style={{ ...s.muted, marginTop: 0 }}>Loading…</p>
-        ) : list.length === 0 ? (
-          <p style={{ ...s.muted, marginTop: 0 }}>
-            Join or create a circle to start sharing your location.
-          </p>
-        ) : (
-          [...list].sort((a, b) => byName(a.name, b.name)).map((c, idx, sorted) => {
-            const st = getCircleSharing(sharing, c.circleId)
-            const isPending = pendingCircleId === c.circleId
-            const expanded = expandedCircleId === c.circleId
-            const err = errorByCircle[c.circleId]
-            const last = idx === sorted.length - 1
-            return (
-              <CircleSharingRow
-                key={c.circleId}
-                circle={c}
-                state={st}
-                isPending={isPending}
-                expanded={expanded}
-                error={err}
-                isLast={last}
-                onExpand={() => setExpandedCircleId(expanded ? null : c.circleId)}
-                onPause={(ms) => apply(c.circleId, false, ms ? Date.now() + ms : null)}
-                onResume={() => apply(c.circleId, true, null)}
-              />
-            )
-          })
-        )}
-      </div>
-    </div>
+    <>
+      {loading ? (
+        <p style={{ ...s.muted, marginTop: 0 }}>Loading…</p>
+      ) : list.length === 0 ? (
+        <p style={{ ...s.muted, marginTop: 0 }}>
+          Join or create a circle to start sharing your location.
+        </p>
+      ) : (
+        [...list].sort((a, b) => byName(a.name, b.name)).map((c, idx, sorted) => {
+          const st = getCircleSharing(sharing, c.circleId)
+          const isPending = pendingCircleId === c.circleId
+          const expanded = expandedCircleId === c.circleId
+          const err = errorByCircle[c.circleId]
+          const last = idx === sorted.length - 1
+          return (
+            <CircleSharingRow
+              key={c.circleId}
+              circle={c}
+              state={st}
+              isPending={isPending}
+              expanded={expanded}
+              error={err}
+              isLast={last}
+              onExpand={() => setExpandedCircleId(expanded ? null : c.circleId)}
+              onPause={(ms) => apply(c.circleId, false, ms ? Date.now() + ms : null)}
+              onResume={() => apply(c.circleId, true, null)}
+            />
+          )
+        })
+      )}
+    </>
   )
 }
 
