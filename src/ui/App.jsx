@@ -3863,10 +3863,12 @@ function CircleSharingRow ({ circle, state, isPending, expanded, error, isLast, 
 }
 
 // Per-circle trip-sharing toggle list (proposal 2026-05-10). Default
-// on everywhere (opt-out). Toggling off shows a confirmation surfacing
-// the privacy posture; toggling on is non-destructive (future trips
-// resume replicating, past trips stay private until the user enables
-// sharing for them explicitly).
+// OFF everywhere (opt-in) — privacy is the load-bearing constraint
+// per the proposal: a user upgrading to this build ships zero trips
+// until they explicitly turn sharing on for at least one circle.
+// Toggling on is non-destructive (only future trips replicate; past
+// trips stay private). Toggling off shows a confirmation surfacing
+// the implications.
 function TripsSharingSection ({ active = true }) {
   const [list, setList] = useState([])
   const [sharing, setSharing] = useState({})
@@ -3926,7 +3928,7 @@ function TripsSharingSection ({ active = true }) {
         When on, future trips you take are shared with members of that circle. Past trips remain private until you turn this on. Off any time.
       </p>
       {[...list].sort((a, b) => byName(a.name, b.name)).map((c) => {
-        const on = sharing[c.circleId] !== false
+        const on = sharing[c.circleId] === true
         const busy = pendingCircleId === c.circleId
         return (
           <div
