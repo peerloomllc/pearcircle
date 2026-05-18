@@ -139,23 +139,23 @@ describe('tripApplyDecision (apply-branch rules)', () => {
 })
 
 describe('shouldReplicateTrip (sharing-gate predicate)', () => {
-  test('true when sharing row is absent (default-on / opt-out)', () => {
-    expect(shouldReplicateTrip(null)).toBe(true)
-    expect(shouldReplicateTrip(undefined)).toBe(true)
+  test('false when sharing row is absent (default-off / opt-in)', () => {
+    expect(shouldReplicateTrip(null)).toBe(false)
+    expect(shouldReplicateTrip(undefined)).toBe(false)
   })
 
-  test('true when row.value is missing or enabled is not explicitly false', () => {
-    expect(shouldReplicateTrip({})).toBe(true)
-    expect(shouldReplicateTrip({ value: null })).toBe(true)
-    expect(shouldReplicateTrip({ value: {} })).toBe(true)
-    expect(shouldReplicateTrip({ value: { enabled: true } })).toBe(true)
-    expect(shouldReplicateTrip({ value: { enabled: 'true' } })).toBe(true)
-    expect(shouldReplicateTrip({ value: { enabled: 1 } })).toBe(true)
-  })
-
-  test('false only when enabled === false (explicit opt-out)', () => {
+  test('false when row.value is missing or enabled is not strictly true', () => {
+    expect(shouldReplicateTrip({})).toBe(false)
+    expect(shouldReplicateTrip({ value: null })).toBe(false)
+    expect(shouldReplicateTrip({ value: {} })).toBe(false)
     expect(shouldReplicateTrip({ value: { enabled: false } })).toBe(false)
-    expect(shouldReplicateTrip({ value: { enabled: false, enabledAt: null } })).toBe(false)
+    expect(shouldReplicateTrip({ value: { enabled: 'true' } })).toBe(false)
+    expect(shouldReplicateTrip({ value: { enabled: 1 } })).toBe(false)
+  })
+
+  test('true only when enabled === true (explicit opt-in)', () => {
+    expect(shouldReplicateTrip({ value: { enabled: true } })).toBe(true)
+    expect(shouldReplicateTrip({ value: { enabled: true, enabledAt: 123 } })).toBe(true)
   })
 })
 

@@ -57,13 +57,17 @@ function tripApplyDecision (key, incoming, existing, verifyValueFn) {
 }
 
 // Whether the worklet should replicate a freshly-completed trip to a
-// given circle. Default-on (opt-out): missing row or row.enabled !==
-// false returns true. Future-trips-only is enforced by where this is
-// called (only from the trip-completion path, never during cold-start
-// catch-up).
+// given circle. Default-OFF (opt-in) per the approved proposal
+// (proposals/2026-05-10-trip-replication.md §"Privacy is the
+// load-bearing constraint"): a user who upgrades to a build that
+// supports trip replication should ship zero trips until they
+// explicitly turn sharing on for at least one circle. Missing row
+// or non-true `enabled` returns false. Future-trips-only is enforced
+// by where this is called (only from the trip-completion path,
+// never during cold-start catch-up).
 function shouldReplicateTrip (sharingRow) {
-  if (!sharingRow || !sharingRow.value) return true
-  return sharingRow.value.enabled !== false
+  if (!sharingRow || !sharingRow.value) return false
+  return sharingRow.value.enabled === true
 }
 
 // View-layer dedup for the merged trip list shown to the user in

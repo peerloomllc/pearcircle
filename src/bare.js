@@ -958,10 +958,11 @@ const handlers = {
     // event so the UI / OS-notification layer can react.
     //
     // Per proposal 2026-05-10, the trip is ALSO appended to each
-    // per-circle autobase unless the user has opted out via the
-    // `trips:sharing:{circleId}` toggle. Default is on (absent row =
-    // sharing enabled); opting out stops FUTURE trips from replicating,
-    // never tombstones past ones. Policy lives in shouldReplicateTrip.
+    // per-circle autobase when the user has opted in via the
+    // `trips:sharing:{circleId}` toggle. Default is OFF (absent row =
+    // sharing disabled, opt-in policy); explicit enable starts
+    // future trips replicating, never resurrects past ones. Policy
+    // lives in shouldReplicateTrip.
     try {
       const sp = typeof speed === 'number' ? speed : null
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
@@ -1101,17 +1102,18 @@ const handlers = {
     }
     if (typeof circleId === 'string') {
       const row = await _localDb.get('trips:sharing:' + circleId)
-      return { enabled: row?.value?.enabled !== false }
+      return { enabled: row?.value?.enabled === true }
     }
-    // No circleId: return explicit toggles. The UI defaults missing
-    // entries to enabled, matching shouldReplicateTrip's policy.
+    // No circleId: return explicit toggles. Missing entries default
+    // to disabled (opt-in) matching shouldReplicateTrip's policy
+    // (proposal 2026-05-10-trip-replication).
     const map = {}
     for await (const { key, value } of _localDb.createReadStream({
       gt: 'trips:sharing:',
       lt: 'trips:sharing:~',
     })) {
       const cid = key.slice('trips:sharing:'.length)
-      map[cid] = value?.enabled !== false
+      map[cid] = value?.enabled === true
     }
     return { sharing: map }
   },
