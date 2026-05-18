@@ -7,6 +7,7 @@
 #
 # Usage:
 #   ./scripts/ios-dev-install.sh                  # full pipeline
+#   SKIP_BUILD=1 ./scripts/ios-dev-install.sh     # bundles already fresh
 #   SKIP_SYNC=1 ./scripts/ios-dev-install.sh      # already in sync
 #   SKIP_INSTALL=1 ./scripts/ios-dev-install.sh   # archive+export only
 #
@@ -39,6 +40,22 @@ KEYCHAIN_PATH="${KEYCHAIN_PATH:-~/Library/Keychains/buildkey.keychain}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 step() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
+
+# ── 0. Build bundles locally ────────────────────────────────────────────────
+# rsync copies assets/* to the Mac mini, but the iOS pipeline never
+# rebuilds the JS bundles — Xcode just packages whatever's in assets/.
+# Stale bundles from a previous build would ship to the device and
+# the user would see "I just merged X but the iPhone doesn't show it"
+# (which is exactly the trap that prompted this step).
+# Builds bare-ios.bundle (worklet, ios preset) and app-ui.bundle
+# (WebView UI) — both are required for an iOS install. The Android
+# universal bare bundle is intentionally skipped here.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  step "build bundles locally (bare:ios + ui)"
+  cd "$REPO_ROOT"
+  npm run build:bare:ios
+  npm run build:ui
+fi
 
 # ── 1. Sync workspace to Mac mini ───────────────────────────────────────────
 # Excludes: anything regenerated on the build host (node_modules, Pods,
