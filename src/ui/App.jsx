@@ -4580,12 +4580,6 @@ function Collapsible ({ title, icon: Icon, open, onToggle, maxHeight = '480px', 
 }
 
 function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }) {
-  // App Store guideline 3.1.1 forbids non-IAP digital purchases including
-  // donations. Hide the Support development section on iOS until we've
-  // been approved -- once approved we can revisit (Apple has loosened
-  // for some non-IAP "value for value" patterns, but the safe default
-  // is to omit until reviewed). Android keeps the section.
-  const isIOS = typeof window !== 'undefined' && window.__pearPlatform === 'ios'
   const [walletModal, setWalletModal] = useState(false)
   // initialExpand opens a single section on navigation (e.g., the
   // donation reminder modal hands us 'support' so the user lands on
@@ -4691,22 +4685,20 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </Collapsible>
       )}
 
-      {!isIOS && (
-        <Collapsible title='Support development' icon={Lightning} open={supportOpen} onToggle={() => setSupportOpen(v => !v)}>
-          <p style={body}>
-            PearCircle is free and open source. If you receive value from
-            it, please consider returning value.
-          </p>
-          <div style={{ display: 'flex', gap: spacing.sm }}>
-            <button onClick={handleDonateBTC} style={{ ...pillBtn, flex: 1 }}>
-              <Lightning size={14} weight='thin' /> BTC <Lightning size={14} weight='thin' />
-            </button>
-            <button onClick={() => openURL('https://buymeacoffee.com/peerloomllc')} style={{ ...pillBtn, flex: 1 }}>
-              <CurrencyDollar size={14} weight='thin' /> USD <CurrencyDollar size={14} weight='thin' />
-            </button>
-          </div>
-        </Collapsible>
-      )}
+      <Collapsible title='Support development' icon={Lightning} open={supportOpen} onToggle={() => setSupportOpen(v => !v)}>
+        <p style={body}>
+          PearCircle is free and open source. If you receive value from
+          it, please consider returning value.
+        </p>
+        <div style={{ display: 'flex', gap: spacing.sm }}>
+          <button onClick={handleDonateBTC} style={{ ...pillBtn, flex: 1 }}>
+            <Lightning size={14} weight='thin' /> BTC <Lightning size={14} weight='thin' />
+          </button>
+          <button onClick={() => openURL('https://buymeacoffee.com/peerloomllc')} style={{ ...pillBtn, flex: 1 }}>
+            <CurrencyDollar size={14} weight='thin' /> USD <CurrencyDollar size={14} weight='thin' />
+          </button>
+        </div>
+      </Collapsible>
 
       <Collapsible title='Learn about Bitcoin' icon={BookOpen} open={bitcoinOpen} onToggle={() => setBitcoinOpen(v => !v)}>
         <p style={body}>
