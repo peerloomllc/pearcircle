@@ -2,7 +2,7 @@
 // Proposal 2026-05-19-blind-seeder-peers slice 3a.
 
 const b4a = require('b4a')
-const { shouldAcceptSeederRow } = require('../src/lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke } = require('../src/lib/seederApply')
 const { signValue, verifyValueWithSigner } = require('../src/lib/sign')
 const { generateKeypair } = require('../src/identity')
 
@@ -169,5 +169,85 @@ describe('shouldAcceptSeederRow — rejection cases', () => {
     const f = makeFixture()
     expect(f.decide({ incoming: null })).toBe(false)
     expect(f.decide({ incoming: 'not an object' })).toBe(false)
+  })
+})
+
+describe('buildSeederRevoke', () => {
+  const f = makeFixture()
+  const revoker = generateKeypair()
+  const revokerHex = b4a.toString(revoker.publicKey, 'hex')
+  const existing = {
+    pubkey: f.seederHex,
+    writer: f.writerHex,
+    addedBy: f.writerHex,
+    addedAt: f.baseTs,
+    updatedAt: f.baseTs,
+    label: 'Pi in the garage',
+    v: 1,
+  }
+
+  test('returns null on null or non-object existing', () => {
+    expect(buildSeederRevoke({ existing: null, revokerPubkeyHex: revokerHex, now: f.baseTs + 100 })).toBe(null)
+    expect(buildSeederRevoke({ existing: 'string', revokerPubkeyHex: revokerHex, now: f.baseTs + 100 })).toBe(null)
+  })
+
+  test('returns null when existing lacks required fields', () => {
+    expect(buildSeederRevoke({ existing: { ...existing, pubkey: undefined }, revokerPubkeyHex: revokerHex, now: 1 })).toBe(null)
+    expect(buildSeederRevoke({ existing: { ...existing, addedBy: undefined }, revokerPubkeyHex: revokerHex, now: 1 })).toBe(null)
+    expect(buildSeederRevoke({ existing: { ...existing, addedAt: undefined }, revokerPubkeyHex: revokerHex, now: 1 })).toBe(null)
+  })
+
+  test('returns null on malformed revokerPubkeyHex', () => {
+    expect(buildSeederRevoke({ existing, revokerPubkeyHex: 'short', now: f.baseTs + 100 })).toBe(null)
+    expect(buildSeederRevoke({ existing, revokerPubkeyHex: 'z'.repeat(64), now: f.baseTs + 100 })).toBe(null)
+  })
+
+  test('preserves pubkey, addedBy, addedAt from existing', () => {
+    const out = buildSeederRevoke({ existing, revokerPubkeyHex: revokerHex, now: f.baseTs + 1000 })
+    expect(out.pubkey).toBe(existing.pubkey)
+    expect(out.addedBy).toBe(existing.addedBy)
+    expect(out.addedAt).toBe(existing.addedAt)
+  })
+
+  test('sets writer, revokedBy, updatedAt, revokedAt, revoked', () => {
+    const out = buildSeederRevoke({ existing, revokerPubkeyHex: revokerHex, now: f.baseTs + 1000 })
+    expect(out.writer).toBe(revokerHex)
+    expect(out.revokedBy).toBe(revokerHex)
+    expect(out.updatedAt).toBe(f.baseTs + 1000)
+    expect(out.revokedAt).toBe(f.baseTs + 1000)
+    expect(out.revoked).toBe(true)
+    expect(out.v).toBe(1)
+  })
+
+  test('preserves label when present', () => {
+    const out = buildSeederRevoke({ existing, revokerPubkeyHex: revokerHex, now: f.baseTs + 1000 })
+    expect(out.label).toBe('Pi in the garage')
+  })
+
+  test('omits label when absent or empty', () => {
+    const { label: _drop, ...noLabel } = existing
+    const out = buildSeederRevoke({ existing: noLabel, revokerPubkeyHex: revokerHex, now: f.baseTs + 1000 })
+    expect(out.label).toBeUndefined()
+    const outEmpty = buildSeederRevoke({ existing: { ...existing, label: '' }, revokerPubkeyHex: revokerHex, now: f.baseTs + 1000 })
+    expect(outEmpty.label).toBeUndefined()
+  })
+
+  test('signed output round-trips through shouldAcceptSeederRow as a valid revoke', () => {
+    const unsigned = buildSeederRevoke({ existing, revokerPubkeyHex: revokerHex, now: f.baseTs + 1000 })
+    const signed = signValue(unsigned, revoker.secretKey)
+    expect(verifyValueWithSigner(signed, 'writer')).toBe(true)
+    // Apply branch should accept the revoke given a current-member revoker
+    // and an existing non-revoked row.
+    const accept = shouldAcceptSeederRow({
+      keyPubkey: f.seederHex,
+      incoming: signed,
+      writerMember: { pubkey: revokerHex },
+      writerRemoved: null,
+      existing,
+      now: f.baseTs + 1500,
+      futureToleranceMs: 5 * 60 * 1000,
+      verifySig: (val) => verifyValueWithSigner(val, 'writer'),
+    })
+    expect(accept).toBe(true)
   })
 })
