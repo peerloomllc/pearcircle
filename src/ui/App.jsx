@@ -270,6 +270,10 @@ export function App () {
     // Trip detail → back to the trips list (preserve list scroll/state),
     // matches the in-sheet ‹ button.
     if (sheet.name === 'tripDetail') { setSheet({ name: 'trips' }); return true }
+    // Any sheet that stashed a returnTo (e.g. seeders opened from Settings)
+    // restores the previous sheet so the hardware/swipe back gesture mirrors
+    // the in-sheet ‹ button instead of jumping to root.
+    if (sheet.returnTo) { setSheet(sheet.returnTo); return true }
     closeSheet()
     return true
   }, [sheet, closeSheet]), !!sheet)
