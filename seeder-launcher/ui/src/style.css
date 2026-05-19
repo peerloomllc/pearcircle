@@ -78,14 +78,14 @@ button.danger { background: var(--bad); color: #1a0606; }
 button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
 button.ghost.danger { color: var(--bad); border-color: var(--bad); background: transparent; }
 
-.circle { padding: 12px 0; border-bottom: 1px solid var(--divider); }
+.circle { padding: 12px 0; border-bottom: 1px solid var(--divider); text-align: center; }
 .circle:last-child { border-bottom: 0; }
 .circle-name { font-size: 14px; font-weight: 400; color: var(--text); }
-.circle-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.circle-controls { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
+.circle-meta { font-size: 12px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+.circle-controls { display: flex; gap: 12px; align-items: center; justify-content: center; margin-top: 8px; }
 
 .toast { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
 .toast.error { background: rgba(239, 83, 80, 0.12); border: 1px solid var(--bad); color: var(--bad); }
 .toast.success { background: rgba(126, 199, 122, 0.12); border: 1px solid var(--good); color: var(--good); }
 
-.empty { color: var(--muted); font-style: italic; font-size: 13px; }
+.empty { color: var(--muted); font-style: italic; font-size: 13px; text-align: center; }
