@@ -1,4 +1,4 @@
-const { buildInvite, parseInvite, NAME_MAX } = require('../src/invite')
+const { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, NAME_MAX } = require('../src/invite')
 
 const VALID = {
   circleId: 'A'.repeat(43),
@@ -219,6 +219,103 @@ describe('parseInvite', () => {
   test('handles malformed percent-encoding gracefully', () => {
     const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=%ZZ&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
+    expect(result.ok).toBe(false)
+  })
+})
+
+describe('buildSeedInvite', () => {
+  test('produces an https /circle/seed URL by default', () => {
+    const url = buildSeedInvite(VALID)
+    expect(url.startsWith('https://peerloomllc.com/circle/seed?')).toBe(true)
+  })
+
+  test('produces a pear:// /seed URL when scheme=pear', () => {
+    const url = buildSeedInvite({ ...VALID, scheme: 'pear' })
+    expect(url.startsWith('pear://pearcircle/seed?')).toBe(true)
+  })
+
+  test('contains every required field', () => {
+    const url = buildSeedInvite(VALID)
+    expect(url).toContain(`circle=${VALID.circleId}`)
+    expect(url).toContain(`key=${VALID.circleKey}`)
+    expect(url).toContain(`bootstrap=${VALID.bootstrap}`)
+    expect(url).toContain(`inviter=${VALID.inviterPublicKey}`)
+  })
+
+  test('does not include an enc field', () => {
+    const url = buildSeedInvite(VALID)
+    expect(url).not.toContain('enc=')
+  })
+
+  test('throws on every malformed field', () => {
+    expect(() => buildSeedInvite({ ...VALID, circleId: 'short' })).toThrow(/circleId/)
+    expect(() => buildSeedInvite({ ...VALID, name: '' })).toThrow(/name/)
+    expect(() => buildSeedInvite({ ...VALID, circleKey: 'z'.repeat(64) })).toThrow(/circleKey/)
+    expect(() => buildSeedInvite({ ...VALID, bootstrap: 'a'.repeat(63) })).toThrow(/bootstrap/)
+    expect(() => buildSeedInvite({ ...VALID, inviterPublicKey: 'g'.repeat(64) })).toThrow(/inviterPublicKey/)
+    expect(() => buildSeedInvite({ ...VALID, scheme: 'ftp' })).toThrow(/scheme/)
+  })
+})
+
+describe('parseSeedInvite', () => {
+  test('round-trips buildSeedInvite (https)', () => {
+    const url = buildSeedInvite(VALID)
+    const result = parseSeedInvite(url)
+    expect(result.ok).toBe(true)
+    expect(result.scheme).toBe('https')
+    expect(result.circleId).toBe(VALID.circleId)
+    expect(result.name).toBe(VALID.name)
+    expect(result.circleKey).toBe(VALID.circleKey)
+    expect(result.bootstrap).toBe(VALID.bootstrap)
+    expect(result.inviterPublicKey).toBe(VALID.inviterPublicKey)
+  })
+
+  test('round-trips buildSeedInvite (pear)', () => {
+    const url = buildSeedInvite({ ...VALID, scheme: 'pear' })
+    const result = parseSeedInvite(url)
+    expect(result.ok).toBe(true)
+    expect(result.scheme).toBe('pear')
+  })
+
+  test('refuses a member-shape /circle/join URL', () => {
+    const memberUrl = buildInvite(VALID)
+    const result = parseSeedInvite(memberUrl)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/seed invite/)
+  })
+
+  test('does not expose an encryptionKey field on the parsed result', () => {
+    const url = buildSeedInvite(VALID)
+    const result = parseSeedInvite(url)
+    expect(result.encryptionKey).toBeUndefined()
+  })
+
+  test('rejects malformed circle param', () => {
+    const url = `https://peerloomllc.com/circle/seed?circle=AAA&name=Test&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
+    const result = parseSeedInvite(url)
+    expect(result.ok).toBe(false)
+  })
+
+  test('rejects missing bootstrap', () => {
+    const url = `https://peerloomllc.com/circle/seed?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}&inviter=${VALID.inviterPublicKey}`
+    const result = parseSeedInvite(url)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/bootstrap/)
+  })
+
+  test('rejects non-string input', () => {
+    expect(parseSeedInvite(null).ok).toBe(false)
+    expect(parseSeedInvite(undefined).ok).toBe(false)
+    expect(parseSeedInvite(42).ok).toBe(false)
+  })
+
+  test('rejects unrecognized scheme', () => {
+    const result = parseSeedInvite('http://peerloomllc.com/circle/seed?circle=' + VALID.circleId)
+    expect(result.ok).toBe(false)
+  })
+
+  test('rejects wrong host', () => {
+    const result = parseSeedInvite('https://evil.example.com/circle/seed?circle=' + VALID.circleId)
     expect(result.ok).toBe(false)
   })
 })

@@ -1,4 +1,4 @@
-const { canonicalize, signValue, verifyValue } = require('../src/lib/sign')
+const { canonicalize, signValue, verifyValue, verifyValueWithSigner } = require('../src/lib/sign')
 const { generateKeypair } = require('../src/identity')
 const b4a = require('b4a')
 
@@ -89,5 +89,62 @@ describe('signValue / verifyValue', () => {
     expect(verifyValue(null)).toBe(false)
     expect(verifyValue(undefined)).toBe(false)
     expect(verifyValue('not an object')).toBe(false)
+  })
+})
+
+describe('verifyValueWithSigner', () => {
+  const writer = generateKeypair()
+  const seeder = generateKeypair()
+  const writerHex = b4a.toString(writer.publicKey, 'hex')
+  const seederHex = b4a.toString(seeder.publicKey, 'hex')
+
+  // A seeder admission row where pubkey = seeder identity and writer =
+  // signing member. Mirrors the shape from src/lib/seederApply.js.
+  const seederRow = () => ({
+    pubkey: seederHex,
+    writer: writerHex,
+    addedBy: writerHex,
+    addedAt: 1714867200000,
+    updatedAt: 1714867200000,
+    v: 1,
+  })
+
+  test('verifies a row signed by the writer when signer field is "writer"', () => {
+    const signed = signValue(seederRow(), writer.secretKey)
+    expect(verifyValueWithSigner(signed, 'writer')).toBe(true)
+  })
+
+  test('default verifyValue (signer=pubkey) rejects a row whose pubkey is not the signer', () => {
+    const signed = signValue(seederRow(), writer.secretKey)
+    expect(verifyValue(signed)).toBe(false)
+  })
+
+  test('rejects when the named signer field does not exist on the value', () => {
+    const signed = signValue(seederRow(), writer.secretKey)
+    expect(verifyValueWithSigner(signed, 'nonexistent')).toBe(false)
+  })
+
+  test('rejects when the signer field holds the wrong key', () => {
+    const other = generateKeypair()
+    const signed = signValue(seederRow(), other.secretKey)
+    expect(verifyValueWithSigner(signed, 'writer')).toBe(false)
+  })
+
+  test('rejects malformed signer field (non-hex, wrong length)', () => {
+    const signed = signValue(seederRow(), writer.secretKey)
+    expect(verifyValueWithSigner({ ...signed, writer: 'z'.repeat(64) }, 'writer')).toBe(false)
+    expect(verifyValueWithSigner({ ...signed, writer: 'short' }, 'writer')).toBe(false)
+  })
+
+  test('rejects non-string signerField', () => {
+    const signed = signValue(seederRow(), writer.secretKey)
+    expect(verifyValueWithSigner(signed, '')).toBe(false)
+    expect(verifyValueWithSigner(signed, null)).toBe(false)
+    expect(verifyValueWithSigner(signed, undefined)).toBe(false)
+  })
+
+  test('canonicalization covers every non-sig field including writer', () => {
+    const signed = signValue(seederRow(), writer.secretKey)
+    expect(verifyValueWithSigner({ ...signed, addedAt: signed.addedAt + 1 }, 'writer')).toBe(false)
   })
 })
