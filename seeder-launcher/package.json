@@ -1,0 +1,23 @@
+{
+  "name": "pearcircle-seeder-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop launcher for the PearCircle blind-seeder worklet. Spawns bare --seed, serves a localhost monitoring UI.",
+  "main": "host/index.js",
+  "scripts": {
+    "start": "node host/index.js",
+    "dev": "node host/index.js --dev",
+    "build:ui": "node ui/build.js",
+    "smoke": "bash scripts/seed-cli-smoke.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "preact": "^10.24.0",
+    "esbuild": "^0.24.0"
+  }
+}

@@ -270,7 +270,16 @@ function isDeleted (place) {
   return place != null && place.deleted === true
 }
 
-const send = (msg) => BareKit.IPC.write(Buffer.from(JSON.stringify(msg) + '\n'))
+// IPC duplex. On mobile the RN shell exposes BareKit.IPC. On a standalone
+// bare-runtime CLI launch (the desktop blind-seeder launcher spawns
+// `bare src/bare.js --seed`) BareKit is undefined; bridge to bare-process
+// stdio so the host parent can pipe the same JSON-newline IPC over the
+// subprocess's stdin/stdout.
+const _bareProcess = typeof BareKit === 'undefined' ? require('bare-process') : null
+const _ipcRead = _bareProcess ? _bareProcess.stdin : BareKit.IPC
+const _ipcWrite = (buf) => _bareProcess ? _bareProcess.stdout.write(buf) : BareKit.IPC.write(buf)
+
+const send = (msg) => _ipcWrite(Buffer.from(JSON.stringify(msg) + '\n'))
 
 const handlers = {
   'ping': async () => ({ ok: true, ts: Date.now() }),
@@ -2634,7 +2643,7 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
 }
 
 let buffer = ''
-BareKit.IPC.on('data', async (chunk) => {
+_ipcRead.on('data', async (chunk) => {
   buffer += chunk.toString()
   let nl
   while ((nl = buffer.indexOf('\n')) !== -1) {

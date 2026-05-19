@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent template loaded into ~/Library/LaunchAgents/ by the .pkg
+     post-install script. Runs the seeder launcher in the user session
+     (not as root) so the data directory lands under ~/Library/Application
+     Support and the daemon survives logout via KeepAlive. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pearcircle.seeder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/lib/pearcircle-seeder/pearcircle-seeder</string>
+    <string>--no-open</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_PATH__</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
