@@ -2,7 +2,7 @@
 // Proposal 2026-05-19-blind-seeder-peers slice 3a.
 
 const b4a = require('b4a')
-const { shouldAcceptSeederRow, buildSeederRevoke } = require('../src/lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('../src/lib/seederApply')
 const { signValue, verifyValueWithSigner } = require('../src/lib/sign')
 const { generateKeypair } = require('../src/identity')
 
@@ -249,5 +249,116 @@ describe('buildSeederRevoke', () => {
       verifySig: (val) => verifyValueWithSigner(val, 'writer'),
     })
     expect(accept).toBe(true)
+  })
+})
+
+describe('buildSeederAdmission', () => {
+  const admin = generateKeypair()
+  const adminHex = b4a.toString(admin.publicKey, 'hex')
+  const seederHex = 'a'.repeat(64)
+  const otherAdminHex = 'd'.repeat(64)
+  const now = 1714867200000
+
+  test('returns null on malformed seederPubkey', () => {
+    expect(buildSeederAdmission({ seederPubkey: 'short', adminPubkeyHex: adminHex, now })).toBe(null)
+  })
+
+  test('returns null on malformed adminPubkeyHex', () => {
+    expect(buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: 'z'.repeat(64), now })).toBe(null)
+  })
+
+  test('returns null on non-finite now', () => {
+    expect(buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, now: NaN })).toBe(null)
+    expect(buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, now: 'string' })).toBe(null)
+  })
+
+  test('returns null on non-string label', () => {
+    expect(buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: 42, now })).toBe(null)
+  })
+
+  test('fresh admit: addedBy=writer=admin, addedAt=updatedAt=now, no revoked', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, now })
+    expect(out.pubkey).toBe(seederHex)
+    expect(out.writer).toBe(adminHex)
+    expect(out.addedBy).toBe(adminHex)
+    expect(out.addedAt).toBe(now)
+    expect(out.updatedAt).toBe(now)
+    expect(out.revoked).toBeUndefined()
+    expect(out.v).toBe(1)
+  })
+
+  test('fresh admit with label includes it', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: 'Pi @ home', now })
+    expect(out.label).toBe('Pi @ home')
+  })
+
+  test('empty-string label is omitted', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: '', now })
+    expect(out.label).toBeUndefined()
+  })
+
+  test('re-admit preserves addedBy + addedAt from existing', () => {
+    const existing = {
+      pubkey: seederHex,
+      addedBy: otherAdminHex,
+      addedAt: now - 1000,
+      writer: otherAdminHex,
+      updatedAt: now - 500,
+      revoked: true,
+      revokedAt: now - 500,
+      revokedBy: otherAdminHex,
+      v: 1,
+    }
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, existing, now })
+    expect(out.addedBy).toBe(otherAdminHex)  // preserved from original admitter
+    expect(out.addedAt).toBe(now - 1000)
+    expect(out.writer).toBe(adminHex)  // this admit by current admin
+    expect(out.updatedAt).toBe(now)
+    expect(out.revoked).toBeUndefined()  // re-admit clears revocation
+  })
+
+  test('re-admit inherits existing label when none provided', () => {
+    const existing = {
+      pubkey: seederHex,
+      addedBy: otherAdminHex,
+      addedAt: now - 1000,
+      label: 'Old label',
+    }
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, existing, now })
+    expect(out.label).toBe('Old label')
+  })
+
+  test('re-admit prefers caller-provided label over inherited', () => {
+    const existing = {
+      pubkey: seederHex,
+      addedBy: otherAdminHex,
+      addedAt: now - 1000,
+      label: 'Old label',
+    }
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, existing, label: 'New label', now })
+    expect(out.label).toBe('New label')
+  })
+
+  test('signed output round-trips through shouldAcceptSeederRow', () => {
+    const unsigned = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, now })
+    const signed = signValue(unsigned, admin.secretKey)
+    expect(verifyValueWithSigner(signed, 'writer')).toBe(true)
+    const accept = shouldAcceptSeederRow({
+      keyPubkey: seederHex,
+      incoming: signed,
+      writerMember: { pubkey: adminHex },
+      writerRemoved: null,
+      existing: null,
+      now: now + 100,
+      futureToleranceMs: 5 * 60 * 1000,
+      verifySig: (val) => verifyValueWithSigner(val, 'writer'),
+    })
+    expect(accept).toBe(true)
+  })
+
+  test('malformed existing.addedBy falls back to admin', () => {
+    const existing = { pubkey: seederHex, addedBy: 'short', addedAt: now - 1000 }
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, existing, now })
+    expect(out.addedBy).toBe(adminHex)
   })
 })
