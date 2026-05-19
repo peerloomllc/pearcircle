@@ -40,11 +40,23 @@ Identity layout under the data directory:
 
 ## Install (macOS)
 
-1. Download `PearCircleSeeder-0.1.0.pkg`.
-2. Double-click. Allow the notarized installer through Gatekeeper.
-3. After install completes, the daemon starts automatically. Open `~/Library/Application Support/PearCircle Seeder/seeder.log` and copy the `UI at` URL (it includes the auth token); paste it into your browser.
+### Interim: unsigned .pkg (v0)
 
-The post-install script writes `~/Library/LaunchAgents/com.pearcircle.seeder.plist` and runs `launchctl load`, so the daemon launches at every login.
+Until a Developer ID Installer cert + notarytool keychain profile are in place, the build emits an unsigned `.pkg` that Gatekeeper refuses to open via double-click. Install it from a terminal:
+
+```bash
+sudo installer -allowUntrusted -pkg PearCircleSeeder-0.1.0.pkg -target /
+```
+
+The post-install script writes `~/Library/LaunchAgents/com.pearcircle.seeder.plist`, chowns it to your user, and runs `launchctl asuser <uid> launchctl load` so the daemon starts in your login session immediately. Open `~/Library/Application Support/PearCircle Seeder/seeder.log` and copy the `UI at` URL (it includes the auth token).
+
+### Final: notarized .pkg (planned)
+
+Once the operator prereqs land:
+1. Generate a Developer ID Installer cert at developer.apple.com → Certificates and install in the keychain on the Mac mini.
+2. `xcrun notarytool store-credentials pearcircle-seeder-notary --apple-id "<your-id>" --team-id G79ALD29NA --password "<app-specific>"`.
+
+Then build with `APP_SIGN_ID="..." PKG_SIGN_ID="..." bash scripts/build-pkg-macos.sh`. Users double-click the `.pkg` and Gatekeeper allows it.
 
 ## Consume a seed invite
 
@@ -82,9 +94,9 @@ The last `rm` drops the seeder's identity and all enrollments. To remove just th
 
 Prereqs:
 - macOS 12+, Xcode CLT
-- Node 20+ on PATH
-- Apple Developer ID Application + Developer ID Installer certificates in the keychain, Team G79ALD29NA
-- A notarytool keychain profile saved as `pearcircle-seeder-notary`:
+- Node 20+ on PATH (for the build host — the .pkg payload bundles its own Node 22 LTS, downloaded from nodejs.org on first build into `dist/cache/`)
+- Apple Developer ID Application certificate in the keychain, Team G79ALD29NA (signs `node` + `bare` inside the payload; without it both are ad-hoc signed and the install requires `-allowUntrusted`)
+- For the fully-notarized .pkg: also a Developer ID Installer cert and a notarytool keychain profile saved as `pearcircle-seeder-notary`:
   ```bash
   xcrun notarytool store-credentials pearcircle-seeder-notary \
     --apple-id "<your-apple-id>" --team-id G79ALD29NA --password "<app-specific-password>"
@@ -97,14 +109,18 @@ Build steps from the repo root:
 npm install
 cd seeder-launcher && npm install && cd ..
 
-# Build and notarize the .pkg
+# Build (unsigned .pkg, daemon binaries signed with Developer ID Application)
 cd seeder-launcher
+APP_SIGN_ID="Developer ID Application: <your name> (G79ALD29NA)" \
+  bash scripts/build-pkg-macos.sh
+
+# Or fully notarized once you have the installer cert:
 APP_SIGN_ID="Developer ID Application: <your name> (G79ALD29NA)" \
 PKG_SIGN_ID="Developer ID Installer: <your name> (G79ALD29NA)" \
   bash scripts/build-pkg-macos.sh
 ```
 
-Output: `seeder-launcher/dist/macos/PearCircleSeeder-0.1.0.pkg`.
+Output: `seeder-launcher/dist/macos/PearCircleSeeder-0.1.0.pkg` (~210MB).
 
 ## Dev round-trip (any platform)
 
