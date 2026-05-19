@@ -109,6 +109,28 @@ cp ui/dist/style.css "$PAYLOAD_LIB/ui/dist/style.css"
 #    template it per-user.
 cp installer/macos/com.pearcircle.seeder.plist "$PAYLOAD_LIB/installer/"
 
+# 6b. Build the PearCircle .icns icon from the repo's 1024x1024 png. iconutil
+#     needs an .iconset directory with the standard 10 size variants.
+ICON_SRC="$ROOT/../assets/images/icon.png"
+if [ -f "$ICON_SRC" ]; then
+  ICONSET="$ROOT/dist/AppIcon.iconset"
+  rm -rf "$ICONSET"; mkdir -p "$ICONSET"
+  sips -z 16 16     "$ICON_SRC" --out "$ICONSET/icon_16x16.png"      >/dev/null
+  sips -z 32 32     "$ICON_SRC" --out "$ICONSET/icon_16x16@2x.png"   >/dev/null
+  sips -z 32 32     "$ICON_SRC" --out "$ICONSET/icon_32x32.png"      >/dev/null
+  sips -z 64 64     "$ICON_SRC" --out "$ICONSET/icon_32x32@2x.png"   >/dev/null
+  sips -z 128 128   "$ICON_SRC" --out "$ICONSET/icon_128x128.png"    >/dev/null
+  sips -z 256 256   "$ICON_SRC" --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+  sips -z 256 256   "$ICON_SRC" --out "$ICONSET/icon_256x256.png"    >/dev/null
+  sips -z 512 512   "$ICON_SRC" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+  sips -z 512 512   "$ICON_SRC" --out "$ICONSET/icon_512x512.png"    >/dev/null
+  cp "$ICON_SRC"                  "$ICONSET/icon_512x512@2x.png"
+  iconutil -c icns "$ICONSET" -o "$PAYLOAD_LIB/AppIcon.icns"
+  rm -rf "$ICONSET"
+else
+  echo "warning: icon source $ICON_SRC missing; Desktop shortcut will use a generic icon"
+fi
+
 # 7. Sign the native executables inside the payload. The pearcircle-seeder
 #    wrapper is a shell script — codesign doesn't apply. Without APP_SIGN_ID
 #    we ad-hoc sign; Gatekeeper will refuse to launch the .pkg unsigned, but

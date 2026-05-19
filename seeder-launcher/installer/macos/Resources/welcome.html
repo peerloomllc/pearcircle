@@ -1,48 +1,16 @@
 <!doctype html>
 <html>
-<head>
-<meta charset="utf-8">
-<style>
-  html, body {
-    margin: 0;
-    padding: 20px;
-    background-color: #ffffff !important;
-    color: #222222 !important;
-    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
-    font-size: 13px;
-    line-height: 1.5;
-  }
-  h2 {
-    margin-top: 0;
-    color: #111111 !important;
-    font-size: 18px;
-  }
-  p, li {
-    color: #222222 !important;
-  }
-  code {
-    background-color: #eef0f3 !important;
-    color: #1a1a1a !important;
-    padding: 2px 5px;
-    border-radius: 3px;
-    font-size: 90%;
-    font-family: "SF Mono", Menlo, Monaco, monospace;
-  }
-  ul { padding-left: 22px; }
-  li + li { margin-top: 4px; }
-  @media (prefers-color-scheme: dark) {
-    html, body { background-color: #ffffff !important; color: #222222 !important; }
-  }
-</style>
-</head>
-<body>
-<h2>PearCircle Seeder</h2>
-<p>Installs an always-on blind-seeder daemon that replicates encrypted PearCircle circle data without holding the decryption key. After install:</p>
-<ul>
-  <li>The daemon launches automatically at login and survives logout.</li>
-  <li>The monitoring UI opens automatically in your default browser.</li>
-  <li>If you missed it, the URL is logged to <code>~/Library/Application Support/PearCircle Seeder/seeder.log</code> (grep for <code>UI at</code>).</li>
+<body bgcolor="#ffffff" text="#222222" style="margin:0;padding:20px;background-color:#ffffff;color:#222222;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:13px;line-height:1.5;">
+<font color="#111111" face="-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif">
+<h2 style="margin-top:0;color:#111111;font-size:18px;">PearCircle Seeder</h2>
+</font>
+<p style="color:#222222;">Installs an always-on blind-seeder daemon that replicates encrypted PearCircle circle data without holding the decryption key. After install:</p>
+<ul style="padding-left:22px;color:#222222;">
+  <li style="color:#222222;margin-bottom:4px;">The daemon launches automatically at login and survives logout.</li>
+  <li style="color:#222222;margin-bottom:4px;">The monitoring UI opens automatically in your default browser.</li>
+  <li style="color:#222222;margin-bottom:4px;">A <b>PearCircle Seeder</b> shortcut is offered on your Desktop &mdash; double-click any time to open the UI.</li>
+  <li style="color:#222222;margin-bottom:4px;">If you missed the URL, look in <span style="background-color:#eef0f3;color:#1a1a1a;padding:2px 5px;border-radius:3px;font-family:'SF Mono',Menlo,Monaco,monospace;font-size:90%;">~/Library/Application Support/PearCircle Seeder/seeder.log</span> (grep for <span style="background-color:#eef0f3;color:#1a1a1a;padding:2px 5px;border-radius:3px;font-family:'SF Mono',Menlo,Monaco,monospace;font-size:90%;">UI at</span>).</li>
 </ul>
-<p>To enroll in a circle, paste a seed invite link from a PearCircle member into the UI.</p>
+<p style="color:#222222;">To enroll in a circle, paste a seed invite link from a PearCircle member into the UI.</p>
 </body>
 </html>

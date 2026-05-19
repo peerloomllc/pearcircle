@@ -27,13 +27,17 @@ function createServer ({ worklet, token, uiDir, log }) {
     try {
       const url = new URL(req.url, 'http://localhost')
 
+      // Static UI assets (HTML, JS, CSS) are served without the bearer
+      // check. Browsers don't propagate ?t=<token> from the parent page
+      // URL to `<script src>` / `<link href>` fetches, so gating these
+      // would 401 the bundle and the React tree never mounts. The token
+      // is in the URL fragment for the JS to pick up and rides every
+      // /api/* and /ws request below.
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-        if (!auth.verify(req, token)) return sendUnauth(res)
         return sendFile(res, path.join(uiDir, 'index.html'))
       }
 
       if (req.method === 'GET' && url.pathname.startsWith('/ui/')) {
-        if (!auth.verify(req, token)) return sendUnauth(res)
         const rel = url.pathname.replace(/^\/ui\//, '')
         const file = path.join(uiDir, rel)
         if (!file.startsWith(uiDir)) return sendStatus(res, 403, 'forbidden')

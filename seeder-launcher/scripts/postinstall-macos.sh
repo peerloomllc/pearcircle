@@ -65,20 +65,61 @@ SHORTCUT_ANSWER=$(launchctl asuser "$USER_UID" sudo -u "$USER_NAME" osascript \
   2>/dev/null || echo "Skip")
 
 if [ "$SHORTCUT_ANSWER" = "Create" ]; then
-  WEBLOC="$USER_HOME/Desktop/PearCircle Seeder.webloc"
-  cat > "$WEBLOC" <<EOF
+  # Drop a real .app bundle on the Desktop. macOS shows the .app with its
+  # own AppIcon and hides the .app extension by default — looks like a
+  # PearCircle Seeder shortcut tile, not an opaque .webloc file. The
+  # launcher script reads auth.token fresh on every click, so the URL
+  # survives token rotation (which happens if the data dir is wiped).
+  APP="$USER_HOME/Desktop/PearCircle Seeder.app"
+  rm -rf "$APP"
+  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+  cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>URL</key>
-  <string>$URL</string>
+  <key>CFBundleExecutable</key><string>open-ui</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIdentifier</key><string>com.pearcircle.seeder.shortcut</string>
+  <key>CFBundleName</key><string>PearCircle Seeder</string>
+  <key>CFBundleDisplayName</key><string>PearCircle Seeder</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>LSUIElement</key><true/>
 </dict>
 </plist>
-EOF
-  chown "$USER_NAME" "$WEBLOC"
-  chmod 0644 "$WEBLOC"
-  echo "Created Desktop shortcut: $WEBLOC"
+PLIST
+
+  cat > "$APP/Contents/MacOS/open-ui" <<'LAUNCH'
+#!/bin/bash
+# Read the current auth token and open the UI in the default browser.
+DATA="$HOME/Library/Application Support/PearCircle Seeder"
+TOKEN=$(cat "$DATA/auth.token" 2>/dev/null | tr -d '\n')
+if [ -z "$TOKEN" ]; then
+  /usr/bin/osascript -e 'display dialog "PearCircle Seeder is not running. Open Activity Monitor or check ~/Library/LaunchAgents/com.pearcircle.seeder.plist." with title "PearCircle Seeder" buttons {"OK"} default button "OK" with icon caution'
+  exit 1
+fi
+exec /usr/bin/open "http://127.0.0.1:8730/?t=$TOKEN"
+LAUNCH
+  chmod +x "$APP/Contents/MacOS/open-ui"
+
+  if [ -f /usr/local/lib/pearcircle-seeder/AppIcon.icns ]; then
+    cp /usr/local/lib/pearcircle-seeder/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+  fi
+
+  chown -R "$USER_NAME" "$APP"
+
+  # Strip any quarantine attribute (installer-created files shouldn't have
+  # one but belt + suspenders so Gatekeeper doesn't refuse the first launch).
+  /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+
+  # Nudge Finder + LaunchServices to pick up the new bundle + icon.
+  /usr/bin/touch "$APP"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
+
+  echo "Created Desktop shortcut: $APP"
 fi
 
 exit 0
