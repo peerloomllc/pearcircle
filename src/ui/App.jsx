@@ -594,7 +594,7 @@ export function App () {
           initialExpand={sheet?.name === 'settings' ? sheet.expand : null}
           onClose={closeSheet}
           onSaved={refresh}
-          onManageSeeders={(circleId, circleName) => setSheet({ name: 'seeders', circleId, circleName })}
+          onManageSeeders={(circleId, circleName) => setSheet({ name: 'seeders', circleId, circleName, returnTo: { name: 'settings' } })}
         />
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'trips'}>
@@ -652,7 +652,11 @@ export function App () {
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'seeders'}>
         {sheet?.name === 'seeders' && (
-          <SeederManageView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
+          <SeederManageView
+            circleId={sheet.circleId}
+            circleName={sheet.circleName}
+            onClose={() => sheet.returnTo ? setSheet(sheet.returnTo) : closeSheet()}
+          />
         )}
       </SheetContainer>
       <SeederApprovalBanner />
