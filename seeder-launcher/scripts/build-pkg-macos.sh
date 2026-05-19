@@ -59,16 +59,11 @@ fi
 cp "$BARE_BIN_SRC" "$PAYLOAD_LIB/bare"
 chmod +x "$PAYLOAD_LIB/bare"
 
-# 4. Worklet entry + JS modules + node_modules. Ship all repo-root worklet code
-#    plus the third-party dep tree the worklet imports at runtime.
-cp "$ROOT/../src/bare.js" "$PAYLOAD_LIB/worklet/bare.js"
-cp "$ROOT/../src/seeder.js" "$PAYLOAD_LIB/worklet/seeder.js"
-cp "$ROOT/../src/identity.js" "$PAYLOAD_LIB/worklet/identity.js"
-cp "$ROOT/../src/circle.js" "$PAYLOAD_LIB/worklet/circle.js"
-cp "$ROOT/../src/invite.js" "$PAYLOAD_LIB/worklet/invite.js"
-cp "$ROOT/../src/swarm.js" "$PAYLOAD_LIB/worklet/swarm.js"
-cp "$ROOT/../src/pair.js" "$PAYLOAD_LIB/worklet/pair.js"
-cp -R "$ROOT/../src/lib" "$PAYLOAD_LIB/worklet/lib"
+# 4. Worklet entry + JS modules + node_modules. Mirror the whole src/
+#    tree minus the UI bundle (src/ui/ is the mobile WebView code and
+#    isn't imported by bare.js) so new modules added by future slices
+#    (seederAdmission.js, seederRetention.js, etc) ship automatically.
+rsync -a --exclude='ui/' --exclude='*.test.js' "$ROOT/../src/" "$PAYLOAD_LIB/worklet/"
 
 # node_modules: rsync the repo-root tree, dropping mobile-only (react-native,
 # expo, the iOS xcframeworks in react-native-bare-kit) and dev-only (jest,
