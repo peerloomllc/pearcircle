@@ -66,10 +66,13 @@ function resolvePaths (opts) {
       uiDir: opts.uiDir || path.join(__dirname, '..', 'ui'),
     }
   }
-  const installRoot = path.resolve(__dirname, '..')
+  // The .pkg installs everything flat under /usr/local/lib/pearcircle-seeder/.
+  // The host-bundled.js lives at the install root, so __dirname IS the
+  // install root in production.
+  const installRoot = __dirname
   return {
-    barePath: opts.barePath || path.join(installRoot, 'bin', 'bare'),
-    bundleEntry: opts.bundleEntry || path.join(installRoot, 'bare-universal.bundle'),
+    barePath: opts.barePath || path.join(installRoot, 'bare'),
+    bundleEntry: opts.bundleEntry || path.join(installRoot, 'worklet', 'bare.js'),
     uiDir: opts.uiDir || path.join(installRoot, 'ui'),
   }
 }

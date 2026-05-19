@@ -1,17 +1,47 @@
 <!doctype html>
 <html>
-<head><meta charset="utf-8"><style>
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px; color: #222; }
-  h2 { margin-top: 0; }
-  code { background: #f3f4f6; padding: 2px 5px; border-radius: 3px; font-size: 90%; }
-</style></head>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin: 0;
+    padding: 20px;
+    background-color: #ffffff !important;
+    color: #222222 !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  h2 {
+    margin-top: 0;
+    color: #111111 !important;
+    font-size: 18px;
+  }
+  p, li {
+    color: #222222 !important;
+  }
+  code {
+    background-color: #eef0f3 !important;
+    color: #1a1a1a !important;
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-size: 90%;
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+  }
+  ul { padding-left: 22px; }
+  li + li { margin-top: 4px; }
+  @media (prefers-color-scheme: dark) {
+    html, body { background-color: #ffffff !important; color: #222222 !important; }
+  }
+</style>
+</head>
 <body>
 <h2>PearCircle Seeder</h2>
 <p>Installs an always-on blind-seeder daemon that replicates encrypted PearCircle circle data without holding the decryption key. After install:</p>
 <ul>
   <li>The daemon launches automatically at login and survives logout.</li>
-  <li>A monitoring UI is available at <code>http://127.0.0.1:8730</code>.</li>
-  <li>The token URL is written to <code>~/Library/Application Support/PearCircle Seeder/seeder.log</code> after first launch.</li>
+  <li>The monitoring UI opens automatically in your default browser.</li>
+  <li>If you missed it, the URL is logged to <code>~/Library/Application Support/PearCircle Seeder/seeder.log</code> (grep for <code>UI at</code>).</li>
 </ul>
 <p>To enroll in a circle, paste a seed invite link from a PearCircle member into the UI.</p>
 </body>

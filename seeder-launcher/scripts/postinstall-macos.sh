@@ -1,9 +1,10 @@
 #!/bin/bash
 # Runs as root under macOS installer's postinstall context. Resolves the
 # actual console user (whose login session needs the LaunchAgent), writes
-# the templated plist into their LaunchAgents directory, chowns it, and
-# loads it via launchctl asuser so the daemon runs in the user session
-# (not as root).
+# the templated plist into their LaunchAgents directory, chowns it, loads
+# it in the user's session, waits for the UI URL to appear in the log,
+# opens the URL in the user's default browser, and prompts (via osascript)
+# whether to drop a .webloc shortcut on the Desktop.
 set -euo pipefail
 
 # Resolve the console user, not $USER (which is root during install).
@@ -31,16 +32,53 @@ chmod 0644 "$PLIST_DST"
 launchctl asuser "$USER_UID" launchctl unload "$PLIST_DST" 2>/dev/null || true
 launchctl asuser "$USER_UID" launchctl load "$PLIST_DST"
 
-# Surface the UI URL on first boot. The launcher writes ?t=<token> into
-# its log; tail that for a few seconds so the install completes with a
-# clickable URL in the installer log.
-for i in $(seq 1 10); do
+# Wait up to ~15s for the host to bind and log the UI URL.
+URL=""
+for i in $(seq 1 30); do
   if grep -q 'UI at ' "$DATA_DIR/seeder.log" 2>/dev/null; then
     URL=$(grep 'UI at ' "$DATA_DIR/seeder.log" | tail -1 | sed 's/.*UI at //')
-    echo "PearCircle Seeder running. Open: $URL"
     break
   fi
-  sleep 1
+  sleep 0.5
 done
+
+if [ -z "$URL" ]; then
+  echo "warning: PearCircle Seeder did not log a UI URL within 15s; check $DATA_DIR/launchd.log"
+  exit 0
+fi
+
+echo "PearCircle Seeder running. Open: $URL"
+
+# Open the UI in the user's default browser. `launchctl asuser` puts us
+# in their Aqua session so `open` routes to their default app.
+launchctl asuser "$USER_UID" sudo -u "$USER_NAME" open "$URL" 2>/dev/null || true
+
+# Prompt for a desktop shortcut via AppleScript. -e returns "button returned:..."
+# on success, exits non-zero on failure or "User cancelled".
+SHORTCUT_ANSWER=$(launchctl asuser "$USER_UID" sudo -u "$USER_NAME" osascript \
+  -e 'try' \
+  -e '  display dialog "Create a Desktop shortcut to open the PearCircle Seeder monitoring UI?" buttons {"Skip", "Create"} default button "Create" with title "PearCircle Seeder" with icon note' \
+  -e '  return button returned of result' \
+  -e 'on error' \
+  -e '  return "Skip"' \
+  -e 'end try' \
+  2>/dev/null || echo "Skip")
+
+if [ "$SHORTCUT_ANSWER" = "Create" ]; then
+  WEBLOC="$USER_HOME/Desktop/PearCircle Seeder.webloc"
+  cat > "$WEBLOC" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>URL</key>
+  <string>$URL</string>
+</dict>
+</plist>
+EOF
+  chown "$USER_NAME" "$WEBLOC"
+  chmod 0644 "$WEBLOC"
+  echo "Created Desktop shortcut: $WEBLOC"
+fi
 
 exit 0
