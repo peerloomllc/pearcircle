@@ -28,12 +28,12 @@ const Autobase = require('autobase')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey, generatePlaceId } = require('./circle')
-const { buildInvite, parseInvite } = require('./invite')
+const { buildInvite, parseInvite, buildSeedInvite } = require('./invite')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
-const { shouldAcceptSeederRow } = require('./lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke } = require('./lib/seederApply')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -688,6 +688,78 @@ const handlers = {
     const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
     const invite = buildInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
     return { invite, name }
+  },
+
+  // Mint a seed-only invite for a circle the local device is a member of.
+  // Proposal 2026-05-19-blind-seeder-peers slice 3b. The seed invite uses
+  // the /circle/seed path and intentionally omits any encryption-key field
+  // so a blind seeder consuming it cannot decrypt circle content. The
+  // optional label is for the inviter's own record-keeping and is NOT
+  // baked into the URL (it lands on the seeder:{pubkey} row at admission
+  // time in slice 3d).
+  'circle:invite:seed': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const record = await _localDb.get('circles:joined:' + circleId)
+    if (!record?.value) throw new Error('not a member of that circle')
+    const { name, circleKey, bootstrap } = record.value
+    const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
+    const invite = buildSeedInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
+    return { invite, name }
+  },
+
+  // List the current (non-revoked) seeders for a circle the local device
+  // is a member of. Proposal 2026-05-19-blind-seeder-peers slice 3b.
+  // Reads the autobase view's `seeder:` prefix; the apply branch already
+  // rejected malformed / unauthorized rows, so consumers can trust the
+  // shape returned here. Settings UI in slice 4 renders this list.
+  'circle:seeders:list': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    const seeders = []
+    for await (const { value } of base.view.createReadStream({
+      gt: 'seeder:',
+      lt: 'seeder:~',
+    })) {
+      if (!value || value.revoked === true) continue
+      seeders.push({
+        pubkey: value.pubkey,
+        addedBy: value.addedBy,
+        addedAt: value.addedAt,
+        updatedAt: value.updatedAt,
+        label: typeof value.label === 'string' ? value.label : null,
+      })
+    }
+    return { seeders }
+  },
+
+  // Revoke an admitted seeder. Proposal 2026-05-19-blind-seeder-peers
+  // slice 3b. Writes a tombstone row signed by the local member. Apply
+  // branch + peer-filter (slice 3d) enforce the revocation across the
+  // fleet: members refuse swarm connections to revoked seeder pubkeys.
+  // Idempotent on already-revoked rows in the sense that re-revoking
+  // just bumps updatedAt; harmless. Refuses on absent rows so callers
+  // get a clear error rather than a silent no-op.
+  'circle:seeder:revoke': async ({ circleId, pubkey } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string' || pubkey.length !== 64) {
+      throw new Error('pubkey must be a 64-char hex string')
+    }
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const existingNode = await base.view.get('seeder:' + pubkey)
+    const existing = existingNode?.value
+    if (!existing) throw new Error('no seeder with that pubkey in this circle')
+    const revokerPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const unsigned = buildSeederRevoke({ existing, revokerPubkeyHex, now: Date.now() })
+    if (!unsigned) throw new Error('existing seeder row is malformed; cannot revoke')
+    const signed = signValue(unsigned, _identity.secretKey)
+    await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
+    return { ok: true, circleId, pubkey }
   },
 
   // Owner-only rename. Appends a fresh `circle:` row with the new name
