@@ -2431,6 +2431,16 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
       identity: seederIdentity,
       mountCircle: mountSeederCircle,
       leaveCircle: leaveSeederCircle,
+      // Sum byteLength across every mounted seeder core. core.byteLength
+      // grows as encrypted blocks land via replication. Reads everything
+      // synchronously off the in-memory cores; no I/O.
+      getReplicatedBytes: () => {
+        let total = 0
+        for (const entry of _seederCircles.values()) {
+          if (entry?.core?.byteLength) total += entry.core.byteLength
+        }
+        return total
+      },
     })
 
     // Re-mount every persisted enrollment so a process restart picks up

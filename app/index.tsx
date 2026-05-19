@@ -520,6 +520,13 @@ export default function Index() {
       catch (e: any) { console.warn('setMode failed', e?.message ?? String(e)) }
     })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
+    // Blind-seeder admission events (proposal 2026-05-19 slice 3d).
+    // seeder:announced surfaces the SeederApprovalBanner in the WebView.
+    // seeder:admitted / seeder:revoked drive optimistic UI refreshes in
+    // SeederManageView when another member's write replicates in.
+    onEvent('seeder:announced', (data) => emitEvent('seeder:announced', data))
+    onEvent('seeder:admitted', (data) => emitEvent('seeder:admitted', data))
+    onEvent('seeder:revoked', (data) => emitEvent('seeder:revoked', data))
     onEvent('sharing:changed', async (data) => {
       emitEvent('sharing:changed', data)
       // FGS lifecycle: when every circle is muted, stop the native

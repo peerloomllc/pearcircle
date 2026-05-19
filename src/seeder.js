@@ -92,15 +92,19 @@ async function loadOrCreateSeederIdentity (localDb) {
  *   Called by seeder:leave before the persistence rows are deleted so the host can
  *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCircle, leaveCircle }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCircle, leaveCircle, getReplicatedBytes }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
     'seeder:status': async () => ({
       pubkey: pubkeyHex,
       uptime: Date.now() - bootTs,
-      // Bytes-replicated counter wires in slice 3 once the swarm is up.
-      totalBytesReplicated: 0,
+      // Live tally across every mounted seeder core. The host wires the
+      // getReplicatedBytes callback from its _seederCircles map; tests
+      // omit it and get 0.
+      totalBytesReplicated: typeof getReplicatedBytes === 'function'
+        ? (await Promise.resolve(getReplicatedBytes())) || 0
+        : 0,
     }),
 
     // Real implementation per slice 3c. Parses the /circle/seed URL, refuses
