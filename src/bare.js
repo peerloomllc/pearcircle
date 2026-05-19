@@ -2444,16 +2444,17 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
       identity: seederIdentity,
       mountCircle: mountSeederCircle,
       leaveCircle: leaveSeederCircle,
-      // Sum contiguous-downloaded bytes across every mounted seeder core.
-      // core.byteLength is the AUTHORITY total (what the writer has
-      // published) — would over-report by including blocks not yet
-      // downloaded. core.contiguousByteLength is the bytes in blocks
-      // 0..contiguousLength-1 we've actually received, which is what we
-      // want for "replicated" reporting.
+      // Sum byteLength across every mounted seeder core. Hypercore 11's
+      // contiguousByteLength is a stub that returns 0 (hypercore/index.js
+      // line 631), so we can't use it. byteLength is the AUTHORITY total
+      // — would normally over-report by including blocks not yet
+      // downloaded — but the open-ended core.download() in mountSeederCircle
+      // means the seeder proactively pulls everything, so authority and
+      // actual-downloaded converge within a short window.
       getReplicatedBytes: () => {
         let total = 0
         for (const entry of _seederCircles.values()) {
-          if (entry?.core?.contiguousByteLength) total += entry.core.contiguousByteLength
+          if (entry?.core?.byteLength) total += entry.core.byteLength
         }
         return total
       },
