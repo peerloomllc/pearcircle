@@ -29,6 +29,14 @@ function generateCircleKey () {
   return b4a.toString(randomBytes32(), 'hex')
 }
 
+// Per-circle 32-byte block-encryption key (hex). Distinct from circleKey
+// (which is the swarm topic seed) so a blind seeder holding circleKey
+// cannot derive encryptionKey. See proposal 2026-05-19-blind-seeder-peers
+// §Design / Encryption key derivation.
+function generateEncryptionKey () {
+  return b4a.toString(randomBytes32(), 'hex')
+}
+
 // 16-byte hex (32 chars). Place ids are scoped within a circle's Autobase
 // view; 128 bits is more than enough to avoid collisions in any practical
 // circle while keeping keys short.
@@ -38,4 +46,4 @@ function generatePlaceId () {
   return b4a.toString(buf, 'hex')
 }
 
-module.exports = { generateCircleId, generateCircleKey, generatePlaceId }
+module.exports = { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId }

@@ -27,7 +27,7 @@ const Hyperswarm = require('hyperswarm')
 const Autobase = require('autobase')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
-const { generateCircleId, generateCircleKey, generatePlaceId } = require('./circle')
+const { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite } = require('./invite')
 const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers } = require('./seeder')
 const { topicForCircleKey } = require('./swarm')
@@ -372,6 +372,11 @@ const handlers = {
 
     const circleId = generateCircleId()
     const circleKey = generateCircleKey()
+    // Per-circle block-encryption key. Always-on for new circles (proposal
+    // 2026-05-19-blind-seeder-peers Q1 resolution). Distinct from circleKey
+    // so a blind seeder holding the swarm topic seed cannot derive enc.
+    const encryptionKey = generateEncryptionKey()
+    const encryptionKeyBuf = b4a.from(encryptionKey, 'hex')
     const ownerPublicKey = b4a.toString(_identity.publicKey, 'hex')
     const createdAt = Date.now()
     const profile = await readProfileForMemberRow(ownerPublicKey)
@@ -385,6 +390,7 @@ const handlers = {
       open: openCircleView,
       apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
       valueEncoding: 'json',
+      encryptionKey: encryptionKeyBuf,
     })
     await base.ready()
     _circleBases.set(circleId, base)
@@ -394,7 +400,7 @@ const handlers = {
     await base.append({
       type: 'put',
       key: 'circle',
-      value: { id: circleId, name, ownerKey: ownerPublicKey, createdAt, v: 1 },
+      value: { id: circleId, name, ownerKey: ownerPublicKey, createdAt, encrypted: true, v: 1 },
     })
     const ownerMember = { pubkey: ownerPublicKey, displayName: profile.displayName, joinedAt: createdAt, v: 1 }
     if (profile.avatar) ownerMember.avatar = profile.avatar
@@ -409,15 +415,16 @@ const handlers = {
       name,
       circleKey,
       bootstrap,
+      encryptionKey,
       role: 'owner',
       createdAt,
     })
 
-    const invite = buildInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey: ownerPublicKey })
+    const invite = buildInvite({ circleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey: ownerPublicKey })
 
     joinCircleTopic(circleId, circleKey)
 
-    return { circleId, circleKey, bootstrap, name, ownerPublicKey, createdAt, invite }
+    return { circleId, circleKey, bootstrap, encryptionKey, name, ownerPublicKey, createdAt, invite }
   },
 
   'circle:join': async ({ invite } = {}) => {
@@ -427,7 +434,7 @@ const handlers = {
     const parsed = parseInvite(invite)
     if (!parsed.ok) throw new Error('invalid invite: ' + parsed.error)
 
-    const { circleId, name, circleKey, bootstrap, inviterPublicKey } = parsed
+    const { circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey } = parsed
 
     // Idempotent: if we already have a record (owner or member), return it
     // unchanged. The owner re-scanning their own invite must not be demoted
@@ -437,12 +444,16 @@ const handlers = {
 
     // Open the per-circle Autobase as a reader. Replication populates the
     // view once a writer connects. addWriter (slice 6E) flips writable=true.
+    // encryptionKey is null for legacy unencrypted invites; in that case
+    // Autobase opens without block encryption (proposal 2026-05-19 Compat).
     const ns = _store.namespace(circleId)
-    const base = new Autobase(ns, b4a.from(bootstrap, 'hex'), {
+    const baseOpts = {
       open: openCircleView,
       apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
       valueEncoding: 'json',
-    })
+    }
+    if (encryptionKey) baseOpts.encryptionKey = b4a.from(encryptionKey, 'hex')
+    const base = new Autobase(ns, b4a.from(bootstrap, 'hex'), baseOpts)
     await base.ready()
 
     // Stale-invite check (proposal amendment 2026-05-07 §1). Join the
@@ -494,6 +505,7 @@ const handlers = {
       inviterPublicKey,
       joinedAt,
     }
+    if (encryptionKey) record.encryptionKey = encryptionKey
     await _localDb.put('circles:joined:' + circleId, record)
 
     return { ...record, alreadyJoined: false }
@@ -694,9 +706,9 @@ const handlers = {
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const record = await _localDb.get('circles:joined:' + circleId)
     if (!record?.value) throw new Error('not a member of that circle')
-    const { name, circleKey, bootstrap } = record.value
+    const { name, circleKey, bootstrap, encryptionKey } = record.value
     const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
-    const invite = buildInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
+    const invite = buildInvite({ circleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey })
     return { invite, name }
   },
 
@@ -1934,14 +1946,16 @@ async function autoAppendMemberRow (circleId) {
   }
 }
 
-async function mountCircleAutobase (circleId, bootstrapHex) {
+async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex) {
   if (_circleBases.has(circleId)) return _circleBases.get(circleId)
   const ns = _store.namespace(circleId)
-  const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), {
+  const baseOpts = {
     open: openCircleView,
     apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
     valueEncoding: 'json',
-  })
+  }
+  if (encryptionKeyHex) baseOpts.encryptionKey = b4a.from(encryptionKeyHex, 'hex')
+  const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
   _circleBases.set(circleId, base)
   openPairChannelsForCircle(circleId, base)
@@ -2153,7 +2167,7 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   })) {
     if (!value || !value.circleId) continue
     if (value.bootstrap) {
-      try { await mountCircleAutobase(value.circleId, value.bootstrap) } catch (e) {
+      try { await mountCircleAutobase(value.circleId, value.bootstrap, value.encryptionKey) } catch (e) {
         console.warn('[bare] failed to mount circle', value.circleId, e?.message)
       }
     }

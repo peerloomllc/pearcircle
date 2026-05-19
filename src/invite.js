@@ -1,12 +1,17 @@
 // Invite link builder and parser for PearCircle.
-// Wire format per proposals/2026-05-03-wire-protocol.md §2 (amended 2026-05-04):
-//   https://peerloomllc.com/circle/join?circle={base64url(32)}&name={name}&key={hex(32)}&bootstrap={hex(32)}&inviter={hex(32)}
+// Wire format per proposals/2026-05-03-wire-protocol.md §2 (amended 2026-05-04,
+// 2026-05-19):
+//   https://peerloomllc.com/circle/join?circle={base64url(32)}&name={name}&key={hex(32)}&bootstrap={hex(32)}&inviter={hex(32)}[&enc={hex(32)}]
 // Legacy custom scheme also accepted: pear://pearcircle/join?...
 //
 // Path prefix is /circle/ (not /join/) so the link never collides with
 // PearCal's invites on the shared peerloomllc.com host.
 // `bootstrap` is the per-circle Autobase bootstrap writer core public key;
 // distinct from `inviter` because the inviter need not be the original owner.
+// `enc` is the per-circle Hypercore block-encryption key; required for
+// circles created post 2026-05-19-blind-seeder-peers and absent on legacy
+// invites. Deliberately separate from `key` (the swarm topic seed) so a
+// blind seeder holding `key` cannot derive `enc`.
 
 const HTTPS_HOST_PATH = 'https://peerloomllc.com/circle/join'
 const PEAR_HOST_PATH = 'pear://pearcircle/join'
@@ -28,10 +33,13 @@ const NAME_MAX = 64
  * @param {string} args.circleKey - 64-char hex (32 bytes)
  * @param {string} args.bootstrap - 64-char hex (32 bytes), Autobase bootstrap pubkey
  * @param {string} args.inviterPublicKey - 64-char hex (32 bytes)
+ * @param {string} [args.encryptionKey] - 64-char hex (32 bytes), block-encryption
+ *   key. Required for circles created post 2026-05-19; omit for legacy
+ *   unencrypted circles.
  * @param {'https'|'pear'} [args.scheme='https']
  * @returns {string}
  */
-function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, scheme = 'https' }) {
+function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey, scheme = 'https' }) {
   if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
     throw new Error('circleId must be a 43-char base64url string (32 bytes)')
   }
@@ -47,6 +55,11 @@ function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, 
   if (typeof inviterPublicKey !== 'string' || !HEX_64.test(inviterPublicKey)) {
     throw new Error('inviterPublicKey must be a 64-char hex string (32 bytes)')
   }
+  if (encryptionKey !== undefined && encryptionKey !== null) {
+    if (typeof encryptionKey !== 'string' || !HEX_64.test(encryptionKey)) {
+      throw new Error('encryptionKey must be a 64-char hex string (32 bytes)')
+    }
+  }
   if (scheme !== 'https' && scheme !== 'pear') {
     throw new Error('scheme must be "https" or "pear"')
   }
@@ -58,14 +71,15 @@ function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, 
     `key=${circleKey}`,
     `bootstrap=${bootstrap}`,
     `inviter=${inviterPublicKey}`,
-  ].join('&')
-  return `${base}?${params}`
+  ]
+  if (encryptionKey) params.push(`enc=${encryptionKey}`)
+  return `${base}?${params.join('&')}`
 }
 
 /**
  * Parse an invite link.
  * @param {string} url
- * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, bootstrap?: string, inviterPublicKey?: string, error?: string }}
+ * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, bootstrap?: string, inviterPublicKey?: string, encryptionKey?: string|null, error?: string }}
  */
 function parseInvite (url) {
   if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
@@ -87,6 +101,7 @@ function parseInvite (url) {
   const circleKey = params.key
   const bootstrap = params.bootstrap
   const inviterPublicKey = params.inviter
+  const encRaw = params.enc
 
   if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
     return { ok: false, error: 'invalid or missing circleId' }
@@ -103,8 +118,15 @@ function parseInvite (url) {
   if (typeof inviterPublicKey !== 'string' || !HEX_64.test(inviterPublicKey)) {
     return { ok: false, error: 'invalid or missing inviterPublicKey' }
   }
+  let encryptionKey = null
+  if (encRaw !== undefined) {
+    if (typeof encRaw !== 'string' || !HEX_64.test(encRaw)) {
+      return { ok: false, error: 'invalid encryptionKey' }
+    }
+    encryptionKey = encRaw
+  }
 
-  return { ok: true, scheme, circleId, name, circleKey, bootstrap, inviterPublicKey }
+  return { ok: true, scheme, circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey }
 }
 
 /**
