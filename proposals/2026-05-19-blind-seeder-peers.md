@@ -1,6 +1,6 @@
 # Blind seeder peers - always-on replication without trust
 
-**Status**: Draft 2026-05-19. Awaiting approval.
+**Status**: Draft 2026-05-19. Open questions resolved 2026-05-19 (see end of doc): Q1 always-on encryption with no user toggle, Q2 one identity per device, Q3 mode fixed at launch, Q4 per-circle list only, Q5 v: 1 on seeder rows, Q6 document anonymity concern only, Q7 any-member admission with transparency, Q8 ship TTL config knob in v1. Awaiting approval.
 
 **Goal**: Let a circle enroll an always-on "blind seeder" device (a Raspberry Pi, a spare phone, eventually a community-run mesh) that replicates encrypted Autobase blocks for the circle but never holds the encryption key, so circle members can sync asynchronously without both being online at the same instant. Closes the structural co-presence gap that today's pure-P2P design has against server-mediated apps like Life360.
 
@@ -24,7 +24,7 @@ This proposal addresses (2) in its strongest form: a "blind" seeder that partici
 
 In scope:
 
-- **Hypercore block encryption** turned on per-circle for the Autobase view core and the per-circle Hyperbee bee. A 32-byte `encryptionKey` is generated at circle-creation time, stored in the circle's local Hyperbee row (never replicated), and threaded into every Hypercore constructor for that circle.
+- **Hypercore block encryption** turned on per-circle for the Autobase view core and the per-circle Hyperbee bee. A 32-byte `encryptionKey` is generated at circle-creation time, stored in the circle's local Hyperbee row (never replicated), and threaded into every Hypercore constructor for that circle. Encryption is **mandatory for all circles created post-feature**; there is no user-facing toggle (Q1 resolution).
 - **Invite-link grammar amendment**: the existing member invite gains a required `enc={hex(encryptionKey)}` field for encrypted circles. Circles created before this proposal stay unencrypted; their invite grammar is unchanged.
 - **Seed-only invite link**: new `/circle/seed` path carrying topic + bootstrap + inviter but no `enc`. Format:
   ```
@@ -48,7 +48,8 @@ In scope:
   - `circle:seeder:revoke({ circleId, pubkey })` writes the tombstone.
 - **Seeder-self-announce protocol**: on first swarm-connection to a member of a circle the seeder has enrolled in, the seeder sends a one-shot Protomux channel message `seeder:announce { pubkey, label? }`. The receiving member's worklet validates the topic admission, prompts the user once via UI ("Add this device as a seeder for circle X?"), and on approval signs and appends the `seeder:{pubkey}` row.
 - **Settings UI**: per-circle "Seeders" section listing enrolled seeders by short pubkey + label, with mint-invite, list, and revoke actions. Counts seeders separately from members; map view does not render seeders.
-- **Verify + test fixtures** for encryption round-trip, seed-mode write refusal, and revocation propagation.
+- **Seeder retention config** (Q8 resolution): a `pruneOlderThan` integer (ms) per enrolled circle on the seeder's local Hyperbee, default `null` (no pruning). Set via `seeder:retention:set({ circleId, pruneOlderThan })` on the seeder process. When non-null, a daily sweep drops Hypercore blocks whose autobase-ordering timestamp is older than the threshold. Members are unaffected; pruning is purely a seeder-local disk-budget knob.
+- **Verify + test fixtures** for encryption round-trip, seed-mode write refusal, revocation propagation, and retention-sweep behavior.
 
 Out of scope:
 
@@ -56,7 +57,6 @@ Out of scope:
 - Encryption-key rotation on member kick. If a removed member kept a copy of `encryptionKey`, they could still decrypt newly-replicated blocks they happen to grab off the DHT. v1 punts; we mitigate operationally (kick implies trust break, full reset of the circle is the recommendation) and track in a follow-up.
 - Migrating existing unencrypted circles to encrypted. Users who want blind-seeder protection must recreate the circle.
 - Per-record-kind seeder authorization. A seeder either replicates the whole circle or nothing. v1 will not support "this seeder only stores `transition:` rows."
-- Disk budgeting / pruning on the seeder. Assume the seeder has effectively unlimited disk relative to circle traffic (a few MB per circle per year at current write rates).
 - Seeder operating-mode UX. The seeder runs as a `node bare.js --seed` or `bare-runtime bare.js seed` command on hardware; no GUI. A future companion app could wrap this, but it's a separate effort.
 - Cross-circle seeder bundling at the protocol level. One seeder process happens to enroll in multiple circles, but each circle's enrollment is independent (no shared admission, no shared identity per circle).
 - Push-wake. This proposal does NOT solve "wake a sleeping iPhone via P2P" - it only solves "the data is there waiting when the iPhone next gets CPU." A seeder + a future push-relay are complementary, not substitutes.
@@ -68,7 +68,7 @@ Mixed-fleet behavior:
 - **Old-code peer + old (unencrypted) circle**: unchanged. Existing fleet keeps working.
 - **Old-code peer + new (encrypted) circle**: cannot join. The old member-join code path doesn't know about the `enc` query field, the local `circle:` row write succeeds, the swarm join succeeds (topic seed is unchanged), but the bootstrap-core read returns ciphertext that the old `view.get` chain treats as malformed JSON. Failure is graceful at the parse layer (`JSON.parse` throws inside the apply branch, the apply-branch try/catch logs and continues), so the join "succeeds" but the member never sees any circle state. UX is broken but not catastrophic. **Mitigation**: bump the minimum-shipped app version before any user is told to create encrypted circles. Settings UI for circle creation gates the "Enable blind-seeder protection" toggle on a build-flag we can flip once the fleet is upgraded.
 - **New-code peer + old (unencrypted) circle**: unchanged. The new code reads `encrypted: true` from the local `circle:` row, sees it absent or false, and proceeds without encryption.
-- **New-code peer + new (encrypted) circle**: full feature.
+- **New-code peer + new (encrypted) circle**: full feature. Every new circle is encrypted; there is no unencrypted-circle creation path in the new build (Q1 resolution). The `encrypted: true` field on the `circle:` row is therefore implicit for any circle created post-feature, but we still write it explicitly so old-circle migration tooling can distinguish.
 - **Blind seeder + encrypted circle**: blind seeder joins the topic, replicates encrypted blocks, never decrypts.
 - **Blind seeder + unencrypted circle**: not supported. Seed invites are only mintable for encrypted circles (the IPC refuses on unencrypted circles with a clear error). This is intentional - a blind seeder for an unencrypted circle is just a full member, and that case is better served by encouraging the user to either (a) recreate the circle encrypted or (b) join a phone as a real member.
 
@@ -217,7 +217,7 @@ New "Seeders" section in the per-circle settings view (`src/ui/App.jsx` per-circ
 - A "Revoke" action per seeder
 - Self-state row when this device is itself a seeder (for the dev / Pi case): "This device is a seeder, not a member" + no other circle settings
 
-The blind-seeder toggle is **per circle at creation time only** for v1. We do not support converting existing circles. Circle-creation flow gains an explicit checkbox "Enable blind-seeder protection (recommended)" - default on, with an info pop describing the trade-off (slightly higher CPU on first sync; requires all members on the latest app version).
+Encryption is always-on for new circles (Q1 resolution). There is no creation-time checkbox. The circle-creation flow is unchanged in terms of user choices; the worklet just always generates an `encryptionKey` and the invite always carries `enc=<hex>`. We do not support converting existing unencrypted circles - users who want blind-seeder protection on a legacy circle must recreate it.
 
 ### IPC additions
 
@@ -231,6 +231,8 @@ The blind-seeder toggle is **per circle at creation time only** for v1. We do no
 | `seeder:enrolled:list` | shell (seed mode) | `{}` | `{ circles: [{ circleId, name, inviter, connectedPeers }] }` |
 | `seeder:leave` | shell (seed mode) | `{ circleId }` | `{ ok: true }` |
 | `seeder:status` | shell (seed mode) | `{}` | `{ pubkey, uptime, totalBytesReplicated }` |
+| `seeder:retention:get` | shell (seed mode) | `{ circleId }` | `{ pruneOlderThan: number \| null }` |
+| `seeder:retention:set` | shell (seed mode) | `{ circleId, pruneOlderThan }` | `{ ok: true }` |
 
 IPC events emitted by member-mode worklet:
 - `seeder:announced` `{ circleId, pubkey, label }` - shell shows an approval prompt
@@ -259,6 +261,7 @@ New tests:
 - `tests/seederMode.test.js` - boot `bare.js` with `{ mode: 'seed' }`, attempt to call `lastSeen:write`, `transition:write`, `place:create`. All return `error: 'not-permitted-in-seed-mode'`. Seeder identity persists across two boots.
 - `tests/seederAdmission.test.js` - end-to-end in a single process: spin up a member-mode worklet + a seed-mode worklet against an in-memory swarm; seeder enrolls, sends announce; member's `seeder:announced` event fires; shell-emulator approves; `seeder:{pubkey}` row appears in autobase view; member's peer-filter accepts the seeder connection. Then revoke; verify peer-filter drops a freshly-replayed seeder connection.
 - `tests/seederRevocation.test.js` - revocation writes propagate to all members; each member's peer-filter independently refuses the seeder connection.
+- `tests/seederRetention.test.js` - seed-mode worklet with `pruneOlderThan = 86_400_000` (1 day) drops blocks whose autobase-ordering timestamp is older than the threshold on the daily sweep; blocks newer than the threshold remain; setting `pruneOlderThan = null` disables the sweep.
 
 Manual smoke (D1 owner / cell, D2 joiner / wifi-only, dev box running seeder):
 
@@ -299,16 +302,16 @@ The Constitution §6 RCA requirement attaches to any T3 change that breaks in pr
 
 Wire-protocol amendment record in `proposals/2026-05-03-wire-protocol.md` will be added as a 2026-05-19 entry noting (a) `enc=<hex>` field on member invites, (b) `/circle/seed` invite shape, (c) `seeder:{pubkey}` record kind with apply rules above, (d) Hypercore block encryption for circles marked `encrypted: true`. A `DECISIONS.md` row records the encryption-key-not-derived-from-circleKey choice.
 
-## Open questions
+## Open questions (resolved 2026-05-19)
 
-- **Q1: Default-on or default-off for new circles?** Recommend default-on for new circles once the minimum-shipped app version is bumped. The privacy and reliability arguments compound (encrypted blocks at rest are good; the seeder option being available is good). Risk: an extra-CPU first-sync on low-end devices. Mitigation: profile on the dev box; if it's noticeable, default-off with a Settings toggle.
-- **Q2: One seeder identity per device or one per circle?** Recommend one per device. Simplest enrollment story; a single revoke removes the device from one circle without affecting others. A future "burn this device's identity" action handles the multi-circle case.
-- **Q3: Should member-mode worklets be allowed to also run as seeders for circles they're not members of?** No in v1. Mode is set at process launch. A future companion app could run a long-lived background seeder process separately from the main PearCircle app.
-- **Q4: Seeder discovery: should there be a Settings affordance to list "seeders available to me" beyond the per-circle list?** No in v1. The seeder enrollment model is opt-in from the member side; there's no global seeder directory. Keeps the trust model simple (you only see seeders you or another circle member explicitly invited).
-- **Q5: Wire-protocol v field on seeder rows?** Yes - `v: 1`, additive within the existing v1 family.
-- **Q6: Should the seeder operate over Tor / VPN by default?** No, but document that anyone running a seeder on a residential connection exposes their IP via DHT announce. Power-user concern; out of scope for v1.
-- **Q7: What stops a malicious member from minting and admitting their own seeder for surveillance?** Nothing at the protocol level - any member can admit a seeder. Mitigation is social: the seeder admission prompt names which member admitted it, and all members see seeder rows in their list. A future Settings UX surface could highlight "seeders not approved by the circle owner" if user feedback indicates the need.
-- **Q8: Storage growth on seeders without pruning?** At current write rates (~one lastSeen per peer per location-update, batched; transitions on geofence events; place rows ~tens per circle), a five-member circle generates roughly 200KB per day per seeder. A year is ~70MB. Acceptable for a Pi with a microSD card. If we hit problem scales (circles with active trip-sharing especially), follow-up adds a `pruneOlderThan` config option per circle on the seeder.
+- **Q1: Default-on or default-off for new circles?** **Resolved: always-on, no toggle.** Stronger than the original recommendation. Every new circle is encrypted; there is no creation-time choice for the user. Drops the toggle UI, drops the unencrypted-new-circle code path entirely. Build-flag gating on the minimum-shipped version still applies before exposing the feature to the fleet.
+- **Q2: One seeder identity per device or one per circle?** **Resolved: one per device.** Single keypair stored under `identity:seeder` in the seeder's local Hyperbee, reused across every circle it enrolls in. Revoke is per-circle either way.
+- **Q3: Should member-mode worklets be allowed to also run as seeders for circles they're not members of?** **Resolved: no, mode fixed at launch.** `bare.js --seed` is one process shape; the default member-mode worklet is another. No mixed mode in v1. Future companion app could run a long-lived background seeder process separately.
+- **Q4: Seeder discovery: should there be a Settings affordance to list "seeders available to me" beyond the per-circle list?** **Resolved: no, per-circle list only.** No cross-circle view, no community directory. Keeps the trust model simple (you only see seeders someone explicitly invited).
+- **Q5: Wire-protocol v field on seeder rows?** **Resolved: yes, `v: 1`.** Consistent with every other replicated record kind.
+- **Q6: Should the seeder operate over Tor / VPN by default?** **Resolved: document only, no routing.** v1 ships plain Hyperswarm. Docs note the IP-via-DHT exposure; running behind a VPN is a power-user mitigation. Revisit if a real user asks.
+- **Q7: What stops a malicious member from minting and admitting their own seeder for surveillance?** **Resolved: any-member admission with transparency.** Nothing at the protocol level prevents it - matches the existing any-member-invite decision (DECISIONS 2026-05-03). Mitigation is social: the admission prompt names the admitting member, all members see seeder rows, revoke is one tap. If real-world abuse emerges, a follow-up could add owner-veto.
+- **Q8: Storage growth on seeders without pruning?** **Resolved: ship a TTL config knob in v1.** Stronger than the original recommendation. `pruneOlderThan` per enrolled circle, default `null` (no pruning). Daily sweep when set. Saves a follow-up proposal and gives Pi operators an immediate disk-budget tool.
 
 ## Sketch of follow-up work
 
