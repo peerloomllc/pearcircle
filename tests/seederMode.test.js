@@ -1,0 +1,292 @@
+// Seeder-mode primitives — proposal 2026-05-19-blind-seeder-peers slice 2.
+// Pure-logic tests against an in-memory Hyperbee-shaped localDb. Network
+// and Autobase wiring land in slice 3, so admission and replication are
+// not exercised here.
+
+const b4a = require('b4a')
+const {
+  SEED_METHODS,
+  detectSeedMode,
+  loadOrCreateSeederIdentity,
+  createSeederHandlers,
+} = require('../src/seeder')
+
+// Minimal Hyperbee-shaped mock backed by a sorted Map. Captures the
+// subset of the API the seeder module touches.
+function makeFakeLocalDb () {
+  const data = new Map()
+  return {
+    _data: data,
+    async get (key) {
+      if (!data.has(key)) return null
+      return { value: data.get(key) }
+    },
+    async put (key, value) {
+      data.set(key, value)
+    },
+    async del (key) {
+      data.delete(key)
+    },
+    async *createReadStream ({ gt, lt } = {}) {
+      const keys = Array.from(data.keys()).sort()
+      for (const key of keys) {
+        if (gt !== undefined && !(key > gt)) continue
+        if (lt !== undefined && !(key < lt)) continue
+        yield { key, value: data.get(key) }
+      }
+    },
+  }
+}
+
+describe('SEED_METHODS', () => {
+  test('lists the slice-2 IPC surface', () => {
+    expect(SEED_METHODS).toEqual([
+      'seeder:status',
+      'seeder:enroll',
+      'seeder:enrolled:list',
+      'seeder:leave',
+      'seeder:retention:get',
+      'seeder:retention:set',
+    ])
+  })
+
+  test('is frozen so callers cannot mutate the contract', () => {
+    expect(Object.isFrozen(SEED_METHODS)).toBe(true)
+  })
+})
+
+describe('detectSeedMode', () => {
+  test('argv with --seed returns true', () => {
+    expect(detectSeedMode(['bare', 'bare.js', '--seed'])).toBe(true)
+  })
+
+  test('argv without --seed returns false', () => {
+    expect(detectSeedMode(['bare', 'bare.js'])).toBe(false)
+  })
+
+  test('options.mode = "seed" returns true', () => {
+    expect(detectSeedMode({ mode: 'seed' })).toBe(true)
+  })
+
+  test('options.mode = "member" returns false', () => {
+    expect(detectSeedMode({ mode: 'member' })).toBe(false)
+  })
+
+  test('options without mode returns false', () => {
+    expect(detectSeedMode({})).toBe(false)
+  })
+
+  test('null / undefined returns false', () => {
+    expect(detectSeedMode(null)).toBe(false)
+    expect(detectSeedMode(undefined)).toBe(false)
+  })
+
+  test('non-array, non-object input returns false', () => {
+    expect(detectSeedMode('seed')).toBe(false)
+    expect(detectSeedMode(42)).toBe(false)
+  })
+})
+
+describe('loadOrCreateSeederIdentity', () => {
+  test('first call generates a fresh keypair and persists it', async () => {
+    const db = makeFakeLocalDb()
+    const id = await loadOrCreateSeederIdentity(db)
+    expect(id.fresh).toBe(true)
+    expect(Buffer.isBuffer(id.publicKey)).toBe(true)
+    expect(id.publicKey.length).toBe(32)
+    expect(id.secretKey.length).toBe(64)
+    const row = db._data.get('identity:seeder')
+    expect(typeof row.publicKey).toBe('string')
+    expect(row.publicKey).toBe(b4a.toString(id.publicKey, 'hex'))
+    expect(typeof row.createdAt).toBe('number')
+  })
+
+  test('second call reuses the persisted identity', async () => {
+    const db = makeFakeLocalDb()
+    const first = await loadOrCreateSeederIdentity(db)
+    const second = await loadOrCreateSeederIdentity(db)
+    expect(second.fresh).toBe(false)
+    expect(b4a.toString(second.publicKey, 'hex')).toBe(b4a.toString(first.publicKey, 'hex'))
+    expect(b4a.toString(second.secretKey, 'hex')).toBe(b4a.toString(first.secretKey, 'hex'))
+  })
+
+  test('identity is stored under identity:seeder, not identity', async () => {
+    const db = makeFakeLocalDb()
+    await loadOrCreateSeederIdentity(db)
+    expect(db._data.has('identity:seeder')).toBe(true)
+    expect(db._data.has('identity')).toBe(false)
+  })
+})
+
+describe('createSeederHandlers', () => {
+  function makeHandlers (db, identityOverride) {
+    const identity = identityOverride ?? {
+      publicKey: b4a.from('a'.repeat(64), 'hex'),
+      secretKey: b4a.from('b'.repeat(128), 'hex'),
+    }
+    return createSeederHandlers({ localDb: db, identity, bootTs: 1000 })
+  }
+
+  describe('seeder:status', () => {
+    test('returns the seeder pubkey hex and uptime', async () => {
+      const db = makeFakeLocalDb()
+      const handlers = makeHandlers(db)
+      const result = await handlers['seeder:status']()
+      expect(result.pubkey).toBe('a'.repeat(64))
+      expect(typeof result.uptime).toBe('number')
+      expect(result.uptime).toBeGreaterThanOrEqual(0)
+      expect(result.totalBytesReplicated).toBe(0)
+    })
+  })
+
+  describe('seeder:enroll', () => {
+    test('rejects non-string invite', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:enroll']({})).rejects.toThrow(/invite/)
+      await expect(handlers['seeder:enroll']({ invite: 42 })).rejects.toThrow(/invite/)
+    })
+
+    test('rejects empty-string invite', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:enroll']({ invite: '' })).rejects.toThrow(/invite/)
+    })
+
+    test('throws not-yet-implemented for well-formed input (slice 3 owns this)', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:enroll']({ invite: 'https://...' })).rejects.toThrow(/slice 3/)
+    })
+  })
+
+  describe('seeder:enrolled:list', () => {
+    test('returns empty list when no enrollments', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      const result = await handlers['seeder:enrolled:list']()
+      expect(result).toEqual({ circles: [] })
+    })
+
+    test('returns rows in sorted order', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c-charlie', { circleId: 'c-charlie', name: 'Charlie', inviter: 'aaa', enrolledAt: 3 })
+      await db.put('seeder:enrolled:a-alpha', { circleId: 'a-alpha', name: 'Alpha', inviter: 'bbb', enrolledAt: 1 })
+      await db.put('seeder:enrolled:b-bravo', { circleId: 'b-bravo', name: 'Bravo', inviter: 'ccc', enrolledAt: 2 })
+      const handlers = makeHandlers(db)
+      const result = await handlers['seeder:enrolled:list']()
+      expect(result.circles.map((c) => c.circleId)).toEqual(['a-alpha', 'b-bravo', 'c-charlie'])
+      expect(result.circles[0].name).toBe('Alpha')
+    })
+
+    test('skips malformed rows (no circleId)', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:good', { circleId: 'good' })
+      await db.put('seeder:enrolled:bad', { somethingElse: true })
+      const handlers = makeHandlers(db)
+      const result = await handlers['seeder:enrolled:list']()
+      expect(result.circles.length).toBe(1)
+      expect(result.circles[0].circleId).toBe('good')
+    })
+
+    test('does not bleed into unrelated key prefixes', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      await db.put('seeder:retention:c1', { pruneOlderThan: 1000 })
+      await db.put('identity:seeder', { publicKey: 'x' })
+      const handlers = makeHandlers(db)
+      const result = await handlers['seeder:enrolled:list']()
+      expect(result.circles.length).toBe(1)
+      expect(result.circles[0].circleId).toBe('c1')
+    })
+  })
+
+  describe('seeder:leave', () => {
+    test('rejects non-string circleId', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:leave']({})).rejects.toThrow(/circleId/)
+    })
+
+    test('deletes both enrollment and retention rows', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      await db.put('seeder:retention:c1', { pruneOlderThan: 1000 })
+      const handlers = makeHandlers(db)
+      const result = await handlers['seeder:leave']({ circleId: 'c1' })
+      expect(result.ok).toBe(true)
+      expect(result.circleId).toBe('c1')
+      expect(db._data.has('seeder:enrolled:c1')).toBe(false)
+      expect(db._data.has('seeder:retention:c1')).toBe(false)
+    })
+
+    test('is idempotent on a circleId we never enrolled in', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      const result = await handlers['seeder:leave']({ circleId: 'unknown' })
+      expect(result.ok).toBe(true)
+    })
+  })
+
+  describe('seeder:retention:get / set', () => {
+    test('get returns null for circles without a row', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      const result = await handlers['seeder:retention:get']({ circleId: 'c1' })
+      expect(result.pruneOlderThan).toBe(null)
+    })
+
+    test('set then get round-trips a numeric ms value', async () => {
+      const db = makeFakeLocalDb()
+      const handlers = makeHandlers(db)
+      await handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: 86_400_000 })
+      const result = await handlers['seeder:retention:get']({ circleId: 'c1' })
+      expect(result.pruneOlderThan).toBe(86_400_000)
+    })
+
+    test('set with null clears the row', async () => {
+      const db = makeFakeLocalDb()
+      const handlers = makeHandlers(db)
+      await handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: 1000 })
+      await handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: null })
+      expect(db._data.has('seeder:retention:c1')).toBe(false)
+      const result = await handlers['seeder:retention:get']({ circleId: 'c1' })
+      expect(result.pruneOlderThan).toBe(null)
+    })
+
+    test('rejects negative pruneOlderThan', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: -1 }))
+        .rejects.toThrow(/pruneOlderThan/)
+    })
+
+    test('rejects non-numeric pruneOlderThan', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: '1000' }))
+        .rejects.toThrow(/pruneOlderThan/)
+    })
+
+    test('rejects Infinity / NaN', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: Infinity }))
+        .rejects.toThrow(/pruneOlderThan/)
+      await expect(handlers['seeder:retention:set']({ circleId: 'c1', pruneOlderThan: NaN }))
+        .rejects.toThrow(/pruneOlderThan/)
+    })
+
+    test('rejects non-string circleId on both get and set', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:retention:get']({})).rejects.toThrow(/circleId/)
+      await expect(handlers['seeder:retention:set']({ pruneOlderThan: 1000 })).rejects.toThrow(/circleId/)
+    })
+  })
+
+  describe('handler map shape', () => {
+    test('exposes exactly the SEED_METHODS surface', () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      const keys = Object.keys(handlers).sort()
+      expect(keys).toEqual([...SEED_METHODS].sort())
+    })
+
+    test('does not expose member-mode methods', () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      expect(handlers['circle:create']).toBeUndefined()
+      expect(handlers['circle:join']).toBeUndefined()
+      expect(handlers['lastSeen:write']).toBeUndefined()
+      expect(handlers['ping']).toBeUndefined()
+    })
+  })
+})

@@ -29,6 +29,7 @@ const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite } = require('./invite')
+const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers } = require('./seeder')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const Protomux = require('protomux')
@@ -91,6 +92,15 @@ let _localDb = null
 let _identity = null
 let _swarm = null
 let _initialized = false
+// Active IPC handler map, swapped in by init based on mode. Defaults to
+// member-mode `handlers` (declared below); seed-mode init reassigns to
+// the restricted seeder handlers from src/seeder.js. The dispatcher at
+// the bottom of this file consults _activeHandlers, never `handlers`
+// directly, so a seed-mode worklet cannot accidentally route a member
+// IPC method (proposal 2026-05-19-blind-seeder-peers Q3 resolution:
+// mode is fixed at process launch and not mixable).
+let _activeHandlers = null
+let _seedMode = false
 
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
@@ -2040,15 +2050,18 @@ function onSwarmConnection (conn, info) {
   })
 }
 
-async function init ({ dataDir } = {}, attempt = 0) {
+async function init ({ dataDir, mode } = {}, attempt = 0) {
   if (_initialized) {
-    send({ event: 'ready', data: { publicKey: b4a.toString(_identity.publicKey, 'hex') } })
+    const pubkey = _seedMode
+      ? b4a.toString(_identity.publicKey, 'hex')
+      : b4a.toString(_identity.publicKey, 'hex')
+    send({ event: 'ready', data: { mode: _seedMode ? 'seed' : 'member', publicKey: pubkey } })
     return
   }
   if (!dataDir || typeof dataDir !== 'string') {
     throw new Error('init requires { dataDir: string }')
   }
-  mark('init:start', { attempt })
+  mark('init:start', { attempt, mode: mode ?? 'member' })
 
   // Retry on lock errors: BareKit may restart the worklet before the prior
   // instance has released the corestore lock file.
@@ -2058,7 +2071,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
   } catch (e) {
     if (e?.message?.includes('lock') && attempt < 20) {
       await new Promise(r => setTimeout(r, 1000))
-      return init({ dataDir }, attempt + 1)
+      return init({ dataDir, mode }, attempt + 1)
     }
     throw e
   }
@@ -2069,6 +2082,21 @@ async function init ({ dataDir } = {}, attempt = 0) {
   await localCore.ready()
   _localDb = new Hyperbee(localCore, { keyEncoding: 'utf-8', valueEncoding: 'json' })
   await _localDb.ready()
+
+  // Seed-mode short path: load (or generate) the seeder identity, install
+  // the restricted handler map, and stop. No Hyperswarm, no Autobase mount,
+  // no member-mode IPC surface. Network / replication wiring lands in
+  // slice 3 of the blind-seeder-peers proposal.
+  if (detectSeedMode({ mode })) {
+    const seederIdentity = await loadOrCreateSeederIdentity(_localDb)
+    _identity = seederIdentity
+    _seedMode = true
+    _activeHandlers = createSeederHandlers({ localDb: _localDb, identity: seederIdentity })
+    mark('init:identity-ready', { fresh: seederIdentity.fresh, mode: 'seed' })
+    _initialized = true
+    mark('init:done', { mode: 'seed' })
+    return
+  }
 
   const stored = await _localDb.get('identity')
   if (stored) {
@@ -2201,6 +2229,7 @@ async function init ({ dataDir } = {}, attempt = 0) {
     if (row?.value?.enabled === false) _tripNotificationsEnabled = false
   } catch {}
 
+  _activeHandlers = handlers
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
 
@@ -2266,9 +2295,20 @@ BareKit.IPC.on('data', async (chunk) => {
       continue
     }
 
-    const handler = handlers[msg.method]
+    const activeHandlers = _activeHandlers ?? handlers
+    const handler = activeHandlers[msg.method]
     if (!handler) {
-      send({ id: msg.id, error: `unknown method: ${msg.method}` })
+      // Distinguish "unknown" from "method exists in member mode but is
+      // not exposed in seed mode" so callers can detect mode mismatch
+      // without inspecting the worklet shape. The seeder handler map is
+      // strictly smaller than the member map; methods present in
+      // `handlers` but absent in seeder handlers fall here when the
+      // worklet booted in seed mode.
+      if (_seedMode && handlers[msg.method]) {
+        send({ id: msg.id, error: 'not-permitted-in-seed-mode' })
+      } else {
+        send({ id: msg.id, error: `unknown method: ${msg.method}` })
+      }
       continue
     }
     try {
