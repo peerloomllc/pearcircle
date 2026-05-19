@@ -93,7 +93,7 @@ function Enroll ({ onEnrolled, setError }) {
           value={invite}
           onInput={(e) => setInvite(e.currentTarget.value)}
         />
-        <div class="row" style={{ marginTop: 12 }}>
+        <div class="row" style={{ marginTop: 12, justifyContent: 'center' }}>
           <button type="submit" disabled={busy || !invite.trim()}>{busy ? 'enrolling…' : 'Enroll'}</button>
           {msg && <span style={{ color: 'var(--good)', fontSize: 13 }}>{msg}</span>}
         </div>

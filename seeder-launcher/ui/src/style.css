@@ -46,7 +46,7 @@ body {
 #root { width: 100%; max-width: 720px; }
 
 h1 { font-size: 24px; font-weight: 400; margin: 0 0 4px; color: var(--text); text-align: center; }
-h2 { font-size: 13px; font-weight: 400; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+h2 { font-size: 13px; font-weight: 400; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; text-align: center; }
 .sub { color: var(--muted); font-size: 13px; margin-bottom: 32px; text-align: center; }
 
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
