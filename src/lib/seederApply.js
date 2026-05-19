@@ -103,4 +103,43 @@ function buildSeederRevoke ({ existing, revokerPubkeyHex, now }) {
   return out
 }
 
-module.exports = { shouldAcceptSeederRow, buildSeederRevoke }
+// Build the unsigned value for an admission write — fresh admit or re-admit
+// after revoke. Proposal 2026-05-19-blind-seeder-peers slice 3d.
+//
+// Fresh admit (existing=null): addedBy=writer=adminPubkey,
+// addedAt=updatedAt=now. Optional label.
+//
+// Re-admit (existing carries a previously-revoked row): preserves the
+// original addedBy and addedAt so the row's history of "first admitter"
+// stays intact. Sets writer=adminPubkey (may differ from addedBy),
+// updatedAt=now, NO revoked field — that's what makes this a re-admit
+// instead of a stale write. Label can be overridden by the new caller
+// or inherited from existing.
+//
+// Caller signs the returned value with the admin's secret key before
+// appending. Returns null on malformed input so the IPC refuses rather
+// than writing a garbage row.
+function buildSeederAdmission ({ seederPubkey, adminPubkeyHex, label, existing, now }) {
+  if (!isHex64(seederPubkey)) return null
+  if (!isHex64(adminPubkeyHex)) return null
+  if (typeof now !== 'number' || !Number.isFinite(now)) return null
+  if (label !== undefined && label !== null && typeof label !== 'string') return null
+
+  const inheritedAddedBy = existing && isHex64(existing.addedBy) ? existing.addedBy : null
+  const inheritedAddedAt = existing && typeof existing.addedAt === 'number' && Number.isFinite(existing.addedAt) ? existing.addedAt : null
+  const inheritedLabel = existing && typeof existing.label === 'string' && existing.label.length > 0 ? existing.label : null
+
+  const out = {
+    pubkey: seederPubkey,
+    writer: adminPubkeyHex,
+    addedBy: inheritedAddedBy ?? adminPubkeyHex,
+    addedAt: inheritedAddedAt ?? now,
+    updatedAt: now,
+    v: 1,
+  }
+  const resolvedLabel = (typeof label === 'string' && label.length > 0) ? label : inheritedLabel
+  if (resolvedLabel) out.label = resolvedLabel
+  return out
+}
+
+module.exports = { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission }

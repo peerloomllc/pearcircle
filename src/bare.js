@@ -34,7 +34,9 @@ const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
-const { shouldAcceptSeederRow, buildSeederRevoke } = require('./lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
+const { setupSeederAdmissionChannel } = require('./seederAdmission')
+const { isConnectionFromRevokedSeeder } = require('./lib/seederPeerFilter')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -786,6 +788,40 @@ const handlers = {
     const signed = signValue(unsigned, _identity.secretKey)
     await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
     return { ok: true, circleId, pubkey }
+  },
+
+  // Admit a seeder (fresh or re-admit) for a circle the local device is a
+  // member of. Proposal 2026-05-19-blind-seeder-peers slice 3d. Called by
+  // the shell when the user approves a seeder:announced prompt OR when the
+  // user wants to re-admit a previously-revoked seeder via Settings.
+  // The seeder pubkey is signed into the row by the local member (writer
+  // field); apply branch ensures the writer is a current circle member.
+  'circle:seeder:approve': async ({ circleId, pubkey, label } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string' || pubkey.length !== 64) {
+      throw new Error('pubkey must be a 64-char hex string')
+    }
+    if (label !== undefined && label !== null && typeof label !== 'string') {
+      throw new Error('label must be a string if provided')
+    }
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
+    const existing = existingNode?.value ?? null
+    const adminPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const unsigned = buildSeederAdmission({
+      seederPubkey: pubkey,
+      adminPubkeyHex,
+      label,
+      existing,
+      now: Date.now(),
+    })
+    if (!unsigned) throw new Error('cannot build admission row from given input')
+    const signed = signValue(unsigned, _identity.secretKey)
+    await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
+    return { ok: true, circleId, pubkey, reAdmit: existing !== null }
   },
 
   // Owner-only rename. Appends a fresh `circle:` row with the new name
@@ -2140,15 +2176,74 @@ function registerPairNotify (conn) {
   })
 }
 
+// Seed-mode swarm connection handler. Proposal 2026-05-19-blind-seeder-peers
+// slice 3d. Pipes corestore replication (so encrypted blocks flow) and opens
+// the admission Protomux channel for each enrolled circle whose topic is
+// reachable through this connection.
+function onSeederSwarmConnection (conn, info) {
+  try { _store.replicate(conn) } catch (e) {
+    console.warn('[bare] seeder replicate failed', e?.message)
+  }
+  const remotePublicKey = info?.publicKey ? b4a.toString(info.publicKey, 'hex') : null
+  const seederPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
+  // Figure out which enrolled circles this connection belongs to. info.topics
+  // is asymmetric (often empty on the announce side); fall back to "any
+  // enrolled circle" so the announce reaches the member regardless of which
+  // direction the connection went. Protomux unmatched channels are harmless.
+  const candidateCircleIds = []
+  if (info?.topics && info.topics.length > 0) {
+    for (const topicBuf of info.topics) {
+      const topicHex = b4a.toString(topicBuf, 'hex')
+      const cid = _topicToCircle.get(topicHex)
+      if (cid && _seederCircles.has(cid)) candidateCircleIds.push(cid)
+    }
+  } else {
+    for (const cid of _seederCircles.keys()) candidateCircleIds.push(cid)
+  }
+  for (const circleId of candidateCircleIds) {
+    const enrollment = _seederCircles.get(circleId)
+    setupSeederAdmissionChannel({
+      conn,
+      role: 'seed',
+      circleId,
+      seederPubkey: seederPubkeyHex,
+      label: enrollment?.label,
+      mark,
+    })
+    if (remotePublicKey) {
+      mark('seeder:announce-channel-open', { circleId, remote: remotePublicKey.slice(0, 8) })
+    }
+  }
+}
+
 function onSwarmConnection (conn, info) {
+  const remotePublicKey = b4a.toString(info.publicKey, 'hex')
+
+  // Peer-filter: if the remote is a revoked seeder for any circle we
+  // participate in, drop the connection before any replication starts.
+  // Proposal 2026-05-19-blind-seeder-peers slice 3d.
+  isConnectionFromRevokedSeeder({
+    remotePubkeyHex: remotePublicKey,
+    circleIds: Array.from(_circleBases.keys()),
+    getSeederRow: async (cid, pk) => {
+      const base = _circleBases.get(cid)
+      if (!base) return null
+      const node = await base.view.get('seeder:' + pk)
+      return node?.value ?? null
+    },
+  }).then((revoked) => {
+    if (revoked) {
+      mark('peer-filter:revoked-seeder-dropped', { remote: remotePublicKey.slice(0, 8) })
+      try { conn.destroy(new Error('seeder revoked')) } catch {}
+    }
+  }).catch(() => {})
+
   // Pipe corestore replication first so cores can negotiate before we
   // emit peer:connected — UI typically calls circle:get right after that
   // event and we want the view to be fresh.
   _store.replicate(conn)
   _activeConns.add(conn)
   registerPairNotify(conn)
-
-  const remotePublicKey = b4a.toString(info.publicKey, 'hex')
 
   // info.topics is asymmetric on real-DHT connections: the lookup side may
   // have it populated, the announce side often does not. Setting up the
@@ -2162,6 +2257,30 @@ function onSwarmConnection (conn, info) {
       base,
       onWriterAdded: (writerKey) => {
         send({ event: 'circle:writer:added', data: { circleId, writerKey } })
+      },
+      mark,
+    })
+    // Seeder admission receiver. Proposal 2026-05-19 slice 3d. Unmatched
+    // channels (peer isn't a seeder) close harmlessly. When a seeder peer
+    // opens the matching channel and sends announce, we dedupe against
+    // any existing seeder row and emit seeder:announced so the shell can
+    // surface an approval prompt.
+    setupSeederAdmissionChannel({
+      conn,
+      role: 'member',
+      circleId,
+      onAnnounce: async ({ pubkey, label }) => {
+        // Dedupe: don't re-notify when a seeder row already exists for
+        // this seeder pubkey in this circle. Revoked rows still count
+        // as "we've seen this seeder before"; un-revoking goes through
+        // circle:seeder:approve, not a fresh announce.
+        const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
+        if (existingNode?.value) {
+          mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8), revoked: !!existingNode.value.revoked })
+          return
+        }
+        mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8) })
+        send({ event: 'seeder:announced', data: { circleId, pubkey, label: label ?? null } })
       },
       mark,
     })
@@ -2253,14 +2372,7 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
     mark('init:identity-ready', { fresh: seederIdentity.fresh, mode: 'seed' })
 
     _swarm = new Hyperswarm({ keyPair: _identity })
-    _swarm.on('connection', (conn) => {
-      // Corestore handles per-core discovery key negotiation; member peers
-      // see the seeder offering whatever cores it has open and replicate.
-      // The seeder never decrypts blocks — it only forwards them.
-      try { _store.replicate(conn) } catch (e) {
-        console.warn('[bare] seeder replicate failed', e?.message)
-      }
-    })
+    _swarm.on('connection', onSeederSwarmConnection)
     mark('init:swarm-created', { mode: 'seed' })
 
     _activeHandlers = createSeederHandlers({
