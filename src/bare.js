@@ -37,6 +37,7 @@ const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { isConnectionFromRevokedSeeder } = require('./lib/seederPeerFilter')
+const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -2093,13 +2094,51 @@ async function mountSeederCircle (enrollment) {
   const ns = _store.namespace(circleId)
   const core = ns.get({ key: b4a.from(bootstrap, 'hex') })
   await core.ready()
+  // Track per-block receive time so the retention sweep can drop blocks
+  // older than the user's pruneOlderThan threshold. Proposal 2026-05-19
+  // slice 5. The 'download' event fires per block as replication
+  // progresses; receivedAt is when the seeder first stored the block,
+  // not when the member wrote it (which we can't read without the
+  // encryption key).
+  const onDownload = (index) => {
+    recordBlockReceived(_localDb, circleId, index, Date.now()).catch((e) => {
+      console.warn('[bare] seeder block-track failed', circleId, index, e?.message)
+    })
+  }
+  core.on('download', onDownload)
   const topic = topicForCircleKey(circleKey)
   const topicHex = b4a.toString(topic, 'hex')
   _topicToCircle.set(topicHex, circleId)
   const discovery = _swarm.join(topic, { server: true, client: true })
-  _seederCircles.set(circleId, { core, topicHex, discovery })
+  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload })
   mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8) })
   return _seederCircles.get(circleId)
+}
+
+// One pass of the seeder retention sweep. Reads pruneOlderThan from the
+// seeder:retention:{circleId} sidecar for every currently-mounted circle;
+// pure helper picks the stale block seqs; we call core.clear + drop the
+// per-block tracker row. Proposal 2026-05-19-blind-seeder-peers slice 5.
+async function runOneSeederRetentionSweep () {
+  return runSeederRetentionSweep({
+    localDb: _localDb,
+    enrolledCircles: Array.from(_seederCircles.keys()),
+    getRetentionMs: async (circleId) => {
+      const row = await _localDb.get('seeder:retention:' + circleId)
+      const v = row?.value?.pruneOlderThan
+      return typeof v === 'number' ? v : null
+    },
+    clearBlock: async (circleId, seq) => {
+      const entry = _seederCircles.get(circleId)
+      if (!entry?.core) return
+      try {
+        await entry.core.clear(seq, seq + 1)
+      } finally {
+        await removeBlockTracking(_localDb, circleId, seq).catch(() => {})
+      }
+    },
+    now: Date.now(),
+  })
 }
 
 async function leaveSeederCircle (circleId) {
@@ -2110,6 +2149,9 @@ async function leaveSeederCircle (circleId) {
     await _swarm.leave(topic).catch(() => {})
   } catch {}
   _topicToCircle.delete(entry.topicHex)
+  if (entry.onDownload && entry.core) {
+    try { entry.core.off('download', entry.onDownload) } catch {}
+  }
   try { await entry.core.close() } catch {}
   _seederCircles.delete(circleId)
   mark('seeder:left', { circleId })
@@ -2398,6 +2440,18 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
       }
     }
     mark('init:circles-mounted', { mode: 'seed', count: mountedCount })
+
+    // Schedule the retention sweep. Once on boot to claw back disk from
+    // anything that aged past the cutoff while the seeder was down, then
+    // on a 24h cadence. Fire-and-forget per the existing trip-prune
+    // pattern; pure helper handles all the I/O.
+    const SEEDER_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000
+    runOneSeederRetentionSweep().then((r) => mark('seeder:retention:boot', r))
+      .catch((e) => console.warn('[bare] seeder retention boot failed', e?.message))
+    setInterval(() => {
+      runOneSeederRetentionSweep().then((r) => mark('seeder:retention:interval', r))
+        .catch((e) => console.warn('[bare] seeder retention interval failed', e?.message))
+    }, SEEDER_RETENTION_INTERVAL_MS)
 
     _initialized = true
     mark('init:done', { mode: 'seed' })
