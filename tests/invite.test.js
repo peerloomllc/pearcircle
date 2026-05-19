@@ -8,6 +8,8 @@ const VALID = {
   inviterPublicKey: 'b'.repeat(64),
 }
 
+const VALID_ENC = 'd'.repeat(64)
+
 describe('buildInvite', () => {
   test('produces an https URL by default', () => {
     const url = buildInvite(VALID)
@@ -77,6 +79,29 @@ describe('buildInvite', () => {
 
   test('throws on invalid scheme', () => {
     expect(() => buildInvite({ ...VALID, scheme: 'ftp' })).toThrow(/scheme/)
+  })
+
+  test('omits enc field when encryptionKey is absent', () => {
+    const url = buildInvite(VALID)
+    expect(url).not.toContain('enc=')
+  })
+
+  test('includes enc field when encryptionKey is provided', () => {
+    const url = buildInvite({ ...VALID, encryptionKey: VALID_ENC })
+    expect(url).toContain(`enc=${VALID_ENC}`)
+  })
+
+  test('throws on encryptionKey of wrong length', () => {
+    expect(() => buildInvite({ ...VALID, encryptionKey: 'a'.repeat(63) })).toThrow(/encryptionKey/)
+  })
+
+  test('throws on encryptionKey with non-hex chars', () => {
+    expect(() => buildInvite({ ...VALID, encryptionKey: 'z'.repeat(64) })).toThrow(/encryptionKey/)
+  })
+
+  test('accepts null encryptionKey as omitted', () => {
+    const url = buildInvite({ ...VALID, encryptionKey: null })
+    expect(url).not.toContain('enc=')
   })
 })
 
@@ -220,5 +245,33 @@ describe('parseInvite', () => {
     const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=%ZZ&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}`
     const result = parseInvite(url)
     expect(result.ok).toBe(false)
+  })
+
+  test('round-trips an invite with encryptionKey', () => {
+    const url = buildInvite({ ...VALID, encryptionKey: VALID_ENC })
+    const result = parseInvite(url)
+    expect(result.ok).toBe(true)
+    expect(result.encryptionKey).toBe(VALID_ENC)
+  })
+
+  test('returns encryptionKey=null for legacy invites without enc', () => {
+    const url = buildInvite(VALID)
+    const result = parseInvite(url)
+    expect(result.ok).toBe(true)
+    expect(result.encryptionKey).toBe(null)
+  })
+
+  test('rejects malformed enc (wrong length)', () => {
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}&enc=${'a'.repeat(63)}`
+    const result = parseInvite(url)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/encryptionKey/)
+  })
+
+  test('rejects malformed enc (non-hex)', () => {
+    const url = `https://peerloomllc.com/circle/join?circle=${VALID.circleId}&name=Test&key=${VALID.circleKey}&bootstrap=${VALID.bootstrap}&inviter=${VALID.inviterPublicKey}&enc=${'z'.repeat(64)}`
+    const result = parseInvite(url)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/encryptionKey/)
   })
 })

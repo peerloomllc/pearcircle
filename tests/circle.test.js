@@ -1,4 +1,4 @@
-const { generateCircleId, generateCircleKey, generatePlaceId } = require('../src/circle')
+const { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('../src/circle')
 const { buildInvite, parseInvite } = require('../src/invite')
 
 describe('generateCircleId', () => {
@@ -35,6 +35,27 @@ describe('generateCircleKey', () => {
   })
 })
 
+describe('generateEncryptionKey', () => {
+  test('returns a 64-char hex string', () => {
+    const key = generateEncryptionKey()
+    expect(typeof key).toBe('string')
+    expect(key.length).toBe(64)
+    expect(key).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  test('successive calls produce different values', () => {
+    const a = generateEncryptionKey()
+    const b = generateEncryptionKey()
+    expect(a).not.toBe(b)
+  })
+
+  test('is distinct from a co-generated circleKey', () => {
+    const circleKey = generateCircleKey()
+    const encryptionKey = generateEncryptionKey()
+    expect(circleKey).not.toBe(encryptionKey)
+  })
+})
+
 describe('generatePlaceId', () => {
   test('returns a 32-char hex string', () => {
     const id = generatePlaceId()
@@ -62,5 +83,19 @@ describe('circle.js × invite.js round-trip', () => {
     expect(parsed.circleId).toBe(circleId)
     expect(parsed.circleKey).toBe(circleKey)
     expect(parsed.bootstrap).toBe(bootstrap)
+    expect(parsed.encryptionKey).toBe(null)
+  })
+
+  test('full encrypted-circle round-trip', () => {
+    const circleId = generateCircleId()
+    const circleKey = generateCircleKey()
+    const encryptionKey = generateEncryptionKey()
+    const inviterPublicKey = 'a'.repeat(64)
+    const bootstrap = 'b'.repeat(64)
+    const url = buildInvite({ circleId, name: 'Smith Family', circleKey, bootstrap, encryptionKey, inviterPublicKey })
+    const parsed = parseInvite(url)
+    expect(parsed.ok).toBe(true)
+    expect(parsed.circleKey).toBe(circleKey)
+    expect(parsed.encryptionKey).toBe(encryptionKey)
   })
 })
