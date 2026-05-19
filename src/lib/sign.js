@@ -37,13 +37,24 @@ function signValue (obj, secretKey) {
 }
 
 function verifyValue (obj) {
+  return verifyValueWithSigner(obj, 'pubkey')
+}
+
+// Variant of verifyValue where the signing pubkey lives in a field other
+// than `pubkey`. Used by seeder admission rows (proposal 2026-05-19) where
+// the row's `pubkey` field identifies the seeder but the signer is the
+// admitting member identified by `addedBy`. Keeps the canonicalization
+// rule identical — the signature still covers every non-sig field.
+function verifyValueWithSigner (obj, signerField) {
   if (!obj || typeof obj !== 'object') return false
+  if (typeof signerField !== 'string' || signerField.length === 0) return false
   if (typeof obj.sig !== 'string' || obj.sig.length !== 128) return false
-  if (typeof obj.pubkey !== 'string' || obj.pubkey.length !== 64) return false
+  const signer = obj[signerField]
+  if (typeof signer !== 'string' || signer.length !== 64) return false
   let sig, pub
   try {
     sig = b4a.from(obj.sig, 'hex')
-    pub = b4a.from(obj.pubkey, 'hex')
+    pub = b4a.from(signer, 'hex')
   } catch {
     return false
   }
@@ -51,4 +62,4 @@ function verifyValue (obj) {
   return verify(canonicalBytes(obj), sig, pub)
 }
 
-module.exports = { canonicalize, canonicalBytes, signValue, verifyValue }
+module.exports = { canonicalize, canonicalBytes, signValue, verifyValue, verifyValueWithSigner }

@@ -33,7 +33,8 @@ const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers } = req
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const Protomux = require('protomux')
-const { signValue, verifyValue } = require('./lib/sign')
+const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
+const { shouldAcceptSeederRow } = require('./lib/seederApply')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -1868,6 +1869,31 @@ async function applyCircleNodes (nodes, view, base, circleId) {
             }
           } catch (e) { console.warn('[bare] peerTrip:completed emit failed', e?.message) }
         }
+        continue
+      }
+      // `seeder:{pubkey}` (proposal 2026-05-19-blind-seeder-peers slice 3a).
+      // Signed by any current member via verifyValueWithSigner against the
+      // `writer` field. shouldAcceptSeederRow encapsulates all gating:
+      // shape, future-ts tolerance, writer-is-member, writer-not-removed,
+      // LWW on updatedAt. See src/lib/seederApply.js for the full rule set.
+      if (op.key.startsWith('seeder:')) {
+        const incoming = op.value
+        if (!incoming || typeof incoming.writer !== 'string') continue
+        const keyPubkey = op.key.slice('seeder:'.length)
+        const writerMember = (await view.get('member:' + incoming.writer))?.value
+        const writerRemoved = (await view.get('removed:' + incoming.writer))?.value
+        const existing = (await view.get(op.key))?.value
+        const accept = shouldAcceptSeederRow({
+          keyPubkey,
+          incoming,
+          writerMember,
+          writerRemoved,
+          existing,
+          now: Date.now(),
+          futureToleranceMs: FUTURE_TS_TOLERANCE_MS,
+          verifySig: (val) => verifyValueWithSigner(val, 'writer'),
+        })
+        if (accept) await view.put(op.key, incoming)
         continue
       }
       // Other prefixes not yet wired — silently dropped.
