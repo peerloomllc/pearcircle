@@ -32,11 +32,22 @@ html, body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
-body { padding: 32px; max-width: 960px; margin: 0 auto; }
+body {
+  min-height: 100vh;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* safe keyword falls back to start-align if content exceeds viewport,
+     so a long enrolled-circles list still scrolls instead of getting
+     clipped off the top. */
+  justify-content: safe center;
+}
+#root { width: 100%; max-width: 720px; }
 
-h1 { font-size: 24px; font-weight: 400; margin: 0 0 4px; color: var(--text); }
+h1 { font-size: 24px; font-weight: 400; margin: 0 0 4px; color: var(--text); text-align: center; }
 h2 { font-size: 13px; font-weight: 400; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
-.sub { color: var(--muted); font-size: 13px; margin-bottom: 32px; }
+.sub { color: var(--muted); font-size: 13px; margin-bottom: 32px; text-align: center; }
 
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
 .row { display: flex; gap: 16px; align-items: center; }
