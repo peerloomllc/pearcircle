@@ -594,6 +594,7 @@ export function App () {
           initialExpand={sheet?.name === 'settings' ? sheet.expand : null}
           onClose={closeSheet}
           onSaved={refresh}
+          onManageSeeders={(circleId, circleName) => setSheet({ name: 'seeders', circleId, circleName })}
         />
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'trips'}>
@@ -649,6 +650,12 @@ export function App () {
           <InviteShareView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
         )}
       </SheetContainer>
+      <SheetContainer open={sheet?.name === 'seeders'}>
+        {sheet?.name === 'seeders' && (
+          <SeederManageView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
+        )}
+      </SheetContainer>
+      <SeederApprovalBanner />
       {deletedNotices.length > 0 && (
         <CircleDeletedNotice
           circleName={deletedNotices[0].circleName}
@@ -1108,6 +1115,244 @@ function InviteShareView ({ circleId, circleName, onClose }) {
           <ShareButton text={invite} />
         </>
       )}
+    </div>
+  )
+}
+
+// Per-circle seeder management. Proposal 2026-05-19-blind-seeder-peers slice 4.
+// Lists admitted seeders, mints seed invites (no encryption key — that's the
+// privacy boundary), and revokes admitted seeders. Seeders cannot read circle
+// content; they just replicate encrypted blocks to bridge co-presence gaps.
+function SeederManageView ({ circleId, circleName, onClose }) {
+  const [seeders, setSeeders] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [invite, setInvite] = useState(null)
+  const [showingInvite, setShowingInvite] = useState(false)
+  const [minting, setMinting] = useState(false)
+  const [confirmingRevoke, setConfirmingRevoke] = useState(null)
+  const [pending, setPending] = useState(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await pear.call('circle:seeders:list', { circleId })
+      setSeeders(r?.seeders ?? [])
+      setError(null)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setLoading(false)
+    }
+  }, [circleId])
+
+  useEffect(() => {
+    refresh()
+    const id = setInterval(refresh, 5000)
+    return () => clearInterval(id)
+  }, [refresh])
+
+  const mintInvite = async () => {
+    setMinting(true)
+    try {
+      const r = await pear.call('circle:invite:seed', { circleId })
+      setInvite(r?.invite ?? null)
+      setShowingInvite(true)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setMinting(false)
+    }
+  }
+
+  const performRevoke = async (seeder) => {
+    setPending(seeder.pubkey)
+    try {
+      await pear.call('circle:seeder:revoke', { circleId, pubkey: seeder.pubkey })
+      await refresh()
+      setConfirmingRevoke(null)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setPending(null)
+    }
+  }
+
+  if (showingInvite && invite) {
+    return (
+      <div style={s.screen}>
+        <BackBar onBack={() => setShowingInvite(false)} title={(circleName ?? 'Circle') + ' - Seed invite'} />
+        <p style={s.muted}>
+          Hand this invite to a seeder device (a Raspberry Pi, a spare phone). The seed invite does
+          NOT carry the encryption key, so the seeder will replicate encrypted blocks without being
+          able to read circle content.
+        </p>
+        <QrImage text={invite} />
+        <textarea style={s.inviteBox} readOnly value={invite} onFocus={(e) => e.target.select()} />
+        <ShareButton text={invite} title={`Add seeder to ${circleName ?? 'circle'}`} />
+      </div>
+    )
+  }
+
+  return (
+    <div style={s.screen}>
+      <BackBar onBack={onClose} title={(circleName ?? 'Circle') + ' - Seeders'} />
+      <p style={s.muted}>
+        Seeders are always-on devices (Pi, spare phone) that replicate this circle's encrypted blocks
+        so members can sync even when no two members are online together. Seeders cannot read circle
+        content.
+      </p>
+      <button
+        onClick={mintInvite}
+        disabled={minting}
+        style={s.primaryBtn}>
+        {minting ? 'Building invite...' : '+ Mint seed invite'}
+      </button>
+      {error && <p style={s.error}>{error}</p>}
+      {loading && <p style={{ ...s.muted, marginTop: spacing.md }}>Loading...</p>}
+      {!loading && seeders.length === 0 && (
+        <p style={{ ...s.muted, marginTop: spacing.md }}>No seeders yet. Mint a seed invite to add one.</p>
+      )}
+      {seeders.length > 0 && (
+        <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.md}px 0 0 0` }}>
+          {seeders.map((seeder) => {
+            const isPending = pending === seeder.pubkey
+            const labelLine = seeder.label || ('Seeder ' + seeder.pubkey.slice(0, 8))
+            const addedAgo = seeder.addedAt ? Math.floor((Date.now() - seeder.addedAt) / 60000) : null
+            return (
+              <li key={seeder.pubkey} style={{
+                display: 'flex', alignItems: 'center', gap: spacing.sm,
+                padding: `${spacing.sm}px 0`,
+                borderBottom: `1px solid ${colors.divider}`,
+              }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {labelLine}
+                  </div>
+                  <div style={{ ...typography.caption, color: colors.text.secondary, fontFamily: typography.monoFamily }}>
+                    {seeder.pubkey.slice(0, 16)}…{addedAgo !== null ? ` · added ${addedAgo < 1 ? 'just now' : addedAgo + 'm ago'}` : ''}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setConfirmingRevoke(seeder)}
+                  disabled={isPending}
+                  title='Revoke seeder'
+                  aria-label='Revoke seeder'
+                  style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                  <Trash size={18} weight='regular' />
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      {confirmingRevoke && (
+        <ConfirmSheet
+          title='Revoke seeder?'
+          message={<>
+            Revoke this seeder from <strong>{circleName ?? 'this circle'}</strong>? Members will refuse
+            to replicate to it within seconds. You can re-admit later by inviting the seeder again.
+          </>}
+          confirmLabel='Revoke'
+          destructive
+          busy={pending === confirmingRevoke.pubkey}
+          onConfirm={() => performRevoke(confirmingRevoke)}
+          onClose={() => { if (pending !== confirmingRevoke.pubkey) setConfirmingRevoke(null) }}
+        />
+      )}
+    </div>
+  )
+}
+
+// Top-level banner that surfaces when a seed-mode device announces itself
+// for a circle the local user is a member of. Proposal 2026-05-19 slice 4.
+// Approve writes a seeder:{pubkey} admission row via circle:seeder:approve;
+// Dismiss drops the announce. No persistence: a dismissed announce will
+// re-surface next time the seeder re-announces on swarm reconnect, which
+// is a feature for now (lets the user defer without losing the option).
+function SeederApprovalBanner () {
+  const [queue, setQueue] = useState([])  // [{ circleId, pubkey, label, circleName }]
+  const [busy, setBusy] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    pear.on('seeder:announced', async ({ circleId, pubkey, label }) => {
+      let circleName = circleId.slice(0, 8)
+      try {
+        const r = await pear.call('circle:get', { circleId })
+        circleName = r?.circle?.name ?? circleName
+      } catch {}
+      setQueue((prev) => {
+        if (prev.some((p) => p.circleId === circleId && p.pubkey === pubkey)) return prev
+        return [...prev, { circleId, pubkey, label, circleName }]
+      })
+    })
+  }, [])
+
+  const current = queue[0]
+  if (!current) return null
+
+  const approve = async () => {
+    setBusy(current.pubkey)
+    setError(null)
+    try {
+      await pear.call('circle:seeder:approve', {
+        circleId: current.circleId,
+        pubkey: current.pubkey,
+        label: current.label ?? undefined,
+      })
+      setQueue((prev) => prev.slice(1))
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const dismiss = () => {
+    setQueue((prev) => prev.slice(1))
+    setError(null)
+  }
+
+  return (
+    <div style={{
+      position: 'fixed',
+      left: spacing.base,
+      right: spacing.base,
+      bottom: `calc(env(safe-area-inset-bottom, 16px) + ${spacing.base}px)`,
+      background: colors.surface.elevated,
+      border: `1px solid ${colors.border}`,
+      borderRadius: radius.lg,
+      padding: spacing.md,
+      boxShadow: '0 6px 18px rgba(0,0,0,0.25)',
+      zIndex: 200,
+      fontFamily: typography.fontFamily,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.sm }}>
+        <Broadcast size={20} weight='regular' color={colors.accent} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ ...typography.body, color: colors.text.primary }}>
+            {current.label || ('Seeder ' + current.pubkey.slice(0, 8))} wants to seed <strong>{current.circleName}</strong>
+          </div>
+          <div style={{ ...typography.caption, color: colors.text.secondary, fontFamily: typography.monoFamily }}>
+            {current.pubkey.slice(0, 16)}…
+          </div>
+        </div>
+      </div>
+      {error && <p style={{ ...s.error, marginTop: 0 }}>{error}</p>}
+      <div style={{ display: 'flex', gap: spacing.sm }}>
+        <button
+          onClick={approve}
+          disabled={busy === current.pubkey}
+          style={{ ...s.primaryBtn, flex: 1, padding: `${spacing.sm + 2}px ${spacing.base}px`, fontSize: typography.body.fontSize }}>
+          {busy === current.pubkey ? 'Approving...' : 'Approve'}
+        </button>
+        <button
+          onClick={dismiss}
+          disabled={busy === current.pubkey}
+          style={{ ...s.secondaryBtn, flex: 1, padding: `${spacing.sm + 2}px ${spacing.base}px`, marginTop: 0, fontSize: typography.body.fontSize }}>
+          Dismiss
+        </button>
+      </div>
     </div>
   )
 }
@@ -3119,7 +3364,7 @@ function fitTo (map, lonLatPairs) {
 // the pencil icon. Calls circle:delete / circle:leave / circle:rename
 // IPCs (proposal 2026-05-07); success drops the row locally and fires
 // onChanged so the home view's circles:getAll poll picks up the rest.
-function CirclesSection ({ active = true, onChanged }) {
+function CirclesSection ({ active = true, onChanged, onManageSeeders }) {
   const [list, setList] = useState([])
   const [loading, setLoading] = useState(true)
   const [confirmingFor, setConfirmingFor] = useState(null) // circle object pending confirm
@@ -3301,6 +3546,16 @@ function CirclesSection ({ active = true, onChanged }) {
                   <PencilSimple size={18} weight="regular" />
                 </button>
               )}
+              {typeof onManageSeeders === 'function' && (
+                <button
+                  onClick={() => onManageSeeders(c.circleId, c.name)}
+                  disabled={isPending}
+                  title='Manage seeders'
+                  aria-label='Manage seeders'
+                  style={iconBtnStyle({ disabled: isPending })}>
+                  <Broadcast size={18} weight='regular' />
+                </button>
+              )}
               <button
                 onClick={() => setConfirmingFor(c)}
                 disabled={isPending}
@@ -3351,7 +3606,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharingForCircle, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved }) {
+function ProfileView ({ active = true, profile, sharing, setSharingForCircle, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved, onManageSeeders }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -3578,7 +3833,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
       </Collapsible>
 
       <Collapsible title='Circles' icon={UsersThree} open={circlesOpen} onToggle={() => setCirclesOpen(v => !v)} maxHeight='1200px'>
-        <CirclesSection active={active && circlesOpen} onChanged={onSaved} />
+        <CirclesSection active={active && circlesOpen} onChanged={onSaved} onManageSeeders={onManageSeeders} />
       </Collapsible>
 
       <Collapsible title='Trip sharing' icon={MapTrifold} open={tripSharingOpen} onToggle={() => setTripSharingOpen(v => !v)} maxHeight='1200px'>
