@@ -2113,14 +2113,27 @@ async function mountSeederCircle (enrollment) {
     recordBlockReceived(_localDb, circleId, index, Date.now()).catch((e) => {
       console.warn('[bare] seeder block-track failed', circleId, index, e?.message)
     })
+    // Coarse instrumentation: log every 10th block so the seeder.log
+    // shows replication progress without flooding on a fast initial sync.
+    if (index % 10 === 0 || index < 5) {
+      mark('seeder:block-downloaded', { circleId, index, length: core.length, contiguousLength: core.contiguousLength })
+    }
   }
   core.on('download', onDownload)
+  // Hypercore's default replication is reactive — peers exchange "have"
+  // bitfields and the core fetches blocks the peer offers. On a fresh
+  // mount the seeder may not actively pull historical blocks until a
+  // get() is called. Force a background download of every block so the
+  // seeder can serve the full core to other peers even when no member
+  // is requesting via the seeder. linear:false lets blocks arrive in
+  // any order; the retention sweep doesn't care.
+  core.download({ start: 0, end: -1, linear: false })
   const topic = topicForCircleKey(circleKey)
   const topicHex = b4a.toString(topic, 'hex')
   _topicToCircle.set(topicHex, circleId)
   const discovery = _swarm.join(topic, { server: true, client: true })
   _seederCircles.set(circleId, { core, topicHex, discovery, onDownload })
-  mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8) })
+  mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8), authorityLength: core.length, contiguousLength: core.contiguousLength })
   return _seederCircles.get(circleId)
 }
 
@@ -2431,13 +2444,16 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
       identity: seederIdentity,
       mountCircle: mountSeederCircle,
       leaveCircle: leaveSeederCircle,
-      // Sum byteLength across every mounted seeder core. core.byteLength
-      // grows as encrypted blocks land via replication. Reads everything
-      // synchronously off the in-memory cores; no I/O.
+      // Sum contiguous-downloaded bytes across every mounted seeder core.
+      // core.byteLength is the AUTHORITY total (what the writer has
+      // published) — would over-report by including blocks not yet
+      // downloaded. core.contiguousByteLength is the bytes in blocks
+      // 0..contiguousLength-1 we've actually received, which is what we
+      // want for "replicated" reporting.
       getReplicatedBytes: () => {
         let total = 0
         for (const entry of _seederCircles.values()) {
-          if (entry?.core?.byteLength) total += entry.core.byteLength
+          if (entry?.core?.contiguousByteLength) total += entry.core.contiguousByteLength
         }
         return total
       },
