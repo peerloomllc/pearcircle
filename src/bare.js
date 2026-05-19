@@ -106,6 +106,10 @@ let _seedMode = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+// Seed-mode only: per-circle replication state. Each entry holds the
+// bootstrap Hypercore session + the swarm discovery handle so leave can
+// tear both down cleanly. Empty in member mode.
+const _seederCircles = new Map()  // circleId → { core, topicHex, discovery }
 // Active Hyperswarm connections (post-handshake, pre-close). Tracked so
 // circle:join can open the pair channel for a newly-added circle on
 // every live connection. Hyperswarm reuses one connection per peer
@@ -2034,6 +2038,47 @@ async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex) {
   return base
 }
 
+// Seed-mode counterpart of mountCircleAutobase. Opens the bootstrap
+// Hypercore for the circle (via corestore namespace) so corestore.replicate
+// can offer it to connecting member peers, then joins the swarm topic so
+// peers find this seeder. Proposal 2026-05-19-blind-seeder-peers slice 3c.
+//
+// What this does NOT do: open the circle's Autobase, decrypt any blocks,
+// or call any apply branch. The seeder is a dumb block-forwarder for the
+// bootstrap core. View core + later writer cores reach the seeder via
+// corestore's on-demand session opening as peers ask for them through
+// the replication mux — provided the seeder has those cores in its store.
+// Multi-writer circles will need the slice 3d admission protocol to push
+// additional writer-core keys to the seeder; v1 of this slice only
+// guarantees bootstrap-core replication.
+async function mountSeederCircle (enrollment) {
+  const { circleId, circleKey, bootstrap } = enrollment
+  if (_seederCircles.has(circleId)) return _seederCircles.get(circleId)
+  const ns = _store.namespace(circleId)
+  const core = ns.get({ key: b4a.from(bootstrap, 'hex') })
+  await core.ready()
+  const topic = topicForCircleKey(circleKey)
+  const topicHex = b4a.toString(topic, 'hex')
+  _topicToCircle.set(topicHex, circleId)
+  const discovery = _swarm.join(topic, { server: true, client: true })
+  _seederCircles.set(circleId, { core, topicHex, discovery })
+  mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8) })
+  return _seederCircles.get(circleId)
+}
+
+async function leaveSeederCircle (circleId) {
+  const entry = _seederCircles.get(circleId)
+  if (!entry) return
+  try {
+    const topic = b4a.from(entry.topicHex, 'hex')
+    await _swarm.leave(topic).catch(() => {})
+  } catch {}
+  _topicToCircle.delete(entry.topicHex)
+  try { await entry.core.close() } catch {}
+  _seederCircles.delete(circleId)
+  mark('seeder:left', { circleId })
+}
+
 // Open pair channels for a newly-added circle on every currently-live
 // swarm connection (joiner-initiated path). The owner side does NOT
 // call this from circle:create — instead the owner relies on the
@@ -2195,16 +2240,53 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   _localDb = new Hyperbee(localCore, { keyEncoding: 'utf-8', valueEncoding: 'json' })
   await _localDb.ready()
 
-  // Seed-mode short path: load (or generate) the seeder identity, install
-  // the restricted handler map, and stop. No Hyperswarm, no Autobase mount,
-  // no member-mode IPC surface. Network / replication wiring lands in
-  // slice 3 of the blind-seeder-peers proposal.
+  // Seed-mode branch (proposal 2026-05-19-blind-seeder-peers slices 2 + 3c).
+  // Load (or generate) the seeder identity, stand up Hyperswarm wired to
+  // corestore replication, mount every persisted enrollment, and install
+  // the restricted handler map. No member-mode IPC surface, no Autobase
+  // instance — the seeder replicates encrypted blocks at the Hypercore
+  // protocol level without ever decrypting them.
   if (detectSeedMode({ mode })) {
     const seederIdentity = await loadOrCreateSeederIdentity(_localDb)
     _identity = seederIdentity
     _seedMode = true
-    _activeHandlers = createSeederHandlers({ localDb: _localDb, identity: seederIdentity })
     mark('init:identity-ready', { fresh: seederIdentity.fresh, mode: 'seed' })
+
+    _swarm = new Hyperswarm({ keyPair: _identity })
+    _swarm.on('connection', (conn) => {
+      // Corestore handles per-core discovery key negotiation; member peers
+      // see the seeder offering whatever cores it has open and replicate.
+      // The seeder never decrypts blocks — it only forwards them.
+      try { _store.replicate(conn) } catch (e) {
+        console.warn('[bare] seeder replicate failed', e?.message)
+      }
+    })
+    mark('init:swarm-created', { mode: 'seed' })
+
+    _activeHandlers = createSeederHandlers({
+      localDb: _localDb,
+      identity: seederIdentity,
+      mountCircle: mountSeederCircle,
+      leaveCircle: leaveSeederCircle,
+    })
+
+    // Re-mount every persisted enrollment so a process restart picks up
+    // where the seeder left off.
+    let mountedCount = 0
+    for await (const { value } of _localDb.createReadStream({
+      gt: 'seeder:enrolled:',
+      lt: 'seeder:enrolled:~',
+    })) {
+      if (!value || !value.circleId || !value.bootstrap || !value.circleKey) continue
+      try {
+        await mountSeederCircle(value)
+        mountedCount++
+      } catch (e) {
+        console.warn('[bare] seeder remount failed', value.circleId, e?.message)
+      }
+    }
+    mark('init:circles-mounted', { mode: 'seed', count: mountedCount })
+
     _initialized = true
     mark('init:done', { mode: 'seed' })
     return

@@ -22,6 +22,7 @@
 
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
+const { parseSeedInvite } = require('./invite')
 
 // IPC methods the seed-mode worklet exposes. Anything else returns
 // not-permitted-in-seed-mode so the seeder cannot accidentally act like
@@ -83,8 +84,15 @@ async function loadOrCreateSeederIdentity (localDb) {
  * @param {object} deps.localDb - Hyperbee-like with get / put / del / createReadStream
  * @param {{ publicKey: Buffer }} deps.identity - seeder identity
  * @param {number} [deps.bootTs=Date.now()] - injected for test determinism
+ * @param {(enrollment: object) => Promise<void>} [deps.mountCircle] - hook fired after
+ *   seeder:enroll persists. Receives the freshly-stored enrollment row so the host
+ *   can open the bootstrap Hypercore and join the swarm topic. Absent in pure-logic
+ *   tests; bare.js seed-mode init provides the real implementation.
+ * @param {(circleId: string) => Promise<void>} [deps.leaveCircle] - reverse of mountCircle.
+ *   Called by seeder:leave before the persistence rows are deleted so the host can
+ *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now() }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCircle, leaveCircle }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
@@ -95,14 +103,50 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now() }) {
       totalBytesReplicated: 0,
     }),
 
-    // Stub: slice 3 implements seed-invite parsing + the admission
-    // Protomux handshake. Slice 2 ships the IPC method shape so the
-    // dispatcher recognizes it.
+    // Real implementation per slice 3c. Parses the /circle/seed URL, refuses
+    // member-shape /circle/join URLs (which would carry the encryption key),
+    // persists the enrollment row, then fires mountCircle so the host opens
+    // the bootstrap core and joins the swarm topic. Roll back persistence
+    // on mount failure so the seeder doesn't think it's enrolled when it isn't.
     'seeder:enroll': async ({ invite } = {}) => {
       if (typeof invite !== 'string' || invite.length === 0) {
         throw new Error('invite must be a non-empty string')
       }
-      throw new Error('not-yet-implemented: slice 3 owns seed-invite admission')
+      const parsed = parseSeedInvite(invite)
+      if (!parsed.ok) {
+        throw new Error('invalid seed invite: ' + (parsed.error ?? 'unknown'))
+      }
+      const { circleId, name, circleKey, bootstrap, inviterPublicKey } = parsed
+      const existing = await localDb.get('seeder:enrolled:' + circleId)
+      if (existing?.value) {
+        return {
+          ok: true,
+          circleId,
+          name: existing.value.name ?? name,
+          inviter: existing.value.inviter ?? inviterPublicKey,
+          alreadyEnrolled: true,
+        }
+      }
+      const row = {
+        circleId,
+        name,
+        circleKey,
+        bootstrap,
+        inviter: inviterPublicKey,
+        enrolledAt: Date.now(),
+      }
+      await localDb.put('seeder:enrolled:' + circleId, row)
+      if (typeof mountCircle === 'function') {
+        try {
+          await mountCircle(row)
+        } catch (e) {
+          // Roll back so the next boot doesn't try to remount a circle the
+          // host couldn't bring up. The user retries via seeder:enroll.
+          await localDb.del('seeder:enrolled:' + circleId).catch(() => {})
+          throw new Error('seeder mount failed: ' + (e?.message ?? String(e)))
+        }
+      }
+      return { ok: true, circleId, name, inviter: inviterPublicKey, alreadyEnrolled: false }
     },
 
     'seeder:enrolled:list': async () => {
@@ -125,6 +169,16 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now() }) {
     'seeder:leave': async ({ circleId } = {}) => {
       if (typeof circleId !== 'string' || circleId.length === 0) {
         throw new Error('circleId must be a non-empty string')
+      }
+      // Tear down the live swarm + core BEFORE deleting persistence so a
+      // crash mid-leave doesn't strand the host with active sockets to a
+      // circle the seeder no longer claims to track.
+      if (typeof leaveCircle === 'function') {
+        try { await leaveCircle(circleId) } catch (e) {
+          // Best-effort: a failed teardown is logged but doesn't block the
+          // persistence clear. The host's next boot won't remount this
+          // circle since the enrolled row is gone.
+        }
       }
       await localDb.del('seeder:enrolled:' + circleId).catch(() => {})
       await localDb.del('seeder:retention:' + circleId).catch(() => {})

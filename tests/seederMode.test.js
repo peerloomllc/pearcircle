@@ -140,6 +140,27 @@ describe('createSeederHandlers', () => {
   })
 
   describe('seeder:enroll', () => {
+    const VALID_SEED_INVITE = (() => {
+      const { buildSeedInvite } = require('../src/invite')
+      return buildSeedInvite({
+        circleId: 'A'.repeat(43),
+        name: 'Smith Family',
+        circleKey: 'a'.repeat(64),
+        bootstrap: 'c'.repeat(64),
+        inviterPublicKey: 'b'.repeat(64),
+      })
+    })()
+    const VALID_MEMBER_INVITE = (() => {
+      const { buildInvite } = require('../src/invite')
+      return buildInvite({
+        circleId: 'A'.repeat(43),
+        name: 'Smith Family',
+        circleKey: 'a'.repeat(64),
+        bootstrap: 'c'.repeat(64),
+        inviterPublicKey: 'b'.repeat(64),
+      })
+    })()
+
     test('rejects non-string invite', async () => {
       const handlers = makeHandlers(makeFakeLocalDb())
       await expect(handlers['seeder:enroll']({})).rejects.toThrow(/invite/)
@@ -151,9 +172,82 @@ describe('createSeederHandlers', () => {
       await expect(handlers['seeder:enroll']({ invite: '' })).rejects.toThrow(/invite/)
     })
 
-    test('throws not-yet-implemented for well-formed input (slice 3 owns this)', async () => {
+    test('rejects /circle/join member-shape invite (would leak encryption key)', async () => {
       const handlers = makeHandlers(makeFakeLocalDb())
-      await expect(handlers['seeder:enroll']({ invite: 'https://...' })).rejects.toThrow(/slice 3/)
+      await expect(handlers['seeder:enroll']({ invite: VALID_MEMBER_INVITE })).rejects.toThrow(/seed invite/)
+    })
+
+    test('rejects malformed seed invite URL', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:enroll']({ invite: 'https://not-a-pearcircle-host/foo' })).rejects.toThrow(/seed invite/)
+    })
+
+    test('persists the enrollment row on a valid invite', async () => {
+      const db = makeFakeLocalDb()
+      const handlers = makeHandlers(db)
+      const result = await handlers['seeder:enroll']({ invite: VALID_SEED_INVITE })
+      expect(result.ok).toBe(true)
+      expect(result.circleId).toBe('A'.repeat(43))
+      expect(result.name).toBe('Smith Family')
+      expect(result.inviter).toBe('b'.repeat(64))
+      expect(result.alreadyEnrolled).toBe(false)
+      const row = db._data.get('seeder:enrolled:' + 'A'.repeat(43))
+      expect(row.circleId).toBe('A'.repeat(43))
+      expect(row.circleKey).toBe('a'.repeat(64))
+      expect(row.bootstrap).toBe('c'.repeat(64))
+      expect(row.inviter).toBe('b'.repeat(64))
+      expect(typeof row.enrolledAt).toBe('number')
+    })
+
+    test('fires mountCircle after persistence with the enrollment row', async () => {
+      const db = makeFakeLocalDb()
+      const calls = []
+      const mountCircle = async (row) => { calls.push(row) }
+      const identity = {
+        publicKey: b4a.from('a'.repeat(64), 'hex'),
+        secretKey: b4a.from('b'.repeat(128), 'hex'),
+      }
+      const handlers = createSeederHandlers({ localDb: db, identity, bootTs: 1000, mountCircle })
+      await handlers['seeder:enroll']({ invite: VALID_SEED_INVITE })
+      expect(calls.length).toBe(1)
+      expect(calls[0].circleId).toBe('A'.repeat(43))
+      expect(calls[0].bootstrap).toBe('c'.repeat(64))
+    })
+
+    test('rolls back persistence when mountCircle throws', async () => {
+      const db = makeFakeLocalDb()
+      const identity = {
+        publicKey: b4a.from('a'.repeat(64), 'hex'),
+        secretKey: b4a.from('b'.repeat(128), 'hex'),
+      }
+      const mountCircle = async () => { throw new Error('hyperswarm fail') }
+      const handlers = createSeederHandlers({ localDb: db, identity, bootTs: 1000, mountCircle })
+      await expect(handlers['seeder:enroll']({ invite: VALID_SEED_INVITE })).rejects.toThrow(/seeder mount failed/)
+      expect(db._data.has('seeder:enrolled:' + 'A'.repeat(43))).toBe(false)
+    })
+
+    test('is idempotent on repeat enroll for the same circleId', async () => {
+      const db = makeFakeLocalDb()
+      const calls = []
+      const mountCircle = async (row) => { calls.push(row) }
+      const identity = {
+        publicKey: b4a.from('a'.repeat(64), 'hex'),
+        secretKey: b4a.from('b'.repeat(128), 'hex'),
+      }
+      const handlers = createSeederHandlers({ localDb: db, identity, bootTs: 1000, mountCircle })
+      await handlers['seeder:enroll']({ invite: VALID_SEED_INVITE })
+      const second = await handlers['seeder:enroll']({ invite: VALID_SEED_INVITE })
+      expect(second.alreadyEnrolled).toBe(true)
+      // mountCircle was only called once — the second enroll short-circuited
+      expect(calls.length).toBe(1)
+    })
+
+    test('survives when mountCircle dep is absent', async () => {
+      const db = makeFakeLocalDb()
+      const handlers = makeHandlers(db)  // no mountCircle dep
+      const result = await handlers['seeder:enroll']({ invite: VALID_SEED_INVITE })
+      expect(result.ok).toBe(true)
+      expect(db._data.has('seeder:enrolled:' + 'A'.repeat(43))).toBe(true)
     })
   })
 
@@ -219,6 +313,39 @@ describe('createSeederHandlers', () => {
       const handlers = makeHandlers(makeFakeLocalDb())
       const result = await handlers['seeder:leave']({ circleId: 'unknown' })
       expect(result.ok).toBe(true)
+    })
+
+    test('fires leaveCircle dep before deleting persistence rows', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      let snapshotAtLeaveTime = null
+      const leaveCircle = async (cid) => {
+        // Capture the row state at leave time — must still be present so
+        // the host can read enrollment data while tearing down the swarm.
+        snapshotAtLeaveTime = db._data.has('seeder:enrolled:' + cid)
+      }
+      const identity = {
+        publicKey: b4a.from('a'.repeat(64), 'hex'),
+        secretKey: b4a.from('b'.repeat(128), 'hex'),
+      }
+      const handlers = createSeederHandlers({ localDb: db, identity, bootTs: 1000, leaveCircle })
+      await handlers['seeder:leave']({ circleId: 'c1' })
+      expect(snapshotAtLeaveTime).toBe(true)
+      expect(db._data.has('seeder:enrolled:c1')).toBe(false)
+    })
+
+    test('still deletes persistence when leaveCircle throws', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      const leaveCircle = async () => { throw new Error('teardown failed') }
+      const identity = {
+        publicKey: b4a.from('a'.repeat(64), 'hex'),
+        secretKey: b4a.from('b'.repeat(128), 'hex'),
+      }
+      const handlers = createSeederHandlers({ localDb: db, identity, bootTs: 1000, leaveCircle })
+      const result = await handlers['seeder:leave']({ circleId: 'c1' })
+      expect(result.ok).toBe(true)
+      expect(db._data.has('seeder:enrolled:c1')).toBe(false)
     })
   })
 
