@@ -72,4 +72,35 @@ function shouldAcceptSeederRow ({
   return true
 }
 
-module.exports = { shouldAcceptSeederRow }
+// Build the unsigned value for a revoke write. Preserves addedBy / addedAt /
+// label from the existing row so a future re-admit (slice 3d) can restore
+// "who first admitted this seeder" without losing history. Caller signs the
+// returned value with the revoker's secret key before appending.
+//
+// Returns null if the existing row is missing required fields (caller
+// should refuse the IPC in that case rather than write a malformed revoke).
+function buildSeederRevoke ({ existing, revokerPubkeyHex, now }) {
+  if (!existing || typeof existing !== 'object') return null
+  if (typeof existing.pubkey !== 'string') return null
+  if (typeof existing.addedBy !== 'string') return null
+  if (typeof existing.addedAt !== 'number') return null
+  if (typeof revokerPubkeyHex !== 'string' || !HEX_64.test(revokerPubkeyHex)) return null
+  if (typeof now !== 'number' || !Number.isFinite(now)) return null
+  const out = {
+    pubkey: existing.pubkey,
+    writer: revokerPubkeyHex,
+    addedBy: existing.addedBy,
+    addedAt: existing.addedAt,
+    updatedAt: now,
+    revoked: true,
+    revokedAt: now,
+    revokedBy: revokerPubkeyHex,
+    v: 1,
+  }
+  if (typeof existing.label === 'string' && existing.label.length > 0) {
+    out.label = existing.label
+  }
+  return out
+}
+
+module.exports = { shouldAcceptSeederRow, buildSeederRevoke }
