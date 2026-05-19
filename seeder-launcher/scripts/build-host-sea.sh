@@ -1,64 +1,67 @@
 #!/usr/bin/env bash
-# Build the Node SEA single-binary host. The .pkg ships this binary in
-# /usr/local/lib/pearcircle-seeder/pearcircle-seeder.
+# Stage the host process for the .pkg payload. Node 25 + postject 1.0.0-alpha.6
+# fails the SEA sentinel check; instead of fighting it, we ship a Node binary
+# copy alongside an esbuild-bundled host CJS file and a tiny wrapper shell
+# script. The LaunchAgent points at the wrapper.
 #
-# Strategy:
-#   1. esbuild bundles host/index.js + ws into a single CJS .js file
-#   2. node --experimental-sea-config writes a blob
-#   3. cp + codesign-remove + postject inject blob into a node binary copy
-#   4. codesign the result (caller signs the final .pkg)
-#
-# Caller responsibilities (Mac mini):
-#   - Node 20+ on PATH
-#   - npx postject available (postject is bundled in node-sea repo or as npm package)
+# Payload layout under /usr/local/lib/pearcircle-seeder/:
+#   pearcircle-seeder      shell wrapper that execs node host-bundled.js
+#   node                   copy of the build-machine's node binary
+#   host-bundled.js        esbuild output (host/index.js + ws)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 OUT_DIR="${OUT_DIR:-dist/macos/payload/usr/local/lib/pearcircle-seeder}"
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" dist
 
-# 1. Bundle host into a single CJS file.
-node_modules/.bin/esbuild host/index.js \
-  --bundle --platform=node --target=node20 --format=cjs \
-  --external:ws \
-  --outfile=dist/host-bundled.js
-# ws is left external because Node SEA + native deps inside the bundle is
-# fragile; we'll pre-bundle ws as well below. Switch back to inlined if
-# the prebuilt-binary detection inside ws (bufferutil/utf-8-validate) is
-# absent on the build machine.
+# 1. Bundle host into a single CJS file. ws bundles fine because its
+#    native optional deps (bufferutil / utf-8-validate) are imported via
+#    try/catch and fall back to pure JS when absent.
 node_modules/.bin/esbuild host/index.js \
   --bundle --platform=node --target=node20 --format=cjs \
   --outfile=dist/host-bundled.js
 
-# 2. SEA config.
-cat > dist/sea-config.json <<JSON
-{
-  "main": "dist/host-bundled.js",
-  "output": "dist/host-blob.bin",
-  "disableExperimentalSEAWarning": true
-}
-JSON
+cp dist/host-bundled.js "$OUT_DIR/host-bundled.js"
 
-node --experimental-sea-config dist/sea-config.json
-
-# 3. Inject into a node binary copy.
-NODE_BIN=$(command -v node)
-cp "$NODE_BIN" "$OUT_DIR/pearcircle-seeder"
-chmod +w "$OUT_DIR/pearcircle-seeder"
-
-# Strip the existing signature so postject can write a new section.
-if command -v codesign >/dev/null 2>&1; then
-  codesign --remove-signature "$OUT_DIR/pearcircle-seeder" 2>/dev/null || true
+# 2. Stage a self-contained Node binary. Homebrew's node dynamically links
+#    to /opt/homebrew dylibs and is unusable on a clean machine. Download
+#    the official Node.js distribution tarball (statically linked, ~80MB
+#    extracted) and reuse it across builds via dist/cache.
+NODE_VERSION="${NODE_VERSION:-22.20.0}"
+case "$(uname -m)" in
+  arm64) NODE_ARCH=arm64 ;;
+  x86_64) NODE_ARCH=x64 ;;
+  *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+esac
+case "$(uname -s)" in
+  Darwin) NODE_OS=darwin ;;
+  *) echo "this script builds darwin payloads only" >&2; exit 1 ;;
+esac
+NODE_PKG="node-v${NODE_VERSION}-${NODE_OS}-${NODE_ARCH}"
+NODE_CACHE="dist/cache/$NODE_PKG"
+if [ ! -x "$NODE_CACHE/bin/node" ]; then
+  mkdir -p dist/cache
+  URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_PKG}.tar.xz"
+  echo "downloading $URL"
+  curl -fsSL "$URL" -o "dist/cache/${NODE_PKG}.tar.xz"
+  tar -xJf "dist/cache/${NODE_PKG}.tar.xz" -C dist/cache
+  rm "dist/cache/${NODE_PKG}.tar.xz"
 fi
+rm -f "$OUT_DIR/node"
+cp "$NODE_CACHE/bin/node" "$OUT_DIR/node"
+chmod +x "$OUT_DIR/node"
 
-npx --yes postject "$OUT_DIR/pearcircle-seeder" NODE_SEA_BLOB dist/host-blob.bin \
-  --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 \
-  --macho-segment-name NODE_SEA
+# 3. Wrapper script. The LaunchAgent and CLI users invoke this.
+cat > "$OUT_DIR/pearcircle-seeder" <<'WRAPPER'
+#!/bin/bash
+# Wrapper: invoke the bundled node binary against the bundled host script.
+DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+exec "$DIR/node" "$DIR/host-bundled.js" "$@"
+WRAPPER
+chmod +x "$OUT_DIR/pearcircle-seeder"
 
-# 4. Ad-hoc sign so the binary can run before .pkg-time codesigning.
-if command -v codesign >/dev/null 2>&1; then
-  codesign --sign - "$OUT_DIR/pearcircle-seeder"
-fi
-
-echo "built: $OUT_DIR/pearcircle-seeder"
+echo "staged:"
+echo "  $OUT_DIR/pearcircle-seeder  (wrapper)"
+echo "  $OUT_DIR/node               ($(wc -c < "$OUT_DIR/node" | tr -d ' ') bytes)"
+echo "  $OUT_DIR/host-bundled.js    ($(wc -c < "$OUT_DIR/host-bundled.js" | tr -d ' ') bytes)"

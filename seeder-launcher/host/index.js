@@ -44,11 +44,24 @@ function printHelp () {
   ].join('\n'))
 }
 
+// Resolve the platform-native bare-runtime binary. The `node bin/bare` JS
+// wrapper installs a no-op SIGTERM handler, so killing the wrapper leaves
+// the native bare child running and holding the corestore lock. Skip the
+// wrapper and invoke the native binary directly.
+function nativeBareBinary (repoRoot) {
+  const platform = process.platform === 'darwin' ? 'darwin'
+    : process.platform === 'win32' ? 'win32' : 'linux'
+  const arch = process.arch === 'x64' ? 'x64'
+    : process.arch === 'arm64' ? 'arm64' : process.arch
+  const ext = platform === 'win32' ? '.exe' : ''
+  return path.join(repoRoot, 'node_modules', `bare-runtime-${platform}-${arch}`, 'bin', `bare${ext}`)
+}
+
 function resolvePaths (opts) {
   if (opts.dev) {
     const repoRoot = path.resolve(__dirname, '..', '..')
     return {
-      barePath: opts.barePath || `node ${path.join(repoRoot, 'node_modules', 'bare', 'bin', 'bare')}`,
+      barePath: opts.barePath || nativeBareBinary(repoRoot),
       bundleEntry: opts.bundleEntry || path.join(repoRoot, 'src', 'bare.js'),
       uiDir: opts.uiDir || path.join(__dirname, '..', 'ui'),
     }
