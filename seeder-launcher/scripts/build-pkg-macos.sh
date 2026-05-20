@@ -27,6 +27,11 @@ APP_SIGN_ID="${APP_SIGN_ID:-}"
 PKG_SIGN_ID="${PKG_SIGN_ID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-pearcircle-seeder-notary}"
 SKIP_NOTARIZE="${SKIP_NOTARIZE:-0}"
+# Both the Developer ID Installer cert and the notarytool credential
+# profile live in the buildkey keychain (empty password) so codesign +
+# notarytool work non-interactively over SSH. The login keychain can't
+# be unlocked from a script.
+KEYCHAIN_PATH="${KEYCHAIN_PATH:-$HOME/Library/Keychains/buildkey.keychain}"
 
 ROOT=$(pwd)
 PAYLOAD="$ROOT/dist/macos/payload"
@@ -71,7 +76,14 @@ rsync -a --exclude='ui/' --exclude='*.test.js' "$ROOT/../src/" "$PAYLOAD_LIB/wor
 # hyperbee, hyperswarm, autobase, hypercore, b4a, protomux, sodium-*, and
 # the bare-* polyfills. Wildcard excludes catch nested copies under
 # transitive deps too. Shrinks the payload from ~1.2GB to ~150MB.
+#
+# bare-runtime-*/ is dropped too: the installed host runs the signed
+# `bare` at the payload root (resolvePaths() in host/index.js), so the
+# bundled copy is unused build-time weight - and its bin/bare is an
+# extensionless Mach-O the addon-signing loop below would miss, failing
+# notarization.
 rsync -a \
+  --exclude='bare-runtime-*/' \
   --exclude='react-native-bare-kit/' \
   --exclude='react-native/' \
   --exclude='react-native-*/' \
@@ -94,6 +106,19 @@ rsync -a \
   --exclude='metro*/' \
   --exclude='@metro*/' \
   "$ROOT/../node_modules/" "$PAYLOAD_LIB/worklet/node_modules/"
+
+# 4b. Prune native prebuilds for platforms this arm64-macOS seeder never
+#     loads. Bare/napi addons ship per-platform prebuilds/<platform>/
+#     dirs; only darwin-arm64 is used here. Removing the rest shrinks the
+#     payload and strips foreign Mach-O binaries (darwin-x64, ios-*) that
+#     Apple's notary service would otherwise reject as unsigned.
+find "$PAYLOAD_LIB/worklet/node_modules" -type d -name prebuilds | while read -r pb; do
+  for plat in "$pb"/*/; do
+    [ -d "$plat" ] || continue
+    [ "$(basename "$plat")" = darwin-arm64 ] && continue
+    rm -rf "$plat"
+  done
+done
 
 # 5. UI.
 cp ui/index.html "$PAYLOAD_LIB/ui/index.html"
@@ -133,13 +158,26 @@ fi
 if [ -n "$APP_SIGN_ID" ]; then
   # Unlock the buildkey keychain so codesign over SSH stops hitting
   # errSecInternalComponent. Matches the pattern in scripts/ios-dev-install.sh.
-  KEYCHAIN_PATH="${KEYCHAIN_PATH:-$HOME/Library/Keychains/buildkey.keychain}"
   if [ -e "$KEYCHAIN_PATH" ] || [ -e "${KEYCHAIN_PATH}-db" ]; then
     security unlock-keychain -p "" "$KEYCHAIN_PATH" 2>/dev/null || true
     security list-keychains -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain >/dev/null 2>&1 || true
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
   fi
   ENTITLEMENTS="$ROOT/installer/macos/entitlements.plist"
+  # Sign every Mach-O native addon in the payload first (inside-out).
+  # Apple's notary service rejects the .pkg if any nested binary is
+  # unsigned or lacks a secure timestamp. ELF/PE addons for foreign
+  # platforms are skipped — notary only inspects Mach-O. Addons don't
+  # JIT, so they're signed without the JIT entitlements.
+  signed_addons=0
+  while IFS= read -r f; do
+    if file "$f" | grep -q 'Mach-O'; then
+      codesign --force --options runtime --timestamp --sign "$APP_SIGN_ID" "$f" \
+        || { echo "error: failed to sign $f" >&2; exit 1; }
+      signed_addons=$((signed_addons + 1))
+    fi
+  done < <(find "$PAYLOAD_LIB" -type f \( -name '*.node' -o -name '*.bare' -o -name '*.dylib' -o -name '*.so' \))
+  echo "signed $signed_addons native addon binaries"
   codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$APP_SIGN_ID" "$PAYLOAD_LIB/node"
   codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$APP_SIGN_ID" "$PAYLOAD_LIB/bare"
 else
@@ -180,9 +218,13 @@ else
   echo "warning: built unsigned .pkg. Install with: sudo installer -allowUntrusted -pkg $DIST -target /"
 fi
 
-# 11. Notarize + staple — only if signed.
+# 11. Notarize + staple — only if signed. The notary credential profile
+# lives in the buildkey keychain (see store-credentials --keychain), so
+# point notarytool at it explicitly rather than the locked login keychain.
 if [ -n "$PKG_SIGN_ID" ] && [ "$SKIP_NOTARIZE" != "1" ]; then
-  xcrun notarytool submit "$DIST" --keychain-profile "$NOTARY_PROFILE" --wait
+  NOTARY_KEYCHAIN="$KEYCHAIN_PATH"
+  [ -e "$NOTARY_KEYCHAIN" ] || NOTARY_KEYCHAIN="${KEYCHAIN_PATH}-db"
+  xcrun notarytool submit "$DIST" --keychain-profile "$NOTARY_PROFILE" --keychain "$NOTARY_KEYCHAIN" --wait
   xcrun stapler staple "$DIST"
 fi
 
