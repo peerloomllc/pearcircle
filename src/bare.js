@@ -29,13 +29,14 @@ const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite, buildSeedInvite } = require('./invite')
-const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers } = require('./seeder')
+const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers, enrollSeedInvite } = require('./seeder')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
+const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
@@ -121,6 +122,14 @@ const _seederCircles = new Map()  // circleId → { core, topicHex, discovery }
 // circle unless we open it explicitly post-hoc.
 // Proposal 2026-05-18-pair-channel-on-circle-add.
 const _activeConns = new Set()
+// Open member-side seeder-sync channels. One per live connection; each
+// entry is { resend }. The channel sends the seed bundle only when the
+// remote is a followed seeder (checked at send time), so a channel to a
+// plain member peer just sits idle. circle:create / circle:join and the
+// follow toggle call every resend so a new circle (or a freshly-followed
+// seeder) picks up the bundle without waiting for a reconnect.
+// Proposal amendment 2026-05-20 (blind-seeder auto-follow).
+const _memberSyncChannels = new Set()
 let _selfLastSeen = null          // latest signed location for own pubkey, used by the home map's empty state
 // Per-circle sharing state. circleId → { enabled, expiresAt, expiryTimer }.
 // Missing entry = enabled (default-on). Persisted as one Hyperbee row per
@@ -440,6 +449,10 @@ const handlers = {
 
     joinCircleTopic(circleId, circleKey)
 
+    // Auto-follow: push the updated bundle to followed seeders so the new
+    // circle seeds without a manual re-paste (proposal amendment 2026-05-20).
+    repushFollowedSeeders().catch(() => {})
+
     return { circleId, circleKey, bootstrap, encryptionKey, name, ownerPublicKey, createdAt, invite }
   },
 
@@ -523,6 +536,10 @@ const handlers = {
     }
     if (encryptionKey) record.encryptionKey = encryptionKey
     await _localDb.put('circles:joined:' + circleId, record)
+
+    // Auto-follow: push the updated bundle to followed seeders so the
+    // joined circle seeds too (proposal amendment 2026-05-20).
+    repushFollowedSeeders().catch(() => {})
 
     return { ...record, alreadyJoined: false }
   },
@@ -783,23 +800,10 @@ const handlers = {
   // parseSeedInvite; no new invite grammar.
   'circle:invite:seed:all': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
-    const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
-    const invites = []
-    let skipped = 0
-    for await (const { value } of _localDb.createReadStream({
-      gt: 'circles:joined:',
-      lt: 'circles:joined:~',
-    })) {
-      if (!value || !value.circleId) continue
-      if (!value.encryptionKey) { skipped++; continue }
-      const { circleId, name, circleKey, bootstrap } = value
-      const invite = buildSeedInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
-      invites.push({ circleId, name, invite })
-    }
-    const bundle = invites.map((i) => i.invite).join('\n')
+    const { entries, skipped } = await collectSeedInvites()
     return {
-      bundle,
-      invites: invites.map(({ circleId, name }) => ({ circleId, name })),
+      bundle: entries.map((e) => e.invite).join('\n'),
+      invites: entries.map(({ circleId, name }) => ({ circleId, name })),
       skipped,
     }
   },
@@ -826,7 +830,7 @@ const handlers = {
           if (!value || typeof value.pubkey !== 'string') continue
           let entry = byPubkey.get(value.pubkey)
           if (!entry) {
-            entry = { pubkey: value.pubkey, label: null, circles: [] }
+            entry = { pubkey: value.pubkey, label: null, followed: false, circles: [] }
             byPubkey.set(value.pubkey, entry)
           }
           if (!entry.label && typeof value.label === 'string') entry.label = value.label
@@ -834,7 +838,32 @@ const handlers = {
         }
       } catch {}
     }
+    // Mark which seeders are followed (auto-enrolled in new circles).
+    // Proposal amendment 2026-05-20 (blind-seeder auto-follow).
+    for (const entry of byPubkey.values()) {
+      entry.followed = await isFollowedSeeder(entry.pubkey)
+    }
     return { seeders: Array.from(byPubkey.values()) }
+  },
+
+  // Toggle a seeder as "followed" — when on, this device auto-pushes
+  // seed invites for every circle it creates/joins to that seeder over
+  // the seeder-sync channel, and auto-approves its announces. Off by
+  // default; the user opts in per device. Proposal amendment 2026-05-20.
+  'circle:seeder:follow:set': async ({ pubkey, enabled } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof pubkey !== 'string' || pubkey.length !== 64) {
+      throw new Error('pubkey must be a 64-char hex string')
+    }
+    if (enabled) {
+      await _localDb.put('seederfollow:' + pubkey, { pubkey, since: Date.now() })
+      // Push the current bundle immediately if we already have an open
+      // sync channel to this seeder (it just became followed).
+      repushFollowedSeeders().catch(() => {})
+    } else {
+      await _localDb.del('seederfollow:' + pubkey).catch(() => {})
+    }
+    return { ok: true, pubkey, enabled: !!enabled }
   },
 
   // Revoke an admitted seeder. Proposal 2026-05-19-blind-seeder-peers
@@ -879,23 +908,7 @@ const handlers = {
     if (label !== undefined && label !== null && typeof label !== 'string') {
       throw new Error('label must be a string if provided')
     }
-    const base = _circleBases.get(circleId)
-    if (!base) throw new Error('unknown circle: ' + circleId)
-    if (!base.writable) throw new Error('not yet a writer for this circle')
-    const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
-    const existing = existingNode?.value ?? null
-    const adminPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
-    const unsigned = buildSeederAdmission({
-      seederPubkey: pubkey,
-      adminPubkeyHex,
-      label,
-      existing,
-      now: Date.now(),
-    })
-    if (!unsigned) throw new Error('cannot build admission row from given input')
-    const signed = signValue(unsigned, _identity.secretKey)
-    await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
-    return { ok: true, circleId, pubkey, reAdmit: existing !== null }
+    return approveSeederRow(circleId, pubkey, label)
   },
 
   // Owner-only rename. Appends a fresh `circle:` row with the new name
@@ -2304,6 +2317,83 @@ function registerPairNotify (conn) {
   })
 }
 
+// Collect a seed invite for every encrypted circle this device is in.
+// Shared by circle:invite:seed:all (the manual bundle mint) and the
+// seeder-sync channel's getBundle (auto-follow push). Legacy unencrypted
+// circles are skipped + counted. Proposal amendments 2026-05-19/-05-20.
+async function collectSeedInvites () {
+  const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
+  const entries = []
+  let skipped = 0
+  for await (const { value } of _localDb.createReadStream({
+    gt: 'circles:joined:',
+    lt: 'circles:joined:~',
+  })) {
+    if (!value || !value.circleId) continue
+    if (!value.encryptionKey) { skipped++; continue }
+    const { circleId, name, circleKey, bootstrap } = value
+    const invite = buildSeedInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
+    entries.push({ circleId, name, invite })
+  }
+  return { entries, skipped }
+}
+
+// Is this pubkey a followed seeder (auto-enroll new circles into it)?
+// Proposal amendment 2026-05-20 (blind-seeder auto-follow).
+async function isFollowedSeeder (pubkeyHex) {
+  if (typeof pubkeyHex !== 'string' || pubkeyHex.length !== 64) return false
+  const row = await _localDb.get('seederfollow:' + pubkeyHex).catch(() => null)
+  return !!row?.value
+}
+
+// Re-push the seed bundle over every open member-side sync channel. Each
+// channel's getBundle re-checks followed-status at send time, so this
+// both feeds new circles to existing followed seeders and starts feeding
+// a seeder the moment its follow toggle is flipped on.
+async function repushFollowedSeeders () {
+  for (const entry of _memberSyncChannels) {
+    try { await entry.resend() } catch {}
+  }
+}
+
+// Seed-mode trust gate: is this pubkey the inviter of a circle this
+// seeder is already enrolled in? Only such members may auto-push more
+// circles over the sync channel, so a random peer can't spam the seeder
+// into enrolling. Proposal amendment 2026-05-20 (blind-seeder auto-follow).
+async function isKnownInviter (pubkeyHex) {
+  if (typeof pubkeyHex !== 'string' || pubkeyHex.length === 0) return false
+  for await (const { value } of _localDb.createReadStream({
+    gt: 'seeder:enrolled:',
+    lt: 'seeder:enrolled:~',
+  })) {
+    if (value?.inviter === pubkeyHex) return true
+  }
+  return false
+}
+
+// Write a signed seeder:{pubkey} admission row. Extracted from the
+// circle:seeder:approve IPC so the auto-approve path (followed seeders)
+// can reuse it. Proposal 2026-05-19 slice 3d + 2026-05-20 amendment.
+async function approveSeederRow (circleId, pubkey, label) {
+  const base = _circleBases.get(circleId)
+  if (!base) throw new Error('unknown circle: ' + circleId)
+  if (!base.writable) throw new Error('not yet a writer for this circle')
+  const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
+  const existing = existingNode?.value ?? null
+  const adminPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
+  const unsigned = buildSeederAdmission({
+    seederPubkey: pubkey,
+    adminPubkeyHex,
+    label,
+    existing,
+    now: Date.now(),
+  })
+  if (!unsigned) throw new Error('cannot build admission row from given input')
+  const signed = signValue(unsigned, _identity.secretKey)
+  await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
+  return { ok: true, circleId, pubkey, reAdmit: existing !== null }
+}
+
 // Seed-mode swarm connection handler. Proposal 2026-05-19-blind-seeder-peers
 // slice 3d. Pipes corestore replication (so encrypted blocks flow) and opens
 // the admission Protomux channel for each enrolled circle whose topic is
@@ -2342,6 +2432,31 @@ function onSeederSwarmConnection (conn, info) {
       mark('seeder:announce-channel-open', { circleId, remote: remotePublicKey.slice(0, 8) })
     }
   }
+
+  // Seeder-sync receiver (proposal amendment 2026-05-20, auto-follow). A
+  // followed member pushes its full seed bundle here; auto-enroll any
+  // circle not yet enrolled. Trust gate: only accept from a member that
+  // is the inviter of an existing enrollment, so a random peer can't
+  // spam this seeder into enrolling in arbitrary circles.
+  setupSeederSyncChannel({
+    conn,
+    role: 'seed',
+    onBundle: async ({ invites }) => {
+      if (!await isKnownInviter(remotePublicKey)) {
+        mark('seedersync:untrusted-push', { remote: (remotePublicKey || '?').slice(0, 8) })
+        return
+      }
+      for (const invite of invites) {
+        try {
+          const r = await enrollSeedInvite({ invite, localDb: _localDb, mountCircle: mountSeederCircle })
+          if (!r.alreadyEnrolled) mark('seedersync:auto-enrolled', { circleId: r.circleId })
+        } catch (e) {
+          mark('seedersync:enroll-failed', { err: e?.message ?? String(e) })
+        }
+      }
+    },
+    mark,
+  })
 }
 
 async function onSwarmConnection (conn, info) {
@@ -2420,11 +2535,46 @@ async function onSwarmConnection (conn, info) {
           mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
           return
         }
+        // Auto-approve for a followed seeder — the user already
+        // designated this device as theirs, so new circles admit
+        // silently (proposal amendment 2026-05-20). Other circles'
+        // members still see the seeder: row and approve independently.
+        if (base.writable && await isFollowedSeeder(pubkey)) {
+          try {
+            await approveSeederRow(circleId, pubkey, label ?? undefined)
+            mark('admission:auto-approved', { circleId, seeder: pubkey.slice(0, 8) })
+            send({ event: 'seeder:admitted', data: { circleId, pubkey } })
+            return
+          } catch (e) {
+            mark('admission:auto-approve-failed', { circleId, err: e?.message ?? String(e) })
+          }
+        }
         mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8), readmit: !!existingNode?.value })
         send({ event: 'seeder:announced', data: { circleId, pubkey, label: label ?? null } })
       },
       mark,
     })
+  }
+
+  // Member-side seeder-sync channel (proposal amendment 2026-05-20,
+  // auto-follow). Set up on every connection — getBundle only emits the
+  // seed bundle when the remote is a followed seeder, so a channel to a
+  // plain member peer stays idle. Registered in _memberSyncChannels so
+  // circle:create / circle:join / the follow toggle can re-push.
+  const syncChannel = setupSeederSyncChannel({
+    conn,
+    role: 'member',
+    getBundle: async () => {
+      if (!await isFollowedSeeder(remotePublicKey)) return []
+      const { entries } = await collectSeedInvites()
+      return entries.map((e) => e.invite)
+    },
+    mark,
+  })
+  if (syncChannel) {
+    const entry = { resend: syncChannel.resend }
+    _memberSyncChannels.add(entry)
+    conn.once('close', () => _memberSyncChannels.delete(entry))
   }
 
   // Peer tracking: prefer info.topics, fall back to all circles we both

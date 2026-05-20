@@ -8,6 +8,7 @@ const {
   SEED_METHODS,
   detectSeedMode,
   loadOrCreateSeederIdentity,
+  enrollSeedInvite,
   createSeederHandlers,
 } = require('../src/seeder')
 
@@ -415,5 +416,52 @@ describe('createSeederHandlers', () => {
       expect(handlers['lastSeen:write']).toBeUndefined()
       expect(handlers['ping']).toBeUndefined()
     })
+  })
+})
+
+// enrollSeedInvite is the shared enroll primitive. The seeder:enroll IPC
+// (tested above) delegates to it; the seeder-sync channel's auto-follow
+// path calls it directly. These cover the direct-call contract.
+// Proposal amendment 2026-05-20 (blind-seeder auto-follow).
+describe('enrollSeedInvite (direct call)', () => {
+  const { buildSeedInvite } = require('../src/invite')
+  const seedInvite = (circleId) => buildSeedInvite({
+    circleId,
+    name: 'Auto Circle',
+    circleKey: 'a'.repeat(64),
+    bootstrap: 'c'.repeat(64),
+    inviterPublicKey: 'b'.repeat(64),
+  })
+
+  test('enrolls a fresh invite and persists the row', async () => {
+    const db = makeFakeLocalDb()
+    const mounted = []
+    const r = await enrollSeedInvite({
+      invite: seedInvite('A'.repeat(43)),
+      localDb: db,
+      mountCircle: async (row) => { mounted.push(row) },
+    })
+    expect(r.ok).toBe(true)
+    expect(r.alreadyEnrolled).toBe(false)
+    expect(r.circleId).toBe('A'.repeat(43))
+    expect(db._data.has('seeder:enrolled:' + 'A'.repeat(43))).toBe(true)
+    expect(mounted).toHaveLength(1)
+  })
+
+  test('is idempotent — re-enroll of a known circle does not re-mount', async () => {
+    const db = makeFakeLocalDb()
+    const mounted = []
+    const mountCircle = async (row) => { mounted.push(row) }
+    const invite = seedInvite('A'.repeat(43))
+    await enrollSeedInvite({ invite, localDb: db, mountCircle })
+    const second = await enrollSeedInvite({ invite, localDb: db, mountCircle })
+    expect(second.alreadyEnrolled).toBe(true)
+    expect(mounted).toHaveLength(1)
+  })
+
+  test('rejects a malformed invite', async () => {
+    const db = makeFakeLocalDb()
+    await expect(enrollSeedInvite({ invite: 'https://evil.example/foo', localDb: db }))
+      .rejects.toThrow(/seed invite/)
   })
 })

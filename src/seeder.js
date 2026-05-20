@@ -75,6 +75,61 @@ async function loadOrCreateSeederIdentity (localDb) {
 }
 
 /**
+ * Enroll a single /circle/seed invite: parse, persist the
+ * seeder:enrolled:{circleId} row, fire mountCircle. Idempotent — a
+ * re-enroll of an already-known circle is a no-op returning
+ * alreadyEnrolled:true. Shared by the seeder:enroll IPC and the
+ * seeder-sync channel (proposal amendment 2026-05-20, auto-follow), so
+ * both the manual paste and the auto-pushed bundle take the same path.
+ *
+ * @param {object} deps
+ * @param {string} deps.invite - a /circle/seed invite URL
+ * @param {object} deps.localDb - Hyperbee-like with get / put / del
+ * @param {(enrollment: object) => Promise<void>} [deps.mountCircle]
+ * @returns {{ ok, circleId, name, inviter, alreadyEnrolled }}
+ */
+async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
+  if (typeof invite !== 'string' || invite.length === 0) {
+    throw new Error('invite must be a non-empty string')
+  }
+  const parsed = parseSeedInvite(invite)
+  if (!parsed.ok) {
+    throw new Error('invalid seed invite: ' + (parsed.error ?? 'unknown'))
+  }
+  const { circleId, name, circleKey, bootstrap, inviterPublicKey } = parsed
+  const existing = await localDb.get('seeder:enrolled:' + circleId)
+  if (existing?.value) {
+    return {
+      ok: true,
+      circleId,
+      name: existing.value.name ?? name,
+      inviter: existing.value.inviter ?? inviterPublicKey,
+      alreadyEnrolled: true,
+    }
+  }
+  const row = {
+    circleId,
+    name,
+    circleKey,
+    bootstrap,
+    inviter: inviterPublicKey,
+    enrolledAt: Date.now(),
+  }
+  await localDb.put('seeder:enrolled:' + circleId, row)
+  if (typeof mountCircle === 'function') {
+    try {
+      await mountCircle(row)
+    } catch (e) {
+      // Roll back so the next boot doesn't try to remount a circle the
+      // host couldn't bring up. The caller retries.
+      await localDb.del('seeder:enrolled:' + circleId).catch(() => {})
+      throw new Error('seeder mount failed: ' + (e?.message ?? String(e)))
+    }
+  }
+  return { ok: true, circleId, name, inviter: inviterPublicKey, alreadyEnrolled: false }
+}
+
+/**
  * Build the seed-mode IPC handler map. Returns an object suitable for
  * direct use as the worklet's `handlers` map; all non-seed methods are
  * intentionally absent so the bare dispatcher returns its existing
@@ -107,51 +162,12 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCi
         : 0,
     }),
 
-    // Real implementation per slice 3c. Parses the /circle/seed URL, refuses
-    // member-shape /circle/join URLs (which would carry the encryption key),
-    // persists the enrollment row, then fires mountCircle so the host opens
-    // the bootstrap core and joins the swarm topic. Roll back persistence
-    // on mount failure so the seeder doesn't think it's enrolled when it isn't.
-    'seeder:enroll': async ({ invite } = {}) => {
-      if (typeof invite !== 'string' || invite.length === 0) {
-        throw new Error('invite must be a non-empty string')
-      }
-      const parsed = parseSeedInvite(invite)
-      if (!parsed.ok) {
-        throw new Error('invalid seed invite: ' + (parsed.error ?? 'unknown'))
-      }
-      const { circleId, name, circleKey, bootstrap, inviterPublicKey } = parsed
-      const existing = await localDb.get('seeder:enrolled:' + circleId)
-      if (existing?.value) {
-        return {
-          ok: true,
-          circleId,
-          name: existing.value.name ?? name,
-          inviter: existing.value.inviter ?? inviterPublicKey,
-          alreadyEnrolled: true,
-        }
-      }
-      const row = {
-        circleId,
-        name,
-        circleKey,
-        bootstrap,
-        inviter: inviterPublicKey,
-        enrolledAt: Date.now(),
-      }
-      await localDb.put('seeder:enrolled:' + circleId, row)
-      if (typeof mountCircle === 'function') {
-        try {
-          await mountCircle(row)
-        } catch (e) {
-          // Roll back so the next boot doesn't try to remount a circle the
-          // host couldn't bring up. The user retries via seeder:enroll.
-          await localDb.del('seeder:enrolled:' + circleId).catch(() => {})
-          throw new Error('seeder mount failed: ' + (e?.message ?? String(e)))
-        }
-      }
-      return { ok: true, circleId, name, inviter: inviterPublicKey, alreadyEnrolled: false }
-    },
+    // Parse the /circle/seed URL, persist the enrollment row, mount the
+    // circle. The shared enrollSeedInvite logic also backs the
+    // seeder-sync channel's auto-follow path. Refuses member-shape
+    // /circle/join URLs (parseSeedInvite rejects them).
+    'seeder:enroll': async ({ invite } = {}) =>
+      enrollSeedInvite({ invite, localDb, mountCircle }),
 
     'seeder:enrolled:list': async () => {
       const circles = []
@@ -224,5 +240,6 @@ module.exports = {
   SEED_METHODS,
   detectSeedMode,
   loadOrCreateSeederIdentity,
+  enrollSeedInvite,
   createSeederHandlers,
 }

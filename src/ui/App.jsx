@@ -1188,6 +1188,16 @@ function SeedersSection ({ active = true }) {
     }
   }
 
+  const toggleFollow = async (seeder) => {
+    setError(null)
+    try {
+      await pear.call('circle:seeder:follow:set', { pubkey: seeder.pubkey, enabled: !seeder.followed })
+      await refresh()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    }
+  }
+
   // Only devices with >=1 non-revoked circle. Fully-revoked devices drop
   // off the list — the revoke tombstone is forward-only history.
   const liveSeeders = seeders
@@ -1246,25 +1256,42 @@ function SeedersSection ({ active = true }) {
             const circleNames = seeder.liveCircles.map((c) => c.name).join(', ')
             return (
               <li key={seeder.pubkey} style={{
-                display: 'flex', alignItems: 'center', gap: spacing.sm,
                 padding: `${spacing.sm}px 0`,
                 borderBottom: `1px solid ${colors.divider}`,
               }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {labelLine}
+                <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {labelLine}
+                    </div>
+                    <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                      Seeding {seeder.liveCircles.length} {seeder.liveCircles.length === 1 ? 'circle' : 'circles'}: {circleNames}
+                    </div>
                   </div>
-                  <div style={{ ...typography.caption, color: colors.text.secondary }}>
-                    seeding {seeder.liveCircles.length} {seeder.liveCircles.length === 1 ? 'circle' : 'circles'}: {circleNames}
-                  </div>
+                  <button
+                    onClick={() => setConfirmingRevoke(seeder)}
+                    disabled={isPending}
+                    title='Revoke seeder'
+                    aria-label='Revoke seeder'
+                    style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                    <Trash size={18} weight='regular' />
+                  </button>
                 </div>
                 <button
-                  onClick={() => setConfirmingRevoke(seeder)}
+                  onClick={() => toggleFollow(seeder)}
                   disabled={isPending}
-                  title='Revoke seeder'
-                  aria-label='Revoke seeder'
-                  style={iconBtnStyle({ disabled: isPending, destructive: true })}>
-                  <Trash size={18} weight='regular' />
+                  aria-pressed={seeder.followed}
+                  style={{
+                    marginTop: spacing.sm,
+                    display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
+                    padding: `4px 10px`, borderRadius: radius.full,
+                    fontSize: typography.micro.fontSize, fontFamily: typography.fontFamily,
+                    cursor: isPending ? 'default' : 'pointer',
+                    background: seeder.followed ? 'rgba(159,225,90,0.12)' : 'transparent',
+                    color: seeder.followed ? colors.primary : colors.text.secondary,
+                    border: `1px solid ${seeder.followed ? colors.primary : colors.border}`,
+                  }}>
+                  {seeder.followed ? '✓ ' : ''}Auto-follow new circles
                 </button>
               </li>
             )
