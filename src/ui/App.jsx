@@ -3599,12 +3599,10 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   // default so first open of Settings is profile + sharing only;
   // user expands what they need. Persists across sheet open/close
   // (SheetContainer keeps the component mounted).
-  const [locationSharingOpen, setLocationSharingOpen] = useState(false)
-  const [circlesOpen, setCirclesOpen] = useState(false)
-  const [seedersOpen, setSeedersOpen] = useState(false)
-  const [tripSharingOpen, setTripSharingOpen] = useState(false)
-  const [displayOpen, setDisplayOpen] = useState(false)
-  const [advancedOpen, setAdvancedOpen] = useState(false)
+  // Accordion: one section open at a time. openSection is the id of the
+  // expanded Collapsible, or null when all are collapsed.
+  const [openSection, setOpenSection] = useState(null)
+  const toggleSection = (id) => setOpenSection((s) => (s === id ? null : id))
   // Battery banner / onboarding deep-link signal: when the sheet opens
   // with initialExpand='battery', auto-expand Advanced and scroll the
   // section into view so the user lands on the toggle instead of the
@@ -3615,7 +3613,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
     if (!active) { handledInitialExpandRef.current = null; return }
     if (initialExpand === 'battery' && handledInitialExpandRef.current !== initialExpand) {
       handledInitialExpandRef.current = initialExpand
-      setAdvancedOpen(true)
+      setOpenSection('advanced')
       requestAnimationFrame(() => {
         try { advancedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
       })
@@ -3808,23 +3806,19 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
 
-      <Collapsible title='Location sharing' icon={Broadcast} open={locationSharingOpen} onToggle={() => setLocationSharingOpen(v => !v)} maxHeight='1200px'>
-        <LocationSharingSection active={active && locationSharingOpen} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
+      <Collapsible title='Circles' icon={UsersThree} open={openSection === 'circles'} onToggle={() => toggleSection('circles')} maxHeight='1200px'>
+        <CirclesSection active={active && openSection === 'circles'} onChanged={onSaved} />
       </Collapsible>
 
-      <Collapsible title='Circles' icon={UsersThree} open={circlesOpen} onToggle={() => setCirclesOpen(v => !v)} maxHeight='1200px'>
-        <CirclesSection active={active && circlesOpen} onChanged={onSaved} />
+      <Collapsible title='Location sharing' icon={Broadcast} open={openSection === 'locationSharing'} onToggle={() => toggleSection('locationSharing')} maxHeight='1200px'>
+        <LocationSharingSection active={active && openSection === 'locationSharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
       </Collapsible>
 
-      <Collapsible title='Seeders' icon={Broadcast} open={seedersOpen} onToggle={() => setSeedersOpen(v => !v)} maxHeight='1600px'>
-        <SeedersSection active={active && seedersOpen} />
+      <Collapsible title='Trip sharing' icon={MapTrifold} open={openSection === 'tripSharing'} onToggle={() => toggleSection('tripSharing')} maxHeight='1200px'>
+        <TripsSharingSection active={active && openSection === 'tripSharing'} />
       </Collapsible>
 
-      <Collapsible title='Trip sharing' icon={MapTrifold} open={tripSharingOpen} onToggle={() => setTripSharingOpen(v => !v)} maxHeight='1200px'>
-        <TripsSharingSection active={active && tripSharingOpen} />
-      </Collapsible>
-
-      <Collapsible title='Display' icon={Palette} open={displayOpen} onToggle={() => setDisplayOpen(v => !v)}>
+      <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
@@ -3833,7 +3827,11 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TripNotificationsSection />
       </Collapsible>
 
-      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={advancedOpen} onToggle={() => setAdvancedOpen(v => !v)} maxHeight='1200px'>
+      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
+        <SeedersSection active={active && openSection === 'seeders'} />
+      </Collapsible>
+
+      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={openSection === 'advanced'} onToggle={() => toggleSection('advanced')} maxHeight='1200px'>
         {battery.supported && (
           <div style={{ marginBottom: spacing.lg }}>
             <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Battery optimization</p>
@@ -4820,18 +4818,13 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
   // when closed), so the initializer only runs on the very first mount.
   // The effect re-runs whenever the prop changes — i.e., every time
   // setSheet({name:'about', expand:'...'}) lands a new value.
-  const [howOpen, setHowOpen] = useState(false)
-  const [tutorialOpen, setTutorialOpen] = useState(false)
-  const [supportOpen, setSupportOpen] = useState(false)
-  const [bitcoinOpen, setBitcoinOpen] = useState(false)
-  const [shareOpen, setShareOpen] = useState(false)
-  const [contactOpen, setContactOpen] = useState(false)
+  // Accordion: one section open at a time.
+  const [openSection, setOpenSection] = useState(null)
+  const toggleSection = (id) => setOpenSection((s) => (s === id ? null : id))
   useEffect(() => {
-    if (initialExpand === 'support') setSupportOpen(true)
-    else if (initialExpand === 'how') setHowOpen(true)
-    else if (initialExpand === 'bitcoin') setBitcoinOpen(true)
-    else if (initialExpand === 'share') setShareOpen(true)
-    else if (initialExpand === 'contact') setContactOpen(true)
+    if (['support', 'how', 'bitcoin', 'share', 'contact'].includes(initialExpand)) {
+      setOpenSection(initialExpand)
+    }
   }, [initialExpand])
 
   const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
@@ -4888,7 +4881,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </div>
       </div>
 
-      <Collapsible title='How it works' icon={InfoIcon} open={howOpen} onToggle={() => setHowOpen(v => !v)}>
+      <Collapsible title='How it works' icon={InfoIcon} open={openSection === 'how'} onToggle={() => toggleSection('how')}>
         <p style={body}>
           PearCircle syncs locations directly between devices using
           peer-to-peer technology powered by Hypercore Protocol. Your
@@ -4902,7 +4895,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
       </Collapsible>
 
       {onReplayOnboarding && (
-        <Collapsible title='Tutorial' icon={BookOpen} open={tutorialOpen} onToggle={() => setTutorialOpen(v => !v)}>
+        <Collapsible title='Tutorial' icon={BookOpen} open={openSection === 'tutorial'} onToggle={() => toggleSection('tutorial')}>
           <p style={body}>
             Replay the welcome tour to revisit how the map, circles,
             places, and trips work.
@@ -4913,7 +4906,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </Collapsible>
       )}
 
-      <Collapsible title='Support development' icon={Lightning} open={supportOpen} onToggle={() => setSupportOpen(v => !v)}>
+      <Collapsible title='Support development' icon={Lightning} open={openSection === 'support'} onToggle={() => toggleSection('support')}>
         <p style={body}>
           PearCircle is free and open source. If you receive value from
           it, please consider returning value.
@@ -4928,7 +4921,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </div>
       </Collapsible>
 
-      <Collapsible title='Learn about Bitcoin' icon={BookOpen} open={bitcoinOpen} onToggle={() => setBitcoinOpen(v => !v)}>
+      <Collapsible title='Learn about Bitcoin' icon={BookOpen} open={openSection === 'bitcoin'} onToggle={() => toggleSection('bitcoin')}>
         <p style={body}>
           New to Bitcoin? The Satoshi Nakamoto Institute has a free,
           concise crash course explaining how Bitcoin works and why it
@@ -4939,7 +4932,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </button>
       </Collapsible>
 
-      <Collapsible title='Share the app' icon={ShareNetwork} open={shareOpen} onToggle={() => setShareOpen(v => !v)}>
+      <Collapsible title='Share the app' icon={ShareNetwork} open={openSection === 'share'} onToggle={() => toggleSection('share')}>
         <p style={body}>
           Know someone who'd want a private, serverless way to share
           location with friends or family? Share PearCircle with them.
@@ -4949,7 +4942,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </button>
       </Collapsible>
 
-      <Collapsible title='Contact' icon={EnvelopeSimple} open={contactOpen} onToggle={() => setContactOpen(v => !v)}>
+      <Collapsible title='Contact' icon={EnvelopeSimple} open={openSection === 'contact'} onToggle={() => toggleSection('contact')}>
         <div style={{ display: 'flex', gap: spacing.sm }}>
           <button onClick={sendEmail} style={{ ...pillBtn, flex: 1 }}>
             <EnvelopeSimple size={14} weight='thin' /> Email <ArrowSquareOut size={13} weight='thin' />
