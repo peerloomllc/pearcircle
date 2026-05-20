@@ -3398,6 +3398,7 @@ function CirclesSection ({ active = true, onChanged, onManageSeeders }) {
           name: c.circle?.name ?? '...',
           isOwner: c.circle?.ownerKey === ourKey,
           memberCount: (c.members ?? []).length,
+          seederCount: c.seederCount ?? 0,
         }))
       setList(next)
     } catch (e) {
@@ -3558,10 +3559,10 @@ function CirclesSection ({ active = true, onChanged, onManageSeeders }) {
                 <button
                   onClick={() => onManageSeeders(c.circleId, c.name)}
                   disabled={isPending}
-                  title='Manage seeders'
-                  aria-label='Manage seeders'
-                  style={iconBtnStyle({ disabled: isPending })}>
-                  <Broadcast size={18} weight='regular' />
+                  title={c.seederCount > 0 ? `Seeding active (${c.seederCount}) - manage` : 'Manage seeders'}
+                  aria-label={c.seederCount > 0 ? `Seeding active, ${c.seederCount} seeder(s)` : 'Manage seeders'}
+                  style={iconBtnStyle({ disabled: isPending, active: c.seederCount > 0 })}>
+                  <Broadcast size={18} weight={c.seederCount > 0 ? 'fill' : 'regular'} />
                 </button>
               )}
               <button
@@ -3601,14 +3602,18 @@ function CirclesSection ({ active = true, onChanged, onManageSeeders }) {
 // disabled. Destructive variant tints the icon error-red; the border
 // stays neutral so the row reads calm at rest (the loud confirmation
 // happens in the sheet, not the row).
-function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
+function iconBtnStyle ({ disabled = false, destructive = false, active = false } = {}) {
   return {
     width: 36, height: 36,
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
     padding: 0, borderRadius: radius.md,
-    background: 'transparent',
-    color: destructive ? colors.error : colors.text.secondary,
-    border: `1px solid ${colors.border}`,
+    // `active` paints the button in the primary green so it reads like an
+    // engaged toggle (used by the seeder Broadcast button when a circle
+    // has live seeders). The 12%-alpha fill mirrors the launcher UI's
+    // success-toast tint.
+    background: active ? 'rgba(159,225,90,0.12)' : 'transparent',
+    color: destructive ? colors.error : (active ? colors.primary : colors.text.secondary),
+    border: `1px solid ${active ? colors.primary : colors.border}`,
     cursor: disabled ? 'default' : 'pointer',
     opacity: disabled ? 0.5 : 1,
   }

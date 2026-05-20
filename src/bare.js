@@ -1658,6 +1658,13 @@ async function snapshotCircle (circleId, base) {
   })) {
     if (value) transitions.push(value)
   }
+  // Count non-revoked seeder admission rows so the UI can flag a circle
+  // as actively seeded. seeder:{pubkey} rows carry revoked:true tombstones
+  // (LWW on revokedAt); a circle is "actively seeded" when >=1 row stands.
+  let seederCount = 0
+  for await (const { value } of view.createReadStream({ gt: 'seeder:', lt: 'seeder:~' })) {
+    if (value && !value.revoked) seederCount++
+  }
   return {
     circle: circleRow ? circleRow.value : null,
     members,
@@ -1665,6 +1672,7 @@ async function snapshotCircle (circleId, base) {
     presence,
     places,
     transitions,
+    seederCount,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
   }
