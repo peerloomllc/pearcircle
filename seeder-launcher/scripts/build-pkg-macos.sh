@@ -27,6 +27,11 @@ APP_SIGN_ID="${APP_SIGN_ID:-}"
 PKG_SIGN_ID="${PKG_SIGN_ID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-pearcircle-seeder-notary}"
 SKIP_NOTARIZE="${SKIP_NOTARIZE:-0}"
+# Both the Developer ID Installer cert and the notarytool credential
+# profile live in the buildkey keychain (empty password) so codesign +
+# notarytool work non-interactively over SSH. The login keychain can't
+# be unlocked from a script.
+KEYCHAIN_PATH="${KEYCHAIN_PATH:-$HOME/Library/Keychains/buildkey.keychain}"
 
 ROOT=$(pwd)
 PAYLOAD="$ROOT/dist/macos/payload"
@@ -133,7 +138,6 @@ fi
 if [ -n "$APP_SIGN_ID" ]; then
   # Unlock the buildkey keychain so codesign over SSH stops hitting
   # errSecInternalComponent. Matches the pattern in scripts/ios-dev-install.sh.
-  KEYCHAIN_PATH="${KEYCHAIN_PATH:-$HOME/Library/Keychains/buildkey.keychain}"
   if [ -e "$KEYCHAIN_PATH" ] || [ -e "${KEYCHAIN_PATH}-db" ]; then
     security unlock-keychain -p "" "$KEYCHAIN_PATH" 2>/dev/null || true
     security list-keychains -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain >/dev/null 2>&1 || true
@@ -180,9 +184,13 @@ else
   echo "warning: built unsigned .pkg. Install with: sudo installer -allowUntrusted -pkg $DIST -target /"
 fi
 
-# 11. Notarize + staple — only if signed.
+# 11. Notarize + staple — only if signed. The notary credential profile
+# lives in the buildkey keychain (see store-credentials --keychain), so
+# point notarytool at it explicitly rather than the locked login keychain.
 if [ -n "$PKG_SIGN_ID" ] && [ "$SKIP_NOTARIZE" != "1" ]; then
-  xcrun notarytool submit "$DIST" --keychain-profile "$NOTARY_PROFILE" --wait
+  NOTARY_KEYCHAIN="$KEYCHAIN_PATH"
+  [ -e "$NOTARY_KEYCHAIN" ] || NOTARY_KEYCHAIN="${KEYCHAIN_PATH}-db"
+  xcrun notarytool submit "$DIST" --keychain-profile "$NOTARY_PROFILE" --keychain "$NOTARY_KEYCHAIN" --wait
   xcrun stapler staple "$DIST"
 fi
 
