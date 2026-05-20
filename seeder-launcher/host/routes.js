@@ -32,7 +32,29 @@ function routes () {
       handler: async (req, ctx) => {
         const body = await jsonBody(req)
         if (!body.invite) throw new HttpError(400, 'invite required')
-        return ctx.worklet.call('seeder:enroll', { invite: body.invite })
+        // The mobile UI mints a bundle: one /circle/seed URL per line,
+        // covering every encrypted circle at once. Split + enroll each;
+        // the worklet's seeder:enroll stays single-invite. A plain
+        // single-invite paste is just a one-line bundle.
+        const lines = String(body.invite)
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0)
+        if (lines.length === 0) throw new HttpError(400, 'invite required')
+        const results = []
+        for (const invite of lines) {
+          try {
+            const r = await ctx.worklet.call('seeder:enroll', { invite })
+            results.push({ ok: true, circleId: r?.circleId, name: r?.name, alreadyEnrolled: !!r?.alreadyEnrolled })
+          } catch (e) {
+            results.push({ ok: false, error: e?.message ?? String(e) })
+          }
+        }
+        return {
+          results,
+          enrolled: results.filter((r) => r.ok).length,
+          failed: results.filter((r) => !r.ok).length,
+        }
       },
     },
     {

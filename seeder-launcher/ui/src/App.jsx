@@ -73,8 +73,18 @@ function Enroll ({ onEnrolled, setError }) {
     e.preventDefault()
     setMsg(null); setError(null); setBusy(true)
     try {
+      // The paste may be a bundle (one /circle/seed URL per line, minted
+      // by the mobile "Set up a seeder device" action) or a single
+      // invite. The host splits + enrolls each, returning per-circle
+      // results.
       const res = await api.enroll(invite.trim())
-      setMsg(`enrolled in ${res.circleId}`)
+      const enrolled = res.enrolled ?? 0
+      const failed = res.failed ?? 0
+      const already = (res.results ?? []).filter((r) => r.ok && r.alreadyEnrolled).length
+      const parts = [`enrolled in ${enrolled} circle${enrolled === 1 ? '' : 's'}`]
+      if (already > 0) parts.push(`${already} already enrolled`)
+      if (failed > 0) parts.push(`${failed} failed`)
+      setMsg(parts.join(', '))
       setInvite('')
       onEnrolled()
     } catch (err) {
@@ -86,10 +96,10 @@ function Enroll ({ onEnrolled, setError }) {
 
   return (
     <div class="panel">
-      <h2>Enroll a new circle</h2>
+      <h2>Enroll circles</h2>
       <form onSubmit={submit}>
         <textarea
-          placeholder="https://peerloomllc.com/circle/seed?circle=…"
+          placeholder="Paste a seed invite, or a bundle (one per line) from a PearCircle member's Settings → Seeders"
           value={invite}
           onInput={(e) => setInvite(e.currentTarget.value)}
         />

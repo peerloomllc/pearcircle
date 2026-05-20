@@ -773,6 +773,70 @@ const handlers = {
     return { seeders }
   },
 
+  // Mint seed invites for every encrypted circle this device is in,
+  // newline-joined into one bundle. Proposal amendment 2026-05-19
+  // (global seeder setup): a seeder operator wants one device covering
+  // all their circles, so the UI mints the whole set in one action.
+  // Legacy unencrypted circles can't take a blind seeder (no encryption
+  // boundary to hide behind) — they're skipped and counted. Each bundle
+  // line is an independent /circle/seed URL that round-trips through
+  // parseSeedInvite; no new invite grammar.
+  'circle:invite:seed:all': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
+    const invites = []
+    let skipped = 0
+    for await (const { value } of _localDb.createReadStream({
+      gt: 'circles:joined:',
+      lt: 'circles:joined:~',
+    })) {
+      if (!value || !value.circleId) continue
+      if (!value.encryptionKey) { skipped++; continue }
+      const { circleId, name, circleKey, bootstrap } = value
+      const invite = buildSeedInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
+      invites.push({ circleId, name, invite })
+    }
+    const bundle = invites.map((i) => i.invite).join('\n')
+    return {
+      bundle,
+      invites: invites.map(({ circleId, name }) => ({ circleId, name })),
+      skipped,
+    }
+  },
+
+  // Every seeder across every circle this device is in, grouped by
+  // seeder pubkey so the Settings UI renders one row per seeder device
+  // (each listing the circles it covers). Proposal amendment 2026-05-19
+  // (global seeder setup). Includes revoked rows with a revoked flag so
+  // the UI can show per-circle state.
+  'seeders:listAll': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const byPubkey = new Map()
+    for (const [circleId, base] of _circleBases) {
+      let circleName = circleId.slice(0, 8)
+      try {
+        const circleRow = await base.view.get('circle')
+        if (circleRow?.value?.name) circleName = circleRow.value.name
+      } catch {}
+      try {
+        for await (const { value } of base.view.createReadStream({
+          gt: 'seeder:',
+          lt: 'seeder:~',
+        })) {
+          if (!value || typeof value.pubkey !== 'string') continue
+          let entry = byPubkey.get(value.pubkey)
+          if (!entry) {
+            entry = { pubkey: value.pubkey, label: null, circles: [] }
+            byPubkey.set(value.pubkey, entry)
+          }
+          if (!entry.label && typeof value.label === 'string') entry.label = value.label
+          entry.circles.push({ circleId, name: circleName, revoked: value.revoked === true })
+        }
+      } catch {}
+    }
+    return { seeders: Array.from(byPubkey.values()) }
+  },
+
   // Revoke an admitted seeder. Proposal 2026-05-19-blind-seeder-peers
   // slice 3b. Writes a tombstone row signed by the local member. Apply
   // branch + peer-filter (slice 3d) enforce the revocation across the
@@ -1658,13 +1722,6 @@ async function snapshotCircle (circleId, base) {
   })) {
     if (value) transitions.push(value)
   }
-  // Count non-revoked seeder admission rows so the UI can flag a circle
-  // as actively seeded. seeder:{pubkey} rows carry revoked:true tombstones
-  // (LWW on revokedAt); a circle is "actively seeded" when >=1 row stands.
-  let seederCount = 0
-  for await (const { value } of view.createReadStream({ gt: 'seeder:', lt: 'seeder:~' })) {
-    if (value && !value.revoked) seederCount++
-  }
   return {
     circle: circleRow ? circleRow.value : null,
     members,
@@ -1672,7 +1729,6 @@ async function snapshotCircle (circleId, base) {
     presence,
     places,
     transitions,
-    seederCount,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
   }

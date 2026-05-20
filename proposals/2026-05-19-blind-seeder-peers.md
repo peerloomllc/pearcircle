@@ -320,3 +320,23 @@ If approved and shipped:
 2. Encryption-key rotation on member kick (T3, separate proposal)
 3. Push-relay service to complement seeder for cross-device wake (T3, separate proposal, much larger trust trade-off)
 4. Seeder mesh discovery (peer-to-peer ledger of "circles I would seed if invited"; opt-in community-run mesh) - speculative, not before v2
+
+## Amendments
+
+### 2026-05-19 — global seeder setup (one bundle mint for all circles)
+
+**Tier: T2.** No wire-protocol change — no new record kind, no invite-grammar change. Additive IPCs + a UI restructure. See `DECISIONS.md` 2026-05-19.
+
+**Motivation.** Slices 3b/4 shipped seeder management per-circle: a member minted a `/circle/seed` invite one circle at a time (`circle:invite:seed`) from a per-circle Broadcast icon in Settings → Circles, and the desktop seeder enrolled one invite per call. Real usage doesn't match that shape — someone setting up a Pi or spare phone as a seeder wants it covering every circle they're in, and minting/pasting N invites by hand is busywork. The desktop-launcher Phase 4 smoke surfaced this directly.
+
+**Change.**
+
+- **Bundle = newline-joined `/circle/seed` URLs.** A "bundle" is not a new invite grammar — it is simply multiple existing seed-invite URLs joined by `\n`. Each line independently round-trips through `parseSeedInvite`. Nothing on the wire changes.
+- **New IPC `circle:invite:seed:all`** (member side, args `{}`): iterates the device's `circles:joined:` rows, mints a seed invite via the existing `buildSeedInvite` for every circle whose local row carries an `encryptionKey`, and returns `{ bundle: string, invites: [{ circleId, name }], skipped: number }`. Legacy unencrypted circles cannot host a blind seeder (no encryption boundary) and are skipped + counted. `circle:invite:seed` (single-circle) remains as the underlying primitive.
+- **New IPC `seeders:listAll`** (member side, args `{}`): returns every seeder across every circle the device is in, grouped by seeder pubkey — `{ seeders: [{ pubkey, label, circles: [{ circleId, name, revoked }] }] }` — so the UI renders one row per seeder *device* rather than per circle.
+- **Settings UI.** The per-circle Broadcast icon + per-circle `SeederManageView` are removed. A single top-level Settings → Seeders section replaces them: "Set up a seeder device" mints the bundle (copy-text + Share; no QR — a multi-circle bundle is too dense for one); the admitted-seeder list shows each device with the circles it covers and a "revoke everywhere" action.
+- **Desktop launcher.** The enroll endpoint accepts a multi-line bundle, splits on newlines, and calls the unchanged single-invite `seeder:enroll` per line, returning aggregated per-circle results.
+
+**Unchanged.** Admission and revocation stay per-circle at the protocol level. Each circle's members still independently approve a seeder (Q7 any-member-admission-with-transparency) and `circle:seeder:revoke` is still per-circle — "revoke everywhere" is a UI convenience that loops it. The `seeder:{pubkey}` record kind, the admission Protomux channel, and the revocation peer-filter are untouched.
+
+**Trust note.** A bundle hands the seeder operator the swarm topics for every circle in it at once — a broader grant than the original opt-in-per-circle mint. This is acceptable for the intended use (your own hardware) and the admission step is still per-circle, so other members remain the gate. Documented, not gated.
