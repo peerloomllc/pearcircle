@@ -1117,6 +1117,38 @@ function InviteShareView ({ circleId, circleName, onClose }) {
   )
 }
 
+// iOS-style sliding toggle switch. Fires a light haptic on flip. Used
+// for the seeder auto-follow control; reusable for any boolean setting.
+function ToggleSwitch ({ on, onChange, disabled = false }) {
+  return (
+    <button
+      role='switch'
+      aria-checked={on}
+      disabled={disabled}
+      onClick={() => {
+        if (disabled) return
+        haptic('light')
+        onChange?.(!on)
+      }}
+      style={{
+        width: 44, height: 26, flexShrink: 0, padding: 0,
+        position: 'relative', borderRadius: radius.full,
+        background: on ? colors.primary : colors.surface.input,
+        border: `1px solid ${on ? colors.primary : colors.border}`,
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.5 : 1,
+        transition: 'background 0.15s ease, border-color 0.15s ease',
+      }}>
+      <span style={{
+        position: 'absolute', top: 2, left: on ? 20 : 2,
+        width: 20, height: 20, borderRadius: '50%',
+        background: on ? colors.text.onPrimary : colors.text.secondary,
+        transition: 'left 0.15s ease, background 0.15s ease',
+      }} />
+    </button>
+  )
+}
+
 // Top-level seeder management. Proposal amendment 2026-05-19 (global
 // seeder setup): one section, not a per-circle thing. "Set up a seeder
 // device" mints seed invites for every encrypted circle at once (no
@@ -1277,22 +1309,19 @@ function SeedersSection ({ active = true }) {
                     <Trash size={18} weight='regular' />
                   </button>
                 </div>
-                <button
-                  onClick={() => toggleFollow(seeder)}
-                  disabled={isPending}
-                  aria-pressed={seeder.followed}
-                  style={{
-                    marginTop: spacing.sm,
-                    display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
-                    padding: `4px 10px`, borderRadius: radius.full,
-                    fontSize: typography.micro.fontSize, fontFamily: typography.fontFamily,
-                    cursor: isPending ? 'default' : 'pointer',
-                    background: seeder.followed ? 'rgba(159,225,90,0.12)' : 'transparent',
-                    color: seeder.followed ? colors.primary : colors.text.secondary,
-                    border: `1px solid ${seeder.followed ? colors.primary : colors.border}`,
-                  }}>
-                  {seeder.followed ? '✓ ' : ''}Auto-follow new circles
-                </button>
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  gap: spacing.sm, marginTop: spacing.sm,
+                }}>
+                  <span style={{ ...typography.caption, color: colors.text.secondary }}>
+                    Auto-follow new circles
+                  </span>
+                  <ToggleSwitch
+                    on={!!seeder.followed}
+                    disabled={isPending}
+                    onChange={() => toggleFollow(seeder)}
+                  />
+                </div>
               </li>
             )
           })}

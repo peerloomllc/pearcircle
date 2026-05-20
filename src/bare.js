@@ -122,6 +122,12 @@ const _seederCircles = new Map()  // circleId → { core, topicHex, discovery }
 // circle unless we open it explicitly post-hoc.
 // Proposal 2026-05-18-pair-channel-on-circle-add.
 const _activeConns = new Set()
+// Seed-mode active connections. Tracked so a circle auto-enrolled after
+// a connection already exists can open its admission channel on that
+// connection — Hyperswarm reuses one connection per peer pair, so a new
+// topic join emits no fresh `connection` event. Member-mode equivalent
+// is _activeConns. Proposal amendment 2026-05-20 (blind-seeder auto-follow).
+const _seederActiveConns = new Set()
 // Open member-side seeder-sync channels. One per live connection; each
 // entry is { resend }. The channel sends the seed bundle only when the
 // remote is a followed seeder (checked at send time), so a channel to a
@@ -448,6 +454,10 @@ const handlers = {
     const invite = buildInvite({ circleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey: ownerPublicKey })
 
     joinCircleTopic(circleId, circleKey)
+    // Open pair + admission channels for the new circle on any live
+    // connection (e.g. an existing connection to a followed seeder for
+    // another circle) so the seeder's announce can be received here.
+    openPairChannelsForCircle(circleId, base)
 
     // Auto-follow: push the updated bundle to followed seeders so the new
     // circle seeds without a manual re-paste (proposal amendment 2026-05-20).
@@ -2211,6 +2221,16 @@ async function mountSeederCircle (enrollment) {
   const discovery = _swarm.join(topic, { server: true, client: true })
   _seederCircles.set(circleId, { core, topicHex, discovery, onDownload })
   mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8), authorityLength: core.length, contiguousLength: core.contiguousLength })
+  // Open the seed-role admission channel for this circle on every
+  // existing connection. New connections get it via onSeederSwarmConnection;
+  // this covers circles auto-enrolled after a connection already formed,
+  // so the seeder can announce itself for them (proposal amendment
+  // 2026-05-20). At boot _seederActiveConns is empty — harmless no-op.
+  const seederPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
+  for (const conn of _seederActiveConns) {
+    setupSeederAdmissionChannel({ conn, role: 'seed', circleId, seederPubkey: seederPubkeyHex, mark })
+    mark('seeder:announce-channel-open', { circleId, remote: 'post-mount' })
+  }
   return _seederCircles.get(circleId)
 }
 
@@ -2266,6 +2286,12 @@ async function leaveSeederCircle (circleId) {
 // catches it and creates the matching channel, letting the handshake
 // complete.
 // Proposal 2026-05-18-pair-channel-on-circle-add.
+// Open the per-circle Protomux channels (pair + seeder-admission) for a
+// circle on every live connection. Needed when a circle is mounted after
+// connections already exist — Hyperswarm reuses one connection per peer
+// pair, so a new topic join emits no fresh `connection` event and the
+// onSwarmConnection per-circle setup never runs for it. Proposal
+// 2026-05-18 (pair) + amendment 2026-05-20 (admission, for auto-follow).
 function openPairChannelsForCircle (circleId, base) {
   let opened = 0
   for (const conn of _activeConns) {
@@ -2279,6 +2305,16 @@ function openPairChannelsForCircle (circleId, base) {
       mark,
     })
     if (ch) opened++
+    // Member-role admission channel — without this a seeder that
+    // auto-enrolls (or is invited to) a circle created after the
+    // connection formed could never have its announce received.
+    setupSeederAdmissionChannel({
+      conn,
+      role: 'member',
+      circleId,
+      onAnnounce: (msg) => handleSeederAnnounce(circleId, base, msg),
+      mark,
+    })
   }
   mark('pair:open-for-circle', { circleId: circleId.slice(0, 8), conns: _activeConns.size, opened, writable: !!base.writable })
 }
@@ -2394,6 +2430,36 @@ async function approveSeederRow (circleId, pubkey, label) {
   return { ok: true, circleId, pubkey, reAdmit: existing !== null }
 }
 
+// Member-side handler for a seeder's admission announce. Dedupes against
+// an existing non-revoked row, auto-approves for a followed seeder
+// (proposal amendment 2026-05-20), otherwise emits seeder:announced for
+// the shell's approval banner. Extracted so onSwarmConnection and the
+// post-circle-add channel opener share one path.
+async function handleSeederAnnounce (circleId, base, { pubkey, label }) {
+  // Dedupe: an already-ADMITTED (non-revoked) row means no re-notify.
+  // A revoked row falls through — re-announce is a re-admission request.
+  const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
+  if (existingNode?.value && existingNode.value.revoked !== true) {
+    mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
+    return
+  }
+  // Auto-approve for a followed seeder — the user designated this device
+  // as theirs, so new circles admit silently. Other circles' members
+  // still see the seeder: row and approve independently.
+  if (base.writable && await isFollowedSeeder(pubkey)) {
+    try {
+      await approveSeederRow(circleId, pubkey, label ?? undefined)
+      mark('admission:auto-approved', { circleId, seeder: pubkey.slice(0, 8) })
+      send({ event: 'seeder:admitted', data: { circleId, pubkey } })
+      return
+    } catch (e) {
+      mark('admission:auto-approve-failed', { circleId, err: e?.message ?? String(e) })
+    }
+  }
+  mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8), readmit: !!existingNode?.value })
+  send({ event: 'seeder:announced', data: { circleId, pubkey, label: label ?? null } })
+}
+
 // Seed-mode swarm connection handler. Proposal 2026-05-19-blind-seeder-peers
 // slice 3d. Pipes corestore replication (so encrypted blocks flow) and opens
 // the admission Protomux channel for each enrolled circle whose topic is
@@ -2402,6 +2468,10 @@ function onSeederSwarmConnection (conn, info) {
   try { _store.replicate(conn) } catch (e) {
     console.warn('[bare] seeder replicate failed', e?.message)
   }
+  // Track for post-mount admission-channel opening (auto-follow enrolls
+  // circles after a connection already exists).
+  _seederActiveConns.add(conn)
+  conn.once('close', () => _seederActiveConns.delete(conn))
   const remotePublicKey = info?.publicKey ? b4a.toString(info.publicKey, 'hex') : null
   const seederPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
   // Figure out which enrolled circles this connection belongs to. info.topics
@@ -2516,42 +2586,13 @@ async function onSwarmConnection (conn, info) {
       mark,
     })
     // Seeder admission receiver. Proposal 2026-05-19 slice 3d. Unmatched
-    // channels (peer isn't a seeder) close harmlessly. When a seeder peer
-    // opens the matching channel and sends announce, we dedupe against
-    // any existing seeder row and emit seeder:announced so the shell can
-    // surface an approval prompt.
+    // channels (peer isn't a seeder) close harmlessly. The announce
+    // handler dedupes / auto-approves / emits seeder:announced.
     setupSeederAdmissionChannel({
       conn,
       role: 'member',
       circleId,
-      onAnnounce: async ({ pubkey, label }) => {
-        // Dedupe: don't re-notify when this seeder is already ADMITTED
-        // (a non-revoked row exists) for this circle. A revoked row must
-        // NOT suppress the announce — re-announce after revocation is a
-        // re-admission request, and the user needs the approval prompt
-        // to act on it (slice 3d + 2026-05-19 amendment).
-        const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
-        if (existingNode?.value && existingNode.value.revoked !== true) {
-          mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
-          return
-        }
-        // Auto-approve for a followed seeder — the user already
-        // designated this device as theirs, so new circles admit
-        // silently (proposal amendment 2026-05-20). Other circles'
-        // members still see the seeder: row and approve independently.
-        if (base.writable && await isFollowedSeeder(pubkey)) {
-          try {
-            await approveSeederRow(circleId, pubkey, label ?? undefined)
-            mark('admission:auto-approved', { circleId, seeder: pubkey.slice(0, 8) })
-            send({ event: 'seeder:admitted', data: { circleId, pubkey } })
-            return
-          } catch (e) {
-            mark('admission:auto-approve-failed', { circleId, err: e?.message ?? String(e) })
-          }
-        }
-        mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8), readmit: !!existingNode?.value })
-        send({ event: 'seeder:announced', data: { circleId, pubkey, label: label ?? null } })
-      },
+      onAnnounce: (msg) => handleSeederAnnounce(circleId, base, msg),
       mark,
     })
   }
