@@ -73,6 +73,7 @@ if [ "${SKIP_SYNC:-0}" != "1" ]; then
     --exclude='android/app/build/' \
     --exclude='.git/' \
     --exclude='.expo/' \
+    --exclude='seeder-launcher/' \
     "$REPO_ROOT/" \
     "${MAC_MINI}:${MAC_REPO_PATH}/"
 fi

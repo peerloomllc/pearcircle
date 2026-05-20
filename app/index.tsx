@@ -520,6 +520,12 @@ export default function Index() {
       catch (e: any) { console.warn('setMode failed', e?.message ?? String(e)) }
     })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
+    // Blind-seeder admission events. The approval prompt was dropped
+    // (proposal amendment 2026-05-20) — seeders auto-admit, so there is
+    // no seeder:announced. seeder:admitted / seeder:revoked are still
+    // forwarded for any UI that wants an optimistic refresh.
+    onEvent('seeder:admitted', (data) => emitEvent('seeder:admitted', data))
+    onEvent('seeder:revoked', (data) => emitEvent('seeder:revoked', data))
     onEvent('sharing:changed', async (data) => {
       emitEvent('sharing:changed', data)
       // FGS lifecycle: when every circle is muted, stop the native

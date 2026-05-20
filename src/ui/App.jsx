@@ -598,7 +598,6 @@ export function App () {
           initialExpand={sheet?.name === 'settings' ? sheet.expand : null}
           onClose={closeSheet}
           onSaved={refresh}
-          onManageSeeders={(circleId, circleName) => setSheet({ name: 'seeders', circleId, circleName, returnTo: { name: 'settings' } })}
         />
       </SheetContainer>
       <SheetContainer open={sheet?.name === 'trips'}>
@@ -654,16 +653,6 @@ export function App () {
           <InviteShareView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
         )}
       </SheetContainer>
-      <SheetContainer open={sheet?.name === 'seeders'}>
-        {sheet?.name === 'seeders' && (
-          <SeederManageView
-            circleId={sheet.circleId}
-            circleName={sheet.circleName}
-            onClose={() => sheet.returnTo ? setSheet(sheet.returnTo) : closeSheet()}
-          />
-        )}
-      </SheetContainer>
-      <SeederApprovalBanner />
       {deletedNotices.length > 0 && (
         <CircleDeletedNotice
           circleName={deletedNotices[0].circleName}
@@ -1127,23 +1116,56 @@ function InviteShareView ({ circleId, circleName, onClose }) {
   )
 }
 
-// Per-circle seeder management. Proposal 2026-05-19-blind-seeder-peers slice 4.
-// Lists admitted seeders, mints seed invites (no encryption key — that's the
-// privacy boundary), and revokes admitted seeders. Seeders cannot read circle
-// content; they just replicate encrypted blocks to bridge co-presence gaps.
-function SeederManageView ({ circleId, circleName, onClose }) {
+// iOS-style sliding toggle switch. Fires a light haptic on flip. Used
+// for the seeder auto-follow control; reusable for any boolean setting.
+function ToggleSwitch ({ on, onChange, disabled = false }) {
+  return (
+    <button
+      role='switch'
+      aria-checked={on}
+      disabled={disabled}
+      onClick={() => {
+        if (disabled) return
+        haptic('light')
+        onChange?.(!on)
+      }}
+      style={{
+        width: 44, height: 26, flexShrink: 0, padding: 0,
+        position: 'relative', borderRadius: radius.full,
+        background: on ? colors.primary : colors.surface.input,
+        border: `1px solid ${on ? colors.primary : colors.border}`,
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.5 : 1,
+        transition: 'background 0.15s ease, border-color 0.15s ease',
+      }}>
+      <span style={{
+        position: 'absolute', top: 2, left: on ? 20 : 2,
+        width: 20, height: 20, borderRadius: '50%',
+        background: on ? colors.text.onPrimary : colors.text.secondary,
+        transition: 'left 0.15s ease, background 0.15s ease',
+      }} />
+    </button>
+  )
+}
+
+// Top-level seeder management. Proposal amendment 2026-05-19 (global
+// seeder setup): one section, not a per-circle thing. "Set up a seeder
+// device" mints seed invites for every encrypted circle at once (no
+// encryption key in any of them — that's the privacy boundary); the
+// list shows each admitted seeder device grouped across its circles.
+function SeedersSection ({ active = true }) {
   const [seeders, setSeeders] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [invite, setInvite] = useState(null)
-  const [showingInvite, setShowingInvite] = useState(false)
+  const [bundle, setBundle] = useState(null)
+  const [bundleInfo, setBundleInfo] = useState(null)
   const [minting, setMinting] = useState(false)
   const [confirmingRevoke, setConfirmingRevoke] = useState(null)
   const [pending, setPending] = useState(null)
 
   const refresh = useCallback(async () => {
     try {
-      const r = await pear.call('circle:seeders:list', { circleId })
+      const r = await pear.call('seeders:listAll')
       setSeeders(r?.seeders ?? [])
       setError(null)
     } catch (e) {
@@ -1151,20 +1173,27 @@ function SeederManageView ({ circleId, circleName, onClose }) {
     } finally {
       setLoading(false)
     }
-  }, [circleId])
+  }, [])
 
   useEffect(() => {
+    if (!active) return
     refresh()
     const id = setInterval(refresh, 5000)
     return () => clearInterval(id)
-  }, [refresh])
+  }, [active, refresh])
 
-  const mintInvite = async () => {
+  const mintBundle = async () => {
     setMinting(true)
+    setError(null)
     try {
-      const r = await pear.call('circle:invite:seed', { circleId })
-      setInvite(r?.invite ?? null)
-      setShowingInvite(true)
+      const r = await pear.call('circle:invite:seed:all')
+      if (!r?.bundle) {
+        setBundle(null)
+        setError('No encrypted circles yet. Seed invites need a circle created with encryption.')
+      } else {
+        setBundle(r.bundle)
+        setBundleInfo({ count: r.invites?.length ?? 0, skipped: r.skipped ?? 0 })
+      }
     } catch (e) {
       setError(String(e?.message ?? e))
     } finally {
@@ -1172,10 +1201,15 @@ function SeederManageView ({ circleId, circleName, onClose }) {
     }
   }
 
-  const performRevoke = async (seeder) => {
+  // Revocation is per-circle at the protocol level; "revoke everywhere"
+  // loops circle:seeder:revoke across every live circle this device seeds.
+  const revokeEverywhere = async (seeder) => {
     setPending(seeder.pubkey)
     try {
-      await pear.call('circle:seeder:revoke', { circleId, pubkey: seeder.pubkey })
+      for (const circle of seeder.circles) {
+        if (circle.revoked) continue
+        await pear.call('circle:seeder:revoke', { circleId: circle.circleId, pubkey: seeder.pubkey })
+      }
       await refresh()
       setConfirmingRevoke(null)
     } catch (e) {
@@ -1185,69 +1219,108 @@ function SeederManageView ({ circleId, circleName, onClose }) {
     }
   }
 
-  if (showingInvite && invite) {
-    return (
-      <div style={s.screen}>
-        <BackBar onBack={() => setShowingInvite(false)} title={(circleName ?? 'Circle') + ' - Seed invite'} />
-        <p style={s.muted}>
-          Hand this invite to a seeder device (a Raspberry Pi, a spare phone). The seed invite does
-          NOT carry the encryption key, so the seeder will replicate encrypted blocks without being
-          able to read circle content.
-        </p>
-        <QrImage text={invite} />
-        <textarea style={s.inviteBox} readOnly value={invite} onFocus={(e) => e.target.select()} />
-        <ShareButton text={invite} title={`Add seeder to ${circleName ?? 'circle'}`} />
-      </div>
-    )
+  const toggleFollow = async (seeder) => {
+    setError(null)
+    try {
+      await pear.call('circle:seeder:follow:set', { pubkey: seeder.pubkey, enabled: !seeder.followed })
+      await refresh()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    }
   }
 
+  // Only devices with >=1 non-revoked circle. Fully-revoked devices drop
+  // off the list — the revoke tombstone is forward-only history.
+  const liveSeeders = seeders
+    .map((sd) => ({ ...sd, liveCircles: (sd.circles ?? []).filter((c) => !c.revoked) }))
+    .filter((sd) => sd.liveCircles.length > 0)
+
   return (
-    <div style={s.screen}>
-      <BackBar onBack={onClose} title={(circleName ?? 'Circle') + ' - Seeders'} />
+    <div>
       <p style={s.muted}>
-        Seeders are always-on devices (Pi, spare phone) that replicate this circle's encrypted blocks
-        so members can sync even when no two members are online together. Seeders cannot read circle
-        content.
+        A seeder is an always-on device (a Raspberry Pi, a spare phone) that replicates your
+        circles' encrypted blocks so members stay in sync even when no two are online together.
+        Seeders never get the encryption key — they cannot read circle content.
       </p>
-      <button
-        onClick={mintInvite}
-        disabled={minting}
-        style={s.primaryBtn}>
-        {minting ? 'Building invite...' : '+ Mint seed invite'}
+      <button onClick={mintBundle} disabled={minting} style={s.primaryBtn}>
+        {minting ? 'Building invites...' : 'Set up a seeder device'}
       </button>
       {error && <p style={s.error}>{error}</p>}
-      {loading && <p style={{ ...s.muted, marginTop: spacing.md }}>Loading...</p>}
-      {!loading && seeders.length === 0 && (
-        <p style={{ ...s.muted, marginTop: spacing.md }}>No seeders yet. Mint a seed invite to add one.</p>
+
+      {bundle && (
+        <div style={{ marginTop: spacing.md }}>
+          <p style={s.muted}>
+            This bundle carries a seed invite for {bundleInfo?.count ?? 0}{' '}
+            {bundleInfo?.count === 1 ? 'circle' : 'circles'}
+            {bundleInfo?.skipped > 0
+              ? ` (${bundleInfo.skipped} legacy circle${bundleInfo.skipped === 1 ? '' : 's'} skipped — only encrypted circles can use a seeder)`
+              : ''}.
+            Send it to your seeder device and paste it into the PearCircle Seeder app. Each
+            circle's members still approve the seeder before it can replicate.
+          </p>
+          <textarea style={s.inviteBox} readOnly value={bundle} onFocus={(e) => e.target.select()} />
+          <ShareButton text={bundle} title='Set up a PearCircle seeder' />
+          <button
+            onClick={() => { setBundle(null); setBundleInfo(null) }}
+            style={{
+              width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
+              background: 'transparent', color: colors.text.primary,
+              border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
+              cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
+            }}>
+            Done
+          </button>
+        </div>
       )}
-      {seeders.length > 0 && (
+
+      {loading && <p style={{ ...s.muted, marginTop: spacing.md }}>Loading...</p>}
+      {!loading && liveSeeders.length === 0 && (
+        <p style={{ ...s.muted, marginTop: spacing.md }}>
+          No seeders admitted yet. Set one up above, then approve it when it announces.
+        </p>
+      )}
+      {liveSeeders.length > 0 && (
         <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.md}px 0 0 0` }}>
-          {seeders.map((seeder) => {
+          {liveSeeders.map((seeder) => {
             const isPending = pending === seeder.pubkey
             const labelLine = seeder.label || ('Seeder ' + seeder.pubkey.slice(0, 8))
-            const addedAgo = seeder.addedAt ? Math.floor((Date.now() - seeder.addedAt) / 60000) : null
+            const circleNames = seeder.liveCircles.map((c) => c.name).join(', ')
             return (
               <li key={seeder.pubkey} style={{
-                display: 'flex', alignItems: 'center', gap: spacing.sm,
                 padding: `${spacing.sm}px 0`,
                 borderBottom: `1px solid ${colors.divider}`,
               }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {labelLine}
+                <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {labelLine}
+                    </div>
+                    <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                      Seeding {seeder.liveCircles.length} {seeder.liveCircles.length === 1 ? 'circle' : 'circles'}: {circleNames}
+                    </div>
                   </div>
-                  <div style={{ ...typography.caption, color: colors.text.secondary, fontFamily: typography.monoFamily }}>
-                    {seeder.pubkey.slice(0, 16)}…{addedAgo !== null ? ` · added ${addedAgo < 1 ? 'just now' : addedAgo + 'm ago'}` : ''}
-                  </div>
+                  <button
+                    onClick={() => setConfirmingRevoke(seeder)}
+                    disabled={isPending}
+                    title='Revoke seeder'
+                    aria-label='Revoke seeder'
+                    style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                    <Trash size={18} weight='regular' />
+                  </button>
                 </div>
-                <button
-                  onClick={() => setConfirmingRevoke(seeder)}
-                  disabled={isPending}
-                  title='Revoke seeder'
-                  aria-label='Revoke seeder'
-                  style={iconBtnStyle({ disabled: isPending, destructive: true })}>
-                  <Trash size={18} weight='regular' />
-                </button>
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  gap: spacing.sm, marginTop: spacing.sm,
+                }}>
+                  <span style={{ ...typography.caption, color: colors.text.secondary }}>
+                    Auto-follow new circles
+                  </span>
+                  <ToggleSwitch
+                    on={!!seeder.followed}
+                    disabled={isPending}
+                    onChange={() => toggleFollow(seeder)}
+                  />
+                </div>
               </li>
             )
           })}
@@ -1257,110 +1330,18 @@ function SeederManageView ({ circleId, circleName, onClose }) {
         <ConfirmSheet
           title='Revoke seeder?'
           message={<>
-            Revoke this seeder from <strong>{circleName ?? 'this circle'}</strong>? Members will refuse
-            to replicate to it within seconds. You can re-admit later by inviting the seeder again.
+            Revoke <strong>{confirmingRevoke.label || ('Seeder ' + confirmingRevoke.pubkey.slice(0, 8))}</strong> from
+            all {confirmingRevoke.liveCircles.length} of its {confirmingRevoke.liveCircles.length === 1 ? 'circle' : 'circles'}?
+            Members will refuse to replicate to it within seconds. You can re-admit later by
+            setting the seeder up again.
           </>}
           confirmLabel='Revoke'
           destructive
           busy={pending === confirmingRevoke.pubkey}
-          onConfirm={() => performRevoke(confirmingRevoke)}
+          onConfirm={() => revokeEverywhere(confirmingRevoke)}
           onClose={() => { if (pending !== confirmingRevoke.pubkey) setConfirmingRevoke(null) }}
         />
       )}
-    </div>
-  )
-}
-
-// Top-level banner that surfaces when a seed-mode device announces itself
-// for a circle the local user is a member of. Proposal 2026-05-19 slice 4.
-// Approve writes a seeder:{pubkey} admission row via circle:seeder:approve;
-// Dismiss drops the announce. No persistence: a dismissed announce will
-// re-surface next time the seeder re-announces on swarm reconnect, which
-// is a feature for now (lets the user defer without losing the option).
-function SeederApprovalBanner () {
-  const [queue, setQueue] = useState([])  // [{ circleId, pubkey, label, circleName }]
-  const [busy, setBusy] = useState(null)
-  const [error, setError] = useState(null)
-
-  useEffect(() => {
-    pear.on('seeder:announced', async ({ circleId, pubkey, label }) => {
-      let circleName = circleId.slice(0, 8)
-      try {
-        const r = await pear.call('circle:get', { circleId })
-        circleName = r?.circle?.name ?? circleName
-      } catch {}
-      setQueue((prev) => {
-        if (prev.some((p) => p.circleId === circleId && p.pubkey === pubkey)) return prev
-        return [...prev, { circleId, pubkey, label, circleName }]
-      })
-    })
-  }, [])
-
-  const current = queue[0]
-  if (!current) return null
-
-  const approve = async () => {
-    setBusy(current.pubkey)
-    setError(null)
-    try {
-      await pear.call('circle:seeder:approve', {
-        circleId: current.circleId,
-        pubkey: current.pubkey,
-        label: current.label ?? undefined,
-      })
-      setQueue((prev) => prev.slice(1))
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  const dismiss = () => {
-    setQueue((prev) => prev.slice(1))
-    setError(null)
-  }
-
-  return (
-    <div style={{
-      position: 'fixed',
-      left: spacing.base,
-      right: spacing.base,
-      bottom: `calc(env(safe-area-inset-bottom, 16px) + ${spacing.base}px)`,
-      background: colors.surface.elevated,
-      border: `1px solid ${colors.border}`,
-      borderRadius: radius.lg,
-      padding: spacing.md,
-      boxShadow: '0 6px 18px rgba(0,0,0,0.25)',
-      zIndex: 200,
-      fontFamily: typography.fontFamily,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.sm }}>
-        <Broadcast size={20} weight='regular' color={colors.accent} />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ ...typography.body, color: colors.text.primary }}>
-            {current.label || ('Seeder ' + current.pubkey.slice(0, 8))} wants to seed <strong>{current.circleName}</strong>
-          </div>
-          <div style={{ ...typography.caption, color: colors.text.secondary, fontFamily: typography.monoFamily }}>
-            {current.pubkey.slice(0, 16)}…
-          </div>
-        </div>
-      </div>
-      {error && <p style={{ ...s.error, marginTop: 0 }}>{error}</p>}
-      <div style={{ display: 'flex', gap: spacing.sm }}>
-        <button
-          onClick={approve}
-          disabled={busy === current.pubkey}
-          style={{ ...s.primaryBtn, flex: 1, padding: `${spacing.sm + 2}px ${spacing.base}px`, fontSize: typography.body.fontSize }}>
-          {busy === current.pubkey ? 'Approving...' : 'Approve'}
-        </button>
-        <button
-          onClick={dismiss}
-          disabled={busy === current.pubkey}
-          style={{ ...s.secondaryBtn, flex: 1, padding: `${spacing.sm + 2}px ${spacing.base}px`, marginTop: 0, fontSize: typography.body.fontSize }}>
-          Dismiss
-        </button>
-      </div>
     </div>
   )
 }
@@ -3372,7 +3353,7 @@ function fitTo (map, lonLatPairs) {
 // the pencil icon. Calls circle:delete / circle:leave / circle:rename
 // IPCs (proposal 2026-05-07); success drops the row locally and fires
 // onChanged so the home view's circles:getAll poll picks up the rest.
-function CirclesSection ({ active = true, onChanged, onManageSeeders }) {
+function CirclesSection ({ active = true, onChanged }) {
   const [list, setList] = useState([])
   const [loading, setLoading] = useState(true)
   const [confirmingFor, setConfirmingFor] = useState(null) // circle object pending confirm
@@ -3554,16 +3535,6 @@ function CirclesSection ({ active = true, onChanged, onManageSeeders }) {
                   <PencilSimple size={18} weight="regular" />
                 </button>
               )}
-              {typeof onManageSeeders === 'function' && (
-                <button
-                  onClick={() => onManageSeeders(c.circleId, c.name)}
-                  disabled={isPending}
-                  title='Manage seeders'
-                  aria-label='Manage seeders'
-                  style={iconBtnStyle({ disabled: isPending })}>
-                  <Broadcast size={18} weight='regular' />
-                </button>
-              )}
               <button
                 onClick={() => setConfirmingFor(c)}
                 disabled={isPending}
@@ -3614,7 +3585,7 @@ function iconBtnStyle ({ disabled = false, destructive = false } = {}) {
   }
 }
 
-function ProfileView ({ active = true, profile, sharing, setSharingForCircle, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved, onManageSeeders }) {
+function ProfileView ({ active = true, profile, sharing, setSharingForCircle, tileStyleUrl, setTileStyleUrl, distanceUnit = 'km', setDistanceUnit, themeMode = 'dark', setThemeMode, battery = { supported: null, exempt: false }, initialExpand = null, onClose, onSaved }) {
   const [name, setName] = useState(profile?.displayName ?? '')
   const [editingName, setEditingName] = useState(false)
   // null = unchanged from server; '' = explicitly cleared; string = new value
@@ -3628,11 +3599,10 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   // default so first open of Settings is profile + sharing only;
   // user expands what they need. Persists across sheet open/close
   // (SheetContainer keeps the component mounted).
-  const [locationSharingOpen, setLocationSharingOpen] = useState(false)
-  const [circlesOpen, setCirclesOpen] = useState(false)
-  const [tripSharingOpen, setTripSharingOpen] = useState(false)
-  const [displayOpen, setDisplayOpen] = useState(false)
-  const [advancedOpen, setAdvancedOpen] = useState(false)
+  // Accordion: one section open at a time. openSection is the id of the
+  // expanded Collapsible, or null when all are collapsed.
+  const [openSection, setOpenSection] = useState(null)
+  const toggleSection = (id) => setOpenSection((s) => (s === id ? null : id))
   // Battery banner / onboarding deep-link signal: when the sheet opens
   // with initialExpand='battery', auto-expand Advanced and scroll the
   // section into view so the user lands on the toggle instead of the
@@ -3643,7 +3613,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
     if (!active) { handledInitialExpandRef.current = null; return }
     if (initialExpand === 'battery' && handledInitialExpandRef.current !== initialExpand) {
       handledInitialExpandRef.current = initialExpand
-      setAdvancedOpen(true)
+      setOpenSection('advanced')
       requestAnimationFrame(() => {
         try { advancedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
       })
@@ -3836,19 +3806,19 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
 
-      <Collapsible title='Location sharing' icon={Broadcast} open={locationSharingOpen} onToggle={() => setLocationSharingOpen(v => !v)} maxHeight='1200px'>
-        <LocationSharingSection active={active && locationSharingOpen} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
+      <Collapsible title='Circles' icon={UsersThree} open={openSection === 'circles'} onToggle={() => toggleSection('circles')} maxHeight='1200px'>
+        <CirclesSection active={active && openSection === 'circles'} onChanged={onSaved} />
       </Collapsible>
 
-      <Collapsible title='Circles' icon={UsersThree} open={circlesOpen} onToggle={() => setCirclesOpen(v => !v)} maxHeight='1200px'>
-        <CirclesSection active={active && circlesOpen} onChanged={onSaved} onManageSeeders={onManageSeeders} />
+      <Collapsible title='Location sharing' icon={Broadcast} open={openSection === 'locationSharing'} onToggle={() => toggleSection('locationSharing')} maxHeight='1200px'>
+        <LocationSharingSection active={active && openSection === 'locationSharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
       </Collapsible>
 
-      <Collapsible title='Trip sharing' icon={MapTrifold} open={tripSharingOpen} onToggle={() => setTripSharingOpen(v => !v)} maxHeight='1200px'>
-        <TripsSharingSection active={active && tripSharingOpen} />
+      <Collapsible title='Trip sharing' icon={MapTrifold} open={openSection === 'tripSharing'} onToggle={() => toggleSection('tripSharing')} maxHeight='1200px'>
+        <TripsSharingSection active={active && openSection === 'tripSharing'} />
       </Collapsible>
 
-      <Collapsible title='Display' icon={Palette} open={displayOpen} onToggle={() => setDisplayOpen(v => !v)}>
+      <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
@@ -3857,7 +3827,11 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TripNotificationsSection />
       </Collapsible>
 
-      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={advancedOpen} onToggle={() => setAdvancedOpen(v => !v)} maxHeight='1200px'>
+      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
+        <SeedersSection active={active && openSection === 'seeders'} />
+      </Collapsible>
+
+      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={openSection === 'advanced'} onToggle={() => toggleSection('advanced')} maxHeight='1200px'>
         {battery.supported && (
           <div style={{ marginBottom: spacing.lg }}>
             <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Battery optimization</p>
@@ -4844,18 +4818,13 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
   // when closed), so the initializer only runs on the very first mount.
   // The effect re-runs whenever the prop changes — i.e., every time
   // setSheet({name:'about', expand:'...'}) lands a new value.
-  const [howOpen, setHowOpen] = useState(false)
-  const [tutorialOpen, setTutorialOpen] = useState(false)
-  const [supportOpen, setSupportOpen] = useState(false)
-  const [bitcoinOpen, setBitcoinOpen] = useState(false)
-  const [shareOpen, setShareOpen] = useState(false)
-  const [contactOpen, setContactOpen] = useState(false)
+  // Accordion: one section open at a time.
+  const [openSection, setOpenSection] = useState(null)
+  const toggleSection = (id) => setOpenSection((s) => (s === id ? null : id))
   useEffect(() => {
-    if (initialExpand === 'support') setSupportOpen(true)
-    else if (initialExpand === 'how') setHowOpen(true)
-    else if (initialExpand === 'bitcoin') setBitcoinOpen(true)
-    else if (initialExpand === 'share') setShareOpen(true)
-    else if (initialExpand === 'contact') setContactOpen(true)
+    if (['support', 'how', 'bitcoin', 'share', 'contact'].includes(initialExpand)) {
+      setOpenSection(initialExpand)
+    }
   }, [initialExpand])
 
   const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
@@ -4912,7 +4881,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </div>
       </div>
 
-      <Collapsible title='How it works' icon={InfoIcon} open={howOpen} onToggle={() => setHowOpen(v => !v)}>
+      <Collapsible title='How it works' icon={InfoIcon} open={openSection === 'how'} onToggle={() => toggleSection('how')}>
         <p style={body}>
           PearCircle syncs locations directly between devices using
           peer-to-peer technology powered by Hypercore Protocol. Your
@@ -4926,7 +4895,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
       </Collapsible>
 
       {onReplayOnboarding && (
-        <Collapsible title='Tutorial' icon={BookOpen} open={tutorialOpen} onToggle={() => setTutorialOpen(v => !v)}>
+        <Collapsible title='Tutorial' icon={BookOpen} open={openSection === 'tutorial'} onToggle={() => toggleSection('tutorial')}>
           <p style={body}>
             Replay the welcome tour to revisit how the map, circles,
             places, and trips work.
@@ -4937,7 +4906,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </Collapsible>
       )}
 
-      <Collapsible title='Support development' icon={Lightning} open={supportOpen} onToggle={() => setSupportOpen(v => !v)}>
+      <Collapsible title='Support development' icon={Lightning} open={openSection === 'support'} onToggle={() => toggleSection('support')}>
         <p style={body}>
           PearCircle is free and open source. If you receive value from
           it, please consider returning value.
@@ -4952,7 +4921,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </div>
       </Collapsible>
 
-      <Collapsible title='Learn about Bitcoin' icon={BookOpen} open={bitcoinOpen} onToggle={() => setBitcoinOpen(v => !v)}>
+      <Collapsible title='Learn about Bitcoin' icon={BookOpen} open={openSection === 'bitcoin'} onToggle={() => toggleSection('bitcoin')}>
         <p style={body}>
           New to Bitcoin? The Satoshi Nakamoto Institute has a free,
           concise crash course explaining how Bitcoin works and why it
@@ -4963,7 +4932,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </button>
       </Collapsible>
 
-      <Collapsible title='Share the app' icon={ShareNetwork} open={shareOpen} onToggle={() => setShareOpen(v => !v)}>
+      <Collapsible title='Share the app' icon={ShareNetwork} open={openSection === 'share'} onToggle={() => toggleSection('share')}>
         <p style={body}>
           Know someone who'd want a private, serverless way to share
           location with friends or family? Share PearCircle with them.
@@ -4973,7 +4942,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </button>
       </Collapsible>
 
-      <Collapsible title='Contact' icon={EnvelopeSimple} open={contactOpen} onToggle={() => setContactOpen(v => !v)}>
+      <Collapsible title='Contact' icon={EnvelopeSimple} open={openSection === 'contact'} onToggle={() => toggleSection('contact')}>
         <div style={{ display: 'flex', gap: spacing.sm }}>
           <button onClick={sendEmail} style={{ ...pillBtn, flex: 1 }}>
             <EnvelopeSimple size={14} weight='thin' /> Email <ArrowSquareOut size={13} weight='thin' />
@@ -6140,7 +6109,7 @@ const s = {
   idMuted: { color: colors.text.muted, fontFamily: typography.monoFamily },
   actions: { display: 'flex', flexDirection: 'column', gap: spacing.sm, marginBottom: spacing.sm },
   primaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.primary, color: colors.text.onPrimary, border: 'none', borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, cursor: 'pointer' },
-  secondaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.surface.elevated, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer', marginTop: spacing.sm },
+  secondaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.surface.input, color: colors.text.primary, border: `1px solid ${colors.text.muted}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer', marginTop: spacing.sm },
   dangerBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: 'transparent', color: colors.error, border: `1px solid ${colors.error}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer' },
   durationRow: { display: 'flex', gap: spacing.sm },
   durationBtn: { flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`, background: colors.surface.input, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.body.fontSize, cursor: 'pointer' },

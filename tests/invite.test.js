@@ -372,3 +372,41 @@ describe('parseSeedInvite', () => {
     expect(result.ok).toBe(false)
   })
 })
+
+// Seed-invite bundle format — proposal amendment 2026-05-19 (global
+// seeder setup). A bundle is just newline-joined /circle/seed URLs;
+// circle:invite:seed:all builds it and the launcher host splits it.
+// No new grammar — every line independently round-trips parseSeedInvite.
+describe('seed invite bundle', () => {
+  const circleIds = ['A'.repeat(43), 'B'.repeat(43), 'C'.repeat(43)]
+  const buildBundle = () => circleIds
+    .map((circleId, i) => buildSeedInvite({ ...VALID, circleId, name: 'Circle ' + i }))
+    .join('\n')
+
+  test('every line round-trips through parseSeedInvite', () => {
+    const bundle = buildBundle()
+    const lines = bundle.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
+    expect(lines).toHaveLength(3)
+    const parsed = lines.map((l) => parseSeedInvite(l))
+    expect(parsed.every((p) => p.ok)).toBe(true)
+    expect(parsed.map((p) => p.circleId)).toEqual(circleIds)
+  })
+
+  test('blank lines and trailing newline are dropped on split', () => {
+    const bundle = buildBundle() + '\n\n'
+    const lines = bundle.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
+    expect(lines).toHaveLength(3)
+  })
+
+  test('a single invite is a valid one-line bundle', () => {
+    const lines = buildSeedInvite(VALID).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+    expect(lines).toHaveLength(1)
+    expect(parseSeedInvite(lines[0]).ok).toBe(true)
+  })
+
+  test('no bundle line carries an encryption key', () => {
+    for (const line of buildBundle().split('\n')) {
+      expect(line).not.toContain('enc=')
+    }
+  })
+})
