@@ -36,7 +36,7 @@ const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
-const { isConnectionFromRevokedSeeder } = require('./lib/seederPeerFilter')
+const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
 const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
@@ -2344,32 +2344,44 @@ function onSeederSwarmConnection (conn, info) {
   }
 }
 
-function onSwarmConnection (conn, info) {
+async function onSwarmConnection (conn, info) {
   const remotePublicKey = b4a.toString(info.publicKey, 'hex')
 
-  // Peer-filter: if the remote is a revoked seeder for any circle we
-  // participate in, drop the connection before any replication starts.
-  // Proposal 2026-05-19-blind-seeder-peers slice 3d.
-  isConnectionFromRevokedSeeder({
-    remotePubkeyHex: remotePublicKey,
-    circleIds: Array.from(_circleBases.keys()),
-    getSeederRow: async (cid, pk) => {
-      const base = _circleBases.get(cid)
-      if (!base) return null
-      const node = await base.view.get('seeder:' + pk)
-      return node?.value ?? null
-    },
-  }).then((revoked) => {
-    if (revoked) {
-      mark('peer-filter:revoked-seeder-dropped', { remote: remotePublicKey.slice(0, 8) })
-      try { conn.destroy(new Error('seeder revoked')) } catch {}
+  // Seeder revocation enforcement (slice 3d + 2026-05-19 amendment).
+  // A seeder revoked in *every* circle it has a row in should stop
+  // receiving blocks — but we must NOT destroy the connection. The
+  // admission Protomux channel rides this same connection; destroying it
+  // permanently bricks re-admission (the seeder could never re-announce,
+  // making the proposal's "re-admit by writing a fresh row" impossible).
+  // So: skip corestore replication for a revoked-everywhere seeder, but
+  // keep the connection + admission channels alive. A seeder still
+  // admitted in some circle keeps replicating — it is blind, so a
+  // revoked circle's blocks are ciphertext to it (bandwidth cost only).
+  let replicate = true
+  try {
+    const cls = await classifySeederConnection({
+      remotePubkeyHex: remotePublicKey,
+      circleIds: Array.from(_circleBases.keys()),
+      getSeederRow: async (cid, pk) => {
+        const base = _circleBases.get(cid)
+        if (!base) return null
+        const node = await base.view.get('seeder:' + pk)
+        return node?.value ?? null
+      },
+    })
+    if (cls === 'revoked-everywhere') {
+      replicate = false
+      mark('peer-filter:revoked-seeder-no-replicate', { remote: remotePublicKey.slice(0, 8) })
     }
-  }).catch(() => {})
+  } catch {}
+  if (conn.destroyed) return
 
   // Pipe corestore replication first so cores can negotiate before we
   // emit peer:connected — UI typically calls circle:get right after that
-  // event and we want the view to be fresh.
-  _store.replicate(conn)
+  // event and we want the view to be fresh. Skipped for a revoked-
+  // everywhere seeder; the admission channels below still get set up so
+  // the seeder can re-announce.
+  if (replicate) _store.replicate(conn)
   _activeConns.add(conn)
   registerPairNotify(conn)
 
@@ -2398,16 +2410,17 @@ function onSwarmConnection (conn, info) {
       role: 'member',
       circleId,
       onAnnounce: async ({ pubkey, label }) => {
-        // Dedupe: don't re-notify when a seeder row already exists for
-        // this seeder pubkey in this circle. Revoked rows still count
-        // as "we've seen this seeder before"; un-revoking goes through
-        // circle:seeder:approve, not a fresh announce.
+        // Dedupe: don't re-notify when this seeder is already ADMITTED
+        // (a non-revoked row exists) for this circle. A revoked row must
+        // NOT suppress the announce — re-announce after revocation is a
+        // re-admission request, and the user needs the approval prompt
+        // to act on it (slice 3d + 2026-05-19 amendment).
         const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
-        if (existingNode?.value) {
-          mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8), revoked: !!existingNode.value.revoked })
+        if (existingNode?.value && existingNode.value.revoked !== true) {
+          mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
           return
         }
-        mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8) })
+        mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8), readmit: !!existingNode?.value })
         send({ event: 'seeder:announced', data: { circleId, pubkey, label: label ?? null } })
       },
       mark,
