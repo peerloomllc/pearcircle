@@ -459,9 +459,13 @@ const handlers = {
     // another circle) so the seeder's announce can be received here.
     openPairChannelsForCircle(circleId, base)
 
-    // Auto-follow: push the updated bundle to followed seeders so the new
-    // circle seeds without a manual re-paste (proposal amendment 2026-05-20).
+    // Auto-follow (proposal amendment 2026-05-20): push the updated
+    // bundle to followed seeders so the new circle seeds, and write the
+    // admission rows directly — the founder is the writer here, so the
+    // seeder shows up in every member's Seeders list immediately with no
+    // announce handshake.
     repushFollowedSeeders().catch(() => {})
+    admitFollowedSeedersToCircle(circleId, base).catch(() => {})
 
     return { circleId, circleKey, bootstrap, encryptionKey, name, ownerPublicKey, createdAt, invite }
   },
@@ -2430,34 +2434,51 @@ async function approveSeederRow (circleId, pubkey, label) {
   return { ok: true, circleId, pubkey, reAdmit: existing !== null }
 }
 
-// Member-side handler for a seeder's admission announce. Dedupes against
-// an existing non-revoked row, auto-approves for a followed seeder
-// (proposal amendment 2026-05-20), otherwise emits seeder:announced for
-// the shell's approval banner. Extracted so onSwarmConnection and the
-// post-circle-add channel opener share one path.
+// Member-side handler for a seeder's admission announce. Auto-admits —
+// the approval prompt was dropped (proposal amendment 2026-05-20): a
+// blind seeder carries no encryption key, the seeder:{pubkey} row stays
+// visible to every circle member (transparency), and revoke remains
+// one-tap, so a human consent gate added friction without payoff.
 async function handleSeederAnnounce (circleId, base, { pubkey, label }) {
-  // Dedupe: an already-ADMITTED (non-revoked) row means no re-notify.
+  // Dedupe: an already-ADMITTED (non-revoked) row means nothing to do.
   // A revoked row falls through — re-announce is a re-admission request.
   const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
   if (existingNode?.value && existingNode.value.revoked !== true) {
     mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
     return
   }
-  // Auto-approve for a followed seeder — the user designated this device
-  // as theirs, so new circles admit silently. Other circles' members
-  // still see the seeder: row and approve independently.
-  if (base.writable && await isFollowedSeeder(pubkey)) {
+  if (!base.writable) {
+    mark('admission:not-writable', { circleId, seeder: pubkey.slice(0, 8) })
+    return
+  }
+  try {
+    await approveSeederRow(circleId, pubkey, label ?? undefined)
+    mark('admission:auto-admitted', { circleId, seeder: pubkey.slice(0, 8) })
+    send({ event: 'seeder:admitted', data: { circleId, pubkey } })
+  } catch (e) {
+    mark('admission:auto-admit-failed', { circleId, err: e?.message ?? String(e) })
+  }
+}
+
+// Write seeder:{pubkey} admission rows for every followed seeder into a
+// circle's autobase. Called on circle:create so an auto-followed
+// seeder's admission lands immediately and locally — no dependence on a
+// cross-device announce handshake. Proposal amendment 2026-05-20.
+async function admitFollowedSeedersToCircle (circleId, base) {
+  if (!base?.writable) return
+  for await (const { value } of _localDb.createReadStream({
+    gt: 'seederfollow:',
+    lt: 'seederfollow:~',
+  })) {
+    const pubkey = value?.pubkey
+    if (typeof pubkey !== 'string' || pubkey.length !== 64) continue
     try {
-      await approveSeederRow(circleId, pubkey, label ?? undefined)
-      mark('admission:auto-approved', { circleId, seeder: pubkey.slice(0, 8) })
-      send({ event: 'seeder:admitted', data: { circleId, pubkey } })
-      return
+      await approveSeederRow(circleId, pubkey)
+      mark('seeder:auto-admitted-followed', { circleId, seeder: pubkey.slice(0, 8) })
     } catch (e) {
-      mark('admission:auto-approve-failed', { circleId, err: e?.message ?? String(e) })
+      mark('seeder:auto-admit-failed', { circleId, err: e?.message ?? String(e) })
     }
   }
-  mark('admission:emit', { circleId, seeder: pubkey.slice(0, 8), readmit: !!existingNode?.value })
-  send({ event: 'seeder:announced', data: { circleId, pubkey, label: label ?? null } })
 }
 
 // Seed-mode swarm connection handler. Proposal 2026-05-19-blind-seeder-peers

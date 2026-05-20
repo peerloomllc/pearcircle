@@ -653,7 +653,6 @@ export function App () {
           <InviteShareView circleId={sheet.circleId} circleName={sheet.circleName} onClose={closeSheet} />
         )}
       </SheetContainer>
-      <SeederApprovalBanner />
       {deletedNotices.length > 0 && (
         <CircleDeletedNotice
           circleName={deletedNotices[0].circleName}
@@ -1264,10 +1263,10 @@ function SeedersSection ({ active = true }) {
           <button
             onClick={() => { setBundle(null); setBundleInfo(null) }}
             style={{
-              width: '100%', marginTop: spacing.sm, padding: `${spacing.sm}px`,
-              background: 'transparent', color: colors.text.secondary,
-              border: `1px solid ${colors.border}`, borderRadius: radius.md,
-              cursor: 'pointer', fontFamily: typography.fontFamily,
+              width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
+              background: 'transparent', color: colors.text.primary,
+              border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
+              cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
             }}>
             Done
           </button>
@@ -1343,100 +1342,6 @@ function SeedersSection ({ active = true }) {
           onClose={() => { if (pending !== confirmingRevoke.pubkey) setConfirmingRevoke(null) }}
         />
       )}
-    </div>
-  )
-}
-
-// Top-level banner that surfaces when a seed-mode device announces itself
-// for a circle the local user is a member of. Proposal 2026-05-19 slice 4.
-// Approve writes a seeder:{pubkey} admission row via circle:seeder:approve;
-// Dismiss drops the announce. No persistence: a dismissed announce will
-// re-surface next time the seeder re-announces on swarm reconnect, which
-// is a feature for now (lets the user defer without losing the option).
-function SeederApprovalBanner () {
-  const [queue, setQueue] = useState([])  // [{ circleId, pubkey, label, circleName }]
-  const [busy, setBusy] = useState(null)
-  const [error, setError] = useState(null)
-
-  useEffect(() => {
-    pear.on('seeder:announced', async ({ circleId, pubkey, label }) => {
-      let circleName = circleId.slice(0, 8)
-      try {
-        const r = await pear.call('circle:get', { circleId })
-        circleName = r?.circle?.name ?? circleName
-      } catch {}
-      setQueue((prev) => {
-        if (prev.some((p) => p.circleId === circleId && p.pubkey === pubkey)) return prev
-        return [...prev, { circleId, pubkey, label, circleName }]
-      })
-    })
-  }, [])
-
-  const current = queue[0]
-  if (!current) return null
-
-  const approve = async () => {
-    setBusy(current.pubkey)
-    setError(null)
-    try {
-      await pear.call('circle:seeder:approve', {
-        circleId: current.circleId,
-        pubkey: current.pubkey,
-        label: current.label ?? undefined,
-      })
-      setQueue((prev) => prev.slice(1))
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  const dismiss = () => {
-    setQueue((prev) => prev.slice(1))
-    setError(null)
-  }
-
-  return (
-    <div style={{
-      position: 'fixed',
-      left: spacing.base,
-      right: spacing.base,
-      bottom: `calc(env(safe-area-inset-bottom, 16px) + ${spacing.base}px)`,
-      background: colors.surface.elevated,
-      border: `1px solid ${colors.border}`,
-      borderRadius: radius.lg,
-      padding: spacing.md,
-      boxShadow: '0 6px 18px rgba(0,0,0,0.25)',
-      zIndex: 200,
-      fontFamily: typography.fontFamily,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.sm }}>
-        <Broadcast size={20} weight='regular' color={colors.accent} />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ ...typography.body, color: colors.text.primary }}>
-            {current.label || ('Seeder ' + current.pubkey.slice(0, 8))} wants to seed <strong>{current.circleName}</strong>
-          </div>
-          <div style={{ ...typography.caption, color: colors.text.secondary, fontFamily: typography.monoFamily }}>
-            {current.pubkey.slice(0, 16)}…
-          </div>
-        </div>
-      </div>
-      {error && <p style={{ ...s.error, marginTop: 0 }}>{error}</p>}
-      <div style={{ display: 'flex', gap: spacing.sm }}>
-        <button
-          onClick={approve}
-          disabled={busy === current.pubkey}
-          style={{ ...s.primaryBtn, flex: 1, padding: `${spacing.sm + 2}px ${spacing.base}px`, fontSize: typography.body.fontSize }}>
-          {busy === current.pubkey ? 'Approving...' : 'Approve'}
-        </button>
-        <button
-          onClick={dismiss}
-          disabled={busy === current.pubkey}
-          style={{ ...s.secondaryBtn, flex: 1, padding: `${spacing.sm + 2}px ${spacing.base}px`, marginTop: 0, fontSize: typography.body.fontSize }}>
-          Dismiss
-        </button>
-      </div>
     </div>
   )
 }
@@ -6211,7 +6116,7 @@ const s = {
   idMuted: { color: colors.text.muted, fontFamily: typography.monoFamily },
   actions: { display: 'flex', flexDirection: 'column', gap: spacing.sm, marginBottom: spacing.sm },
   primaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.primary, color: colors.text.onPrimary, border: 'none', borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, cursor: 'pointer' },
-  secondaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.surface.elevated, color: colors.text.primary, border: `1px solid ${colors.border}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer', marginTop: spacing.sm },
+  secondaryBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: colors.surface.input, color: colors.text.primary, border: `1px solid ${colors.text.muted}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer', marginTop: spacing.sm },
   dangerBtn: { width: '100%', padding: `${spacing.md + 2}px ${spacing.base}px`, background: 'transparent', color: colors.error, border: `1px solid ${colors.error}`, borderRadius: radius.lg, fontSize: typography.subheading.fontSize, fontWeight: 400, cursor: 'pointer' },
   durationRow: { display: 'flex', gap: spacing.sm },
   durationBtn: { flex: 1, padding: `${spacing.sm + 2}px ${spacing.sm}px`, background: colors.surface.input, color: colors.text.secondary, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.body.fontSize, cursor: 'pointer' },
