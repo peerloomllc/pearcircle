@@ -10,6 +10,9 @@ Both run the seeder as a **systemd user service** that auto-starts on login.
 `loginctl enable-linger` keeps it running across logout and reboot; the
 installers enable linger for you.
 
+Download the latest packages from the
+[releases page](https://github.com/peerloomllc/pearcircle/releases).
+
 ## Install - Debian / Ubuntu / Raspberry Pi OS (.deb)
 
 ```bash
