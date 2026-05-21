@@ -1219,6 +1219,25 @@ function SeedersSection ({ active = true }) {
     }
   }
 
+  // Re-admit a seeder for every circle it was revoked from. Mirror of
+  // revokeEverywhere — loops circle:seeder:approve. Re-admission must be an
+  // explicit action: a revoked seeder no longer auto-re-admits when it
+  // re-announces (proposal 2026-05-21 amendment, durable revocation).
+  const reAdmit = async (seeder) => {
+    setPending(seeder.pubkey)
+    setError(null)
+    try {
+      for (const circle of seeder.revokedCircles) {
+        await pear.call('circle:seeder:approve', { circleId: circle.circleId, pubkey: seeder.pubkey })
+      }
+      await refresh()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setPending(null)
+    }
+  }
+
   const toggleFollow = async (seeder) => {
     setError(null)
     try {
@@ -1229,11 +1248,17 @@ function SeedersSection ({ active = true }) {
     }
   }
 
-  // Only devices with >=1 non-revoked circle. Fully-revoked devices drop
-  // off the list — the revoke tombstone is forward-only history.
-  const liveSeeders = seeders
-    .map((sd) => ({ ...sd, liveCircles: (sd.circles ?? []).filter((c) => !c.revoked) }))
-    .filter((sd) => sd.liveCircles.length > 0)
+  // Each seeder device, with its circles split into live and revoked. A
+  // fully-revoked device stays in the list so the user can re-admit it —
+  // durable revocation (proposal 2026-05-21 amendment) makes re-admission
+  // an explicit action, so the row must remain reachable.
+  const seederRows = seeders
+    .map((sd) => ({
+      ...sd,
+      liveCircles: (sd.circles ?? []).filter((c) => !c.revoked),
+      revokedCircles: (sd.circles ?? []).filter((c) => c.revoked),
+    }))
+    .filter((sd) => sd.liveCircles.length + sd.revokedCircles.length > 0)
 
   return (
     <div>
@@ -1274,17 +1299,18 @@ function SeedersSection ({ active = true }) {
       )}
 
       {loading && <p style={{ ...s.muted, marginTop: spacing.md }}>Loading...</p>}
-      {!loading && liveSeeders.length === 0 && (
+      {!loading && seederRows.length === 0 && (
         <p style={{ ...s.muted, marginTop: spacing.md }}>
           No seeders admitted yet. Set one up above, then approve it when it announces.
         </p>
       )}
-      {liveSeeders.length > 0 && (
+      {seederRows.length > 0 && (
         <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.md}px 0 0 0` }}>
-          {liveSeeders.map((seeder) => {
+          {seederRows.map((seeder) => {
             const isPending = pending === seeder.pubkey
             const labelLine = seeder.label || ('Seeder ' + seeder.pubkey.slice(0, 8))
-            const circleNames = seeder.liveCircles.map((c) => c.name).join(', ')
+            const liveNames = seeder.liveCircles.map((c) => c.name).join(', ')
+            const revokedNames = seeder.revokedCircles.map((c) => c.name).join(', ')
             return (
               <li key={seeder.pubkey} style={{
                 padding: `${spacing.sm}px 0`,
@@ -1295,19 +1321,42 @@ function SeedersSection ({ active = true }) {
                     <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {labelLine}
                     </div>
-                    <div style={{ ...typography.caption, color: colors.text.secondary }}>
-                      Seeding {seeder.liveCircles.length} {seeder.liveCircles.length === 1 ? 'circle' : 'circles'}: {circleNames}
-                    </div>
+                    {seeder.liveCircles.length > 0 && (
+                      <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                        Seeding {seeder.liveCircles.length} {seeder.liveCircles.length === 1 ? 'circle' : 'circles'}: {liveNames}
+                      </div>
+                    )}
+                    {seeder.revokedCircles.length > 0 && (
+                      <div style={{ ...typography.caption, color: colors.warn }}>
+                        Revoked from {seeder.revokedCircles.length} {seeder.revokedCircles.length === 1 ? 'circle' : 'circles'}: {revokedNames}
+                      </div>
+                    )}
                   </div>
-                  <button
-                    onClick={() => setConfirmingRevoke(seeder)}
-                    disabled={isPending}
-                    title='Revoke seeder'
-                    aria-label='Revoke seeder'
-                    style={iconBtnStyle({ disabled: isPending, destructive: true })}>
-                    <Trash size={18} weight='regular' />
-                  </button>
+                  {seeder.liveCircles.length > 0 && (
+                    <button
+                      onClick={() => setConfirmingRevoke(seeder)}
+                      disabled={isPending}
+                      title='Revoke seeder'
+                      aria-label='Revoke seeder'
+                      style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                      <Trash size={18} weight='regular' />
+                    </button>
+                  )}
                 </div>
+                {seeder.revokedCircles.length > 0 && (
+                  <button
+                    onClick={() => reAdmit(seeder)}
+                    disabled={isPending}
+                    style={{
+                      width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
+                      background: 'transparent', color: colors.text.primary,
+                      border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
+                      cursor: isPending ? 'not-allowed' : 'pointer', opacity: isPending ? 0.5 : 1,
+                      fontFamily: typography.fontFamily, fontSize: 14,
+                    }}>
+                    {isPending ? 'Working...' : (seeder.revokedCircles.length === 1 ? 'Re-admit' : 'Re-admit all')}
+                  </button>
+                )}
                 <div style={{
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                   gap: spacing.sm, marginTop: spacing.sm,
@@ -1332,8 +1381,8 @@ function SeedersSection ({ active = true }) {
           message={<>
             Revoke <strong>{confirmingRevoke.label || ('Seeder ' + confirmingRevoke.pubkey.slice(0, 8))}</strong> from
             all {confirmingRevoke.liveCircles.length} of its {confirmingRevoke.liveCircles.length === 1 ? 'circle' : 'circles'}?
-            Members will refuse to replicate to it within seconds. You can re-admit later by
-            setting the seeder up again.
+            Members will refuse to replicate to it within seconds. You can re-admit it
+            later from this list.
           </>}
           confirmLabel='Revoke'
           destructive
