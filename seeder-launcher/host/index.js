@@ -66,12 +66,15 @@ function resolvePaths (opts) {
       uiDir: opts.uiDir || path.join(__dirname, '..', 'ui'),
     }
   }
-  // The .pkg installs everything flat under /usr/local/lib/pearcircle-seeder/.
-  // The host-bundled.js lives at the install root, so __dirname IS the
-  // install root in production.
+  // The installer lays everything out flat under the install root
+  // (/usr/local/lib/pearcircle-seeder on macOS, the Program Files dir on
+  // Windows). host-bundled.js lives at that root, so __dirname IS the
+  // install root in production. The bare runtime is `bare` on POSIX and
+  // `bare.exe` on Windows - spawn() needs the exact name.
   const installRoot = __dirname
+  const bareName = process.platform === 'win32' ? 'bare.exe' : 'bare'
   return {
-    barePath: opts.barePath || path.join(installRoot, 'bare'),
+    barePath: opts.barePath || path.join(installRoot, bareName),
     bundleEntry: opts.bundleEntry || path.join(installRoot, 'worklet', 'bare.js'),
     uiDir: opts.uiDir || path.join(installRoot, 'ui'),
   }
