@@ -1,0 +1,24 @@
+# systemd user service for the PearCircle blind-seeder.
+#
+# Installed to ~/.config/systemd/user/pearcircle-seeder.service by the .deb
+# postinst or the AppImage `--install-service` action; the ExecStart line is
+# templated to the install-specific launch command at install time.
+#
+# Runs in the user's login session so the data dir resolves under
+# $HOME/.local/share/pearcircle-seeder. `loginctl enable-linger <user>` keeps
+# it running across logout / reboot - the installers do this automatically.
+
+[Unit]
+Description=PearCircle blind-seeder
+Documentation=https://peerloomllc.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__EXEC__
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

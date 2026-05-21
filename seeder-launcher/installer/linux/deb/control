@@ -1,0 +1,15 @@
+Package: pearcircle-seeder
+Version: __VERSION__
+Architecture: __ARCH__
+Maintainer: PeerLoom LLC <noreply@peerloomllc.com>
+Section: net
+Priority: optional
+Depends: systemd, libc6
+Installed-Size: __SIZE__
+Homepage: https://peerloomllc.com
+Description: PearCircle blind-seeder background service
+ Keeps a PearCircle circle's encrypted data online when no member device is.
+ Runs the blind-seeder worklet as a systemd user service and serves a
+ localhost monitoring dashboard at http://127.0.0.1:8730 for enrolling
+ circles and watching replication. The seeder is "blind": it stores and
+ serves a circle's blocks without ever being able to decrypt them.

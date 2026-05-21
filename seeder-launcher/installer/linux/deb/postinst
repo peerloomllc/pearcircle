@@ -1,0 +1,52 @@
+#!/bin/bash
+# Debian postinst - installs and starts the PearCircle Seeder systemd user
+# service for the user who invoked the install. dpkg runs this as root;
+# $SUDO_USER names the human behind `sudo apt install` / `sudo dpkg -i`.
+set -e
+
+INSTALL_ROOT=/opt/pearcircle-seeder
+UNIT_SRC="$INSTALL_ROOT/pearcircle-seeder.service"
+
+TARGET_USER="${SUDO_USER:-}"
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+  echo "pearcircle-seeder: no non-root install user detected; skipping service setup."
+  echo "  To enable it yourself, as your normal user run:"
+  echo "    mkdir -p ~/.config/systemd/user"
+  echo "    sed 's|__EXEC__|$INSTALL_ROOT/pearcircle-seeder --no-open|' \\"
+  echo "      $UNIT_SRC > ~/.config/systemd/user/pearcircle-seeder.service"
+  echo "    systemctl --user daemon-reload"
+  echo "    systemctl --user enable --now pearcircle-seeder.service"
+  echo "    sudo loginctl enable-linger \$USER"
+  exit 0
+fi
+
+TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+TARGET_UID=$(id -u "$TARGET_USER")
+UNIT_DIR="$TARGET_HOME/.config/systemd/user"
+
+install -d -o "$TARGET_USER" -g "$TARGET_USER" "$UNIT_DIR"
+sed "s|__EXEC__|$INSTALL_ROOT/pearcircle-seeder --no-open|g" "$UNIT_SRC" \
+  > "$UNIT_DIR/pearcircle-seeder.service"
+chown "$TARGET_USER:$TARGET_USER" "$UNIT_DIR/pearcircle-seeder.service"
+
+# Linger first so the user's systemd instance exists even with no login
+# session - that is what makes the seeder a true always-on service.
+loginctl enable-linger "$TARGET_USER" 2>/dev/null || true
+
+export XDG_RUNTIME_DIR="/run/user/$TARGET_UID"
+for _ in 1 2 3 4 5 6; do
+  [ -d "$XDG_RUNTIME_DIR" ] && break
+  sleep 0.5
+done
+
+runuser -u "$TARGET_USER" -- systemctl --user daemon-reload 2>/dev/null || true
+if runuser -u "$TARGET_USER" -- systemctl --user enable --now pearcircle-seeder.service 2>/dev/null; then
+  echo "pearcircle-seeder: service enabled and started for $TARGET_USER."
+  echo "  Dashboard URL: grep 'UI at' $TARGET_HOME/.local/share/pearcircle-seeder/seeder.log"
+else
+  echo "pearcircle-seeder: unit installed but could not be started now."
+  echo "  It starts automatically on $TARGET_USER's next login, or start it now with:"
+  echo "    systemctl --user enable --now pearcircle-seeder.service"
+fi
+
+exit 0

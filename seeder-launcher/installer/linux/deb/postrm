@@ -1,0 +1,19 @@
+#!/bin/bash
+# Debian postrm - removes the templated systemd user unit. The seeder data
+# directory (~/.local/share/pearcircle-seeder: identity, enrollments, logs)
+# is deliberately left intact so a reinstall keeps the seeder identity.
+set -e
+
+case "$1" in
+  remove|purge|abort-install)
+    TARGET_USER="${SUDO_USER:-}"
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+      TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+      if [ -n "$TARGET_HOME" ]; then
+        rm -f "$TARGET_HOME/.config/systemd/user/pearcircle-seeder.service"
+      fi
+    fi
+    ;;
+esac
+
+exit 0
