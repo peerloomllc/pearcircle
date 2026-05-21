@@ -75,7 +75,7 @@ function resolvePaths (opts) {
   const bareName = process.platform === 'win32' ? 'bare.exe' : 'bare'
   return {
     barePath: opts.barePath || path.join(installRoot, bareName),
-    bundleEntry: opts.bundleEntry || path.join(installRoot, 'worklet', 'bare.js'),
+    bundleEntry: opts.bundleEntry || path.join(installRoot, 'worklet', 'worklet.bundle'),
     uiDir: opts.uiDir || path.join(installRoot, 'ui'),
   }
 }

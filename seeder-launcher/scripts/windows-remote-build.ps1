@@ -103,37 +103,28 @@ Copy-Item (Join-Path $winDir 'nssm.exe')               (Join-Path $payload 'nssm
 Copy-Item (Join-Path $winDir 'open-ui.vbs')            (Join-Path $payload 'open-ui.vbs')
 Copy-Item (Join-Path $winDir 'AppIcon.ico')            (Join-Path $payload 'AppIcon.ico')
 
-# 6b. Worklet JS tree (repo src/ minus the mobile WebView UI and tests).
+# 6b. Worklet bundle. bare-pack collapses the worklet's entire JS module
+#     graph into one bundle; only the native addon prebuilds ship beside
+#     it. --base one level below node_modules makes the bundle's addon
+#     references resolve as ../node_modules/ next to the bundle.
 $worklet = Join-Path $payload 'worklet'
-& robocopy (Join-Path $repo 'src') $worklet /E /XD ui /XF *.test.js /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { Fail "robocopy worklet failed ($LASTEXITCODE)" }
+New-Item -ItemType Directory -Force -Path $worklet | Out-Null
+Push-Location $repo
+& npx bare-pack --host win32-x64 --base (Join-Path $repo 'worklet') --defer fs --defer path (Join-Path $repo 'src\bare.js') -o (Join-Path $worklet 'worklet.bundle')
+if ($LASTEXITCODE -ne 0) { Fail "bare-pack failed ($LASTEXITCODE)" }
+Pop-Location
 
-# 6c. node_modules for the worklet. Skip the mobile/dev giants on copy,
-#     then prune the wildcard families and foreign-platform prebuilds.
-#     bare-runtime-* is dropped entirely - the host runs the bare.exe at
-#     the payload root, so the bundled copy is dead weight.
-$wmn = Join-Path $worklet 'node_modules'
-$xd  = @('react-native','@react-native','react-native-bare-kit','expo','@expo',
-         'jest','@jest','@babel','@types','esbuild','@esbuild','metro','@metro',
-         '@maplibre','bare-pack','eslint',
-         'bare-runtime-darwin-arm64','bare-runtime-darwin-x64',
-         'bare-runtime-linux-arm64','bare-runtime-linux-x64',
-         'bare-runtime-win32-arm64','bare-runtime-win32-x64')
-& robocopy (Join-Path $repo 'node_modules') $wmn /E /XD $xd /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { Fail "robocopy node_modules failed ($LASTEXITCODE)" }
-
-# Prune the wildcard package families that the exact-name /XD missed.
-# Remove-Tree-Long handles deep trees: expo-modules-autolinking nests
-# Kotlin sources past MAX_PATH, which plain Remove-Item cannot delete.
-Get-ChildItem -Path $wmn -Directory -ErrorAction SilentlyContinue | Where-Object {
-  $_.Name -match '^(react-native-|expo-|jest-|babel-|metro|eslint)'
-} | ForEach-Object { Remove-Tree-Long $_.FullName }
-
-# Prune native prebuilds for every platform except win32-x64.
-Get-ChildItem -Path $wmn -Recurse -Directory -Filter prebuilds -ErrorAction SilentlyContinue | ForEach-Object {
-  Get-ChildItem -Path $_.FullName -Directory |
-    Where-Object { $_.Name -ne 'win32-x64' } | ForEach-Object { Remove-Tree-Long $_.FullName }
-}
+# 6c. Stage only the native addon prebuilds the bundle references, at
+#     worklet/node_modules/<pkg>/prebuilds/win32-x64/ so the bundle's
+#     ../node_modules/ specifiers resolve.
+$nmRoot = Join-Path $repo 'node_modules'
+Get-ChildItem -Path $nmRoot -Recurse -Directory -Filter win32-x64 -ErrorAction SilentlyContinue |
+  Where-Object { $_.Parent.Name -eq 'prebuilds' } | ForEach-Object {
+    $rel = $_.FullName.Substring($nmRoot.Length + 1)
+    $dst = Join-Path $worklet (Join-Path 'node_modules' $rel)
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item -Path (Join-Path $_.FullName '*') -Destination $dst -Recurse -Force
+  }
 
 # 6d. UI.
 Copy-Item (Join-Path $launcher 'ui\index.html')     (Join-Path $payload 'ui\index.html')

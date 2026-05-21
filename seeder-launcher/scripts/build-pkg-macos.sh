@@ -51,8 +51,8 @@ bash scripts/build-host-sea.sh
 # 3. bare-runtime native binary.
 ARCH=$(uname -m)
 case "$ARCH" in
-  arm64) BARE_PKG="bare-runtime-darwin-arm64" ;;
-  x86_64) BARE_PKG="bare-runtime-darwin-x64" ;;
+  arm64) BARE_PKG="bare-runtime-darwin-arm64"; BARE_HOST="darwin-arm64" ;;
+  x86_64) BARE_PKG="bare-runtime-darwin-x64"; BARE_HOST="darwin-x64" ;;
   *) echo "unsupported arch: $ARCH" >&2 ; exit 1 ;;
 esac
 BARE_BIN_SRC="$ROOT/../node_modules/$BARE_PKG/bin/bare"
@@ -64,60 +64,25 @@ fi
 cp "$BARE_BIN_SRC" "$PAYLOAD_LIB/bare"
 chmod +x "$PAYLOAD_LIB/bare"
 
-# 4. Worklet entry + JS modules + node_modules. Mirror the whole src/
-#    tree minus the UI bundle (src/ui/ is the mobile WebView code and
-#    isn't imported by bare.js) so new modules added by future slices
-#    (seederAdmission.js, seederRetention.js, etc) ship automatically.
-rsync -a --exclude='ui/' --exclude='*.test.js' "$ROOT/../src/" "$PAYLOAD_LIB/worklet/"
+# 4. Worklet bundle. bare-pack collapses the worklet's entire JS module
+#    graph into a single bundle; only the native addon prebuilds ship
+#    alongside it. --base one level below node_modules makes the bundle's
+#    addon references resolve as ../node_modules/ next to the bundle.
+#    --linked is omitted on purpose: that flag is the mobile path
+#    (pre-linked addons); the desktop runtime loads file: prebuilds from
+#    disk.
+"$ROOT/../node_modules/.bin/bare-pack" --host "$BARE_HOST" \
+  --base "$ROOT/../worklet" --defer fs --defer path \
+  "$ROOT/../src/bare.js" -o "$PAYLOAD_LIB/worklet/worklet.bundle"
 
-# node_modules: rsync the repo-root tree, dropping mobile-only (react-native,
-# expo, the iOS xcframeworks in react-native-bare-kit) and dev-only (jest,
-# babel, eslint, @types) trees. The worklet at runtime needs corestore,
-# hyperbee, hyperswarm, autobase, hypercore, b4a, protomux, sodium-*, and
-# the bare-* polyfills. Wildcard excludes catch nested copies under
-# transitive deps too. Shrinks the payload from ~1.2GB to ~150MB.
-#
-# bare-runtime-*/ is dropped too: the installed host runs the signed
-# `bare` at the payload root (resolvePaths() in host/index.js), so the
-# bundled copy is unused build-time weight - and its bin/bare is an
-# extensionless Mach-O the addon-signing loop below would miss, failing
-# notarization.
-rsync -a \
-  --exclude='bare-runtime-*/' \
-  --exclude='react-native-bare-kit/' \
-  --exclude='react-native/' \
-  --exclude='react-native-*/' \
-  --exclude='@react-native/' \
-  --exclude='@react-native-*/' \
-  --exclude='expo/' \
-  --exclude='expo-*/' \
-  --exclude='@expo/' \
-  --exclude='jest/' \
-  --exclude='jest-*/' \
-  --exclude='@jest/' \
-  --exclude='babel-*/' \
-  --exclude='@babel/' \
-  --exclude='eslint*/' \
-  --exclude='@types/' \
-  --exclude='esbuild/' \
-  --exclude='@esbuild/' \
-  --exclude='bare-pack/' \
-  --exclude='@maplibre/' \
-  --exclude='metro*/' \
-  --exclude='@metro*/' \
-  "$ROOT/../node_modules/" "$PAYLOAD_LIB/worklet/node_modules/"
-
-# 4b. Prune native prebuilds for platforms this arm64-macOS seeder never
-#     loads. Bare/napi addons ship per-platform prebuilds/<platform>/
-#     dirs; only darwin-arm64 is used here. Removing the rest shrinks the
-#     payload and strips foreign Mach-O binaries (darwin-x64, ios-*) that
-#     Apple's notary service would otherwise reject as unsigned.
-find "$PAYLOAD_LIB/worklet/node_modules" -type d -name prebuilds | while read -r pb; do
-  for plat in "$pb"/*/; do
-    [ -d "$plat" ] || continue
-    [ "$(basename "$plat")" = darwin-arm64 ] && continue
-    rm -rf "$plat"
-  done
+# 4b. Stage only the native addon prebuilds the bundle references, at
+#     worklet/node_modules/<pkg>/prebuilds/$BARE_HOST/ so the bundle's
+#     ../node_modules/ specifiers resolve. The Mach-O binaries here are
+#     signed by the addon-signing loop below for notarization.
+( cd "$ROOT/../node_modules" && find . -type d -path "*/prebuilds/$BARE_HOST" ) | while read -r d; do
+  rel="${d#./}"
+  mkdir -p "$PAYLOAD_LIB/worklet/node_modules/$(dirname "$rel")"
+  cp -R "$ROOT/../node_modules/$rel" "$PAYLOAD_LIB/worklet/node_modules/$(dirname "$rel")/"
 done
 
 # 5. UI.
