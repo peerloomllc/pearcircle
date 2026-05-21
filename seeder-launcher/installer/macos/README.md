@@ -2,7 +2,8 @@
 
 ## Install
 
-1. Download `PearCircleSeeder-<version>.pkg`.
+1. Download the latest `PearCircleSeeder-<version>.pkg` from the
+   [releases page](https://github.com/peerloomllc/pearcircle/releases).
 2. Double-click it and follow the installer.
 
 The package is signed and notarized by Apple, so Gatekeeper allows it with no extra steps. The installer places the seeder under `/usr/local/lib/pearcircle-seeder`, adds a LaunchAgent at `~/Library/LaunchAgents/com.pearcircle.seeder.plist`, and starts the background service in your login session right away.
