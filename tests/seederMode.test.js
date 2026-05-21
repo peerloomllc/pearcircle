@@ -290,6 +290,41 @@ describe('createSeederHandlers', () => {
       expect(result.circles.length).toBe(1)
       expect(result.circles[0].circleId).toBe('c1')
     })
+
+    // Revocation join — proposal 2026-05-21-seeder-revocation-signal.
+    test('flags a circle that has a seeder:revoked row', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1', name: 'One', enrolledAt: 1 })
+      await db.put('seeder:enrolled:c2', { circleId: 'c2', name: 'Two', enrolledAt: 2 })
+      await db.put('seeder:revoked:c1', { circleId: 'c1', revokedAt: 1700, noticedAt: 1800 })
+      const handlers = makeHandlers(db)
+      const { circles } = await handlers['seeder:enrolled:list']()
+      const c1 = circles.find((c) => c.circleId === 'c1')
+      const c2 = circles.find((c) => c.circleId === 'c2')
+      expect(c1.revoked).toBe(true)
+      expect(c1.revokedAt).toBe(1700)
+      expect(c2.revoked).toBe(false)
+      expect(c2.revokedAt).toBe(null)
+    })
+
+    test('revoked defaults to false when no revoked row exists', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      const handlers = makeHandlers(db)
+      const { circles } = await handlers['seeder:enrolled:list']()
+      expect(circles[0].revoked).toBe(false)
+      expect(circles[0].revokedAt).toBe(null)
+    })
+
+    test('revokedAt is null when the revoked row carries no timestamp', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      await db.put('seeder:revoked:c1', { circleId: 'c1', revokedAt: null, noticedAt: 5 })
+      const handlers = makeHandlers(db)
+      const { circles } = await handlers['seeder:enrolled:list']()
+      expect(circles[0].revoked).toBe(true)
+      expect(circles[0].revokedAt).toBe(null)
+    })
   })
 
   describe('seeder:leave', () => {
@@ -347,6 +382,17 @@ describe('createSeederHandlers', () => {
       const result = await handlers['seeder:leave']({ circleId: 'c1' })
       expect(result.ok).toBe(true)
       expect(db._data.has('seeder:enrolled:c1')).toBe(false)
+    })
+
+    // Proposal 2026-05-21: leaving clears the revocation row so a later
+    // re-enroll of the same circle does not surface a stale badge.
+    test('also deletes the seeder:revoked row', async () => {
+      const db = makeFakeLocalDb()
+      await db.put('seeder:enrolled:c1', { circleId: 'c1' })
+      await db.put('seeder:revoked:c1', { circleId: 'c1', revokedAt: 1, noticedAt: 2 })
+      const handlers = makeHandlers(db)
+      await handlers['seeder:leave']({ circleId: 'c1' })
+      expect(db._data.has('seeder:revoked:c1')).toBe(false)
     })
   })
 

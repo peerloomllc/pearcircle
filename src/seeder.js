@@ -170,17 +170,28 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCi
       enrollSeedInvite({ invite, localDb, mountCircle }),
 
     'seeder:enrolled:list': async () => {
-      const circles = []
+      // Collect enrolled rows first, then join each with its
+      // seeder:revoked:{circleId} row (proposal 2026-05-21-seeder-revocation
+      // -signal). Doing the revoked lookups after the enrolled range scan
+      // keeps the two reads from interleaving on the same Hyperbee.
+      const enrolled = []
       for await (const { value } of localDb.createReadStream({
         gt: 'seeder:enrolled:',
         lt: 'seeder:enrolled:~',
       })) {
-        if (!value?.circleId) continue
+        if (value?.circleId) enrolled.push(value)
+      }
+      const circles = []
+      for (const value of enrolled) {
+        const revokedNode = await localDb.get('seeder:revoked:' + value.circleId)
+        const revoked = revokedNode?.value ?? null
         circles.push({
           circleId: value.circleId,
           name: value.name ?? '',
           inviter: value.inviter ?? null,
           enrolledAt: value.enrolledAt ?? null,
+          revoked: !!revoked,
+          revokedAt: revoked && typeof revoked.revokedAt === 'number' ? revoked.revokedAt : null,
         })
       }
       return { circles }
@@ -202,6 +213,9 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCi
       }
       await localDb.del('seeder:enrolled:' + circleId).catch(() => {})
       await localDb.del('seeder:retention:' + circleId).catch(() => {})
+      // Drop the revocation row too (proposal 2026-05-21) so a later
+      // re-enroll of the same circle does not surface a stale badge.
+      await localDb.del('seeder:revoked:' + circleId).catch(() => {})
       return { ok: true, circleId }
     },
 

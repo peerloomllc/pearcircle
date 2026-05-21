@@ -155,9 +155,17 @@ function Circle ({ circle, onChanged, setError }) {
   }
 
   return (
-    <div class="circle">
-      <div class="circle-name">{circle.name || '(unnamed)'}</div>
+    <div class={'circle' + (circle.revoked ? ' revoked' : '')}>
+      <div class="circle-name">
+        {circle.name || '(unnamed)'}
+        {circle.revoked && <span class="badge revoked">revoked</span>}
+      </div>
       <div class="circle-meta mono">{circle.circleId}</div>
+      {circle.revoked && (
+        <div class="circle-note">
+          A member of this circle revoked this seeder; it can no longer sync the circle. Use Leave to remove it.
+        </div>
+      )}
       <div class="circle-controls">
         <label class="label" style={{ minWidth: 0 }}>retain</label>
         <select
