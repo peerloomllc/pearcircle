@@ -8,7 +8,7 @@ const fs = require('node:fs')
 //
 //   macOS    ~/Library/Application Support/PearCircle Seeder
 //   Linux    $XDG_DATA_HOME/pearcircle-seeder  (default ~/.local/share/pearcircle-seeder)
-//   Windows  %APPDATA%/PearCircle Seeder
+//   Windows  %ProgramData%\PearCircle Seeder
 function resolveDataDir (override) {
   if (override) return path.resolve(override)
   const home = os.homedir()
@@ -16,8 +16,12 @@ function resolveDataDir (override) {
     return path.join(home, 'Library', 'Application Support', 'PearCircle Seeder')
   }
   if (process.platform === 'win32') {
-    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
-    return path.join(appData, 'PearCircle Seeder')
+    // Machine-wide: the installed launcher runs as a LocalSystem service,
+    // whose %APPDATA% resolves under System32\config and is unreadable by
+    // ordinary users (the dashboard launcher needs to read auth.token).
+    // ProgramData is the machine-wide, user-readable home.
+    const programData = process.env.ProgramData || 'C:\\ProgramData'
+    return path.join(programData, 'PearCircle Seeder')
   }
   const xdg = process.env.XDG_DATA_HOME || path.join(home, '.local', 'share')
   return path.join(xdg, 'pearcircle-seeder')

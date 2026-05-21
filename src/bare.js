@@ -290,9 +290,14 @@ function isDeleted (place) {
 // `bare src/bare.js --seed`) BareKit is undefined; bridge to bare-process
 // stdio so the host parent can pipe the same JSON-newline IPC over the
 // subprocess's stdin/stdout.
+//
+// Outbound IPC is a synchronous write straight to fd 1: bare-stdio wraps a
+// piped stdout in a buffered pipe stream that does not flush to the parent
+// until the worklet exits, which deadlocks the host's init handshake.
 const _bareProcess = typeof BareKit === 'undefined' ? require('bare-process') : null
+const _bareFs = _bareProcess ? require('bare-fs') : null
 const _ipcRead = _bareProcess ? _bareProcess.stdin : BareKit.IPC
-const _ipcWrite = (buf) => _bareProcess ? _bareProcess.stdout.write(buf) : BareKit.IPC.write(buf)
+const _ipcWrite = (buf) => _bareProcess ? _bareFs.writeSync(1, buf) : BareKit.IPC.write(buf)
 
 const send = (msg) => _ipcWrite(Buffer.from(JSON.stringify(msg) + '\n'))
 

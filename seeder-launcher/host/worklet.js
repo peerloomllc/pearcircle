@@ -33,9 +33,10 @@ class Worklet extends EventEmitter {
 
   start () {
     if (this._proc) return this._readyP
-    const [cmd, ...preArgs] = this._barePath.split(/\s+/)
-    const args = [...preArgs, this._bundleEntry, ...this._args]
-    this._proc = spawn(cmd, args, {
+    // barePath is a single executable path - do not split on whitespace,
+    // the Windows install path (C:\Program Files\...) contains spaces.
+    const args = [this._bundleEntry, ...this._args]
+    this._proc = spawn(this._barePath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
     })
