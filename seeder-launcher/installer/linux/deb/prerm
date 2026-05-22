@@ -1,0 +1,25 @@
+#!/bin/bash
+# Debian prerm - stops the user service before files are removed/replaced.
+# On `remove` the service is also disabled; on `upgrade` it is only stopped
+# (postinst re-enables the new version).
+set -e
+
+TARGET_USER="${SUDO_USER:-}"
+if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+  TARGET_UID=$(id -u "$TARGET_USER" 2>/dev/null || true)
+  if [ -n "$TARGET_UID" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$TARGET_UID"
+    case "$1" in
+      remove)
+        runuser -u "$TARGET_USER" -- systemctl --user disable --now \
+          pearcircle-seeder.service 2>/dev/null || true
+        ;;
+      upgrade)
+        runuser -u "$TARGET_USER" -- systemctl --user stop \
+          pearcircle-seeder.service 2>/dev/null || true
+        ;;
+    esac
+  fi
+fi
+
+exit 0

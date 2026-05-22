@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PearCircle Seeder
+Comment=Keeps a PearCircle circle's data online when no member device is
+Exec=pearcircle-seeder
+Icon=pearcircle-seeder
+Categories=Network;
+Terminal=false

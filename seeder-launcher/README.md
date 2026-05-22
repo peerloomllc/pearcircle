@@ -42,8 +42,8 @@ The host keeps the seeder identity, enrollments, and logs in a per-OS applicatio
 Installer guides live alongside each platform's packaging files under `installer/`:
 
 - macOS: [installer/macos/README.md](installer/macos/README.md)
-
-Linux and Windows installers are planned.
+- Windows: [installer/windows/README.md](installer/windows/README.md)
+- Linux: [installer/linux/README.md](installer/linux/README.md)
 
 ## Design
 

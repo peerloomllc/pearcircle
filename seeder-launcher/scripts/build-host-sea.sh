@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Stage the host process for the .pkg payload. Node 25 + postject 1.0.0-alpha.6
-# fails the SEA sentinel check; instead of fighting it, we ship a Node binary
-# copy alongside an esbuild-bundled host CJS file and a tiny wrapper shell
-# script. The LaunchAgent points at the wrapper.
+# Stage the host process for an installer payload. Node 25 + postject
+# 1.0.0-alpha.6 fails the SEA sentinel check; instead of fighting it, we ship
+# a Node binary copy alongside an esbuild-bundled host CJS file and a tiny
+# wrapper shell script. The macOS LaunchAgent / Linux systemd unit point at
+# the wrapper.
 #
-# Payload layout under /usr/local/lib/pearcircle-seeder/:
+# Payload layout under the install root:
 #   pearcircle-seeder      shell wrapper that execs node host-bundled.js
-#   node                   copy of the build-machine's node binary
+#   node                   copy of a pinned Node binary for the target
 #   host-bundled.js        esbuild output (host/index.js + ws)
+#
+# Cross-platform: NODE_OS / NODE_ARCH default to the build machine (darwin or
+# linux; x64 or arm64) but may be overridden so a Linux box can stage an
+# arm64 payload. OUT_DIR must be passed for any non-macOS build.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -29,15 +34,20 @@ cp dist/host-bundled.js "$OUT_DIR/host-bundled.js"
 #    the official Node.js distribution tarball (statically linked, ~80MB
 #    extracted) and reuse it across builds via dist/cache.
 NODE_VERSION="${NODE_VERSION:-22.20.0}"
-case "$(uname -m)" in
-  arm64) NODE_ARCH=arm64 ;;
-  x86_64) NODE_ARCH=x64 ;;
-  *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-esac
-case "$(uname -s)" in
-  Darwin) NODE_OS=darwin ;;
-  *) echo "this script builds darwin payloads only" >&2; exit 1 ;;
-esac
+if [ -z "${NODE_OS:-}" ]; then
+  case "$(uname -s)" in
+    Darwin) NODE_OS=darwin ;;
+    Linux)  NODE_OS=linux ;;
+    *) echo "unsupported OS: $(uname -s) — set NODE_OS explicitly" >&2; exit 1 ;;
+  esac
+fi
+if [ -z "${NODE_ARCH:-}" ]; then
+  case "$(uname -m)" in
+    arm64|aarch64) NODE_ARCH=arm64 ;;
+    x86_64|amd64)  NODE_ARCH=x64 ;;
+    *) echo "unsupported arch: $(uname -m) — set NODE_ARCH explicitly" >&2; exit 1 ;;
+  esac
+fi
 NODE_PKG="node-v${NODE_VERSION}-${NODE_OS}-${NODE_ARCH}"
 NODE_CACHE="dist/cache/$NODE_PKG"
 if [ ! -x "$NODE_CACHE/bin/node" ]; then
