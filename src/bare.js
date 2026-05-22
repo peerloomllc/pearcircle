@@ -2240,7 +2240,10 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       if (b === base) { myCircleId = cid; break }
     }
     if (myCircleId) {
-      setTimeout(() => autoAppendMemberRow(myCircleId).catch(() => {}), 0)
+      setTimeout(() => {
+        autoAppendMemberRow(myCircleId).catch(() => {})
+        autoAppendSelfLastSeen(myCircleId).catch(() => {})
+      }, 0)
     }
   }
 }
@@ -2263,6 +2266,30 @@ async function autoAppendMemberRow (circleId) {
     send({ event: 'circle:writer:added', data: { circleId, writerKey: ourKey } })
   } catch {
     // base closed / already appended via race; harmless
+  }
+}
+
+// Backfill our last-known position into a circle we just gained write
+// access to. location:update writes lastSeen only to circles writable at
+// the instant the native event fires, so a circle joined afterwards has
+// no position for us until the next native event. On a stationary iPhone
+// in significant-location-change mode that wait can be very long, leaving
+// us as "no location yet" to the other members. Seeding _selfLastSeen on
+// becoming a writer makes us visible right away. One-shot per circle: it
+// is skipped once any lastSeen for us exists, so it never overwrites a
+// fresher organic write and is not a periodic heartbeat.
+async function autoAppendSelfLastSeen (circleId) {
+  if (!_selfLastSeen) return
+  const base = _circleBases.get(circleId)
+  if (!base || !base.writable) return
+  if (!getCircleSharing(circleId).enabled) return
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const existing = await base.view.get('lastSeen:' + ourKey)
+  if (existing && existing.value) return
+  try {
+    await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value: _selfLastSeen })
+  } catch {
+    // base closed / raced an organic location:update; the 5s sweep retries
   }
 }
 
@@ -3091,6 +3118,7 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   setInterval(() => {
     for (const [circleId] of _circleBases) {
       autoAppendMemberRow(circleId).catch(() => {})
+      autoAppendSelfLastSeen(circleId).catch(() => {})
     }
   }, 5000)
 
@@ -3104,11 +3132,14 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   // Cold-boot self-position preload. Loads the most recent lastSeen
   // we previously wrote into any writable circle so the home-screen
   // empty-state and the self pin have something to render before the
-  // first organic location:update arrives. Local-only: nothing is
-  // republished from this value — peers see our position freshness
-  // through their swarm-connected dot plus our actual location writes
-  // (proposal 2026-05-17-swarm-live-signal). The heartbeat republish
-  // that motivated this preload's earlier incarnation is gone.
+  // first organic location:update arrives. Beyond the self pin, this
+  // value is seeded once into a circle when we become its writer (see
+  // autoAppendSelfLastSeen) so a freshly joined device shows up for the
+  // other members without waiting on the next native fix. It is never
+  // republished periodically; peers see ongoing freshness through their
+  // swarm-connected dot plus our actual location writes (proposal
+  // 2026-05-17-swarm-live-signal). The heartbeat republish that
+  // motivated this preload's earlier incarnation is gone.
   try {
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     let newest = null
