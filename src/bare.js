@@ -814,7 +814,8 @@ const handlers = {
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const base = _circleBases.get(circleId)
     if (!base) throw new Error('unknown circle: ' + circleId)
-    await base.update()
+    // No base.update(): same cold-boot discovery stall as snapshotCircle
+    // (see the note there). Read the on-disk view directly.
     const places = []
     for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
       if (value && !isDeleted(value)) places.push(value)
@@ -1806,7 +1807,18 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
 }
 
 async function snapshotCircle (circleId, base) {
-  await base.update()
+  // No base.update() here. On a cold boot Autobase's update() blocks
+  // until Hyperswarm peer discovery flushes -- 40+ seconds when a
+  // circle's members are offline (confirmed on-device 2026-05-22 via the
+  // snapshot:slow trace). circles:getAll polls this every ~3s, so a
+  // blocking update froze the whole circle list and map. The view core
+  // is already on disk and Autobase auto-applies replicated data into
+  // it, so reading it directly returns last-known state instantly and
+  // the re-poll converges as the swarm warms up. The in-flight update()
+  // also serialized base.append() behind it on the same base, delaying
+  // the device's own location writes -- dropping it frees that too.
+  // circle:join / circle:create keep their own explicit update() where
+  // a synchronous wait is genuinely required.
   const view = base.view
   const circleRow = await view.get('circle')
   // Pull `left:` rows up front so the member / lastSeen / presence
