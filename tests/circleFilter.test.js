@@ -1,4 +1,4 @@
-const { circleIsDeleted, memberHiddenByLeft, shouldAcceptRemovedRow } = require('../src/lib/circleFilter')
+const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('../src/lib/circleFilter')
 
 describe('circleIsDeleted', () => {
   test('null and undefined are not deleted', () => {
@@ -49,6 +49,34 @@ describe('memberHiddenByLeft', () => {
 
   test('leftAt older than joinedAt does not hide (rejoin wins)', () => {
     expect(memberHiddenByLeft(1000, 2000)).toBe(false)
+  })
+})
+
+describe('memberHiddenByRemoved', () => {
+  test('no removedAt means never hide', () => {
+    expect(memberHiddenByRemoved(null, 1000)).toBe(false)
+    expect(memberHiddenByRemoved(undefined, 1000)).toBe(false)
+  })
+
+  test('non-numeric removedAt means never hide', () => {
+    expect(memberHiddenByRemoved('1000', 500)).toBe(false)
+  })
+
+  test('member-row missing joinedAt with a removed row hides', () => {
+    expect(memberHiddenByRemoved(1000, null)).toBe(true)
+    expect(memberHiddenByRemoved(1000, undefined)).toBe(true)
+  })
+
+  test('removedAt strictly newer than joinedAt hides (the kick wins)', () => {
+    expect(memberHiddenByRemoved(2000, 1000)).toBe(true)
+  })
+
+  test('removedAt equal to joinedAt does not hide (rejoin tied with kick shows)', () => {
+    expect(memberHiddenByRemoved(1000, 1000)).toBe(false)
+  })
+
+  test('removedAt older than joinedAt does not hide (rejoin overrides the kick)', () => {
+    expect(memberHiddenByRemoved(1000, 2000)).toBe(false)
   })
 })
 
