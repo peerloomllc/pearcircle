@@ -562,6 +562,9 @@ export default function Index() {
     // a peer's circle has been deleted by its owner. UI surfaces a
     // one-time toast and then runs circle:cleanup-deleted.
     onEvent('circle:deleted', (data) => emitEvent('circle:deleted', data))
+    // Owner removed this member from a circle (proposal 2026-05-03 §3).
+    // Same UI path as circle:deleted -- one-time notice, then cleanup.
+    onEvent('circle:removed-self', (data) => emitEvent('circle:removed-self', data))
     // Geofence transitions land here; fire OS notification if it's a peer
     // (not us) and the place isn't muted on this device.
     onEvent('transition:applied', (data) => { fireTransitionNotification(data) })

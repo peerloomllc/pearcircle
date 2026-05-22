@@ -40,7 +40,7 @@ const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
-const { circleIsDeleted, memberHiddenByLeft } = require('./lib/circleFilter')
+const { circleIsDeleted, memberHiddenByLeft, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -1146,6 +1146,37 @@ const handlers = {
     return { ok: true, alreadyLeft: false }
   },
 
+  // Owner-only member removal (proposal 2026-05-03 §3). Appends a
+  // `removed:{pubkey}` tombstone. Owner-write only: the apply branch
+  // accepts it solely from the bootstrap writer. The tombstone rides the
+  // owner's bootstrap core -- the most reliably replicated core in the
+  // circle -- so it converges to every member. snapshotCircle then hides
+  // the member and the pubkey-keyed apply branches drop their later
+  // writes; the removed member's own device tears the circle down via
+  // the circle:removed-self event.
+  'circle:remove': async ({ circleId, pubkey } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string' || pubkey.length === 0) throw new Error('pubkey must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    if (pubkey === ourKeyHex) throw new Error('the owner cannot remove themselves')
+    const circleRow = await base.view.get('circle')
+    if (!circleRow?.value) throw new Error('circle metadata missing')
+    if (circleRow.value.ownerKey !== ourKeyHex) {
+      throw new Error('only the owner can remove members')
+    }
+    if (circleRow.value.deleted) throw new Error('this circle has been deleted')
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    await base.append({
+      type: 'put',
+      key: 'removed:' + pubkey,
+      value: { pubkey, removedBy: ourKeyHex, ts: Date.now(), v: 1 },
+    })
+    return { ok: true, pubkey }
+  },
+
   // Peer-side post-notification cleanup (proposal amendment 2026-05-07).
   // Bare emits `circle:deleted` when the apply branch processes an
   // owner-tear-down tombstone; the UI shows a one-time notice and then
@@ -1830,8 +1861,16 @@ async function snapshotCircle (circleId, base) {
     const pubkey = key.slice('left:'.length)
     if (typeof value?.leftAt === 'number') leftAtByPubkey.set(pubkey, value.leftAt)
   }
+  // Owner-kicked members (proposal 2026-05-03 §3). Unlike `left:`, a
+  // `removed:` tombstone is unconditional -- the pubkey is dropped from
+  // the member / lastSeen / presence views with no joinedAt comparison.
+  const removedPubkeys = new Set()
+  for await (const { key } of view.createReadStream({ gt: 'removed:', lt: 'removed:~' })) {
+    removedPubkeys.add(key.slice('removed:'.length))
+  }
   const members = []
   for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+    if (removedPubkeys.has(value?.pubkey)) continue
     const leftAt = leftAtByPubkey.get(value?.pubkey)
     if (memberHiddenByLeft(leftAt, value?.joinedAt)) continue
     members.push({ key, value })
@@ -1839,6 +1878,7 @@ async function snapshotCircle (circleId, base) {
   const lastSeen = {}
   for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
     const pubkey = key.slice('lastSeen:'.length)
+    if (removedPubkeys.has(pubkey)) continue
     if (leftAtByPubkey.has(pubkey)) {
       const memberRow = await view.get('member:' + pubkey)
       if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
@@ -1848,6 +1888,7 @@ async function snapshotCircle (circleId, base) {
   const presence = {}
   for await (const { key, value } of view.createReadStream({ gt: 'presence:', lt: 'presence:~' })) {
     const pubkey = key.slice('presence:'.length)
+    if (removedPubkeys.has(pubkey)) continue
     if (leftAtByPubkey.has(pubkey)) {
       const memberRow = await view.get('member:' + pubkey)
       if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
@@ -2020,8 +2061,40 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         await view.put(op.key, incoming)
         continue
       }
-      // `member:*`: any current writer
+      // `removed:{pubkey}` (proposal 2026-05-03 §3): owner-only kick
+      // tombstone, gated by shouldAcceptRemovedRow (bootstrap-writer
+      // authored, well-formed, key matches value). snapshotCircle hides
+      // the member and the pubkey-keyed branches below drop their later
+      // writes. If the tombstone names our own identity the owner kicked
+      // us: emit circle:removed-self once so the shell can show a notice
+      // and tear the circle down locally, mirroring the circle:deleted
+      // flow.
+      if (op.key.startsWith('removed:')) {
+        const fromHex = b4a.toString(node.from.key, 'hex')
+        const keyPubkey = op.key.slice('removed:'.length)
+        if (!shouldAcceptRemovedRow({ fromHex, bootstrapHex, keyPubkey, value: op.value })) continue
+        const alreadyRemoved = !!(await view.get(op.key))?.value
+        await view.put(op.key, op.value)
+        if (!alreadyRemoved && circleId) {
+          const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
+          if (ourKeyHex && keyPubkey === ourKeyHex) {
+            try {
+              const circleRow = await view.get('circle')
+              send({ event: 'circle:removed-self', data: {
+                circleId,
+                circleName: circleRow?.value?.name || 'Circle',
+              }})
+            } catch (e) { console.warn('[bare] circle:removed-self emit failed', e?.message) }
+          }
+        }
+        continue
+      }
+      // `member:*`: any current writer, unless the member has been
+      // removed by the owner -- a removed member's later member: writes
+      // (including a reinstall's fresh row) are dropped.
       if (op.key.startsWith('member:')) {
+        const memberPubkey = op.key.slice('member:'.length)
+        if ((await view.get('removed:' + memberPubkey))?.value) continue
         await view.put(op.key, op.value)
         continue
       }
@@ -2036,6 +2109,7 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (incoming.ts > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
         const keyPubkey = op.key.slice('lastSeen:'.length)
         if (keyPubkey !== incoming.pubkey) continue
+        if ((await view.get('removed:' + keyPubkey))?.value) continue
         await view.put(op.key, incoming)
         if (circleId && !_firstLastSeenRemoteMarked.has(circleId)) {
           const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
@@ -2058,6 +2132,7 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (incoming.state !== 'visible' && incoming.state !== 'muted') continue
         const keyPubkey = op.key.slice('presence:'.length)
         if (keyPubkey !== incoming.pubkey) continue
+        if ((await view.get('removed:' + keyPubkey))?.value) continue
         const existing = await view.get(op.key)
         if (existing?.value && typeof existing.value.setAt === 'number') {
           if (incoming.setAt <= existing.value.setAt) continue
@@ -2108,6 +2183,7 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         const keyPlaceId = tail.slice(secondColon + 1)
         if (keyPubkey !== incoming.pubkey) continue
         if (keyPlaceId !== incoming.placeId) continue
+        if ((await view.get('removed:' + keyPubkey))?.value) continue
         await view.put(op.key, incoming)
         // Emit transition:applied so the RN shell can fire an OS notification.
         // Skip the emit when we've already fired for this exact op key in

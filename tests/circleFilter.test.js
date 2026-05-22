@@ -1,4 +1,4 @@
-const { circleIsDeleted, memberHiddenByLeft } = require('../src/lib/circleFilter')
+const { circleIsDeleted, memberHiddenByLeft, shouldAcceptRemovedRow } = require('../src/lib/circleFilter')
 
 describe('circleIsDeleted', () => {
   test('null and undefined are not deleted', () => {
@@ -49,5 +49,47 @@ describe('memberHiddenByLeft', () => {
 
   test('leftAt older than joinedAt does not hide (rejoin wins)', () => {
     expect(memberHiddenByLeft(1000, 2000)).toBe(false)
+  })
+})
+
+describe('shouldAcceptRemovedRow', () => {
+  const owner = 'a'.repeat(64)
+  const member = 'b'.repeat(64)
+  const valid = { pubkey: member, removedBy: owner, ts: 1000, v: 1 }
+
+  test('owner-authored, well-formed row is accepted', () => {
+    expect(shouldAcceptRemovedRow({
+      fromHex: owner, bootstrapHex: owner, keyPubkey: member, value: valid,
+    })).toBe(true)
+  })
+
+  test('non-owner author is rejected (owner-write-only)', () => {
+    expect(shouldAcceptRemovedRow({
+      fromHex: member, bootstrapHex: owner, keyPubkey: member, value: valid,
+    })).toBe(false)
+  })
+
+  test('key suffix not matching the value pubkey is rejected', () => {
+    expect(shouldAcceptRemovedRow({
+      fromHex: owner, bootstrapHex: owner, keyPubkey: 'c'.repeat(64), value: valid,
+    })).toBe(false)
+  })
+
+  test('missing or malformed value is rejected', () => {
+    expect(shouldAcceptRemovedRow({
+      fromHex: owner, bootstrapHex: owner, keyPubkey: member, value: null,
+    })).toBe(false)
+    expect(shouldAcceptRemovedRow({
+      fromHex: owner, bootstrapHex: owner, keyPubkey: member, value: { removedBy: owner },
+    })).toBe(false)
+  })
+
+  test('non-string author or bootstrap key is rejected', () => {
+    expect(shouldAcceptRemovedRow({
+      fromHex: null, bootstrapHex: owner, keyPubkey: member, value: valid,
+    })).toBe(false)
+    expect(shouldAcceptRemovedRow({
+      fromHex: owner, bootstrapHex: undefined, keyPubkey: member, value: valid,
+    })).toBe(false)
   })
 })
