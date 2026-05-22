@@ -2,7 +2,8 @@
 
 ## Install
 
-1. Download `PearCircleSeeder-Setup-<version>.exe`.
+1. Download the latest `PearCircleSeeder-Setup-<version>.exe` from the
+   [releases page](https://github.com/peerloomllc/pearcircle/releases).
 2. Run it. The installer is not yet signed, so Windows SmartScreen shows a "Windows protected your PC" notice - click **More info**, then **Run anyway**.
 3. Follow the installer.
 

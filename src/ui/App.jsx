@@ -43,6 +43,11 @@ const TOUR_STEPS = [
     body: 'Open this to see everyone in the active circle, add a Place, and get notified when people arrive or leave.',
     placement: 'top',
   },
+  {
+    anchor: '__no-anchor__',
+    title: 'Keep your circle in sync',
+    body: "A seeder is an always-on computer that keeps your circle's locations and history synced even when everyone's phone is off. It's optional but handy. Set one up any time from Settings.",
+  },
 ]
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
@@ -1252,6 +1257,8 @@ function SeedersSection ({ active = true }) {
     }
   }
 
+  const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
+
   // Each seeder device, with its circles split into live and revoked. A
   // fully-revoked device stays in the list so the user can re-admit it —
   // durable revocation (proposal 2026-05-21 amendment) makes re-admission
@@ -1267,12 +1274,30 @@ function SeedersSection ({ active = true }) {
   return (
     <div>
       <p style={s.muted}>
-        A seeder is an always-on device (a Raspberry Pi, a spare phone) that replicates your
-        circles' encrypted blocks so members stay in sync even when no two are online together.
-        Seeders never get the encryption key — they cannot read circle content.
+        A seeder is an always-on computer (a Raspberry Pi, an old laptop, a spare
+        desktop) that keeps a copy of your circles' encrypted data. Without one, a
+        circle only syncs while two members have the app open at the same moment.
+        A seeder closes that gap, so everyone's locations and history stay current
+        even when all the phones are asleep. It never receives the encryption key,
+        so it cannot read anything it stores.
+      </p>
+      <p style={s.muted}>
+        Install the free PearCircle Seeder app (macOS, Windows or Linux) on that
+        computer, then set up a device below to link it to your circles.
       </p>
       <button onClick={mintBundle} disabled={minting} style={s.primaryBtn}>
         {minting ? 'Building invites...' : 'Set up a seeder device'}
+      </button>
+      <button
+        onClick={() => openURL('https://github.com/peerloomllc/pearcircle/releases')}
+        style={{
+          width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
+          background: 'transparent', color: colors.text.primary,
+          border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
+          cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
+        }}>
+        Download the seeder app <ArrowSquareOut size={14} weight='thin' />
       </button>
       {error && <p style={s.error}>{error}</p>}
 
