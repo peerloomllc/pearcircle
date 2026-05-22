@@ -65,6 +65,8 @@
     <string>PearCircle shows your location to other members of your circle while the app is open.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Required by AVCaptureSession for QR scanning</string>
+    <key>NSMotionUsageDescription</key>
+    <string>PearCircle notices when you start moving so it can keep your circle's map fresh without keeping GPS on while you are still.</string>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>Used to set your profile photo</string>
     <key>NSUserActivityTypes</key>

@@ -296,6 +296,14 @@ function ensureLocationListener() {
     if (_worklet) sendToWorklet(msg)
     else _pendingRegionEvents.push(msg)
   })
+  // CoreMotion activity transitions from the iOS native side (proposal
+  // 2026-05-21). A stationary -> moving change escalates the worklet's
+  // adaptive location mode out of SLC-only "idle" without waiting on
+  // the trip detector, closing the idle-trap. Android emits no
+  // equivalent, so the listener simply never fires there.
+  emitter.addListener('PearCircleLocation:motion:changed', (data: any) => {
+    sendToWorklet({ method: 'motion:changed', args: data })
+  })
   _locationListenerSet = true
 }
 
@@ -473,6 +481,13 @@ export default function Index() {
       shellMark('worklet:ready-received')
       // Capture our pubkey so transition:applied can suppress self-notifications.
       if (data?.publicKey && typeof data.publicKey === 'string') _ourPubkey = data.publicKey
+      // Seed the worklet's adaptive-location app-foreground state
+      // (proposal 2026-05-21). AppState.addEventListener only fires on
+      // change, so without this initial push the worklet wouldn't know
+      // the app is foregrounded until the first background/foreground
+      // cycle -- and a cold launch is exactly when foreground tracking
+      // matters most.
+      sendToWorklet({ method: 'app:state', args: { state: AppState.currentState } })
       emitEvent('ready', data)
     })
     // Phase-4 device verification side-channel: write the worklet's

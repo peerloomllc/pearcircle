@@ -177,6 +177,26 @@ let _tripState = newTripState()
 const ADAPTIVE_LOCATION_MODE_ENABLED = true
 let _lastAdaptiveMode = null   // null until the first emission; mirrors what the shell last received
 
+// Adaptive-mode escalation inputs (proposal 2026-05-21). The 2026-05-16
+// design drove the mode from trip phase alone, which left the idle-trap:
+// in "idle" mode location:update fires only on ~500m SLC events, so a
+// trip starting while idle wasn't seen until ~500m in. These two
+// trip-detector-independent signals escalate to "tracking" promptly.
+let _appForeground = false   // RN AppState 'active'; set via the app:state IPC
+let _motionMoving = false    // CoreMotion reported the device moving (iOS)
+let _motionRecentUntil = 0   // motion still counts as "recent" until this ms timestamp
+let _motionGraceTimer = null // re-runs the driver when the grace window lapses
+// True once the first real location:update has been processed. The
+// driver must not emit "idle" before this: native startUpdatesNow only
+// begins continuous delivery when its mode is "tracking", so a premature
+// "idle" (from an app:state event that lands before native startUpdates)
+// would suppress the very first GPS fix entirely.
+let _locationUpdateSeen = false
+// Q3: hold "tracking" for this long after motion stops before allowing
+// a step-down, so a brief stop (red light, gas station, the user
+// briefly backgrounding the app mid-walk) doesn't flap the radio.
+const MOTION_GRACE_MS = 2 * 60 * 1000
+
 // Suppress duplicate `transition:applied` IPC emits when autobase
 // re-applies the same op (indexer reorganization on writer-add or
 // fork-merge can replay previously-processed nodes). The shell already
@@ -315,10 +335,75 @@ const _ipcWrite = (buf) => _bareProcess ? _bareFs.writeSync(1, buf) : BareKit.IP
 
 const send = (msg) => _ipcWrite(Buffer.from(JSON.stringify(msg) + '\n'))
 
+// Motion counts as "recent" while CoreMotion still reports the device
+// moving, or within MOTION_GRACE_MS of the last moving->stationary
+// transition (the Q3 step-down grace window).
+function motionIsRecent () {
+  return _motionMoving || Date.now() < _motionRecentUntil
+}
+
+// Adaptive iOS location-mode driver (proposals 2026-05-16, 2026-05-21).
+// Recomputes the desired native CLLocationManager mode from the three
+// escalation inputs (trip phase, app foreground, recent motion) and
+// emits location:mode:set only on an actual change. Called from the
+// location:update, app:state, and motion:changed handlers and from the
+// motion grace timer. The shell ignores the event on non-iOS platforms,
+// so it is safe to run unconditionally.
+function runLocationModeDriver () {
+  const nextMode = nextEmittedMode(
+    _lastAdaptiveMode,
+    {
+      phase: _tripState.phase,
+      appForeground: _appForeground,
+      recentMotion: motionIsRecent(),
+      locationStarted: _locationUpdateSeen,
+    },
+    ADAPTIVE_LOCATION_MODE_ENABLED,
+  )
+  if (nextMode != null) {
+    _lastAdaptiveMode = nextMode
+    send({ event: 'location:mode:set', data: { mode: nextMode } })
+  }
+}
+
 const handlers = {
   'ping': async () => ({ ok: true, ts: Date.now() }),
 
-  'app:state': async ({ state }) => ({ state }),
+  // RN AppState foreground/background, forwarded from app/index.tsx.
+  // Foreground pins the adaptive location mode to "tracking" (proposal
+  // 2026-05-21) so an opened map shows fresh positions including the
+  // user's own; backgrounding hands control back to the trip-phase and
+  // motion escalations.
+  'app:state': async ({ state } = {}) => {
+    _appForeground = state === 'active'
+    runLocationModeDriver()
+    return { state, appForeground: _appForeground }
+  },
+
+  // CoreMotion activity transition from the iOS native module (proposal
+  // 2026-05-21). A stationary->moving change escalates the adaptive
+  // location mode to "tracking" without waiting on the trip detector,
+  // closing the idle-trap. On moving->stationary the Q3 grace window
+  // holds "tracking" a while longer before a step-down is allowed.
+  'motion:changed': async ({ moving } = {}) => {
+    const isMoving = moving === true
+    if (_motionGraceTimer) { clearTimeout(_motionGraceTimer); _motionGraceTimer = null }
+    if (isMoving) {
+      _motionMoving = true
+    } else {
+      _motionMoving = false
+      _motionRecentUntil = Date.now() + MOTION_GRACE_MS
+      // Nothing else fires once the device is sitting still, so arm a
+      // timer to re-run the driver when the grace window lapses --
+      // otherwise the mode would stay "tracking" indefinitely.
+      _motionGraceTimer = setTimeout(() => {
+        _motionGraceTimer = null
+        runLocationModeDriver()
+      }, MOTION_GRACE_MS)
+    }
+    runLocationModeDriver()
+    return { moving: isMoving, recentMotion: motionIsRecent() }
+  },
 
   // Default-network change on the device (wifi <-> cell, vpn on/off,
   // ethernet plug). The Android side debounces the burst of native
@@ -1162,6 +1247,9 @@ const handlers = {
     if (typeof lat !== 'number' || typeof lon !== 'number') {
       return { ok: false, reason: 'invalid_coords' }
     }
+    // Continuous delivery is confirmed up: the driver may now step the
+    // native side down to "idle" when escalations go quiet.
+    _locationUpdateSeen = true
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     const stamp = typeof ts === 'number' ? ts : Date.now()
     if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
@@ -1226,14 +1314,10 @@ const handlers = {
       const sp = typeof speed === 'number' ? speed : null
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
       _tripState = r.state
-      // Adaptive iOS location mode driver. Re-evaluate desired mode on
-      // every step; emit only on actual change. Shell ignores the event
-      // on non-iOS platforms so it's safe to fire unconditionally.
-      const nextMode = nextEmittedMode(_lastAdaptiveMode, _tripState.phase, ADAPTIVE_LOCATION_MODE_ENABLED)
-      if (nextMode != null) {
-        _lastAdaptiveMode = nextMode
-        send({ event: 'location:mode:set', data: { mode: nextMode } })
-      }
+      // Re-evaluate the adaptive location mode now that trip phase may
+      // have changed. The foreground and motion escalations re-run the
+      // driver from their own IPC handlers.
+      runLocationModeDriver()
       if (r.completed) {
         const tripKey = 'trips:' + ourKey + ':' + r.completed.startTs
         const trip = {
