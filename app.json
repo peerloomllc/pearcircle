@@ -16,6 +16,7 @@
         "NSMicrophoneUsageDescription": "Required by AVCaptureSession for QR scanning",
         "NSLocationWhenInUseUsageDescription": "PearCircle shows your location to other members of your circle while the app is open.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "PearCircle shares your location with your circle and notifies them when you arrive at or leave the Places you have set, even when the app is closed.",
+        "NSMotionUsageDescription": "PearCircle notices when you start moving so it can keep your circle's map fresh without keeping GPS on while you are still.",
         "NSLocalNetworkUsageDescription": "PearCircle connects directly to nearby devices on your Wi-Fi to sync circle data peer-to-peer.",
         "NSBonjourServices": [
           "_hyperswarm._udp"

@@ -1,5 +1,6 @@
 import Foundation
 import CoreLocation
+import CoreMotion
 import Network
 import UIKit
 import React
@@ -24,7 +25,13 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   private static let NETWORK_EVENT = "PearCircleLocation:network:changed"
   private static let REGION_ENTER_EVENT = "PearCircleLocation:region:enter"
   private static let REGION_EXIT_EVENT = "PearCircleLocation:region:exit"
+  private static let MOTION_EVENT = "PearCircleLocation:motion:changed"
   private static let DEBOUNCE_SECONDS: TimeInterval = 2.0
+  // CoreMotion smoothing (proposal 2026-05-21 Q4, reusing the 2026-05-03
+  // isMoving decision): a raw classification must repeat this many
+  // consecutive activity callbacks before it flips the value emitted to
+  // JS, filtering CoreMotion's brief low-confidence flickers.
+  private static let MOTION_SMOOTHING_SAMPLES = 3
   // Cold-start launch path: when iOS revives the app from a region
   // crossing while the user had it force-quit, didEnterRegion can fire
   // before the JS bundle finishes booting and attaches the
@@ -46,6 +53,19 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // Flushed in startObserving when the shell side wires up the
   // NativeEventEmitter listener.
   private var bufferedRegionEvents: [(name: String, body: [String: Any])] = []
+
+  // CoreMotion activity monitoring (proposal 2026-05-21). Feeds the
+  // worklet a trip-detector-independent "device started moving" signal
+  // so it can leave SLC-only "idle" mode promptly, closing the
+  // idle-trap. Runs on the always-on motion coprocessor at negligible
+  // battery cost. motionEmittedMoving is the smoothed state last sent
+  // to JS; motionPendingMoving / motionPendingCount implement the
+  // N-consistent-samples smoothing (see MOTION_SMOOTHING_SAMPLES).
+  private var motionManager: CMMotionActivityManager?
+  private var motionUpdatesActive = false
+  private var motionEmittedMoving = false
+  private var motionPendingMoving: Bool?
+  private var motionPendingCount = 0
 
   // Resolver for an in-flight startUpdates() call that's blocked on
   // the user's response to the location-permission dialog. didChange
@@ -81,6 +101,7 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
 
   deinit {
     pathMonitor?.cancel()
+    motionManager?.stopActivityUpdates()
   }
 
   override static func requiresMainQueueSetup() -> Bool { return true }
@@ -91,6 +112,7 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       PearCircleLocationModule.NETWORK_EVENT,
       PearCircleLocationModule.REGION_ENTER_EVENT,
       PearCircleLocationModule.REGION_EXIT_EVENT,
+      PearCircleLocationModule.MOTION_EVENT,
     ]
   }
 
@@ -157,9 +179,12 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     DispatchQueue.main.async {
       // Stop BOTH continuous and SLC. The FGS-lifecycle caller (mute
       // every circle) wants the radio fully idle; leaving SLC on would
-      // still wake the worklet for nothing.
+      // still wake the worklet for nothing. CoreMotion activity
+      // monitoring stops too -- with sharing off there is no escalation
+      // for it to drive.
       self.manager?.stopUpdatingLocation()
       self.manager?.stopMonitoringSignificantLocationChanges()
+      self.stopActivityUpdates()
       resolve(true)
     }
   }
@@ -372,12 +397,15 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // by this knob).
     m.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
     m.distanceFilter = 10
-    // Let iOS pause delivery when the device is stationary; it resumes
-    // automatically on detected motion. The worklet's 15s heartbeat
-    // (HEARTBEAT_CHECK_INTERVAL_MS in bare.js) re-signs the last
-    // position so peers still see "Live" while paused. Was previously
-    // false; that combined with Best accuracy kept the GPS chip hot
-    // 24/7 and was the dominant battery drain reported by users.
+    // Let iOS pause continuous delivery when the device is stationary;
+    // it resumes automatically on detected motion. SLC stays subscribed
+    // underneath (proposal 2026-05-16 adaptive modes), so a paused
+    // device is still woken on ~500m cell-tower moves, and the
+    // swarm-connected dot -- not a periodic location republish -- now
+    // carries the "this peer is live" signal (2026-05-17
+    // swarm-live-signal change). Was previously false; that combined
+    // with Best accuracy kept the GPS chip hot 24/7 and was the
+    // dominant battery drain reported by users.
     m.pausesLocationUpdatesAutomatically = true
     // allowsBackgroundLocationUpdates needs UIBackgroundModes "location"
     // in Info.plist (set) and Always authorization at runtime; iOS
@@ -397,6 +425,77 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     if currentMode == "tracking" {
       mgr.startUpdatingLocation()
     }
+    // CoreMotion activity monitoring (proposal 2026-05-21). Started
+    // alongside location so a trip beginning while the worklet is in
+    // "idle" mode is noticed promptly instead of ~500m in.
+    startActivityUpdatesIfAvailable()
+  }
+
+  // MARK: - CoreMotion activity monitoring
+
+  // Begin CoreMotion activity updates if the device has the motion
+  // coprocessor. The first call triggers the Motion & Fitness
+  // permission dialog; if the user denies it the handler simply never
+  // reports motion and the trip-phase / foreground escalations still
+  // cover the idle-trap. Idempotent.
+  private func startActivityUpdatesIfAvailable() {
+    guard CMMotionActivityManager.isActivityAvailable() else { return }
+    if motionUpdatesActive { return }
+    let mgr = motionManager ?? CMMotionActivityManager()
+    motionManager = mgr
+    motionUpdatesActive = true
+    mgr.startActivityUpdates(to: OperationQueue.main) { [weak self] activity in
+      guard let self = self, let activity = activity else { return }
+      self.handleActivityUpdate(activity)
+    }
+  }
+
+  private func stopActivityUpdates() {
+    guard motionUpdatesActive else { return }
+    motionManager?.stopActivityUpdates()
+    motionUpdatesActive = false
+    // Reset the smoothing state so a later restart re-derives from
+    // scratch rather than carrying a stale pending count.
+    motionPendingMoving = nil
+    motionPendingCount = 0
+  }
+
+  // Classify one CMMotionActivity sample. A sample counts as "moving"
+  // only for an active mode of transport (walking / running / cycling /
+  // automotive) reported at medium-or-higher confidence (Q4). Stationary,
+  // unknown, and any low-confidence sample read as not-moving.
+  private func rawMoving(_ activity: CMMotionActivity) -> Bool {
+    guard activity.confidence != .low else { return false }
+    return activity.walking || activity.running || activity.cycling || activity.automotive
+  }
+
+  // Apply the N-consistent-samples smoothing and emit a motion:changed
+  // event only when the smoothed value actually flips.
+  private func handleActivityUpdate(_ activity: CMMotionActivity) {
+    let raw = rawMoving(activity)
+    if raw == motionEmittedMoving {
+      // Sample agrees with what JS already knows; drop any pending flip.
+      motionPendingMoving = nil
+      motionPendingCount = 0
+      return
+    }
+    if motionPendingMoving == raw {
+      motionPendingCount += 1
+    } else {
+      motionPendingMoving = raw
+      motionPendingCount = 1
+    }
+    if motionPendingCount >= PearCircleLocationModule.MOTION_SMOOTHING_SAMPLES {
+      motionPendingMoving = nil
+      motionPendingCount = 0
+      motionEmittedMoving = raw
+      emitMotionChanged(raw)
+    }
+  }
+
+  private func emitMotionChanged(_ moving: Bool) {
+    guard hasListeners else { return }
+    sendEvent(withName: PearCircleLocationModule.MOTION_EVENT, body: ["moving": moving])
   }
 
   // Apply a worklet-requested mode change. "idle" stops continuous

@@ -826,8 +826,11 @@ function PermissionPrimingModal ({ onContinue }) {
         <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
           PearCircle uses your location to share live position with your circles and notify them when you arrive at or leave the Places you've set.
         </p>
-        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.lg, lineHeight: 1.5 }}>
+        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
           On the next screen, choose <strong style={{ color: colors.text.primary, fontWeight: 400 }}>Always</strong> so sharing keeps working when the app is in the background. <strong style={{ color: colors.text.primary, fontWeight: 400 }}>While Using App</strong> works too, but sharing pauses whenever you leave the app.
+        </p>
+        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.lg, lineHeight: 1.5 }}>
+          PearCircle will also ask for <strong style={{ color: colors.text.primary, fontWeight: 400 }}>Motion &amp; Fitness</strong> access. It uses this to notice when you start moving so the map stays fresh without keeping GPS on while you are still.
         </p>
         <button
           onClick={onContinue}
