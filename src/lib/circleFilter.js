@@ -27,14 +27,29 @@ function memberHiddenByLeft (leftAt, joinedAt) {
   return leftAt > joinedAt
 }
 
+// Owner-kick filter (proposal 2026-05-03 §3). A `removed:{pubkey}` row
+// hides the matching member while its `ts` strictly beats the member
+// row's joinedAt -- the same rule as memberHiddenByLeft. Removal is
+// reversible: a rejoin writes a fresh `member:` row whose joinedAt beats
+// removed.ts and flips the member back to visible; the owner kicking
+// again writes a newer removed.ts that re-hides them.
+//
+//   removedAt non-number     - no tombstone, never hide
+//   joinedAt non-number      - no member row, hide if removed exists
+//   removedAt > joinedAt     - kick is newer, hide
+//   removedAt <= joinedAt    - rejoin is newer, show
+function memberHiddenByRemoved (removedAt, joinedAt) {
+  if (typeof removedAt !== 'number') return false
+  if (typeof joinedAt !== 'number') return true
+  return removedAt > joinedAt
+}
+
 // Owner-kick admission rule (proposal 2026-05-03 §3). A `removed:{pubkey}`
 // row is owner-write-only: the apply branch accepts it only when the
 // authoring writer is the autobase bootstrap key (the owner), the value
 // carries a string pubkey, and the key suffix matches that pubkey so a
 // writer cannot tombstone an unrelated key. Any non-owner append is
-// dropped. Unlike `left:`, the resulting tombstone is unconditional --
-// there is no joinedAt comparison, so a removed member stays hidden even
-// if a fresh member: row arrives later.
+// dropped. The hide itself is reversible -- see memberHiddenByRemoved.
 function shouldAcceptRemovedRow ({ fromHex, bootstrapHex, keyPubkey, value }) {
   if (typeof fromHex !== 'string' || typeof bootstrapHex !== 'string') return false
   if (fromHex !== bootstrapHex) return false
@@ -43,4 +58,4 @@ function shouldAcceptRemovedRow ({ fromHex, bootstrapHex, keyPubkey, value }) {
   return true
 }
 
-module.exports = { circleIsDeleted, memberHiddenByLeft, shouldAcceptRemovedRow }
+module.exports = { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow }

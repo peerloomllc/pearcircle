@@ -1000,7 +1000,7 @@ function CircleDeletedNotice ({ circleName, kind = 'deleted', onDismiss }) {
         </div>
         <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
           {kind === 'removed'
-            ? <>You were removed from the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.</>
+            ? <>You were removed from the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles. You can rejoin if you still have an invite link.</>
             : <>The owner deleted the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.</>}
         </div>
         <button

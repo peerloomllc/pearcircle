@@ -40,7 +40,7 @@ const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
-const { circleIsDeleted, memberHiddenByLeft, shouldAcceptRemovedRow } = require('./lib/circleFilter')
+const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -1861,16 +1861,18 @@ async function snapshotCircle (circleId, base) {
     const pubkey = key.slice('left:'.length)
     if (typeof value?.leftAt === 'number') leftAtByPubkey.set(pubkey, value.leftAt)
   }
-  // Owner-kicked members (proposal 2026-05-03 §3). Unlike `left:`, a
-  // `removed:` tombstone is unconditional -- the pubkey is dropped from
-  // the member / lastSeen / presence views with no joinedAt comparison.
-  const removedPubkeys = new Set()
-  for await (const { key } of view.createReadStream({ gt: 'removed:', lt: 'removed:~' })) {
-    removedPubkeys.add(key.slice('removed:'.length))
+  // Owner-kicked members (proposal 2026-05-03 §3). Like `left:`, a
+  // `removed:` tombstone hides the member only while its `ts` beats
+  // their member-row joinedAt -- a fresh rejoin (newer joinedAt)
+  // overrides it, so removal is reversible by rejoining.
+  const removedAtByPubkey = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'removed:', lt: 'removed:~' })) {
+    const pubkey = key.slice('removed:'.length)
+    if (typeof value?.ts === 'number') removedAtByPubkey.set(pubkey, value.ts)
   }
   const members = []
   for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
-    if (removedPubkeys.has(value?.pubkey)) continue
+    if (memberHiddenByRemoved(removedAtByPubkey.get(value?.pubkey), value?.joinedAt)) continue
     const leftAt = leftAtByPubkey.get(value?.pubkey)
     if (memberHiddenByLeft(leftAt, value?.joinedAt)) continue
     members.push({ key, value })
@@ -1878,9 +1880,9 @@ async function snapshotCircle (circleId, base) {
   const lastSeen = {}
   for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
     const pubkey = key.slice('lastSeen:'.length)
-    if (removedPubkeys.has(pubkey)) continue
-    if (leftAtByPubkey.has(pubkey)) {
+    if (removedAtByPubkey.has(pubkey) || leftAtByPubkey.has(pubkey)) {
       const memberRow = await view.get('member:' + pubkey)
+      if (memberHiddenByRemoved(removedAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
       if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
     }
     lastSeen[pubkey] = value
@@ -1888,9 +1890,9 @@ async function snapshotCircle (circleId, base) {
   const presence = {}
   for await (const { key, value } of view.createReadStream({ gt: 'presence:', lt: 'presence:~' })) {
     const pubkey = key.slice('presence:'.length)
-    if (removedPubkeys.has(pubkey)) continue
-    if (leftAtByPubkey.has(pubkey)) {
+    if (removedAtByPubkey.has(pubkey) || leftAtByPubkey.has(pubkey)) {
       const memberRow = await view.get('member:' + pubkey)
+      if (memberHiddenByRemoved(removedAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
       if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
     }
     presence[pubkey] = value
@@ -2063,38 +2065,45 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       }
       // `removed:{pubkey}` (proposal 2026-05-03 §3): owner-only kick
       // tombstone, gated by shouldAcceptRemovedRow (bootstrap-writer
-      // authored, well-formed, key matches value). snapshotCircle hides
-      // the member and the pubkey-keyed branches below drop their later
-      // writes. If the tombstone names our own identity the owner kicked
-      // us: emit circle:removed-self once so the shell can show a notice
-      // and tear the circle down locally, mirroring the circle:deleted
-      // flow.
+      // authored, well-formed, key matches value), LWW on `ts`. Removal
+      // is NOT permanent: snapshotCircle hides the member only while
+      // removed.ts beats their member-row joinedAt, so a fresh rejoin
+      // overrides it -- same rule as the `left:` tombstone. If the
+      // tombstone names our own identity AND post-dates our current join
+      // we emit circle:removed-self so the shell shows a notice and
+      // tears the circle down; gating on the local circles:joined
+      // joinedAt stops a stale removed: row from bouncing us again after
+      // we have rejoined.
       if (op.key.startsWith('removed:')) {
         const fromHex = b4a.toString(node.from.key, 'hex')
         const keyPubkey = op.key.slice('removed:'.length)
         if (!shouldAcceptRemovedRow({ fromHex, bootstrapHex, keyPubkey, value: op.value })) continue
-        const alreadyRemoved = !!(await view.get(op.key))?.value
+        const existingRemoved = (await view.get(op.key))?.value
+        if (existingRemoved && typeof existingRemoved.ts === 'number' &&
+            typeof op.value?.ts === 'number' && op.value.ts <= existingRemoved.ts) continue
         await view.put(op.key, op.value)
-        if (!alreadyRemoved && circleId) {
+        if (circleId && typeof op.value?.ts === 'number') {
           const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
           if (ourKeyHex && keyPubkey === ourKeyHex) {
             try {
-              const circleRow = await view.get('circle')
-              send({ event: 'circle:removed-self', data: {
-                circleId,
-                circleName: circleRow?.value?.name || 'Circle',
-              }})
+              const joinedRec = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+              const localJoinedAt = joinedRec?.value?.joinedAt
+              if (typeof localJoinedAt === 'number' && op.value.ts > localJoinedAt) {
+                const circleRow = await view.get('circle')
+                send({ event: 'circle:removed-self', data: {
+                  circleId,
+                  circleName: circleRow?.value?.name || 'Circle',
+                }})
+              }
             } catch (e) { console.warn('[bare] circle:removed-self emit failed', e?.message) }
           }
         }
         continue
       }
-      // `member:*`: any current writer, unless the member has been
-      // removed by the owner -- a removed member's later member: writes
-      // (including a reinstall's fresh row) are dropped.
+      // `member:*`: any current writer. A removed member's rejoin is a
+      // fresh member: row with a newer joinedAt; storing it is what
+      // overrides the removed: tombstone (see snapshotCircle).
       if (op.key.startsWith('member:')) {
-        const memberPubkey = op.key.slice('member:'.length)
-        if ((await view.get('removed:' + memberPubkey))?.value) continue
         await view.put(op.key, op.value)
         continue
       }
@@ -2109,7 +2118,6 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (incoming.ts > Date.now() + FUTURE_TS_TOLERANCE_MS) continue
         const keyPubkey = op.key.slice('lastSeen:'.length)
         if (keyPubkey !== incoming.pubkey) continue
-        if ((await view.get('removed:' + keyPubkey))?.value) continue
         await view.put(op.key, incoming)
         if (circleId && !_firstLastSeenRemoteMarked.has(circleId)) {
           const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
@@ -2132,7 +2140,6 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (incoming.state !== 'visible' && incoming.state !== 'muted') continue
         const keyPubkey = op.key.slice('presence:'.length)
         if (keyPubkey !== incoming.pubkey) continue
-        if ((await view.get('removed:' + keyPubkey))?.value) continue
         const existing = await view.get(op.key)
         if (existing?.value && typeof existing.value.setAt === 'number') {
           if (incoming.setAt <= existing.value.setAt) continue
@@ -2183,7 +2190,6 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         const keyPlaceId = tail.slice(secondColon + 1)
         if (keyPubkey !== incoming.pubkey) continue
         if (keyPlaceId !== incoming.placeId) continue
-        if ((await view.get('removed:' + keyPubkey))?.value) continue
         await view.put(op.key, incoming)
         // Emit transition:applied so the RN shell can fire an OS notification.
         // Skip the emit when we've already fired for this exact op key in
@@ -2301,7 +2307,11 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (!incoming || typeof incoming.writer !== 'string') continue
         const keyPubkey = op.key.slice('seeder:'.length)
         const writerMember = (await view.get('member:' + incoming.writer))?.value
-        const writerRemoved = (await view.get('removed:' + incoming.writer))?.value
+        // Soft-removal: the writer counts as removed only while a
+        // removed: ts still beats their member-row joinedAt; a rejoin
+        // clears it (same rule as snapshotCircle).
+        const writerRemovedRow = (await view.get('removed:' + incoming.writer))?.value
+        const writerRemoved = memberHiddenByRemoved(writerRemovedRow?.ts, writerMember?.joinedAt)
         const existing = (await view.get(op.key))?.value
         const accept = shouldAcceptSeederRow({
           keyPubkey,
@@ -2341,7 +2351,22 @@ async function autoAppendMemberRow (circleId) {
   if (!base || !base.writable) return
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const existing = await base.view.get('member:' + ourKey)
-  if (existing && existing.value) return
+  if (existing && existing.value) {
+    // A member row already exists, so joinedAt normally stays stable --
+    // a left: / removed: tombstone hides us only while its ts beats
+    // joinedAt, and a periodic rewrite would keep bumping joinedAt and
+    // defeat that. The exception is a rejoin: if such a tombstone
+    // currently hides us, rewrite the row with a fresh joinedAt so the
+    // tombstone is out-dated and peers see us again. Without this a
+    // rejoining member keeps the stale joinedAt and stays hidden on
+    // every other device (their own still shows them via self-inject).
+    const leftRow = await base.view.get('left:' + ourKey)
+    const removedRow = await base.view.get('removed:' + ourKey)
+    const hidden =
+      memberHiddenByLeft(leftRow?.value?.leftAt, existing.value.joinedAt) ||
+      memberHiddenByRemoved(removedRow?.value?.ts, existing.value.joinedAt)
+    if (!hidden) return
+  }
   const profile = await readProfileForMemberRow(ourKey)
   const memberValue = { pubkey: ourKey, displayName: profile.displayName, joinedAt: Date.now(), v: 1 }
   if (profile.avatar) memberValue.avatar = profile.avatar
