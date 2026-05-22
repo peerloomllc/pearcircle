@@ -8,6 +8,7 @@ import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork,
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
+import { computeFanOffsets } from '../lib/fanOut.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
 import appConfig from '../../app.json'
@@ -2826,6 +2827,7 @@ const CircleMap = React.forwardRef(function CircleMap (
         if (t >= 1) state.anim = null
         else stillAnimating = true
       }
+      applyFanOut(mapRef.current, markerStatesRef.current)
       rafRef.current = stillAnimating ? requestAnimationFrame(tick) : null
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -2862,6 +2864,10 @@ const CircleMap = React.forwardRef(function CircleMap (
     map.on('moveend', publishViewport)
     map.on('zoomend', publishViewport)
     publishViewport()
+
+    // Re-fan overlapping member avatars on camera moves; zoom changes
+    // which avatars collide in screen space.
+    map.on('move', () => applyFanOut(map, markerStatesRef.current))
 
     map.on('load', () => {
       map.addSource('places', { type: 'geojson', data: emptyFC() })
@@ -3317,6 +3323,31 @@ function renderBubble (root, member, selected, last, connected) {
     onlineHtml
 }
 
+// Spread overlapping member avatars apart. Member markers are anchored
+// to exact coordinates, so members sharing a location stack on a single
+// pixel and hide each other. Project every marker to screen space, get a
+// per-marker fan-out offset from the pure helper, and push it onto the
+// marker with setOffset. Cheap enough to run on every camera move and
+// tween frame; the per-state guard skips redundant setOffset calls.
+function applyFanOut (map, states) {
+  if (!map) return
+  const points = []
+  for (const [pubkey, state] of states) {
+    let p
+    try { p = map.project([state.lng, state.lat]) } catch { continue }
+    points.push({ id: pubkey, x: p.x, y: p.y })
+  }
+  const offsets = computeFanOffsets(points)
+  for (const [pubkey, state] of states) {
+    const off = offsets.get(pubkey)
+    if (!off) continue
+    const cur = state.fanOffset
+    if (cur && cur[0] === off[0] && cur[1] === off[1]) continue
+    state.fanOffset = off
+    state.marker.setOffset(off)
+  }
+}
+
 function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, states, clickRef, ensureRaf) {
   const seen = new Set()
   for (const m of data?.members ?? []) {
@@ -3369,6 +3400,7 @@ function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, sta
       states.delete(pubkey)
     }
   }
+  applyFanOut(map, states)
 }
 
 function fitTo (map, lonLatPairs) {
