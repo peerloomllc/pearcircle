@@ -507,7 +507,17 @@ export function App () {
       if (typeof circleId !== 'string') return
       setDeletedNotices((prev) => {
         if (prev.some((n) => n.circleId === circleId)) return prev
-        return [...prev, { circleId, circleName: circleName || 'Circle' }]
+        return [...prev, { circleId, circleName: circleName || 'Circle', kind: 'deleted' }]
+      })
+    })
+    // Owner removed us from a circle (proposal 2026-05-03 §3). The
+    // worklet emits this when a removed:{ourPubkey} tombstone lands.
+    // Same one-shot notice + cleanup path as circle:deleted.
+    pear.on('circle:removed-self', ({ circleId, circleName }) => {
+      if (typeof circleId !== 'string') return
+      setDeletedNotices((prev) => {
+        if (prev.some((n) => n.circleId === circleId)) return prev
+        return [...prev, { circleId, circleName: circleName || 'Circle', kind: 'removed' }]
       })
     })
     // Light tactile feedback on every button tap. Capture-phase listener
@@ -662,6 +672,7 @@ export function App () {
       {deletedNotices.length > 0 && (
         <CircleDeletedNotice
           circleName={deletedNotices[0].circleName}
+          kind={deletedNotices[0].kind}
           onDismiss={() => dismissDeletedNotice(deletedNotices[0].circleId)}
         />
       )}
@@ -962,13 +973,14 @@ function BatteryOptBanner ({ onOpenSettings, onDismiss }) {
   )
 }
 
-// Modal alert shown when a peer's circle is torn down by its owner.
-// One-shot per circle: dismiss runs circle:cleanup-deleted on the
-// worklet side which frees local state and removes the circle from the
-// dropdown / sheets. zIndex sits above SheetContainer (100) and the
-// BottomSheet (200) so the user can't miss it. Brand-aligned plain
-// styling — no icons, no extra chrome.
-function CircleDeletedNotice ({ circleName, onDismiss }) {
+// Modal alert shown when a circle leaves the user involuntarily: the
+// owner deleted it (kind 'deleted', circle:deleted) or the owner removed
+// this member (kind 'removed', circle:removed-self). One-shot per circle:
+// dismiss runs circle:cleanup-deleted on the worklet side which frees
+// local state and removes the circle from the dropdown / sheets. zIndex
+// sits above SheetContainer (100) and the BottomSheet (200) so the user
+// can't miss it. Brand-aligned plain styling — no icons, no extra chrome.
+function CircleDeletedNotice ({ circleName, kind = 'deleted', onDismiss }) {
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 300,
@@ -984,10 +996,12 @@ function CircleDeletedNotice ({ circleName, onDismiss }) {
         border: `1px solid ${colors.border}`,
       }}>
         <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
-          Circle deleted
+          {kind === 'removed' ? 'Removed from circle' : 'Circle deleted'}
         </div>
         <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
-          The owner deleted the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.
+          {kind === 'removed'
+            ? <>You were removed from the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.</>
+            : <>The owner deleted the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.</>}
         </div>
         <button
           onClick={onDismiss}
@@ -1959,6 +1973,15 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     }
   })()
 
+  // The single circle we own when exactly one is in view -- the only
+  // context where "Remove from circle" is unambiguous. Hidden in the
+  // merged "All circles" view, same single-circle gate as rename /
+  // delete.
+  const ownedCircleForRemoval =
+    isSingleCircle && activeCircles[0]?.circle?.ownerKey === myPubkey
+      ? activeCircles[0]
+      : null
+
   // Title is the current filter label.
   const filterLabel = selectedCircleId
     ? (activeCircles[0]?.circle?.name ?? '...')
@@ -2310,6 +2333,17 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           placesById={placesById}
           isSelf={selectedPubkey === myPubkey}
           connected={connectedPubkeys.has(selectedPubkey)}
+          canRemove={!!ownedCircleForRemoval && selectedPubkey !== myPubkey}
+          circleNameForRemoval={ownedCircleForRemoval?.circle?.name ?? 'this circle'}
+          onRemove={async () => {
+            const r = await pear.call('circle:remove', {
+              circleId: ownedCircleForRemoval.circleId,
+              pubkey: selectedPubkey,
+            })
+            if (!r?.ok) throw new Error('Could not remove member')
+            setMemberSheetVisible(false)
+            setSelectedPubkey(null)
+          }}
           onOpenTrips={() => {
             setMemberSheetVisible(false)
             const isSelf = selectedPubkey === myPubkey
@@ -5227,7 +5261,7 @@ function initialsFor (label) {
 // places list. Closing only hides the sheet; the focus state lives on
 // the parent so the user can re-open via tap-on-focus-bar without
 // re-flying the map.
-function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, onOpenTrips, onClose }) {
+function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', onRemove, onOpenTrips, onClose }) {
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
   // Whether this member has any trips visible to us. Async-probed
@@ -5237,6 +5271,9 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
   // saved"; for non-self it's "do we have any replicated trips for
   // them in any circle we're in."
   const [tripCount, setTripCount] = useState(null)
+  const [confirmingRemove, setConfirmingRemove] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState(null)
   useEffect(() => {
     if (!member?.pubkey) return
     let cancelled = false
@@ -5278,6 +5315,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
   }
 
   return (
+    <>
     <BottomSheet onClose={onClose}>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.sm, paddingTop: spacing.sm, paddingBottom: spacing.base }}>
         <Avatar base64={member.avatar} label={member.displayName} size={80} />
@@ -5379,9 +5417,49 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
               {tripCount === 1 ? 'View 1 trip' : `View ${tripCount} trips`}
             </button>
           )}
+          {canRemove && (
+            <button
+              onClick={() => { setRemoveError(null); setConfirmingRemove(true) }}
+              style={{
+                width: '100%', padding: '12px', borderRadius: radius.md,
+                background: 'transparent', color: colors.error,
+                border: `1px solid ${colors.error}`, cursor: 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              }}
+            >
+              Remove from circle
+            </button>
+          )}
         </div>
       )}
     </BottomSheet>
+    {confirmingRemove && (
+      <ConfirmSheet
+        title='Remove from circle?'
+        message={<>
+          Remove <strong>{member.displayName}</strong> from <strong>{circleNameForRemoval}</strong>? They stop appearing on the map for everyone, and their device drops the circle.
+          {removeError && <div style={{ color: colors.error, marginTop: spacing.sm }}>{removeError}</div>}
+        </>}
+        confirmLabel='Remove'
+        destructive
+        busy={removing}
+        onConfirm={async () => {
+          setRemoving(true)
+          setRemoveError(null)
+          try {
+            await onRemove?.()
+          } catch (e) {
+            setRemoveError(e?.message || 'Could not remove member')
+            setRemoving(false)
+            return
+          }
+          setRemoving(false)
+          setConfirmingRemove(false)
+        }}
+        onClose={() => { if (!removing) { setConfirmingRemove(false); setRemoveError(null) } }}
+      />
+    )}
+    </>
   )
 }
 

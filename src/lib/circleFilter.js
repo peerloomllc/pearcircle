@@ -27,4 +27,20 @@ function memberHiddenByLeft (leftAt, joinedAt) {
   return leftAt > joinedAt
 }
 
-module.exports = { circleIsDeleted, memberHiddenByLeft }
+// Owner-kick admission rule (proposal 2026-05-03 §3). A `removed:{pubkey}`
+// row is owner-write-only: the apply branch accepts it only when the
+// authoring writer is the autobase bootstrap key (the owner), the value
+// carries a string pubkey, and the key suffix matches that pubkey so a
+// writer cannot tombstone an unrelated key. Any non-owner append is
+// dropped. Unlike `left:`, the resulting tombstone is unconditional --
+// there is no joinedAt comparison, so a removed member stays hidden even
+// if a fresh member: row arrives later.
+function shouldAcceptRemovedRow ({ fromHex, bootstrapHex, keyPubkey, value }) {
+  if (typeof fromHex !== 'string' || typeof bootstrapHex !== 'string') return false
+  if (fromHex !== bootstrapHex) return false
+  if (!value || typeof value.pubkey !== 'string') return false
+  if (keyPubkey !== value.pubkey) return false
+  return true
+}
+
+module.exports = { circleIsDeleted, memberHiddenByLeft, shouldAcceptRemovedRow }
