@@ -30,6 +30,12 @@ async function initTileCache () {
 let _nextId = 1
 const _pending = new Map()
 const _eventHandlers = new Map()
+// Events that arrive before any handler is registered get buffered here
+// and delivered when the first handler subscribes. Needed because the
+// shell can inject an event (e.g. deeplink:invite at webview:loaded)
+// before initTileCache() resolves and App.jsx mounts its pear.on
+// listeners. Without this buffer the event is silently dropped.
+const _bufferedEvents = new Map()
 
 function call(method, args = {}) {
   return new Promise((resolve) => {
@@ -43,6 +49,11 @@ function on(event, fn) {
   const handlers = _eventHandlers.get(event) ?? []
   handlers.push(fn)
   _eventHandlers.set(event, handlers)
+  const buffered = _bufferedEvents.get(event)
+  if (buffered) {
+    _bufferedEvents.delete(event)
+    for (const data of buffered) fn(data)
+  }
 }
 
 window.__pearResponse = (id, result) => {
@@ -51,7 +62,14 @@ window.__pearResponse = (id, result) => {
 }
 
 window.__pearEvent = (event, data) => {
-  for (const fn of _eventHandlers.get(event) ?? []) fn(data)
+  const handlers = _eventHandlers.get(event)
+  if (!handlers || handlers.length === 0) {
+    const buf = _bufferedEvents.get(event) ?? []
+    buf.push(data)
+    _bufferedEvents.set(event, buf)
+    return
+  }
+  for (const fn of handlers) fn(data)
 }
 
 window.pear = { call, on }
