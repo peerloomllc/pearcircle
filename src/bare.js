@@ -42,6 +42,7 @@ const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = re
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
+const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
@@ -111,6 +112,7 @@ let _seedMode = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
 // Seed-mode only: per-circle replication state. Each entry holds the
 // bootstrap Hypercore session + the swarm discovery handle so leave can
 // tear both down cleanly. Empty in member mode.
@@ -376,6 +378,11 @@ const handlers = {
   // motion escalations.
   'app:state': async ({ state } = {}) => {
     _appForeground = state === 'active'
+    // Reset the lastSeen movement gate on foreground so the next fix
+    // (typically the foreground one-shot, #63) always publishes a current
+    // position even when the user is stationary (storage-growth
+    // remediation, proposal 2026-05-29).
+    if (_appForeground) _lastAppendedPos.clear()
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
   },
@@ -1312,8 +1319,18 @@ const handlers = {
       // classification + trip detection below still run so the user
       // sees their own arrivals/trips.
       if (!getCircleSharing(circleId).enabled) continue
+      // Movement gate (storage-growth remediation, proposal 2026-05-29):
+      // skip the append when we haven't moved far enough since the last
+      // one we wrote for this circle. lastSeen is LWW current position,
+      // so dropping near-stationary repeats costs the peer nothing and
+      // stops a stationary phone bloating the core on every ~10s native
+      // fix. _lastAppendedPos is reset on app foreground so opening the
+      // app always publishes a current fix even when stationary. The
+      // classifier and trip detector below run on every fix regardless.
+      if (!shouldAppendLastSeen(_lastAppendedPos.get(circleId), lat, lon)) continue
       try {
         await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
+        _lastAppendedPos.set(circleId, { lat, lon })
         written++
         if (!_firstLastSeenWriteMarked.has(circleId)) {
           _firstLastSeenWriteMarked.add(circleId)
