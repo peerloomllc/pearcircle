@@ -91,6 +91,14 @@ class PearCircleLocationService : Service() {
         if (callback != null) return
         val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10_000L)
             .setMinUpdateIntervalMillis(5_000L)
+            // Movement gate (storage-growth remediation, proposal
+            // 2026-05-29): without this the stream delivers every ~10s
+            // regardless of movement, so a stationary phone wakes the
+            // worklet and (pre-coalescing) appended a lastSeen block every
+            // 10s. 10m stops the gateless stationary stream at the OS
+            // level, cutting wakeups and battery; the worklet's own ~20m
+            // gate stays authoritative for what actually gets written.
+            .setMinUpdateDistanceMeters(10f)
             .build()
         val cb = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
