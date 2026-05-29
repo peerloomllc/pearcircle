@@ -47,14 +47,25 @@ The fix for the growth rate. A stationary phone must not append thousands of ide
 
 Phase 1 stops growth. It does NOT shrink the existing 1GB - that needs Phase 2.
 
-### Phase 2 - member-side block reclamation (T2, after a validation spike)
+### Phase 2 - member-side block reclamation (T2)
 
-Generalize the seeder retention pattern to member devices to reclaim disk from superseded blocks.
+The O1 spike (2026-05-29, against installed autobase 7.27.3 / hypercore 11.29.0) resolved the safe-frontier question. It splits Phase 2 into a viable 2a and a not-viable-in-place 2b.
 
-- Once an input-oplog block is below the Autobase indexed/checkpoint frontier and has been applied to the local view, this device no longer needs the block *content* to maintain current state. `core.clear(seq, seq+1)` frees its disk while preserving the merkle tree (so the log stays verifiable and the length is unchanged).
-- Reuse the `seederRetention.js` shape: a local sidecar tracking clearable seqs per core, a periodic sweep calling `core.clear`, then a RocksDB compaction to actually return space to the filesystem.
-- Safety: clearing is local-only and makes no wire change. A peer that needs the cleared history fetches it from someone who retained it (another member, or a blind seeder) or fast-forwards to the snapshot. Each device manages its own disk independently.
-- The load-bearing uncertainty is the Autobase safe-clear frontier (O1): what is the exact, supported way in autobase 7 to know "all ops up to seq S on writer W are applied and causally settled, so their blocks are safe to clear locally," and whether clearing them interferes with Autobase's own bookkeeping or fast-forward. This needs a spike against the Holepunch source before committing.
+**Phase 2a - clear settled input/writer cores (VIABLE).**
+
+- The spike confirmed boot does NOT replay from seq 0: `_getSystemInfo` reads the persisted `BootRecord.systemLength` (= indexed frontier), loads the system/views checked out at that frontier (`autobase/index.js:597`, `getIndexedInfo(batch, indexedLength)`), and restarts each writer at its system-clock length (`index.js:1175`, `len = writerInfo.length`). Only un-indexed nodes above the frontier are re-applied; `apply-state` truncate only ever rolls back the speculative tail above `indexedLength`, never below (`apply-state.js:781,873,877`).
+- So an input/writer-core block whose seq is below that writer's indexed length is settled, already folded into the persisted view, and never re-read. Clearing it is safe.
+- `hypercore` `clear(start, end)` (`hypercore/index.js:866` -> `session-state.js:518`) deletes block data + bitfield, deletes tree nodes only where the whole span is gone (preserves merkle verifiability of retained blocks), leaves length unchanged, and calls `replicator.onhave(..., false)` so replication state stays honest. Exactly the `seederRetention.js` mechanism, now applied member-side.
+- Frontier query: per writer core, the safe ceiling is `(await system.get(writerKey)).length` (the indexed length the system already uses at boot), or `writer.indexed` at runtime (`writer.js:138`). Clear `[0, indexedLen - SAFETY_MARGIN)` keeping a small recent tail. Applies to the local writer core AND replicated peers' writer cores (all live in the local corestore).
+- Reuse `seederRetention.js` directly: sidecar of cleared ranges, periodic sweep, then RocksDB compaction to return space (corestore 7 is rocksdb-native; clears are tombstones reclaimed on compaction).
+- Cost: after clearing, this device can no longer serve that history to a lagging peer; the peer sources it from another holder, the blind seeder, or an Autobase fast-forward to the snapshot (`fast-forward.js:125` checks out at a recent length and does not need old blocks). Local-only, no wire change.
+
+**Phase 2b - the view core (NOT safe in-place).**
+
+- The materialized Hyperbee view core also grows (~1 put per applied `lastSeen`, appending b-tree node blocks). But Hyperbee b-tree nodes are shared across versions: the current root references blocks scattered through history, and Hyperbee exposes no liveness/GC API to tell which old blocks are dead. Clearing arbitrary old view blocks would break reads of any key whose b-tree path runs through them. So the view core must NOT be cleared in place.
+- The view residual is reclaimable only by re-bootstrapping the local Autobase via fast-forward from a peer/seeder (a fresh checkout fetches the view sparsely from the indexed snapshot, yielding a compact store), or by an upstream Hyperbee/Autobase GC that does not exist today. Both are heavier; see Phase 3.
+
+Net: Phase 2a is safe and ships the bulk of member-side reclamation (the entire historical oplog across all writers). Phase 2b is deferred.
 
 ### Phase 3 - optional / future
 
@@ -128,7 +139,7 @@ Manual smoke (D1 / D2 / iPhone):
 
 ## Open questions
 
-- **O1 (load-bearing, gates Phase 2)**: In autobase 7.27.3, what is the supported way to determine the safe-to-clear frontier per input core (all ops applied and causally settled below the indexed checkpoint), and does `core.clear` on those blocks interfere with Autobase bookkeeping or fast-forward? Needs a spike against the Holepunch source (the holepunch-p2p-architect skill) before committing. Until resolved, Phase 2 is design-only.
+- **O1 (RESOLVED 2026-05-29 spike)**: The safe-to-clear frontier per writer core is its indexed length from the system view (`(await system.get(writerKey)).length`); boot resumes from the persisted indexed view rather than replaying from seq 0, so input blocks below that frontier are settled and safe to `core.clear` (tree-preserving, replication-honest). Phase 2a is therefore viable. The view core is NOT safely clearable in place (Hyperbee b-tree node sharing, no GC API) - Phase 2b deferred to re-bootstrap/fast-forward. Evidence: `autobase/index.js:254,597,1175`, `apply-state.js:781,873,877`, `hypercore/index.js:866` + `session-state.js:518`, `fast-forward.js:125`.
 - **O2**: `LASTSEEN_MIN_MOVE_M` value. Proposed ~20m (above the iOS 5m `distanceFilter` so the gate is meaningful, below a city block). Tune on device against pin-smoothness vs write volume.
 - **O3**: Should there be any maximum interval at which a stationary phone still writes one `lastSeen` (a slow heartbeat), or is pure movement-gating correct? Recommend pure movement-gating, since liveness is the swarm dot and freshness-on-open is the one-shot. Confirm no UI path silently depends on `lastSeen.ts` advancing.
 - **O4**: Confirm the trip polyline is built from the trip detector's own point buffer and not from `lastSeen` history, so coalescing does not coarsen trips. If it does read `lastSeen`, feed the detector a separate ungated point stream.
