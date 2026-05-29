@@ -39,6 +39,17 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // first crossing isn't lost; cap the queue so a runaway scenario
   // (JS never attaches) can't grow unbounded.
   private static let REGION_BUFFER_MAX = 64
+  // Self-region re-centering (Tier 1 B, 2026-05-29). A single dynamic
+  // geofence centered on the user's current location; exiting it wakes
+  // the app (even when suspended / force-quit) at SELF_REGION_RADIUS
+  // granularity, much finer than SLC's ~500m, at negligible battery. The
+  // id is namespaced so it never collides with a Place region and is
+  // excluded from the setMonitoredRegions reconciliation.
+  private static let SELF_REGION_ID = "pearcircle:self-region"
+  private static let SELF_REGION_RADIUS: CLLocationDistance = 120
+  // Apple caps an app at 20 simultaneously-monitored regions; reserve
+  // one for the self-region so a 20-Place user doesn't starve it.
+  private static let MAX_PLACE_REGIONS = 19
 
   private var manager: CLLocationManager?
   private var hasListeners = false
@@ -53,6 +64,17 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // Flushed in startObserving when the shell side wires up the
   // NativeEventEmitter listener.
   private var bufferedRegionEvents: [(name: String, body: [String: Any])] = []
+  // Latest location fix that arrived while no JS listener was attached.
+  // A Visit / SLC / region crossing can revive a force-quit app and
+  // deliver a fix before the RN bundle wires up the emitter; without
+  // this the wake would be wasted. Only the newest fix matters, so this
+  // is a single slot (newer supersedes), flushed in startObserving.
+  private var pendingLocation: [String: Any]?
+  // Set when the next fix should re-center the self-region: after a
+  // self-region exit (the user moved out of the circle) or when no
+  // self-region is armed yet. Keeps re-centering off the per-fix hot
+  // path while the user stays put inside the circle.
+  private var pendingSelfRecenter = false
 
   // CoreMotion activity monitoring (proposal 2026-05-21). Feeds the
   // worklet a trip-detector-independent "device started moving" signal
@@ -127,6 +149,13 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     for event in pending {
       sendEvent(withName: event.name, body: event.body)
     }
+    // Flush a location fix that landed during the cold-start window
+    // (Visit / SLC / region wake before JS attached) so the wake-driven
+    // refresh actually reaches the worklet.
+    if let loc = pendingLocation {
+      pendingLocation = nil
+      sendEvent(withName: PearCircleLocationModule.UPDATE_EVENT, body: loc)
+    }
   }
   override func stopObserving() { hasListeners = false }
 
@@ -184,6 +213,16 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       // for it to drive.
       self.manager?.stopUpdatingLocation()
       self.manager?.stopMonitoringSignificantLocationChanges()
+      self.manager?.stopMonitoringVisits()
+      // Drop the self-region too; with sharing off there is no reason to
+      // wake on movement.
+      if let mgr = self.manager {
+        for region in mgr.monitoredRegions
+            where region.identifier == PearCircleLocationModule.SELF_REGION_ID {
+          mgr.stopMonitoring(for: region)
+        }
+      }
+      self.pendingSelfRecenter = false
       self.stopActivityUpdates()
       resolve(true)
     }
@@ -257,7 +296,7 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       // Apple requires location authorization (when in use is enough
       // for region monitoring to register, but didEnterRegion only
       // fires reliably with Always). We still register what we can.
-      let desired: [(id: String, lat: Double, lon: Double, radius: Double)] = regions.compactMap { raw in
+      var desired: [(id: String, lat: Double, lon: Double, radius: Double)] = regions.compactMap { raw in
         guard let dict = raw as? [String: Any],
               let id = dict["id"] as? String,
               let lat = (dict["lat"] as? NSNumber)?.doubleValue,
@@ -268,11 +307,25 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
         }
         return (id, lat, lon, radius)
       }
+      // Reserve one of Apple's 20 region slots for the self-region (Tier
+      // 1 B) so a user with many Places can't starve the movement-wake
+      // mechanism. The worklet already caps + prioritizes Places; this
+      // trims the tail of that list. Phase 3 distance-based Place
+      // rotation should account for the reserved slot too.
+      if desired.count > PearCircleLocationModule.MAX_PLACE_REGIONS {
+        NSLog("PearCircleLocation: trimming %d place regions to %d (1 reserved for self-region)",
+              desired.count, PearCircleLocationModule.MAX_PLACE_REGIONS)
+        desired = Array(desired.prefix(PearCircleLocationModule.MAX_PLACE_REGIONS))
+      }
       let desiredIds = Set(desired.map { $0.id })
       // Stop monitoring anything that's been dropped from the set or
       // is a non-circular region (defensive; only CLCircularRegion
       // entries should exist, but the OS may have leftover types).
-      for region in mgr.monitoredRegions where !desiredIds.contains(region.identifier) {
+      // Never touch the self-region here; it is managed independently by
+      // recenterSelfRegion and is not part of the Place set.
+      for region in mgr.monitoredRegions
+          where region.identifier != PearCircleLocationModule.SELF_REGION_ID
+              && !desiredIds.contains(region.identifier) {
         mgr.stopMonitoring(for: region)
       }
       // Start (or refresh) monitoring for each desired region. Apple
@@ -305,7 +358,12 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
         region.notifyOnExit = true
         mgr.startMonitoring(for: region)
       }
-      resolve(["count": mgr.monitoredRegions.count])
+      // Report Place count only; the self-region is internal and would
+      // otherwise inflate the worklet's accounting against its own cap.
+      let placeCount = mgr.monitoredRegions.filter {
+        $0.identifier != PearCircleLocationModule.SELF_REGION_ID
+      }.count
+      resolve(["count": placeCount])
     }
   }
 
@@ -355,10 +413,43 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   ) {
     guard let loc = locations.last else { return }
     emitLocation(loc)
+    // Arm the self-region on the first fix, or re-center it after an
+    // exit (Tier 1 B). No churn while the user stays inside the circle;
+    // each SELF_REGION_RADIUS of travel costs one exit + re-center.
+    if pendingSelfRecenter || !hasSelfRegion(manager) {
+      pendingSelfRecenter = false
+      recenterSelfRegion(manager, at: loc)
+    }
   }
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
     NSLog("PearCircleLocation: didFailWithError %@", error.localizedDescription)
+  }
+
+  // Visit arrive/depart callback (Tier 1 A, 2026-05-29). departureDate
+  // == distantFuture means the visit is ongoing (the user just arrived /
+  // is still here); a real departureDate means they left. iOS may revive
+  // a force-quit app to deliver this, so it is a key freshness signal
+  // for a stationary, backgrounded phone.
+  func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
+    let isArrival = visit.departureDate == Date.distantFuture
+    if isArrival {
+      // They are at this coordinate right now. Emit it immediately,
+      // stamped now, so lastSeen refreshes even if a precise fix can't
+      // be had (indoor "Home"/"Work" visits, where GPS often stalls).
+      let fix = CLLocation(
+        coordinate: visit.coordinate,
+        altitude: 0,
+        horizontalAccuracy: visit.horizontalAccuracy >= 0 ? visit.horizontalAccuracy : 0,
+        verticalAccuracy: -1,
+        timestamp: Date()
+      )
+      emitLocation(fix)
+    }
+    // Refine with (arrival) or rely on (departure) a precise current fix.
+    // requestLocation routes through didUpdateLocations -> emitLocation,
+    // superseding the coarse visit coordinate when a real fix lands.
+    manager.requestLocation()
   }
 
   // CLCircularRegion enter/exit callbacks. Fires both while the app is
@@ -368,10 +459,23 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // flush in startObserving so the first crossing isn't lost while the
   // RN bundle is still booting.
   func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
+    // The self-region is exit-only and internal; never forward it as a
+    // Place crossing (the worklet would fail to classify the id).
+    if region.identifier == PearCircleLocationModule.SELF_REGION_ID { return }
     emitOrBufferRegion(name: PearCircleLocationModule.REGION_ENTER_EVENT, id: region.identifier)
   }
 
   func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
+    if region.identifier == PearCircleLocationModule.SELF_REGION_ID {
+      // The user left the self-region, i.e. moved ~SELF_REGION_RADIUS.
+      // Pull a fresh fix: requestLocation publishes it via emitLocation
+      // and the didUpdateLocations handler re-centers the self-region.
+      // This is not a Place event, so it never reaches the worklet's
+      // geofence classifier.
+      pendingSelfRecenter = true
+      manager.requestLocation()
+      return
+    }
     emitOrBufferRegion(name: PearCircleLocationModule.REGION_EXIT_EVENT, id: region.identifier)
   }
 
@@ -430,6 +534,13 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // tower transitions while continuous delivery is stopped. Cheap
     // (<1% battery) and required for "idle" mode to deliver anything.
     mgr.startMonitoringSignificantLocationChanges()
+    // Visit monitoring (Tier 1 A, 2026-05-29). Very-low-power arrive/
+    // depart wakes at significant locations; like SLC and region
+    // monitoring it revives a suspended or force-quit app. It is the
+    // antidote to the stationary-staleness case: when a backgrounded
+    // phone settles somewhere, didVisit fires so we publish a fresh fix
+    // instead of letting lastSeen rot. Runs in both adaptive modes.
+    mgr.startMonitoringVisits()
     if currentMode == "tracking" {
       mgr.startUpdatingLocation()
     }
@@ -437,6 +548,33 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // alongside location so a trip beginning while the worklet is in
     // "idle" mode is noticed promptly instead of ~500m in.
     startActivityUpdatesIfAvailable()
+  }
+
+  // MARK: - Self-region (Tier 1 B)
+
+  private func hasSelfRegion(_ mgr: CLLocationManager) -> Bool {
+    return mgr.monitoredRegions.contains {
+      $0.identifier == PearCircleLocationModule.SELF_REGION_ID
+    }
+  }
+
+  // (Re)create the self-region centered on `loc`, removing any prior one
+  // so exactly one is ever monitored. Exit-only: iOS treats the device
+  // as already inside on creation, so the wake comes when the user
+  // leaves the circle.
+  private func recenterSelfRegion(_ mgr: CLLocationManager, at loc: CLLocation) {
+    for region in mgr.monitoredRegions
+        where region.identifier == PearCircleLocationModule.SELF_REGION_ID {
+      mgr.stopMonitoring(for: region)
+    }
+    let region = CLCircularRegion(
+      center: loc.coordinate,
+      radius: PearCircleLocationModule.SELF_REGION_RADIUS,
+      identifier: PearCircleLocationModule.SELF_REGION_ID
+    )
+    region.notifyOnEntry = false
+    region.notifyOnExit = true
+    mgr.startMonitoring(for: region)
   }
 
   // MARK: - CoreMotion activity monitoring
@@ -611,7 +749,6 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   }
 
   private func emitLocation(_ loc: CLLocation) {
-    guard hasListeners else { return }
     let level = UIDevice.current.batteryLevel
     let battery: Any = level >= 0 ? Int(round(level * 100)) : NSNull()
     let state = UIDevice.current.batteryState
@@ -629,6 +766,12 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       "battery": battery,
       "isCharging": isCharging,
     ]
+    guard hasListeners else {
+      // Cold-start wake before JS attached; hold the newest fix for the
+      // startObserving flush rather than dropping it.
+      pendingLocation = payload
+      return
+    }
     sendEvent(withName: PearCircleLocationModule.UPDATE_EVENT, body: payload)
   }
 
