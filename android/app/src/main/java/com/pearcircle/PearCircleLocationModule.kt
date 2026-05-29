@@ -8,6 +8,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.content.IntentFilter
+import android.location.Location
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -24,6 +27,10 @@ import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.facebook.react.modules.core.PermissionAwareActivity
 import com.facebook.react.modules.core.PermissionListener
+import com.google.android.gms.location.CurrentLocationRequest
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 
 class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     : ReactContextBaseJavaModule(ctx) {
@@ -151,6 +158,75 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
             arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
             REQ_BACKGROUND,
             listener,
+        )
+    }
+
+    // One-shot fresh fix on app-foreground, parity with iOS's
+    // requestSingleFix (foreground-refresh, 2026-05-29). The shell calls
+    // this on every AppState 'active'. On Android the foreground service
+    // already streams updates every ~10s while sharing is enabled, but
+    // this still earns its keep: it delivers an immediate fix the moment
+    // the app is opened (no up-to-10s wait), and it covers the window
+    // where the service isn't running yet (just-launched, or Doze killed
+    // it). getCurrentLocation actively obtains a fix rather than handing
+    // back a stale cached one (maxUpdateAge=0), and routes it through the
+    // same emitLocation -> location:update path the service uses. No-op
+    // (resolve false) without location permission or if the request fails.
+    @ReactMethod
+    fun requestSingleFix(promise: Promise) {
+        if (!hasFineLocation()) { promise.resolve(false); return }
+        val client = LocationServices.getFusedLocationProviderClient(ctx)
+        val request = CurrentLocationRequest.Builder()
+            .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+            .setMaxUpdateAgeMillis(0L)
+            .build()
+        val cts = CancellationTokenSource()
+        try {
+            client.getCurrentLocation(request, cts.token)
+                .addOnSuccessListener { loc ->
+                    if (loc != null) {
+                        emitToJs(loc)
+                        promise.resolve(true)
+                    } else {
+                        // Provider couldn't produce a fix in time (no
+                        // signal indoors, etc.); the next service callback
+                        // will refresh when one is available.
+                        promise.resolve(false)
+                    }
+                }
+                .addOnFailureListener { promise.resolve(false) }
+        } catch (e: SecurityException) {
+            promise.resolve(false)
+        }
+    }
+
+    // Read the current battery level + charging state and forward a
+    // location through emitLocation. Shared by the foreground service's
+    // streaming callback and requestSingleFix so both surface identical
+    // battery metadata.
+    fun emitToJs(loc: Location) {
+        // BATTERY_PROPERTY_CAPACITY is a near-zero-cost system call;
+        // returns Int.MIN_VALUE on unsupported devices, so anything
+        // outside 0..100 becomes null.
+        val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        val cap = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        val battery: Double? = if (cap in 0..100) cap.toDouble() else null
+        // Charging state via the sticky ACTION_BATTERY_CHANGED broadcast;
+        // registerReceiver(null, ...) reads the last intent without
+        // subscribing. STATUS_FULL counts as charging so a plugged-in
+        // fully-charged device still shows the bolt.
+        val battStatusIntent = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val status = battStatusIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+        emitLocation(
+            loc.latitude,
+            loc.longitude,
+            loc.accuracy.toDouble(),
+            loc.time.toDouble(),
+            loc.speed.toDouble(),
+            battery,
+            isCharging,
         )
     }
 

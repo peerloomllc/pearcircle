@@ -396,7 +396,15 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // monitoring runs on its own OS-managed pipeline and is unaffected
     // by this knob).
     m.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
-    m.distanceFilter = 10
+    // 5m (was 10m, foreground-refresh 2026-05-29): tightens how often a
+    // moving device republishes so the map and trip polylines refresh
+    // sooner. Still well above kCLDistanceFilterNone, which fires on
+    // every raw GPS sample and pins the radio -- the battery posture
+    // (NearestTenMeters accuracy + pausesLocationUpdatesAutomatically +
+    // SLC-backed adaptive idle) is unchanged. Note this knob only
+    // affects a device that is actually moving; the stationary-staleness
+    // case is handled by requestSingleFix on foreground.
+    m.distanceFilter = 5
     // Let iOS pause continuous delivery when the device is stationary;
     // it resumes automatically on detected motion. SLC stays subscribed
     // underneath (proposal 2026-05-16 adaptive modes), so a paused
@@ -528,6 +536,41 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       } else {
         mgr.stopUpdatingLocation()
       }
+      resolve(true)
+    }
+  }
+
+  // One-shot fresh fix, used by the shell on app-foreground
+  // (foreground-refresh, 2026-05-29). The steady-state pipeline only
+  // writes lastSeen when the device moves past distanceFilter (or on a
+  // ~500m SLC), and pausesLocationUpdatesAutomatically shuts the GPS off
+  // while stationary -- so a phone that just reopened the app at a new
+  // place keeps reporting a stale "last seen" timestamp even though the
+  // peer is live. requestLocation() makes CoreLocation actively obtain
+  // one current fix and deliver it through the normal
+  // didUpdateLocations -> emitLocation path, refreshing position and
+  // timestamp. iOS auto-stops after the single delivery; the SLC and any
+  // continuous subscriptions are untouched. The shell issues this a beat
+  // after forwarding app:state so a coincident idle->tracking
+  // startUpdatingLocation can't cancel the pending one-shot. No-op
+  // (resolve false) when unauthorized.
+  @objc func requestSingleFix(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      let mgr = self.ensureManager()
+      let status: CLAuthorizationStatus
+      if #available(iOS 14.0, *) {
+        status = mgr.authorizationStatus
+      } else {
+        status = CLLocationManager.authorizationStatus()
+      }
+      guard status == .authorizedAlways || status == .authorizedWhenInUse else {
+        resolve(false)
+        return
+      }
+      mgr.requestLocation()
       resolve(true)
     }
   }

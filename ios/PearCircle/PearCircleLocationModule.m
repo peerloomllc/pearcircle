@@ -18,4 +18,6 @@ RCT_EXTERN_METHOD(getMonitoredRegions:(RCTPromiseResolveBlock)resolve
 RCT_EXTERN_METHOD(setMode:(NSString *)mode
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(requestSingleFix:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 @end

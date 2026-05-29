@@ -8,11 +8,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.location.Location
-import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
@@ -97,7 +94,10 @@ class PearCircleLocationService : Service() {
             .build()
         val cb = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
-                result.lastLocation?.let { emitToJs(it) }
+                // Route through the module's shared emitToJs so streaming
+                // fixes and requestSingleFix one-shots carry identical
+                // battery metadata. No-op if the React context is gone.
+                result.lastLocation?.let { PearCircleLocationModule.instance?.emitToJs(it) }
             }
         }
         callback = cb
@@ -107,34 +107,6 @@ class PearCircleLocationService : Service() {
             // ACCESS_FINE_LOCATION revoked while we were running.
             stopSelf()
         }
-    }
-
-    private fun emitToJs(loc: Location) {
-        // Battery percentage piggybacks on every location event. Reading
-        // BATTERY_PROPERTY_CAPACITY is a near-zero-cost system call (no
-        // broadcast subscription needed). Returns Int.MIN_VALUE on
-        // unsupported devices; we treat anything outside 0..100 as null.
-        val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
-        val cap = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
-        val battery: Double? = if (cap in 0..100) cap.toDouble() else null
-        // Charging state via the sticky ACTION_BATTERY_CHANGED broadcast.
-        // registerReceiver(null, ...) returns the most recent battery
-        // intent without subscribing -- cheap, no leak. Treat both
-        // STATUS_CHARGING and STATUS_FULL as "charging" because users
-        // see the bolt icon on a fully-charged plugged-in device.
-        val battStatusIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val status = battStatusIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING
-            || status == BatteryManager.BATTERY_STATUS_FULL
-        PearCircleLocationModule.instance?.emitLocation(
-            loc.latitude,
-            loc.longitude,
-            loc.accuracy.toDouble(),
-            loc.time.toDouble(),
-            loc.speed.toDouble(),
-            battery,
-            isCharging,
-        )
     }
 
     private fun ensureChannel() {
