@@ -1,6 +1,8 @@
 # Storage growth remediation - bound the per-circle log and reclaim disk
 
-**Status**: Draft 2026-05-29. Awaiting approval. Open questions unresolved (see end).
+**Status**: Phase 1 SHIPPED (PR #66). Phase 2 (reclamation) FAILED on-device 2026-05-29 and is ABANDONED - DO NOT IMPLEMENT AS DESIGNED. See the warning under Phase 2 below.
+
+> **WARNING - Phase 2 corrupts data.** Phase 2a (clearing settled local-writer-core blocks) was built, unit-tested, and deployed to D1/D2/iPhone on 2026-05-29. On-device it CORRUPTED the circle view: a Place vanished, memberships went inconsistent across devices, Settings -> Circles read empty while the map pill still listed circles, devices then failed to create/join circles, and recovery required wiping app data on each device (which also resets identity). The O1 source-spike's boot-safety conclusion was WRONG in practice. Two mechanisms it missed: (1) the local/bootstrap writer core holds STRUCTURAL ops (circle create, `place:`, `member:`, `addWriter`), not just `lastSeen`, so clearing its early blocks loses data the writer-set/view reconstruction needs; (2) `hypercore` `clear(0, end)` resets the core's `contiguousLength` hint toward 0, which Autobase's linearizer/writer-length accounting depends on. The reclaim code was reverted (never merged; only Phase 1 is on master). Any future reclamation must not clear writer cores from seq 0, must exclude structural-op blocks, and requires an on-device soak proving the view survives clear + restart, with the feature flag defaulting OFF. The reliable way to shrink a bloated device remains a clean-slate re-join (peers re-feed the truth), not block-clearing.
 
 **Goal**: Stop the per-circle Autobase store from growing without bound (measured at ~1.05GB of app data on a long-running Android install, almost entirely the Corestore), and reclaim disk already consumed, without breaking replication or the wire protocol.
 
@@ -51,7 +53,7 @@ Phase 1 stops growth. It does NOT shrink the existing 1GB - that needs Phase 2.
 
 The O1 spike (2026-05-29, against installed autobase 7.27.3 / hypercore 11.29.0) resolved the safe-frontier question. It splits Phase 2 into a viable 2a and a not-viable-in-place 2b.
 
-**Phase 2a - clear settled input/writer cores (VIABLE).**
+**Phase 2a - clear settled input/writer cores (looked VIABLE on paper; FAILED on-device - see the WARNING at the top).**
 
 - The spike confirmed boot does NOT replay from seq 0: `_getSystemInfo` reads the persisted `BootRecord.systemLength` (= indexed frontier), loads the system/views checked out at that frontier (`autobase/index.js:597`, `getIndexedInfo(batch, indexedLength)`), and restarts each writer at its system-clock length (`index.js:1175`, `len = writerInfo.length`). Only un-indexed nodes above the frontier are re-applied; `apply-state` truncate only ever rolls back the speculative tail above `indexedLength`, never below (`apply-state.js:781,873,877`).
 - So an input/writer-core block whose seq is below that writer's indexed length is settled, already folded into the persisted view, and never re-read. Clearing it is safe.
