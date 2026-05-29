@@ -6033,7 +6033,12 @@ function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive =
 function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, connected, isSelf, onFocus }) {
   const pubkey = member.value?.pubkey ?? ''
   const displayName = member.value?.displayName ?? short(pubkey)
-  const focusable = !!seen && !isPaused
+  // Every row opens the member-detail sheet on tap, even one with no
+  // shared location (a never-positioned peer, e.g. a failed/abandoned
+  // join). The sheet is the only path to "Remove from circle", so
+  // gating the tap on a lastSeen position left positionless members
+  // unremovable from the UI. focusMember handles a missing position
+  // gracefully -- it just skips the map fly-to.
   // Only fetch a "near X" label when there's no recent transition
   // explaining where they are (and they're not paused). Saves
   // requests and keeps the row stable when transitions are fresh.
@@ -6046,8 +6051,8 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, c
   )
   return (
     <li
-      style={{ ...s.memberItem, cursor: focusable ? 'pointer' : 'default' }}
-      onClick={focusable ? () => onFocus(pubkey) : undefined}
+      style={{ ...s.memberItem, cursor: 'pointer' }}
+      onClick={() => onFocus(pubkey)}
     >
       <div style={s.memberRow}>
         <Avatar base64={member.value?.avatar} label={displayName} size={36} />
