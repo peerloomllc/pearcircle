@@ -474,6 +474,24 @@ export default function Index() {
           emitEvent('permission:status', { status })
         }).catch(() => {})
       }
+      // Force one fresh location fix on every foreground
+      // (foreground-refresh, 2026-05-29). On iOS the adaptive pipeline
+      // only writes lastSeen on movement past distanceFilter / a ~500m
+      // SLC, so a stationary phone that just reopened the app keeps
+      // showing a stale "last seen" timestamp; on Android it delivers an
+      // instant fix instead of waiting up to the ~10s service interval
+      // (and covers the window before the foreground service is running).
+      // requestSingleFix actively obtains a current fix and pushes it
+      // through the normal location:update path. Delayed a beat so the
+      // app:state we just forwarded has time to re-establish iOS
+      // "tracking" mode first -- otherwise a coincident idle->tracking
+      // startUpdatingLocation would cancel the pending one-shot (harmless
+      // on Android). No-op natively when unauthorized.
+      if (s === 'active' && PearCircleLocation?.requestSingleFix) {
+        setTimeout(() => {
+          PearCircleLocation.requestSingleFix?.().catch(() => {})
+        }, 1500)
+      }
     })
 
     // Forward worklet events to the WebView so the UI can react.
