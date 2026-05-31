@@ -41,7 +41,7 @@ const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
-const { haversineMeters, classify, applyRegionEvent } = require('./lib/geofence')
+const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -285,7 +285,18 @@ function untrackPlace (circleId, placeId) {
 // per second while a circle hydrates.
 const REGIONS_PUSH_DEBOUNCE_MS = 200
 const REGIONS_HARD_CAP = 20
+// Re-rank the OS region set once the device has moved far enough that the
+// nearest-N places may have changed (proposal 2026-05-30 fix 2, Q3). Big
+// enough not to churn native setMonitoredRegions calls on every ~10s fix
+// while stationary or on a short walk, small enough to follow a real drive.
+const REGION_RERANK_MIN_MOVE_M = 500
 let _regionsPushTimer = null
+// Device's last known position, used to proximity-rank which Places win the
+// limited OS region slots. Null before the first fix (we then fall back to
+// insertion order). _lastRegionRankPos is the position captured at the last
+// push, used to decide when a move warrants a re-rank.
+let _lastDevicePos = null
+let _lastRegionRankPos = null
 function schedulePushRegionsToShell () {
   if (_regionsPushTimer) return
   _regionsPushTimer = setTimeout(() => {
@@ -294,22 +305,17 @@ function schedulePushRegionsToShell () {
   }, REGIONS_PUSH_DEBOUNCE_MS)
 }
 function pushRegionsToShell () {
-  const regions = []
-  for (const state of _circlePlaces.values()) {
-    if (regions.length >= REGIONS_HARD_CAP) break
-    if (!Number.isFinite(state.lat) || !Number.isFinite(state.lon)) continue
-    if (!Number.isFinite(state.radiusMeters) || state.radiusMeters <= 0) continue
-    regions.push({
-      // Compose circleId into the id so the shell-side enter/exit
-      // handler can route back to the right autobase without an
-      // extra lookup. region:enter/exit on the worklet side splits
-      // this back into (circleId, placeId).
-      id: state.circleId + '|' + state.placeId,
-      lat: state.lat,
-      lon: state.lon,
-      radius: state.radiusMeters,
-    })
-  }
+  // Keep the nearest Places (proposal 2026-05-30 fix 2). Compose circleId into
+  // the id so the shell-side enter/exit handler can route back to the right
+  // autobase without an extra lookup; the worklet splits it on '|'.
+  const selected = selectNearestRegions([..._circlePlaces.values()], _lastDevicePos, REGIONS_HARD_CAP)
+  const regions = selected.map((state) => ({
+    id: state.circleId + '|' + state.placeId,
+    lat: state.lat,
+    lon: state.lon,
+    radius: state.radiusMeters,
+  }))
+  _lastRegionRankPos = _lastDevicePos
   send({ event: 'regions:set', data: { regions } })
 }
 
@@ -1289,6 +1295,15 @@ const handlers = {
     // Continuous delivery is confirmed up: the driver may now step the
     // native side down to "idle" when escalations go quiet.
     _locationUpdateSeen = true
+    // Track position for proximity-ranking the OS region set, and re-rank
+    // when we've moved far enough that the nearest-N places may have changed
+    // (proposal 2026-05-30 fix 2). The first fix always re-ranks (the boot
+    // push used insertion order with no position). Debounced in the scheduler.
+    _lastDevicePos = { lat, lon }
+    if (!_lastRegionRankPos ||
+        haversineMeters(_lastRegionRankPos.lat, _lastRegionRankPos.lon, lat, lon) >= REGION_RERANK_MIN_MOVE_M) {
+      schedulePushRegionsToShell()
+    }
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     const stamp = typeof ts === 'number' ? ts : Date.now()
     if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {

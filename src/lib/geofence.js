@@ -66,4 +66,31 @@ function applyRegionEvent (prev, kind) {
   return { deduped: false, classification: target }
 }
 
-module.exports = { haversineMeters, classify, applyRegionEvent, EARTH_RADIUS_M }
+// Select which Places get the limited OS region-monitoring slots. iOS caps
+// an app at 20 simultaneously-monitored regions, so when there are more
+// Places than slots (e.g. across multiple circles) we keep the ones NEAREST
+// the device's last known position rather than whichever happened to be
+// inserted first. Without proximity ranking a user's actual neighbourhood
+// could go unmonitored in the background, dropping their real arrivals and
+// departures (proposal 2026-05-30 fix 2).
+//
+// `places` is an array of { lat, lon, radiusMeters, ... }; the returned array
+// is a new capped slice preserving each entry's other fields. Invalid
+// coords/radius are dropped. With no usable `devicePos` (cold boot before the
+// first fix) the input order is kept, matching the old insertion-order
+// behavior. Pure.
+function selectNearestRegions (places, devicePos, cap) {
+  const valid = places.filter((p) =>
+    Number.isFinite(p.lat) && Number.isFinite(p.lon) &&
+    Number.isFinite(p.radiusMeters) && p.radiusMeters > 0)
+  let ordered = valid
+  if (devicePos && Number.isFinite(devicePos.lat) && Number.isFinite(devicePos.lon)) {
+    ordered = valid
+      .map((p) => ({ p, d: haversineMeters(devicePos.lat, devicePos.lon, p.lat, p.lon) }))
+      .sort((a, b) => a.d - b.d)
+      .map((x) => x.p)
+  }
+  return typeof cap === 'number' && cap >= 0 ? ordered.slice(0, cap) : ordered
+}
+
+module.exports = { haversineMeters, classify, applyRegionEvent, selectNearestRegions, EARTH_RADIUS_M }
