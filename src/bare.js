@@ -86,6 +86,10 @@ function mark (name, extra) {
     : '[coldstart worklet+' + dt + 'ms] ' + name
   console.warn(line)
   _coldStartLines.push(line)
+  // After init, stream runtime marks to the shell for the persistent
+  // events.log. Guarded by _eventLogLive (only true post-init), so `send`
+  // (defined below) is never referenced before initialization.
+  if (_eventLogLive) send({ event: 'events:line', data: { line } })
 }
 mark('worklet:loaded')
 
@@ -99,6 +103,12 @@ let _localDb = null
 let _identity = null
 let _swarm = null
 let _initialized = false
+// Once true (set right after the cold-start trace ships at init:done), mark()
+// also streams each line to the shell as an `events:line` IPC for the
+// persistent events.log (prototype 2026-05-30). Stays false during init so the
+// init-phase trace rides the one-shot coldstart:trace path, and so mark() never
+// touches `send` before it is initialized below.
+let _eventLogLive = false
 // Active IPC handler map, swapped in by init based on mode. Defaults to
 // member-mode `handlers` (declared below); seed-mode init reassigns to
 // the restricted seeder handlers from src/seeder.js. The dispatcher at
@@ -3392,6 +3402,8 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   // expo-file-system path is known-good. Android-side: the shell
   // ignores this event; logcat already has the same lines.
   send({ event: 'coldstart:trace', data: { lines: _coldStartLines.slice() } })
+  // From here on, mark() also streams to the shell's persistent events.log.
+  _eventLogLive = true
   send({
     event: 'ready',
     data: {
