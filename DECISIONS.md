@@ -2,6 +2,13 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-06-01 - cold-boot first-write lag is an edge case, not a universal tax: deferred for real-user repro
+Tier: T1 (investigation, no code shipped beyond instrumentation)
+Context: Investigated the recorded "cold-boot own-location write lags ~1min" bug as the next freshness win. Traced it: the first `base.append` blocks in Autobase 7.27.3's first `_drain()`->`_catchupApplyState()` (index.js:1838), which resolves on the EARLIER of a peer connecting+syncing or discovery exhausting. Measured on the controlled debug devices (Pixel, instrumented branch `feature/coldboot-write-investigation` adding `swarm:flushed{ms}` + `appendMs` marks): a clean cold boot is ~1.8s even with `peers:0` (append itself ~50ms); with a peer present ~3.5s. The ~66s did NOT reproduce.
+Choice: Defer. The common cold-boot case is already fast; the ~66s is a narrower edge case (booting device knows of remote writer heads it lacks AND can't fetch from an unreachable peer, so `catchup -> w.update(sys)` waits until discovery exhausts). It cannot be reproduced with the converged-state debug devices; it needs real iPhone+Android users with divergent data in one circle. Marked for future investigation in TODO.
+Alternatives: bounded catchup peer-wait (`findingPeers()` + `min(discovery.flushed(), ~8s)`, fork-benign for LWW lastSeen) -- the candidate fix once it can be reproduced; build it then. The timing instrumentation (`swarm:flushed{ms}` + `appendMs`, ~one extra boot mark per circle, negligible noise) is merged so a future real-user repro has the numbers ready.
+Consequences: Corrects the TODO's "universal cold-boot tax" framing; the field-incident lag was likely dominated by the stale-socket-while-moving path (addressed by #70) plus this divergent-state edge. No code change to master.
+
 ## 2026-06-01 - shed dead swarm sockets via a secret-stream timeout (not UDX's)
 Tier: T1 (local connection lifecycle, no wire/persisted change)
 Context: The 2026-05-30 lag investigation pinned the "location lag while moving" limitation on a dead Hyperswarm socket lingering in the connection set until UDX's slow internal timeout, blocking the redial that would replicate the fresh position. The earlier `discovery.refresh()` fix couldn't beat the dead socket sitting in the set. HyperDHT already sends a 5s keepalive but no secret-stream `timeout` was set.
