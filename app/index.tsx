@@ -246,34 +246,6 @@ function shellMark(name: string, extra?: any) {
   else console.warn('[coldstart shell+' + dt + 'ms] ' + name)
 }
 
-// Persistent runtime event log (prototype 2026-05-30). The worklet's cold-start
-// trace is written once at init:done; runtime marks (conn:stale-dropped,
-// conn:probe, peer:reconnected, lastseen:* ...) are otherwise console.warn-only
-// and vanish when the logcat ring rolls. The worklet ships each post-init mark
-// as an `events:line` IPC; we accumulate (bounded, wall-clock stamped) and
-// persist to FileSystem.documentDirectory/events.log so a drive's drop/redial
-// timeline can be pulled after the fact on either platform.
-const _eventLog: string[] = []
-const EVENT_LOG_MAX = 5000
-let _eventLogWriteTimer: any = null
-function scheduleEventLogWrite() {
-  if (_eventLogWriteTimer) return
-  _eventLogWriteTimer = setTimeout(async () => {
-    _eventLogWriteTimer = null
-    try {
-      const path = FileSystem.documentDirectory + 'events.log'
-      await FileSystem.writeAsStringAsync(path, _eventLog.join('\n') + '\n')
-    } catch (e: any) {
-      console.warn('events.log write failed', e?.message)
-    }
-  }, 1500)
-}
-function appendEventLine(line: string) {
-  _eventLog.push(new Date().toISOString() + ' ' + line)
-  if (_eventLog.length > EVENT_LOG_MAX) _eventLog.splice(0, _eventLog.length - EVENT_LOG_MAX)
-  scheduleEventLogWrite()
-}
-
 let _worklet: any = null
 let _workletStarted = false
 let _nextId = 1
@@ -552,10 +524,6 @@ export default function Index() {
       } catch (e: any) {
         console.warn('coldstart trace write failed', e?.message)
       }
-    })
-    // Persistent runtime event log (prototype 2026-05-30). See appendEventLine.
-    onEvent('events:line', (data) => {
-      if (typeof data?.line === 'string') appendEventLine(data.line)
     })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
