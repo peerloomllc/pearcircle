@@ -42,6 +42,7 @@ const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = re
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
+const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -270,7 +271,40 @@ function trackPlace (circleId, place) {
 
 function untrackPlace (circleId, placeId) {
   _circlePlaces.delete(circleId + '|' + placeId)
+  // Drop the persisted classification too so deleted places don't leave
+  // stale geofence: rows on _localDb (proposal 2026-05-30).
+  if (_localDb) geofencePersist.deleteClassification(_localDb, circleId, placeId).catch(() => {})
   schedulePushRegionsToShell()
+}
+
+// Persist a place's inside/outside classification to the local Hyperbee so a
+// crossing that happens while the app is suspended or force-quit can be
+// recovered on the first fix after the next wake, instead of being lost to the
+// in-memory reset (which silently re-baselines and drops the transition).
+// Local-only, never signed, never replicated (proposal 2026-05-30).
+function persistClassification (circleId, placeId, classification, ts) {
+  if (!_localDb) return Promise.resolve()
+  return geofencePersist
+    .persistClassification(_localDb, circleId, placeId, classification, ts)
+    .catch((e) => console.warn('[bare] persistClassification failed', e?.message))
+}
+
+// Restore a place's persisted classification into the in-process tracker.
+// Called during boot hydration, before _initialized flips (so before any
+// location:update is processed). Only fills a null slot; never clobbers an
+// in-session value, and ignores anything but a clean inside/outside.
+async function restorePersistedClassification (circleId, placeId) {
+  if (!_localDb) return
+  const state = _circlePlaces.get(circleId + '|' + placeId)
+  if (!state) return
+  try {
+    const restored = await geofencePersist.readClassification(_localDb, circleId, placeId)
+    if (geofencePersist.shouldRestore(state.lastClassification, restored)) {
+      state.lastClassification = restored
+    }
+  } catch (e) {
+    console.warn('[bare] restorePersistedClassification failed', e?.message)
+  }
 }
 
 // CLCircularRegion reconciliation. Apple caps each app at 20
@@ -856,7 +890,10 @@ const handlers = {
     // Sync the tracked classification so the JS check doesn't fight with
     // the manual fire on the next location:update.
     const tracked = _circlePlaces.get(circleId + '|' + placeId)
-    if (tracked) tracked.lastClassification = kind === 'enter' ? 'inside' : 'outside'
+    if (tracked) {
+      tracked.lastClassification = kind === 'enter' ? 'inside' : 'outside'
+      await persistClassification(circleId, placeId, tracked.lastClassification, stamp)
+    }
 
     return { ok: true, transition }
   },
@@ -1831,6 +1868,9 @@ async function handleRegionEvent (kind, id, ts) {
   const result = applyRegionEvent(state.lastClassification, kind)
   if (result.deduped) return { ok: true, deduped: true }
   state.lastClassification = result.classification
+  // Persist the flip (even for muted circles below) so the dedup state and
+  // the recoverable baseline survive a suspend/force-quit (proposal 2026-05-30).
+  await persistClassification(circleId, placeId, result.classification, typeof ts === 'number' ? ts : Date.now())
   // Per-circle mute: still update the dedup classifier above so a
   // later resume doesn't replay the boundary cross, but suppress the
   // autobase append for muted circles.
@@ -1851,8 +1891,15 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
     const base = _circleBases.get(state.circleId)
     if (!base || !base.writable) continue
     const dist = haversineMeters(lat, lon, state.lat, state.lon)
-    const result = classify(dist, state.radiusMeters, state.lastClassification)
+    const prev = state.lastClassification
+    const result = classify(dist, state.radiusMeters, prev)
     state.lastClassification = result.classification
+    // Persist on any change of stored state, including the null->baseline
+    // establishment, so the inside/outside is on disk to recover a crossing
+    // after a suspend/force-quit (proposal 2026-05-30).
+    if (result.classification !== prev) {
+      await persistClassification(state.circleId, state.placeId, result.classification, ts)
+    }
     if (!result.kind) continue
     // Per-circle mute: still flip the classifier above (so a later
     // resume doesn't re-fire the entry/exit), but skip the autobase
@@ -3234,14 +3281,21 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
 
   // Populate the in-process geofence tracker from each circle's current
   // view. Places landing later via apply branch will be added there too.
-  // Initial classification is null; the first location:update establishes
-  // the baseline silently so a cold start while inside a Place doesn't
-  // fire a spurious "arrived" notification.
+  // Restore each place's persisted inside/outside classification (proposal
+  // 2026-05-30) so the first location:update after a wake can recover a
+  // crossing that happened while suspended/force-quit. A place with no
+  // persisted row stays null and re-baselines silently on the first fix, so
+  // a genuine first-ever cold start while inside a Place still fires no
+  // spurious "arrived". This runs before _initialized flips, so it always
+  // completes before any location:update is processed.
   _circlePlaces.clear()
   for (const [circleId, base] of _circleBases) {
     try {
       for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-        if (value && !isDeleted(value)) trackPlace(circleId, value)
+        if (value && !isDeleted(value)) {
+          trackPlace(circleId, value)
+          await restorePersistedClassification(circleId, value.id)
+        }
       }
     } catch (e) {
       console.warn('[bare] failed to enumerate places for', circleId, e?.message)
