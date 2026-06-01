@@ -1,4 +1,4 @@
-const { haversineMeters, classify, applyRegionEvent } = require('../src/lib/geofence')
+const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('../src/lib/geofence')
 
 describe('haversineMeters', () => {
   test('zero distance for identical points', () => {
@@ -123,5 +123,58 @@ describe('applyRegionEvent (native enter/exit dedup)', () => {
     const second = applyRegionEvent(state, 'enter')
     expect(first.deduped).toBe(false)
     expect(second.deduped).toBe(true)
+  })
+})
+
+describe('selectNearestRegions (proximity ranking for the OS region cap)', () => {
+  const r = 100
+  // device at (0,0); places spread east, so distance grows with longitude.
+  const near = { id: 'near', lat: 0, lon: 0.1, radiusMeters: r }
+  const mid = { id: 'mid', lat: 0, lon: 0.2, radiusMeters: r }
+  const far = { id: 'far', lat: 0, lon: 0.3, radiusMeters: r }
+  const dev = { lat: 0, lon: 0 }
+
+  test('returns all when fewer than the cap', () => {
+    const out = selectNearestRegions([near, mid], dev, 20)
+    expect(out.map((p) => p.id).sort()).toEqual(['mid', 'near'])
+  })
+
+  test('keeps the nearest N when there are more places than slots', () => {
+    // input order is deliberately not distance order
+    const out = selectNearestRegions([far, near, mid], dev, 2)
+    expect(out.map((p) => p.id)).toEqual(['near', 'mid'])
+  })
+
+  test('orders nearest-first', () => {
+    const out = selectNearestRegions([far, near, mid], dev, 20)
+    expect(out.map((p) => p.id)).toEqual(['near', 'mid', 'far'])
+  })
+
+  test('no device position falls back to input order, still capped', () => {
+    const out = selectNearestRegions([far, near, mid], null, 2)
+    expect(out.map((p) => p.id)).toEqual(['far', 'near'])
+  })
+
+  test('non-finite device position also falls back to input order', () => {
+    const out = selectNearestRegions([far, near, mid], { lat: NaN, lon: 0 }, 20)
+    expect(out.map((p) => p.id)).toEqual(['far', 'near', 'mid'])
+  })
+
+  test('drops entries with invalid coords or radius before ranking', () => {
+    const badCoord = { id: 'badc', lat: NaN, lon: 0.05, radiusMeters: r }
+    const badRadius = { id: 'badr', lat: 0, lon: 0.05, radiusMeters: 0 }
+    const negRadius = { id: 'negr', lat: 0, lon: 0.05, radiusMeters: -10 }
+    const out = selectNearestRegions([badCoord, far, badRadius, near, negRadius], dev, 20)
+    expect(out.map((p) => p.id)).toEqual(['near', 'far'])
+  })
+
+  test('omitted cap returns the full ordered list', () => {
+    const out = selectNearestRegions([far, near, mid], dev)
+    expect(out.map((p) => p.id)).toEqual(['near', 'mid', 'far'])
+  })
+
+  test('preserves the other fields on each place', () => {
+    const out = selectNearestRegions([near], dev, 20)
+    expect(out[0]).toEqual(near)
   })
 })
