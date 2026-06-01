@@ -383,9 +383,9 @@ const handlers = {
     // position even when the user is stationary (storage-growth
     // remediation, proposal 2026-05-29).
     if (_appForeground) _lastAppendedPos.clear()
-    // EXPERIMENTAL: on foreground, nudge connections so a stale socket from a
-    // network change while backgrounded is shed before the user looks at the
-    // map (prototype 2026-05-30).
+    // On foreground, nudge connections so a stale socket from a network change
+    // while backgrounded is shed before the user looks at the map (proposal
+    // 2026-06-01).
     if (_appForeground) probeConnections('foreground')
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
@@ -1293,10 +1293,10 @@ const handlers = {
     // Continuous delivery is confirmed up: the driver may now step the
     // native side down to "idle" when escalations go quiet.
     _locationUpdateSeen = true
-    // EXPERIMENTAL: we're getting fresh fixes (likely moving), the exact case
-    // where a swarm socket goes stale. Probe connections so a dead one is shed
-    // and a fresh one redials before we try to replicate this position
-    // (prototype 2026-05-30; debounced internally).
+    // We're getting fresh fixes (likely moving), the exact case where a swarm
+    // socket goes stale. Probe connections so a dead one is shed and a fresh
+    // one redials before we try to replicate this position (proposal
+    // 2026-06-01; debounced internally).
     probeConnections('location')
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     const stamp = typeof ts === 'number' ? ts : Date.now()
@@ -2917,14 +2917,14 @@ function onSeederSwarmConnection (conn, info) {
   })
 }
 
-// --- EXPERIMENTAL: stale-connection probing (prototype 2026-05-30) ----------
-// Targets the known "geofence/location lag while moving" limitation (TODO
-// Bugs): a moving device's Hyperswarm socket dies on a network change without
-// firing `network:changed`, and the dead socket lingers in the swarm's
-// connection set until UDX's slow internal timeout, blocking a fresh
-// connection and therefore replication of the fresh position. The earlier
-// discovery.refresh() attempt failed because a new connection can't form
-// while the dead one still occupies the set.
+// --- Stale-connection shedding (proposal 2026-06-01) ------------------------
+// Addresses the "location lag while moving" limitation (TODO Bugs): a moving
+// device's Hyperswarm socket dies on a network change without firing
+// `network:changed`, and the dead socket lingers in the swarm's connection set
+// until UDX's slow internal timeout, blocking a fresh connection and therefore
+// replication of the fresh position. An earlier discovery.refresh() attempt
+// failed because a new connection can't form while the dead one still occupies
+// the set.
 //
 // HyperDHT already sends a 5s keepalive (empty frame) on every connection, but
 // no secret-stream-level `timeout` is set, so dead-detection falls through to
@@ -2935,7 +2935,9 @@ function onSeederSwarmConnection (conn, info) {
 //      socket is destroyed, letting Hyperswarm redial a fresh one.
 //   2) SECONDARY: a one-shot sendKeepAlive() nudge on demand (foreground +
 //      movement) to solicit traffic and help the peer converge.
-// Flip STALE_CONN_PROBE_ENABLED to false to disable both for an A/B run.
+// On-device validated 2026-05-31 (drop at the 15s timeout, prompt redial when
+// the peer was reachable, no lag observed while moving). STALE_CONN_PROBE_ENABLED
+// is a kill-switch: flip to false to fall back to stock UDX-timeout behavior.
 const STALE_CONN_PROBE_ENABLED = true
 const STALE_CONN_TIMEOUT_MS = 15000   // > 2x the 5s DHT keepalive, so live links are safe
 const CONN_PROBE_DEBOUNCE_MS = 3000   // min spacing between on-demand probes
@@ -3010,7 +3012,7 @@ async function onSwarmConnection (conn, info) {
   if (replicate) _store.replicate(conn)
   _activeConns.add(conn)
   _connPubkey.set(conn, remotePublicKey)
-  // EXPERIMENTAL: drop this socket fast if it goes silent (prototype 2026-05-30).
+  // Drop this socket fast if it goes silent (proposal 2026-06-01).
   armStaleConnTimeout(conn)
   registerPairNotify(conn)
 
@@ -3104,7 +3106,7 @@ async function onSwarmConnection (conn, info) {
   })
   conn.on('error', (err) => {
     const msg = err?.message ?? String(err)
-    // Distinguish our timeout-driven drop (prototype 2026-05-30) from other
+    // Distinguish our timeout-driven drop (proposal 2026-06-01) from other
     // errors so the on-device trace can confirm stale sockets are being shed.
     if (msg.includes('timed out')) {
       mark('conn:stale-dropped', { remote: remotePublicKey.slice(0, 8), timeoutMs: STALE_CONN_TIMEOUT_MS })
