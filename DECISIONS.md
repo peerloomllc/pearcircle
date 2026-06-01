@@ -2,6 +2,13 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-06-01 - shed dead swarm sockets via a secret-stream timeout (not UDX's)
+Tier: T1 (local connection lifecycle, no wire/persisted change)
+Context: The 2026-05-30 lag investigation pinned the "location lag while moving" limitation on a dead Hyperswarm socket lingering in the connection set until UDX's slow internal timeout, blocking the redial that would replicate the fresh position. The earlier `discovery.refresh()` fix couldn't beat the dead socket sitting in the set. HyperDHT already sends a 5s keepalive but no secret-stream `timeout` was set.
+Choice: Arm `conn.setTimeout(15s)` on every member connection (refreshed by the 5s keepalives on a live link, trips fast on a dead one so Hyperswarm redials) plus a one-shot `sendKeepAlive()` nudge on foreground and each `location:update`. Behind a `STALE_CONN_PROBE_ENABLED` kill-switch. Proposal `proposals/2026-06-01-stale-connection-shedding.md`.
+Alternatives: discovery.refresh() (tried, didn't help); cellular-handoff network:changed (follow-up); leave as-is (rejected, the lag was a real complaint).
+Consequences: On-device validated 2026-05-31 (drop at 15s, prompt redial, no lag while moving), but no controlled flag-on/off A/B was completed -- adoption rests on positive signals + no regression. The persistent events.log built to measure it crashed the worklet (per-mark IPC flood) and was reverted; revisit only with batched flushing. The cold-boot first-write gate (~66s) is a separate unaddressed bug. Updates the TODO "moving lag" entry.
+
 ## 2026-05-29 - push wake-on-demand deferred (decision B): no PeerLoom-operated wake relay
 Tier: T3 (deferred, no code shipped)
 Context: The 2026-05-29 "stale location" investigation explored remote-waking a suspended iPhone via push so it grabs a fresh fix on demand - the one freshness gap not closed by the blind seeder (last-known while offline), the Tier 1 CLVisit + self-region wakes (PR #64), and the foreground one-shot (PR #63). Full design drafted at `proposals/2026-05-29-push-wake-on-demand.md`.

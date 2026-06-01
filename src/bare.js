@@ -423,6 +423,10 @@ const handlers = {
     // position even when the user is stationary (storage-growth
     // remediation, proposal 2026-05-29).
     if (_appForeground) _lastAppendedPos.clear()
+    // On foreground, nudge connections so a stale socket from a network change
+    // while backgrounded is shed before the user looks at the map (proposal
+    // 2026-06-01).
+    if (_appForeground) probeConnections('foreground')
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
   },
@@ -1341,6 +1345,11 @@ const handlers = {
         haversineMeters(_lastRegionRankPos.lat, _lastRegionRankPos.lon, lat, lon) >= REGION_RERANK_MIN_MOVE_M) {
       schedulePushRegionsToShell()
     }
+    // We're getting fresh fixes (likely moving), the exact case where a swarm
+    // socket goes stale. Probe connections so a dead one is shed and a fresh
+    // one redials before we try to replicate this position (proposal
+    // 2026-06-01; debounced internally).
+    probeConnections('location')
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
     const stamp = typeof ts === 'number' ? ts : Date.now()
     if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
@@ -2970,6 +2979,55 @@ function onSeederSwarmConnection (conn, info) {
   })
 }
 
+// --- Stale-connection shedding (proposal 2026-06-01) ------------------------
+// Addresses the "location lag while moving" limitation (TODO Bugs): a moving
+// device's Hyperswarm socket dies on a network change without firing
+// `network:changed`, and the dead socket lingers in the swarm's connection set
+// until UDX's slow internal timeout, blocking a fresh connection and therefore
+// replication of the fresh position. An earlier discovery.refresh() attempt
+// failed because a new connection can't form while the dead one still occupies
+// the set.
+//
+// HyperDHT already sends a 5s keepalive (empty frame) on every connection, but
+// no secret-stream-level `timeout` is set, so dead-detection falls through to
+// UDX. Two levers, both tunable:
+//   1) PRIMARY: arm a secret-stream setTimeout on every connection. Inbound
+//      data (incl. the peer's 5s keepalives) refreshes it, so a LIVE link
+//      never trips; a DEAD link trips after STALE_CONN_TIMEOUT_MS and the
+//      socket is destroyed, letting Hyperswarm redial a fresh one.
+//   2) SECONDARY: a one-shot sendKeepAlive() nudge on demand (foreground +
+//      movement) to solicit traffic and help the peer converge.
+// On-device validated 2026-05-31 (drop at the 15s timeout, prompt redial when
+// the peer was reachable, no lag observed while moving). STALE_CONN_PROBE_ENABLED
+// is a kill-switch: flip to false to fall back to stock UDX-timeout behavior.
+const STALE_CONN_PROBE_ENABLED = true
+const STALE_CONN_TIMEOUT_MS = 15000   // > 2x the 5s DHT keepalive, so live links are safe
+const CONN_PROBE_DEBOUNCE_MS = 3000   // min spacing between on-demand probes
+let _lastConnProbeAt = 0
+
+function armStaleConnTimeout (conn) {
+  if (!STALE_CONN_PROBE_ENABLED || !STALE_CONN_TIMEOUT_MS) return
+  if (typeof conn.setTimeout !== 'function') return
+  try { conn.setTimeout(STALE_CONN_TIMEOUT_MS) } catch {}
+}
+
+// Solicit traffic on every active connection now (debounced). Does NOT reset
+// the per-connection timeout (that would push detection out); it only writes
+// an empty keepalive frame so the link exchanges data promptly.
+function probeConnections (reason) {
+  if (!STALE_CONN_PROBE_ENABLED) return
+  const now = Date.now()
+  if (now - _lastConnProbeAt < CONN_PROBE_DEBOUNCE_MS) return
+  _lastConnProbeAt = now
+  let probed = 0
+  for (const conn of _activeConns) {
+    if (typeof conn.sendKeepAlive !== 'function') continue
+    try { conn.sendKeepAlive(); probed++ } catch {}
+  }
+  if (probed > 0) mark('conn:probe', { reason, probed })
+}
+// ----------------------------------------------------------------------------
+
 async function onSwarmConnection (conn, info) {
   const remotePublicKey = b4a.toString(info.publicKey, 'hex')
 
@@ -3016,6 +3074,8 @@ async function onSwarmConnection (conn, info) {
   if (replicate) _store.replicate(conn)
   _activeConns.add(conn)
   _connPubkey.set(conn, remotePublicKey)
+  // Drop this socket fast if it goes silent (proposal 2026-06-01).
+  armStaleConnTimeout(conn)
   registerPairNotify(conn)
 
   // info.topics is asymmetric on real-DHT connections: the lookup side may
@@ -3107,7 +3167,13 @@ async function onSwarmConnection (conn, info) {
     }
   })
   conn.on('error', (err) => {
-    mark('peer:error', { remote: remotePublicKey.slice(0, 8), err: err?.message ?? String(err) })
+    const msg = err?.message ?? String(err)
+    // Distinguish our timeout-driven drop (proposal 2026-06-01) from other
+    // errors so the on-device trace can confirm stale sockets are being shed.
+    if (msg.includes('timed out')) {
+      mark('conn:stale-dropped', { remote: remotePublicKey.slice(0, 8), timeoutMs: STALE_CONN_TIMEOUT_MS })
+    }
+    mark('peer:error', { remote: remotePublicKey.slice(0, 8), err: msg })
   })
 }
 
