@@ -1390,13 +1390,18 @@ const handlers = {
       // classifier and trip detector below run on every fix regardless.
       if (!shouldAppendLastSeen(_lastAppendedPos.get(circleId), lat, lon)) continue
       try {
+        // Investigation 2026-06-01: time the append itself so we can separate
+        // "append() blocked N ms" (the cold-boot catchup gate) from "the first
+        // fix just arrived late". appendMs is the load-bearing number.
+        const _firstWrite = !_firstLastSeenWriteMarked.has(circleId)
+        const _appendT0 = _firstWrite ? Date.now() : 0
         await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
         _lastAppendedPos.set(circleId, { lat, lon })
         written++
-        if (!_firstLastSeenWriteMarked.has(circleId)) {
+        if (_firstWrite) {
           _firstLastSeenWriteMarked.add(circleId)
           const peers = _circlePeers.get(circleId)?.size ?? 0
-          mark('lastseen:first-write', { circleId, peers })
+          mark('lastseen:first-write', { circleId, peers, appendMs: Date.now() - _appendT0 })
         }
       } catch {
         // base closed mid-flight, etc.
@@ -3322,7 +3327,22 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
         console.warn('[bare] failed to mount circle', value.circleId, e?.message)
       }
     }
-    if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
+    if (value.circleKey) {
+      const discovery = joinCircleTopic(value.circleId, value.circleKey)
+      // Instrumentation only (investigation 2026-06-01): time the DHT
+      // announce+lookup flush per circle so we can tell whether the ~66s
+      // cold-boot first-write lag IS the swarm flush, or an internal autobase
+      // wait that merely happens to finish around the same time. mark() ->
+      // logcat; fires once per circle, reproducible stationary on the Pixel.
+      if (discovery && typeof discovery.flushed === 'function') {
+        const cid = value.circleId.slice(0, 8)
+        const t0 = Date.now()
+        discovery.flushed().then(
+          () => mark('swarm:flushed', { circleId: cid, ms: Date.now() - t0 }),
+          (e) => mark('swarm:flush-failed', { circleId: cid, ms: Date.now() - t0, err: e?.message }),
+        )
+      }
+    }
   }
   mark('init:circles-mounted', { count: _circleBases.size })
 
