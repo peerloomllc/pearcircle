@@ -10,6 +10,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.content.IntentFilter
 import android.location.Location
+import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -27,6 +28,8 @@ import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.facebook.react.modules.core.PermissionAwareActivity
 import com.facebook.react.modules.core.PermissionListener
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
@@ -175,6 +178,18 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     @ReactMethod
     fun requestSingleFix(promise: Promise) {
         if (!hasFineLocation()) { promise.resolve(false); return }
+        // Fused requires Google Play Services. On de-Googled ROMs
+        // (LineageOS/GrapheneOS without microG) it never delivers a fix,
+        // so fall back to the platform LocationManager. Proposal
+        // 2026-06-03.
+        if (gmsAvailable(ctx)) {
+            fusedSingleFix(promise)
+        } else {
+            platformSingleFix(promise)
+        }
+    }
+
+    private fun fusedSingleFix(promise: Promise) {
         val client = LocationServices.getFusedLocationProviderClient(ctx)
         val request = CurrentLocationRequest.Builder()
             .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
@@ -195,6 +210,42 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
                     }
                 }
                 .addOnFailureListener { promise.resolve(false) }
+        } catch (e: SecurityException) {
+            promise.resolve(false)
+        }
+    }
+
+    // GMS-free one-shot fix via the platform LocationManager. GPS is
+    // primary; NETWORK is used only when GPS is absent (on de-Googled
+    // devices NETWORK usually has no backend). API 30+ uses the active,
+    // timeout-bounded getCurrentLocation; API 29 emits the freshest
+    // last-known fix so the map shows something immediately, and leaves
+    // fresh streaming fixes to the foreground service. Resolve false
+    // (non-fatal) on any miss — the service stream is authoritative.
+    private fun platformSingleFix(promise: Promise) {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (lm == null) { promise.resolve(false); return }
+        val provider = when {
+            lm.allProviders.contains(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+            lm.allProviders.contains(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+            else -> { promise.resolve(false); return }
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                lm.getCurrentLocation(
+                    provider,
+                    null,
+                    ContextCompat.getMainExecutor(ctx),
+                    java.util.function.Consumer { loc ->
+                        if (loc != null) { emitToJs(loc); promise.resolve(true) }
+                        else promise.resolve(false)
+                    },
+                )
+            } else {
+                val last = lm.getLastKnownLocation(provider)
+                if (last != null) { emitToJs(last); promise.resolve(true) }
+                else promise.resolve(false)
+            }
         } catch (e: SecurityException) {
             promise.resolve(false)
         }
@@ -424,5 +475,18 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         private const val REQ_NOTIFICATIONS = 4713
         private const val DEBOUNCE_MS = 2000L
         @JvmStatic var instance: PearCircleLocationModule? = null
+
+        // True only when Google Play Services is present and usable, so
+        // FusedLocationProvider will actually deliver fixes. The detection
+        // code lives in play-services-base (bundled in our APK), so this
+        // runs even on devices where GMS is not installed; it returns
+        // false there, routing callers to the LocationManager fallback.
+        // Proposal 2026-06-03.
+        @JvmStatic
+        fun gmsAvailable(ctx: Context): Boolean = try {
+            GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(ctx) == ConnectionResult.SUCCESS
+        } catch (e: Throwable) {
+            false
+        }
     }
 }

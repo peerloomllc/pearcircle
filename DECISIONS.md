@@ -2,6 +2,13 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-06-03 - LocationManager fallback when Google Play Services is absent
+Tier: T1 (Android-native only, no wire/IPC/Hyperbee/permission change)
+Context: A new user on LineageOS without microG reported the app cannot find them while Organic Maps can. Both Android location surfaces (the foreground service stream and `requestSingleFix`) use Google's FusedLocationProvider, which silently delivers nothing on a ROM without Play Services and without microG -- the GMS client classes are bundled in the APK so nothing throws, the provider just never produces a fix. Geofencing is unaffected (computed in the worklet from `location:update`, no `GeofencingClient` on Android).
+Choice: Hybrid detection. A shared `gmsAvailable(Context)` (via `GoogleApiAvailability.isGooglePlayServicesAvailable == SUCCESS`) gates the fused path; when GMS is absent both surfaces fall back to the platform `LocationManager`. GPS_PROVIDER is primary, NETWORK_PROVIDER only when GPS is absent (no fusion/blending). Streaming keeps the fused 10s/10m cadence; one-shot uses `getCurrentLocation` on API 30+ and freshest last-known on API 29. Both feed the existing `emitToJs` -> `location:update` path unchanged. Proposal `proposals/2026-06-03-android-location-no-gms.md`.
+Alternatives: always use LocationManager (rejected -- regresses battery/accuracy for the ~99% with GMS); require microG (rejected -- conflicts with the decentralization principle and surprises de-Googled users who are the natural audience).
+Consequences: Fused path unchanged and regression-checked on a GMS device (D2: fused selected, FGS up, no crash). The fallback path itself is NOT yet validated on a GMS-less device -- needs the reporter's LineageOS device or an AOSP/google_apis-free emulator with a mock route before merge. Single-commit revert restores fused-only.
+
 ## 2026-06-01 - shed dead swarm sockets via a secret-stream timeout (not UDX's)
 Tier: T1 (local connection lifecycle, no wire/persisted change)
 Context: The 2026-05-30 lag investigation pinned the "location lag while moving" limitation on a dead Hyperswarm socket lingering in the connection set until UDX's slow internal timeout, blocking the redial that would replicate the fresh position. The earlier `discovery.refresh()` fix couldn't beat the dead socket sitting in the set. HyperDHT already sends a 5s keepalive but no secret-stream `timeout` was set.
