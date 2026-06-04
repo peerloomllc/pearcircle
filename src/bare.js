@@ -32,6 +32,8 @@ const { buildInvite, parseInvite, buildSeedInvite } = require('./invite')
 const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers, enrollSeedInvite } = require('./seeder')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
+const { setupLiveChannel, LIVE_PROTOCOL } = require('./liveLocation')
+const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
@@ -114,6 +116,12 @@ let _seedMode = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+// Ephemeral live position (proposal 2026-06-04-lastseen-ephemeral, phase 1).
+// _liveLastSeen: circleId → Map<pubkeyHex, signed value> of the freshest fix
+// received over the live protomux channel (never persisted). _liveChannels:
+// conn → Map<circleId, send(value)> for broadcasting our fix to that peer.
+const _liveLastSeen = new Map()
+const _liveChannels = new Map()
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
@@ -1501,6 +1509,16 @@ const handlers = {
       }
     }
 
+    // Phase 1 (proposal 2026-06-04-lastseen-ephemeral): also broadcast the
+    // fix ephemerally to connected peers, alongside the Autobase dual-write
+    // above. This is the path that will replace the oplog write in phase 2.
+    // Independent of writable / the movement gate, so a read-only member and a
+    // stationary-but-open app still share live position.
+    for (const circleId of _circleBases.keys()) {
+      if (!getCircleSharing(circleId).enabled) continue
+      broadcastLive(circleId, value)
+    }
+
     // After lastSeen lands, run the JS-side geofence check. Any flips
     // produce additional transition appends (and bump lastSeen again,
     // but the second write is byte-identical so the view is unchanged).
@@ -2190,10 +2208,15 @@ async function snapshotCircle (circleId, base) {
   })) {
     if (value) transitions.push(value)
   }
+  // Overlay ephemeral live positions (proposal 2026-06-04 phase 1). Freshest
+  // ts wins; restricted to visible members so a stale live entry for a
+  // left/removed member (already filtered out of `members`) can't reappear.
+  const allowedMemberKeys = new Set(members.map((m) => m.value?.pubkey).filter(Boolean))
+  const mergedLastSeen = mergeLiveLastSeen(lastSeen, _liveLastSeen.get(circleId), allowedMemberKeys)
   return {
     circle: circleRow ? circleRow.value : null,
     members,
-    lastSeen,
+    lastSeen: mergedLastSeen,
     presence,
     places,
     transitions,
@@ -2266,6 +2289,9 @@ async function tearDownCircleLocally (circleId) {
     _circleBases.delete(circleId)
   }
   _circlePeers.delete(circleId)
+  // Drop ephemeral live state for the circle (proposal 2026-06-04 phase 1).
+  _liveLastSeen.delete(circleId)
+  for (const perConn of _liveChannels.values()) perConn.delete(circleId)
   for (const key of Array.from(_circlePlaces.keys())) {
     if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
   }
@@ -2941,8 +2967,76 @@ function openPairChannelsForCircle (circleId, base) {
     // auto-enrolls (or is invited to) a circle created after the
     // connection formed could never have its announce received.
     setupMemberAdmissionChannel(conn, circleId, base)
+    // Ephemeral live-position channel (proposal 2026-06-04 phase 1).
+    setupLiveChannelFor(conn, circleId)
   }
   mark('pair:open-for-circle', { circleId: circleId.slice(0, 8), conns: _activeConns.size, opened, writable: !!base.writable })
+}
+
+// Open the live-position channel for (conn, circleId) and register its sender
+// so location:update can broadcast to this peer. getOutgoing sends our current
+// fix on open only when the circle is actively sharing (respects per-circle
+// mute). Received positions go through handleLivePosition. Proposal 2026-06-04.
+function setupLiveChannelFor (conn, circleId) {
+  const handle = setupLiveChannel({
+    conn,
+    circleId,
+    mark,
+    getOutgoing: () => (getCircleSharing(circleId).enabled ? _selfLastSeen : null),
+    onPosition: (value) => { handleLivePosition(circleId, value).catch(() => {}) },
+  })
+  if (!handle) return
+  let perConn = _liveChannels.get(conn)
+  if (!perConn) { perConn = new Map(); _liveChannels.set(conn, perConn) }
+  perConn.set(circleId, handle.send)
+}
+
+// Lazy live-channel creation when a peer opens the live protocol for a circle
+// we know about but didn't proactively open (mirrors registerPairNotify).
+function registerLiveNotify (conn) {
+  const mux = Protomux.from(conn)
+  mux.pair({ protocol: LIVE_PROTOCOL, id: null }, async (id) => {
+    if (!id) return
+    let circleIdStr
+    try { circleIdStr = b4a.toString(id) } catch { return }
+    if (!_circleBases.has(circleIdStr)) return
+    const perConn = _liveChannels.get(conn)
+    if (perConn && perConn.has(circleIdStr)) return // already open
+    setupLiveChannelFor(conn, circleIdStr)
+  })
+}
+
+// Verify + gate a received live position, then store the freshest per member.
+// Security: verifyValue proves the sender holds the embedded pubkey's secret
+// key, and the member-row check keeps non-members out of memory. snapshotCircle
+// re-filters against left/removed, so this is a coarse gate. Drops our own
+// echoes and stale/duplicate fixes (ts not advancing).
+async function handleLivePosition (circleId, value) {
+  if (!value || typeof value.pubkey !== 'string') return
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  if (value.pubkey === ourKey) return
+  if (!verifyValue(value)) return
+  const base = _circleBases.get(circleId)
+  if (!base) return
+  const member = await base.view.get('member:' + value.pubkey).catch(() => null)
+  if (!member?.value) return
+  let perCircle = _liveLastSeen.get(circleId)
+  if (!perCircle) { perCircle = new Map(); _liveLastSeen.set(circleId, perCircle) }
+  const cur = perCircle.get(value.pubkey)
+  if (cur && typeof cur.ts === 'number' && typeof value.ts === 'number' && value.ts <= cur.ts) return
+  perCircle.set(value.pubkey, value)
+  // Nudge the UI to re-read the snapshot promptly (it polls circles:getAll).
+  send({ event: 'circle:liveLocation', data: { circleId } })
+}
+
+// Broadcast a signed fix to every connected peer's live channel for a circle.
+function broadcastLive (circleId, value) {
+  let sent = 0
+  for (const perConn of _liveChannels.values()) {
+    const sendFn = perConn.get(circleId)
+    if (sendFn && sendFn(value)) sent++
+  }
+  return sent
 }
 
 // Register a protomux pair() notify on every conn so an OPEN frame
@@ -3291,6 +3385,7 @@ async function onSwarmConnection (conn, info) {
   // Drop this socket fast if it goes silent (proposal 2026-06-01).
   armStaleConnTimeout(conn)
   registerPairNotify(conn)
+  registerLiveNotify(conn)
 
   // info.topics is asymmetric on real-DHT connections: the lookup side may
   // have it populated, the announce side often does not. Setting up the
@@ -3320,6 +3415,8 @@ async function onSwarmConnection (conn, info) {
       conn, circleId, base,
       revocationNoticeFor(circleId, seederRowByCircle.get(circleId)),
     )
+    // Ephemeral live-position channel (proposal 2026-06-04 phase 1).
+    setupLiveChannelFor(conn, circleId)
   }
 
   // Member-side seeder-sync channel (proposal amendment 2026-05-20,
@@ -3372,6 +3469,7 @@ async function onSwarmConnection (conn, info) {
   conn.on('close', () => {
     _activeConns.delete(conn)
     _memberAdmissionChannels.delete(conn)
+    _liveChannels.delete(conn)
     _connPubkey.delete(conn)
     for (const circleId of matchedCircleIds) {
       const peers = _circlePeers.get(circleId)
