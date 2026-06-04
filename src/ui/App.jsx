@@ -2335,6 +2335,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           connected={connectedPubkeys.has(selectedPubkey)}
           canRemove={!!ownedCircleForRemoval && selectedPubkey !== myPubkey}
           circleNameForRemoval={ownedCircleForRemoval?.circle?.name ?? 'this circle'}
+          needsRepair={isSingleCircle && !!activeCircles[0]?.needsRepair}
+          onRepair={async () => {
+            if (!actionTargetCircleId) return
+            const r = await pear.call('circle:repair', { circleId: actionTargetCircleId })
+            if (!r?.ok) throw new Error('Repair failed')
+          }}
           onRemove={async () => {
             const r = await pear.call('circle:remove', {
               circleId: ownedCircleForRemoval.circleId,
@@ -5261,7 +5267,8 @@ function initialsFor (label) {
 // places list. Closing only hides the sheet; the focus state lives on
 // the parent so the user can re-open via tap-on-focus-bar without
 // re-flying the map.
-function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', onRemove, onOpenTrips, onClose }) {
+function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', needsRepair = false, onRepair, onRemove, onOpenTrips, onClose }) {
+  const [repairing, setRepairing] = useState(false)
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
   // Whether this member has any trips visible to us. Async-probed
@@ -5373,6 +5380,31 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
             )
           })}
         </ul>
+      )}
+
+      {isSelf && needsRepair && onRepair && (
+        <div style={{ marginTop: spacing.lg, padding: spacing.base, borderRadius: radius.md, border: `1px solid ${colors.border}` }}>
+          <div style={{ ...typography.body, color: colors.text.primary }}>This circle's data is stuck</div>
+          <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.xs, lineHeight: 1.5 }}>
+            Your location and trips may have stopped updating. Repairing rebuilds this circle from your peers, so it can take a moment to reconnect before your sharing resumes. Your identity and history are kept.
+          </div>
+          <button
+            disabled={repairing}
+            onClick={async () => {
+              setRepairing(true)
+              try { await onRepair() } finally { setRepairing(false) }
+            }}
+            style={{
+              marginTop: spacing.sm, width: '100%', padding: '12px', borderRadius: radius.md,
+              background: colors.primary, color: colors.text.onPrimary,
+              border: 'none', cursor: repairing ? 'default' : 'pointer',
+              fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              opacity: repairing ? 0.6 : 1,
+            }}
+          >
+            {repairing ? 'Repairing…' : 'Repair circle data'}
+          </button>
+        </div>
       )}
 
       {isSelf ? (
