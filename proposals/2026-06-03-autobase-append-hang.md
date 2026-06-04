@@ -123,7 +123,26 @@ Observed: the worklet stays **responsive** — `trips:listFor` completed (7 loca
 
 Not yet observed on-device: an actual `append:timeout` -> `circle:degraded` -> Repair-button -> `circle:repair` (nukeTip) cycle. Blocked by the device's location stack: the fused `getCurrentLocation` one-shot **fires but its callback never returns** on this GrapheneOS + sandboxed-Play device, so the last-known fallback (which only runs in the null/failure callback) never emits a `location:update`, and the auto-appends early-return because the member/lastSeen rows already exist. With no append attempted, the wedge never manifests and the circle is never flagged for repair, so the Repair button never appears. This is an environmental block, not a logic gap.
 
-Follow-up that unblocks validation AND fixes the location fallback for real: add a hard timeout to `requestSingleFix` so that if `getCurrentLocation` hasn't called back within ~8s, cancel it (CancellationToken) and emit `getLastKnownLocation`. Today the fallback is unreachable whenever the fused provider hangs (exactly this device). Belongs on the location branch.
+Follow-up that unblocks validation AND fixes the location fallback for real: add a hard timeout to `requestSingleFix` so that if `getCurrentLocation` hasn't called back within ~8s, cancel it (CancellationToken) and emit `getLastKnownLocation`. Today the fallback is unreachable whenever the fused provider hangs (exactly this device). Belongs on the location branch. (Done: committed on the location branch.)
+
+## Revision 2026-06-03c: read-path hangs + self-healing auto-repair
+A second validation round (v1.0.13, with the getfix-timeout) showed Parts A+B as first drafted are **insufficient**, for two reasons:
+
+1. **Reads hang too, not just appends.** `append:timeout` never fired, yet the worklet still went silent. `safeAppend` bounds only appends; the corrupt base also stalls the read paths — `snapshotCircle`'s view reads (the `circles:getAll` poll that drives the whole UI), the `base.view.get` calls in `autoAppendMemberRow`/`autoAppendSelfLastSeen`, and `trips:listFor`'s stream. A hung read freezes the dispatcher before any append is reached. (The map still renders, so `getAll` succeeds at least once — the corruption is intermittent, not a clean permanent hang.)
+
+2. **`circle:repair` is unreachable once wedged.** `needsRepair` is only set by an `append:timeout` (which isn't firing), and a wedged dispatcher would queue the repair IPC behind the stuck handler anyway. The user can't reach a button on a frozen UI.
+
+### Refined design
+**A2 — bound the hot read handlers.** Wrap the view reads in `snapshotCircle` and `trips:listFor` with a generous timeout (`READ_TIMEOUT_MS`, ~12s). On timeout: flag the circle `needsRepair`, return partial/last-known so the UI never hangs. This catches read-hangs `safeAppend` misses. Deliberately **not** a blanket dispatcher-level timeout — that would falsely abort legitimately slow handlers (`circle:join`/`circle:create` run `base.update()`, which can block 40s+ when peers are offline).
+
+**B2 — persist `needsRepair` and self-heal on boot.** Persist the degraded flag to the local DB (`circleDegraded:{circleId}`). On boot, mount any flagged circle with `nukeTip: true` directly, **before** the first snapshot/auto-append read runs — so a corrupt device heals during mount without the user ever touching a frozen UI. Clear the flag on a successful clean mount. The manual `circle:repair` IPC + Repair button stay for in-session recovery; `safeAppend`'s append-path flag stays as a second detector.
+
+This makes the system self-healing: the first bounded read or append that times out flags + persists the circle, and the next launch nuke-tips it clean. Within the offending session, the bounded reads keep the UI responsive and the Repair button is reachable.
+
+### Verify (additions)
+- `node` test: a read helper bounds a never-resolving stream/get and returns the fallback.
+- `node` test: the persisted-degraded flag round-trips and drives a nukeTip mount on boot.
+- Device: confirm a flagged Pixel 7 boots, auto-nukeTips the circle, and `lastseen` + trips start working.
 
 ## Open questions
 - Auto-repair on repeated `append:timeout`, or always user-triggered?
