@@ -490,6 +490,12 @@ export function App () {
     pear.call('shell:permission:status').then((r) => {
       if (r && typeof r.status === 'string') setPermissionStatus(r.status)
     }).catch(() => {})
+    // Same cold-boot pull for the network-location provider, so the banner
+    // can appear on a fresh launch with network location already off (the
+    // shell's app:state emit would otherwise be dropped before mount).
+    pear.call('shell:location:networkEnabled').then((r) => {
+      if (r && typeof r.enabled === 'boolean') setNetworkLocationOff(!r.enabled)
+    }).catch(() => {})
     // Two-week donation reminder check. Skipped on iOS per App Store
     // policy 3.1.1 (same gating as the About page's Support section).
     const isIOSPlatform = typeof window !== 'undefined' && window.__pearPlatform === 'ios'

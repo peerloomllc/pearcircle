@@ -1010,6 +1010,25 @@ export default function Index() {
       }
       return
     }
+    if (msg.method === 'shell:location:networkEnabled') {
+      // On-demand network-location-provider query for the cold-boot pull:
+      // the shell emits networkLocation:status on app:state, but on a cold
+      // launch that fires before the WebView attaches and the injected event
+      // is dropped, so the banner would only appear after a background ->
+      // foreground cycle. iOS has no such provider; resolve enabled=true so
+      // the banner never shows there.
+      try {
+        if (!PearCircleLocation?.isNetworkLocationEnabled) {
+          respond(msg.id, { enabled: true })
+          return
+        }
+        const enabled = await PearCircleLocation.isNetworkLocationEnabled()
+        respond(msg.id, { enabled: !!enabled })
+      } catch (err: any) {
+        respond(msg.id, { enabled: true, error: err?.message ?? String(err) })
+      }
+      return
+    }
     if (msg.method === 'shell:openSettings') {
       // Deep-link the user to "where they can fix the location
       // permission." Each OS exposes a different best path:
