@@ -115,6 +115,7 @@ const _firstLiveBroadcastMarked = new Set()   // circleIds where we first broadc
 const _firstLiveRecvMarked = new Set()        // circleIds where we first received a peer's live fix
 const _firstLastKnownWriteMarked = new Set()  // circleIds where we first appended our last-known core fix (proposal 2026-06-04 slice 2a)
 const _firstPeerLastKnownMarked = new Set()   // circleIds where we first cached a peer's last-known core tip
+const _seederLastknownTipMarked = new Set()   // coreKeyHex of peer last-known cores whose tip the seeder has replicated (slice 2b)
 
 let _store = null
 let _localDb = null
@@ -3021,22 +3022,29 @@ async function openSeederLastknownCore (entry, circleId, pubkey, coreKey) {
   entry.lastknownCores.set(pubkey, core)
   // Follow the member's appends: download each new tip, then clear the prior
   // blocks so the seeder's copy stays O(1) (mirrors the member's appendFix).
-  const onAppend = () => { refreshSeederLastknownTip(core).catch(() => {}) }
+  const onAppend = () => { refreshSeederLastknownTip(core, circleId, pubkey).catch(() => {}) }
   core.on('append', onAppend)
-  refreshSeederLastknownTip(core).catch(() => {})
+  refreshSeederLastknownTip(core, circleId, pubkey).catch(() => {})
   mark('seeder:lastknown-opened', { circleId, pubkey: pubkey.slice(0, 8), coreKey: coreKey.slice(0, 8) })
 }
 
 // Download a seeder-held last-known core's tip block, then clear earlier blocks
 // so storage stays bounded to the latest fix (we never decrypt — the seeder
 // only stores + serves ciphertext). Best-effort throughout.
-async function refreshSeederLastknownTip (core) {
+async function refreshSeederLastknownTip (core, circleId, pubkey) {
   await core.ready()
   try { await core.update({ wait: false }) } catch {}
   if (core.length === 0) return
   try {
     await core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
   } catch { return } // tip not served yet; the 'append'/next push retries
+  // One-shot observability: the seeder replicated a member's (encrypted) tip,
+  // so it can now serve offline last-known (proposal 2026-06-04 slice 2b).
+  const coreKeyHex = b4a.toString(core.key, 'hex')
+  if (!_seederLastknownTipMarked.has(coreKeyHex)) {
+    _seederLastknownTipMarked.add(coreKeyHex)
+    mark('seeder:lastknown-tip', { circleId, pubkey: (pubkey || '').slice(0, 8), length: core.length })
+  }
   if (core.length > 1) { try { await core.clear(0, core.length - 1) } catch {} }
 }
 
