@@ -93,10 +93,22 @@ function mark (name, extra) {
 }
 mark('worklet:loaded')
 
+// Re-ship the accumulated mark buffer to the shell so it overwrites
+// coldstart.log with the latest lines. The buffered trace is otherwise only
+// shipped once at init:done; this lets late, rare marks (e.g. the first live
+// broadcast/receive, proposal 2026-06-04 phase 1) reach the pulled log on a
+// debug build where worklet console.warn does not hit logcat. Called only on
+// bounded one-shot events, never per location update, so no IPC flood.
+function reshipTrace () {
+  try { send({ event: 'coldstart:trace', data: { lines: _coldStartLines.slice() } }) } catch {}
+}
+
 const _firstPeerMarked = new Set()      // circleIds with peer:first-connected emitted
 const _firstWriterMarked = new Set()    // circleIds with writer:first-added emitted
 const _firstLastSeenWriteMarked = new Set()   // circleIds with our first own lastSeen write
 const _firstLastSeenRemoteMarked = new Set()  // circleIds where a non-self lastSeen has applied
+const _firstLiveBroadcastMarked = new Set()   // circleIds where we first broadcast a live fix (proposal 2026-06-04 phase 1)
+const _firstLiveRecvMarked = new Set()        // circleIds where we first received a peer's live fix
 
 let _store = null
 let _localDb = null
@@ -3025,6 +3037,14 @@ async function handleLivePosition (circleId, value) {
   const cur = perCircle.get(value.pubkey)
   if (cur && typeof cur.ts === 'number' && typeof value.ts === 'number' && value.ts <= cur.ts) return
   perCircle.set(value.pubkey, value)
+  // One-shot observability: the first live fix received per circle confirms the
+  // ephemeral receive path works (proposal 2026-06-04 phase 1). Bounded to once
+  // per circle, then re-ship the trace so it lands in coldstart.log.
+  if (!_firstLiveRecvMarked.has(circleId)) {
+    _firstLiveRecvMarked.add(circleId)
+    mark('live:recv:first', { circleId: circleId.slice(0, 8), from: value.pubkey.slice(0, 8) })
+    reshipTrace()
+  }
   // Nudge the UI to re-read the snapshot promptly (it polls circles:getAll).
   send({ event: 'circle:liveLocation', data: { circleId } })
 }
@@ -3035,6 +3055,14 @@ function broadcastLive (circleId, value) {
   for (const perConn of _liveChannels.values()) {
     const sendFn = perConn.get(circleId)
     if (sendFn && sendFn(value)) sent++
+  }
+  // One-shot observability: the first time we actually push a live fix to at
+  // least one peer for a circle (proposal 2026-06-04 phase 1). Bounded to once
+  // per circle, then re-ship the trace so it lands in coldstart.log.
+  if (sent > 0 && !_firstLiveBroadcastMarked.has(circleId)) {
+    _firstLiveBroadcastMarked.add(circleId)
+    mark('live:broadcast:first', { circleId: circleId.slice(0, 8), peers: sent })
+    reshipTrace()
   }
   return sent
 }
