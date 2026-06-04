@@ -5386,7 +5386,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
         <div style={{ marginTop: spacing.lg, padding: spacing.base, borderRadius: radius.md, border: `1px solid ${colors.border}` }}>
           <div style={{ ...typography.body, color: colors.text.primary }}>This circle's data is stuck</div>
           <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.xs, lineHeight: 1.5 }}>
-            Your location and trips may have stopped updating. Repairing rebuilds this circle from your peers. Your identity and history are kept.
+            Your location and trips may have stopped updating. Repairing rebuilds this circle from your peers, so it can take a moment to reconnect before your sharing resumes. Your identity and history are kept.
           </div>
           <button
             disabled={repairing}

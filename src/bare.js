@@ -1251,22 +1251,27 @@ const handlers = {
 
   // Local recovery for a wedged circle Autobase (proposal
   // 2026-06-03-autobase-append-hang). When appends to a circle have timed
-  // out (it shows needsRepair), the local Autobase tip is corrupt and every
-  // append hangs in the advance loop, which freezes the whole worklet. Heal
-  // it in place: close the base, re-mount with nukeTip so the corrupt local
-  // tip + view rewind to their last indexed length and re-replicate from the
-  // seeder / peers. Same corestore namespace -> same writer key, so write
-  // access survives; identity, membership and the seeder's authoritative
-  // history are untouched. User-triggered only (never automatic) so it can't
-  // loop. Every await is bounded so a still-corrupt base surfaces an error
-  // instead of re-wedging the worklet.
+  // out (it shows needsRepair), the local Autobase is wedged below the tip
+  // (the linearizer stalls on the indexed history) and every append hangs.
+  // nukeTip is not enough — it rewinds the tip but the corruption persists
+  // (validated on-device 2026-06-03). Strong repair: remount the circle under
+  // a FRESH corestore namespace (rebuildGen+1), giving it brand-new local
+  // writer/view/system cores that re-apply from the bootstrap and re-sync
+  // clean from the seeder. The corrupt old-generation cores are orphaned on
+  // disk. The new namespace means a new local writer key, so this device
+  // drops to read-only for the circle until an existing writer re-admits it
+  // via the pair-channel addWriter flow (automatic once the owner is online)
+  // — exactly the join-as-writer path. Identity, membership and history are
+  // preserved (the seeder holds them). Every await is bounded so a still-bad
+  // base reports an error instead of re-wedging the worklet.
   'circle:repair': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const record = await _localDb.get('circles:joined:' + circleId).catch(() => null)
     if (!record?.value?.bootstrap) return { ok: false, reason: 'unknown_circle' }
     const { bootstrap, encryptionKey } = record.value
-    mark('circle:repair:start', { circleId: circleId.slice(0, 8) })
+    const newGen = (typeof record.value.rebuildGen === 'number' ? record.value.rebuildGen : 0) + 1
+    mark('circle:repair:start', { circleId: circleId.slice(0, 8), newGen })
     // 1. Close + drop the wedged base (bounded — a hung close must not freeze
     //    this handler too).
     const existing = _circleBases.get(circleId)
@@ -1279,26 +1284,42 @@ const handlers = {
       ])
       if (closed === T) mark('circle:repair:close-timeout', { circleId: circleId.slice(0, 8) })
     }
-    // 2. Reset per-circle state so the rebuilt base starts clean. clearDegraded
-    //    also drops the persisted circleDegraded flag (it's being healed now).
+    // 2. Clear the bootstrap's autobase/local pin. A fresh namespace alone
+    //    re-opens the SAME corrupt writer, because the shared bootstrap core
+    //    pins our local writer key in its autobase/local userData (boot.js
+    //    reads it before falling back to the namespace-derived name:'local').
+    //    Clearing it makes the gen+1 mount derive a brand-new local writer.
+    try {
+      const bc = _store.get({ key: b4a.from(bootstrap, 'hex'), active: false })
+      await bc.ready()
+      await bc.setUserData('autobase/local', null)
+      await bc.close()
+    } catch (e) {
+      mark('circle:repair:pin-clear-failed', { circleId: circleId.slice(0, 8), err: e?.message })
+    }
+    // 3. Persist the new generation so a crash mid-repair still boots into the
+    //    fresh namespace, not the corrupt one.
+    await _localDb.put('circles:joined:' + circleId, { ...record.value, rebuildGen: newGen }).catch(() => {})
+    // 4. Reset per-circle state. clearDegraded drops the in-memory skip + the
+    //    persisted circleDegraded flag (we're rebuilding now).
     clearDegraded(circleId)
     _firstLastSeenWriteMarked.delete(circleId)
     _firstWriterMarked.delete(circleId)
     _lastAppendedPos.delete(circleId)
     _lastGoodSnapshot.delete(circleId)
-    // 3. Re-mount with nukeTip, bounded so a still-corrupt base reports an
+    // 5. Mount the fresh namespace, bounded so a still-broken base reports an
     //    error rather than hanging.
     let base
     try {
       base = await Promise.race([
-        mountCircleAutobase(circleId, bootstrap, encryptionKey || null, { nukeTip: true }),
+        mountCircleAutobase(circleId, bootstrap, encryptionKey || null, { rebuildGen: newGen }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('repair_mount_timeout')), 20000)),
       ])
     } catch (e) {
       mark('circle:repair:failed', { circleId: circleId.slice(0, 8), err: e?.message })
       return { ok: false, reason: e?.message || 'mount_failed' }
     }
-    mark('circle:repair:done', { circleId: circleId.slice(0, 8), writable: !!base?.writable })
+    mark('circle:repair:done', { circleId: circleId.slice(0, 8), newGen, writable: !!base?.writable })
     send({ event: 'circle:repaired', data: { circleId } })
     return { ok: true, writable: !!base?.writable }
   },
@@ -2617,20 +2638,23 @@ async function autoAppendSelfLastSeen (circleId) {
   await safeAppend(base, { type: 'put', key: 'lastSeen:' + ourKey, value: _selfLastSeen }, 'lastSeen:boot')
 }
 
-async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, { nukeTip = false } = {}) {
+// Derive the corestore namespace for a circle at a given rebuild generation.
+// Gen 0 uses the bare circleId (legacy / freshly joined). circle:repair bumps
+// the generation and remounts under `:r{gen}`, so the rebuilt base gets fresh
+// local cores (writer/view/system) and re-syncs clean from the seeder while
+// the corrupt gen-0 cores are orphaned (proposal 2026-06-03c, strong repair).
+function circleNamespaceKey (circleId, rebuildGen) {
+  return rebuildGen ? circleId + ':r' + rebuildGen : circleId
+}
+
+async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, { rebuildGen = 0 } = {}) {
   if (_circleBases.has(circleId)) return _circleBases.get(circleId)
-  const ns = _store.namespace(circleId)
+  const ns = _store.namespace(circleNamespaceKey(circleId, rebuildGen))
   const baseOpts = {
     open: openCircleView,
     apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
     valueEncoding: 'json',
   }
-  // nukeTip rewinds the local writer's unindexed tip and the view/system
-  // cores to their last indexed length on open, discarding a corrupt local
-  // tip that wedges append() (proposal 2026-06-03-autobase-append-hang).
-  // Same namespace -> same writer key, so write access is preserved; the
-  // seeder's authoritative blocks re-replicate the trimmed state.
-  if (nukeTip) baseOpts.nukeTip = true
   if (encryptionKeyHex) baseOpts.encryptionKey = b4a.from(encryptionKeyHex, 'hex')
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
@@ -3438,35 +3462,35 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   _swarm.on('connection', onSwarmConnection)
   mark('init:swarm-created')
 
-  // Self-healing for wedged circles (proposal 2026-06-03c). A circle whose
-  // append/read timed out in a prior session persisted a circleDegraded:{id}
-  // flag. Load those up front so the mount below opens them with nukeTip,
-  // rewinding the corrupt local tip BEFORE any snapshot/auto-append read runs
-  // — the device heals without the user touching a (possibly frozen) UI.
-  const persistedDegraded = new Set()
+  // Persisted degraded flags (proposal 2026-06-03c). A circle whose
+  // append/read timed out in a prior session persisted circleDegraded:{id}.
+  // Re-arm the in-memory skip so needsRepair survives the reboot and appends
+  // to the wedged base are skipped (keeping the worklet responsive). We do NOT
+  // auto-rebuild on boot: the read/append bounding already prevents a freeze,
+  // so the UI stays reachable and the user drives the (writer-key-changing)
+  // strong repair from the Repair button. Recovery is therefore never an
+  // automatic loop.
   for await (const { key } of _localDb.createReadStream({
     gt: 'circleDegraded:', lt: 'circleDegraded:~',
   })) {
-    persistedDegraded.add(key.slice('circleDegraded:'.length))
+    _degradedCircles.add(key.slice('circleDegraded:'.length))
   }
-  if (persistedDegraded.size) mark('circle:degraded-persisted', { count: persistedDegraded.size })
+  if (_degradedCircles.size) mark('circle:degraded-persisted', { count: _degradedCircles.size })
 
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced
-  // and their Autobases reopened on every boot.
+  // and their Autobases reopened on every boot. Mount at the record's
+  // rebuildGen so a previously-repaired circle opens its fresh namespace, not
+  // the orphaned corrupt one.
   for await (const { value } of _localDb.createReadStream({
     gt: 'circles:joined:',
     lt: 'circles:joined:~',
   })) {
     if (!value || !value.circleId) continue
     if (value.bootstrap) {
-      const heal = persistedDegraded.has(value.circleId)
-      if (heal) mark('circle:nuketip-on-boot', { circleId: value.circleId.slice(0, 8) })
+      const rebuildGen = typeof value.rebuildGen === 'number' ? value.rebuildGen : 0
       try {
-        await mountCircleAutobase(value.circleId, value.bootstrap, value.encryptionKey, { nukeTip: heal })
-        // Clean mount of a previously-degraded circle: presume healed and
-        // clear the flag. If it re-wedges, the next timeout re-flags it.
-        if (heal) clearDegraded(value.circleId)
+        await mountCircleAutobase(value.circleId, value.bootstrap, value.encryptionKey, { rebuildGen })
       } catch (e) {
         console.warn('[bare] failed to mount circle', value.circleId, e?.message)
       }
