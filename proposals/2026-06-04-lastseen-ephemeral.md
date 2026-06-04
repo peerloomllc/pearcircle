@@ -44,6 +44,12 @@ This is the load-bearing section because peers do not upgrade together.
 - Phase 1 is additive (new channel + new core + dual-write); reverting restores autobase-only lastSeen, no peer-visible break.
 - Phase 2 is a single flag; flip it back on to resume autobase writes if an interop problem surfaces.
 
+## Slice plan (phase 1)
+- **Slice 1 (shipped, PR #78):** ephemeral live-position Protomux channel + in-memory store + read-precedence overlay in `snapshotCircle`. Additive, dual-write, no wire/persistence change.
+- **Slice 2a (in progress):** per-member last-known Hypercore. `src/memberLastKnown.js` (open self/peer core, `appendFix` = append latest + clear earlier blocks so DATA stays O(1), non-blocking `readTip`). Mechanics proven in `tests/memberLastKnown.test.js`: bounded storage, cross-store encrypted tip replication, and a blind holder cannot decrypt (privacy boundary). Remaining wiring: create self core on mount; append on `location:update` alongside the live broadcast + Autobase dual-write; announce the core key once in the Autobase as `lastknownCore:{pubkey}` (a single low-frequency op per member, negligible); read peers' announced keys, open their cores, read tips into a cache; extend `snapshotCircle` precedence to live > core > view (compose `mergeLiveLastSeen` twice, freshest-ts wins); teardown cleanup.
+- **Slice 2b:** seeder replication of the last-known cores. The blind seeder can't read the `lastknownCore:` announce from the view, so the core keys are pushed over the existing seeder admission/sync protocol (as writer-core keys are), so the seeder holds + serves the tip for offline last-known.
+- **Slice 3:** capability handshake + phase-2 cutover (stop the Autobase `lastSeen` write).
+
 ## Decisions (2026-06-04)
 - **Persisted last-known: a dedicated per-member single-writer Hypercore**, truncated to the latest fix, replicated like the existing circle cores so the blind seeder serves offline last-known. Chosen over a gossiped local slot (which can't give the seeder an offline last-known to serve).
 - **Phase-2 cutover: capability handshake** (see Compat), not a manual fleet-wide flag.
