@@ -1496,6 +1496,11 @@ const handlers = {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof pubkey !== 'string') throw new Error('pubkey must be a string')
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    // Diagnostic marks (2026-06-03): TripsView reports an indefinite
+    // "Loading…" on some devices. This handler fans a read across the
+    // local DB and every circle base; if any stream stalls the IPC
+    // never resolves. Marking each stage localises where it hangs.
+    mark('trips:listFor:start', { self: pubkey === ourKey, bases: _circleBases.size })
 
     const localTrips = []
     if (pubkey === ourKey) {
@@ -1506,9 +1511,10 @@ const handlers = {
         if (value) localTrips.push(value)
       }
     }
+    mark('trips:listFor:local-done', { count: localTrips.length })
 
     const circleTrips = []
-    for (const [, base] of _circleBases) {
+    for (const [circleId, base] of _circleBases) {
       const list = []
       for await (const { value } of base.view.createReadStream({
         gt: 'trip:' + pubkey + ':',
@@ -1517,8 +1523,10 @@ const handlers = {
         if (value) list.push(value)
       }
       if (list.length > 0) circleTrips.push(list)
+      mark('trips:listFor:base-done', { circleId: circleId.slice(0, 8), count: list.length })
     }
 
+    mark('trips:listFor:done', { circles: circleTrips.length })
     return { trips: mergeTripStreams({ localTrips, circleTrips }) }
   },
 
