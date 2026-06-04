@@ -48,6 +48,11 @@ Confirmed on-device (Pixel 7, GrapheneOS sandboxed Play): `network provider enab
 
 Shared helpers `emitLastKnownOrFalse` / `platformLastKnown` in `PearCircleLocationModule`. Still T1: native-only, same `emitToJs` -> `location:update` shape, no wire/IPC/key/permission change. Rollback remains a single-commit revert.
 
+## Addendum 2026-06-03d: iOS parity last-known fallback
+The iOS `requestSingleFix` had the same gap: it called `requestLocation()` and, if CoreLocation couldn't obtain a fresh fix (indoors, precise-location off, no signal), it emitted nothing (`didFailWithError` only logged), freezing the shared position the same way. iPhones don't have the GrapheneOS network-location trigger, but the gap is real on any fix-starved iPhone.
+
+**Change** (`PearCircleLocationModule.swift`): track the in-flight one-shot (`singleFixPending` + a `gen` token). On a `SINGLE_FIX_TIMEOUT` (8s) without delivery, or on `didFailWithError` while pending, republish CoreLocation's cached `manager.location` via the existing `emitLocation` path, with its real timestamp. A fresh `didUpdateLocations` clears the pending flag so the fallback doesn't fire. Mirrors the Android timeout + last-known fallback. Still T1, single-commit revert. Not yet built/tested on a device (no iPhone in the validating session); compiles on the Mac toolchain only.
+
 ## Open questions
 - Register NETWORK_PROVIDER alongside GPS for faster cold/indoor acquisition, accepting possible coarse-vs-fine jitter on the map? Current plan: GPS-primary, NETWORK only as a fallback when GPS is absent. Revisit if cold-fix latency on the fallback path is poor in testing.
 - Should we surface a one-time UI hint on the fallback path (e.g. "using device GPS")? Deferred - no behavior the user must act on.

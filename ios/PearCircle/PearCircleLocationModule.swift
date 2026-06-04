@@ -96,6 +96,19 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // resolve the prior one as false rather than leaking it.
   private var pendingResolve: RCTPromiseResolveBlock?
 
+  // One-shot last-known fallback (proposal 2026-06-03, iOS parity with the
+  // Android requestSingleFix). requestLocation() can fail to obtain a fresh
+  // fix (indoors, precise-location off, no signal) and then emits nothing,
+  // leaving a stationary phone's shared position frozen. We track the in-
+  // flight one-shot; if it hasn't delivered within SINGLE_FIX_TIMEOUT (or it
+  // fails), we publish the cached last-known fix (mgr.location) instead, with
+  // its real timestamp, so peers see the last real position rather than a
+  // multi-day freeze. The gen token ignores a stale timeout after a newer
+  // one-shot supersedes it.
+  private var singleFixPending = false
+  private var singleFixGen = 0
+  private static let SINGLE_FIX_TIMEOUT: TimeInterval = 8
+
   // Network-change debounce. iOS emits a burst of NWPathMonitor
   // callbacks during a single transition (interface up, address
   // assigned, default route changed, ...). We collapse them with a
@@ -412,6 +425,9 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     didUpdateLocations locations: [CLLocation]
   ) {
     guard let loc = locations.last else { return }
+    // A fresh fix satisfies any in-flight one-shot, so its timeout/last-known
+    // fallback should not fire.
+    singleFixPending = false
     emitLocation(loc)
     // Arm the self-region on the first fix, or re-center it after an
     // exit (Tier 1 B). No churn while the user stays inside the circle;
@@ -424,6 +440,15 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
     NSLog("PearCircleLocation: didFailWithError %@", error.localizedDescription)
+    // If a one-shot was in flight and CoreLocation couldn't produce a fix,
+    // republish the cached last-known instead of emitting nothing (parity
+    // with Android's last-known fallback, proposal 2026-06-03).
+    if singleFixPending {
+      singleFixPending = false
+      if let last = manager.location {
+        emitLocation(last)
+      }
+    }
   }
 
   // Visit arrive/depart callback (Tier 1 A, 2026-05-29). departureDate
@@ -708,8 +733,24 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
         resolve(false)
         return
       }
+      self.singleFixGen += 1
+      let gen = self.singleFixGen
+      self.singleFixPending = true
       mgr.requestLocation()
       resolve(true)
+      // If requestLocation hasn't delivered a fix in time, fall back to the
+      // cached last-known so a fix-starved / stationary device still
+      // republishes a real position (parity with Android's last-known
+      // fallback). The gen guard skips a stale timeout once a fresh fix
+      // arrived (didUpdateLocations clears singleFixPending) or a newer
+      // one-shot started.
+      DispatchQueue.main.asyncAfter(deadline: .now() + PearCircleLocationModule.SINGLE_FIX_TIMEOUT) { [weak self] in
+        guard let self = self, self.singleFixPending, self.singleFixGen == gen else { return }
+        self.singleFixPending = false
+        if let last = mgr.location {
+          self.emitLocation(last)
+        }
+      }
     }
   }
 
