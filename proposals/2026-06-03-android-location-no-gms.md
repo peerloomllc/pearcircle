@@ -39,6 +39,16 @@ No cross-peer surface touched. A device on the fallback path emits the same `loc
 ## Rollback
 Single-commit revert. The change is additive (a branch inside each call site); reverting restores the fused-only behavior. No persisted state or peer-visible artifact to unwind.
 
+## Addendum 2026-06-03b: last-known fallback for the GMS-present-but-no-fix case
+The original change only helps fully de-Googled devices (`gmsAvailable` false). A second, more common failure surfaced on-device: **GrapheneOS with sandboxed Google Play**. There `gmsAvailable` returns `SUCCESS`, so the device stays on the fused path, but the fused provider routes to a GPS-only `OsLocationProvider` (network provider disabled), which cannot lock indoors while stationary. `getCurrentLocation(HIGH_ACCURACY, maxUpdateAge=0)` then resolves `null` and `requestSingleFix` emits nothing, so the user's shared `lastSeen` freezes at their last successful fix (observed: 4.2 days stale while the OS held a 32-minute-old GPS last-known).
+
+Confirmed on-device (Pixel 7, GrapheneOS sandboxed Play): `network provider enabled=false`, `gps provider enabled=true`, app last-known GPS fix 32 min old, worklet `coldboot:selfLastSeen:preloaded ageMs=362574181`. A live foreground cycle logged `getCurrentLocation` firing with no subsequent emit or `lastseen:first-write`.
+
+**Change**: when an active one-shot returns null/fails on *either* path (fused or platform), fall back to the freshest platform `getLastKnownLocation` across GPS+NETWORK and emit that, instead of emitting nothing. The fix's own `loc.time` is preserved, so peers see honest staleness (e.g. "32 min ago" instead of a 4-day freeze) and the position republishes at all. A user who then moves >10m gets fresh streaming fixes as before.
+
+Shared helpers `emitLastKnownOrFalse` / `platformLastKnown` in `PearCircleLocationModule`. Still T1: native-only, same `emitToJs` -> `location:update` shape, no wire/IPC/key/permission change. Rollback remains a single-commit revert.
+
 ## Open questions
 - Register NETWORK_PROVIDER alongside GPS for faster cold/indoor acquisition, accepting possible coarse-vs-fine jitter on the map? Current plan: GPS-primary, NETWORK only as a fallback when GPS is absent. Revisit if cold-fix latency on the fallback path is poor in testing.
 - Should we surface a one-time UI hint on the fallback path (e.g. "using device GPS")? Deferred - no behavior the user must act on.
+- Cap last-known age on the fallback (e.g. ignore fixes older than N hours)? Current plan: emit whatever exists with its real timestamp; the UI already shows the age, and a real-but-old position beats none. Revisit if a very stale last-known proves misleading.

@@ -203,16 +203,53 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
                         emitToJs(loc)
                         promise.resolve(true)
                     } else {
-                        // Provider couldn't produce a fix in time (no
-                        // signal indoors, etc.); the next service callback
-                        // will refresh when one is available.
-                        promise.resolve(false)
+                        // Provider couldn't produce a fresh fix in time.
+                        // This is the common case on GrapheneOS with
+                        // sandboxed Play: gmsAvailable() is true, so we are
+                        // on the fused path, but the fused provider routes
+                        // to a GPS-only OsLocationProvider that can't lock
+                        // indoors while stationary, and there is no network
+                        // provider. Rather than emit nothing (which leaves
+                        // peers seeing a days-old position), fall back to
+                        // the platform last-known fix so we republish the
+                        // last real position. Proposal 2026-06-03
+                        // (last-known fallback).
+                        emitLastKnownOrFalse(promise)
                     }
                 }
-                .addOnFailureListener { promise.resolve(false) }
+                .addOnFailureListener { emitLastKnownOrFalse(promise) }
         } catch (e: SecurityException) {
             promise.resolve(false)
         }
+    }
+
+    // Emit the freshest platform last-known fix if one exists, else
+    // resolve false. Shared fallback for both the fused and platform
+    // one-shot paths when an active fix can't be acquired (indoors /
+    // GPS-only / no network provider). Republishing a last-known fix is
+    // strictly better than emitting nothing: a stationary user keeps
+    // showing their real last position instead of freezing for days.
+    // The fix's own loc.time is preserved (honest staleness), so peers
+    // see when it was actually taken. Proposal 2026-06-03.
+    private fun emitLastKnownOrFalse(promise: Promise) {
+        val last = platformLastKnown()
+        if (last != null) { emitToJs(last); promise.resolve(true) }
+        else promise.resolve(false)
+    }
+
+    // Freshest getLastKnownLocation across GPS + NETWORK. Null when no
+    // provider has ever produced a fix this boot.
+    private fun platformLastKnown(): Location? {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+        var best: Location? = null
+        for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            if (!lm.allProviders.contains(p)) continue
+            try {
+                val loc = lm.getLastKnownLocation(p) ?: continue
+                if (best == null || loc.time > best!!.time) best = loc
+            } catch (e: SecurityException) { /* skip provider */ }
+        }
+        return best
     }
 
     // GMS-free one-shot fix via the platform LocationManager. GPS is
@@ -238,7 +275,7 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
                     ContextCompat.getMainExecutor(ctx),
                     java.util.function.Consumer { loc ->
                         if (loc != null) { emitToJs(loc); promise.resolve(true) }
-                        else promise.resolve(false)
+                        else emitLastKnownOrFalse(promise)
                     },
                 )
             } else {
