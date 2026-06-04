@@ -196,30 +196,51 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
             .setMaxUpdateAgeMillis(0L)
             .build()
         val cts = CancellationTokenSource()
+        // Single-settle guard + hard timeout. On GrapheneOS with sandboxed
+        // Play the fused getCurrentLocation can fire but never call back at
+        // all (the OsLocationProvider can't lock indoors and reports
+        // nothing), which left requestSingleFix hanging and the last-known
+        // fallback unreachable. If neither listener fires within
+        // GET_FIX_TIMEOUT_MS, cancel the request and fall back to the
+        // platform last-known fix. settled ensures the promise resolves
+        // exactly once whichever path wins. Proposal 2026-06-03 (getfix
+        // timeout).
+        val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val handler = Handler(Looper.getMainLooper())
+        val onTimeout = Runnable {
+            if (settled.compareAndSet(false, true)) {
+                try { cts.cancel() } catch (_: Throwable) {}
+                emitLastKnownOrFalse(promise)
+            }
+        }
+        handler.postDelayed(onTimeout, GET_FIX_TIMEOUT_MS)
         try {
             client.getCurrentLocation(request, cts.token)
                 .addOnSuccessListener { loc ->
+                    if (!settled.compareAndSet(false, true)) return@addOnSuccessListener
+                    handler.removeCallbacks(onTimeout)
                     if (loc != null) {
                         emitToJs(loc)
                         promise.resolve(true)
                     } else {
-                        // Provider couldn't produce a fresh fix in time.
-                        // This is the common case on GrapheneOS with
-                        // sandboxed Play: gmsAvailable() is true, so we are
-                        // on the fused path, but the fused provider routes
-                        // to a GPS-only OsLocationProvider that can't lock
-                        // indoors while stationary, and there is no network
-                        // provider. Rather than emit nothing (which leaves
-                        // peers seeing a days-old position), fall back to
-                        // the platform last-known fix so we republish the
-                        // last real position. Proposal 2026-06-03
+                        // Provider returned no fresh fix (common on
+                        // GrapheneOS sandboxed Play / GPS-only indoors).
+                        // Republish the platform last-known so peers stop
+                        // seeing a days-old position. Proposal 2026-06-03
                         // (last-known fallback).
                         emitLastKnownOrFalse(promise)
                     }
                 }
-                .addOnFailureListener { emitLastKnownOrFalse(promise) }
+                .addOnFailureListener {
+                    if (!settled.compareAndSet(false, true)) return@addOnFailureListener
+                    handler.removeCallbacks(onTimeout)
+                    emitLastKnownOrFalse(promise)
+                }
         } catch (e: SecurityException) {
-            promise.resolve(false)
+            if (settled.compareAndSet(false, true)) {
+                handler.removeCallbacks(onTimeout)
+                promise.resolve(false)
+            }
         }
     }
 
@@ -511,6 +532,9 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         private const val REQ_BACKGROUND = 4712
         private const val REQ_NOTIFICATIONS = 4713
         private const val DEBOUNCE_MS = 2000L
+        // Hard cap on the fused one-shot before we fall back to last-known.
+        // The fused provider can hang indefinitely on de-Googled ROMs.
+        private const val GET_FIX_TIMEOUT_MS = 8000L
         @JvmStatic var instance: PearCircleLocationModule? = null
 
         // True only when Google Play Services is present and usable, so
