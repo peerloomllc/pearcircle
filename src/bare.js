@@ -44,7 +44,7 @@ const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAccept
 const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
-const { raceAppend, APPEND_TIMEOUT_MS } = require('./lib/appendTimeout')
+const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
@@ -114,7 +114,8 @@ let _seedMode = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
-const _degradedCircles = new Set() // circleIds whose base.append() timed out (wedged local Autobase); surfaced as needsRepair, cleared by circle:repair (proposal 2026-06-03-autobase-append-hang)
+const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
+const _lastGoodSnapshot = new Map() // circleId → last successful snapshotCircle result, served when a bounded snapshot times out so the UI stays populated (proposal 2026-06-03c)
 const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
 // Seed-mode only: per-circle replication state. Each entry holds the
 // bootstrap Hypercore session + the swarm discovery handle so leave can
@@ -720,7 +721,7 @@ const handlers = {
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const base = _circleBases.get(circleId)
     if (!base) throw new Error('unknown circle: ' + circleId)
-    return await snapshotCircle(circleId, base)
+    return await safeSnapshot(circleId, base)
   },
 
   'circles:getAll': async () => {
@@ -728,13 +729,15 @@ const handlers = {
     const out = []
     for (const [circleId, base] of _circleBases) {
       try {
-        const snap = await snapshotCircle(circleId, base)
+        const snap = await safeSnapshot(circleId, base)
         out.push({ circleId, ...snap })
         // Maintenance: every refresh, ensure our member row exists in
         // every writable circle. Idempotent: skips if a row already
         // exists. This is the reliable path that catches cases the
-        // apply-branch hook misses (timing, missed restart, etc).
-        autoAppendMemberRow(circleId).catch(() => {})
+        // apply-branch hook misses (timing, missed restart, etc). Skip a
+        // degraded circle: its view reads stall, so this would just spawn
+        // more hung tasks until the next-boot nukeTip heals it (2026-06-03c).
+        if (!_degradedCircles.has(circleId)) autoAppendMemberRow(circleId).catch(() => {})
       } catch (e) {
         // Surface the failure but keep going so one bad base doesn't
         // black out the whole home view.
@@ -1276,11 +1279,13 @@ const handlers = {
       ])
       if (closed === T) mark('circle:repair:close-timeout', { circleId: circleId.slice(0, 8) })
     }
-    // 2. Reset per-circle in-memory state so the rebuilt base starts clean.
-    _degradedCircles.delete(circleId)
+    // 2. Reset per-circle state so the rebuilt base starts clean. clearDegraded
+    //    also drops the persisted circleDegraded flag (it's being healed now).
+    clearDegraded(circleId)
     _firstLastSeenWriteMarked.delete(circleId)
     _firstWriterMarked.delete(circleId)
     _lastAppendedPos.delete(circleId)
+    _lastGoodSnapshot.delete(circleId)
     // 3. Re-mount with nukeTip, bounded so a still-corrupt base reports an
     //    error rather than hanging.
     let base
@@ -1569,15 +1574,27 @@ const handlers = {
 
     const circleTrips = []
     for (const [circleId, base] of _circleBases) {
-      const list = []
-      for await (const { value } of base.view.createReadStream({
-        gt: 'trip:' + pubkey + ':',
-        lt: 'trip:' + pubkey + ':~',
-      })) {
-        if (value) list.push(value)
+      // Bound the per-base view read (proposal 2026-06-03c): a corrupt base
+      // stalls the stream and would hang trips forever. On timeout, flag the
+      // circle for repair and skip it rather than freeze the whole list.
+      const drain = (async () => {
+        const list = []
+        for await (const { value } of base.view.createReadStream({
+          gt: 'trip:' + pubkey + ':',
+          lt: 'trip:' + pubkey + ':~',
+        })) {
+          if (value) list.push(value)
+        }
+        return list
+      })()
+      const { value: list, timedOut } = await withTimeout(drain, READ_TIMEOUT_MS)
+      if (timedOut) {
+        flagDegraded(circleId, 'trips:read')
+        mark('trips:listFor:base-timeout', { circleId: circleId.slice(0, 8) })
+        continue
       }
-      if (list.length > 0) circleTrips.push(list)
-      mark('trips:listFor:base-done', { circleId: circleId.slice(0, 8), count: list.length })
+      if (list && list.length > 0) circleTrips.push(list)
+      mark('trips:listFor:base-done', { circleId: circleId.slice(0, 8), count: list ? list.length : 0 })
     }
 
     mark('trips:listFor:done', { circles: circleTrips.length })
@@ -1881,6 +1898,25 @@ function circleIdForBase (base) {
   return null
 }
 
+// Mark a circle's local Autobase as wedged (append or read timed out). Idempotent.
+// Persists `circleDegraded:{id}` so the next boot mounts it with nukeTip and
+// self-heals (proposal 2026-06-03c), surfaces needsRepair to the UI, and the
+// in-memory set short-circuits further appends until repaired.
+function flagDegraded (circleId, label) {
+  if (!circleId || _degradedCircles.has(circleId)) return
+  _degradedCircles.add(circleId)
+  mark('circle:degraded', { circleId: circleId.slice(0, 8), label })
+  _localDb.put('circleDegraded:' + circleId, { ts: Date.now(), label: label || null }).catch(() => {})
+  send({ event: 'circle:degraded', data: { circleId } })
+}
+
+// Clear the degraded state after a (presumed) heal — circle:repair, or a clean
+// nukeTip mount on boot. If the base re-wedges, the next timeout re-flags it.
+function clearDegraded (circleId) {
+  _degradedCircles.delete(circleId)
+  _localDb.del('circleDegraded:' + circleId).catch(() => {})
+}
+
 // Drop-in for `await base.append(op)` on the automatic/background write paths.
 // Bounds the append (raceAppend) so it cannot wedge the dispatcher: on timeout
 // it flags the circle degraded (surfaced to the UI as needsRepair), skips
@@ -1892,12 +1928,27 @@ async function safeAppend (base, op, label) {
   const cid = circleIdForBase(base)
   if (cid && _degradedCircles.has(cid)) return false
   const { ok, timedOut } = await raceAppend(base.append(op), APPEND_TIMEOUT_MS)
-  if (timedOut && cid && !_degradedCircles.has(cid)) {
-    _degradedCircles.add(cid)
-    mark('append:timeout', { circleId: cid.slice(0, 8), label })
-    send({ event: 'circle:degraded', data: { circleId: cid } })
-  }
+  if (timedOut) flagDegraded(cid, 'append:' + (label || ''))
   return ok
+}
+
+// Bounded snapshotCircle (proposal 2026-06-03c). A corrupt base stalls the
+// view reads inside snapshotCircle, which would freeze the circles:getAll
+// poll and the whole UI. Bound it: on timeout, flag the circle degraded (so
+// the next boot nuke-tips it) and serve the last good snapshot so the map
+// stays populated instead of hanging. Caches every clean snapshot.
+async function safeSnapshot (circleId, base) {
+  const { value, timedOut } = await withTimeout(snapshotCircle(circleId, base), READ_TIMEOUT_MS)
+  if (timedOut) {
+    flagDegraded(circleId, 'snapshot')
+    const cached = _lastGoodSnapshot.get(circleId)
+    if (cached) return { ...cached, needsRepair: true }
+    // No prior snapshot to serve: return the full empty shape (not a bare
+    // object) so the UI's renderers never hit an undefined members/places.
+    return { circle: null, members: [], lastSeen: {}, presence: {}, places: [], transitions: [], writable: false, writers: null, needsRepair: true, stale: true }
+  }
+  _lastGoodSnapshot.set(circleId, value)
+  return value
 }
 
 async function appendTransition (base, placeId, kind, ts) {
@@ -3387,6 +3438,19 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   _swarm.on('connection', onSwarmConnection)
   mark('init:swarm-created')
 
+  // Self-healing for wedged circles (proposal 2026-06-03c). A circle whose
+  // append/read timed out in a prior session persisted a circleDegraded:{id}
+  // flag. Load those up front so the mount below opens them with nukeTip,
+  // rewinding the corrupt local tip BEFORE any snapshot/auto-append read runs
+  // — the device heals without the user touching a (possibly frozen) UI.
+  const persistedDegraded = new Set()
+  for await (const { key } of _localDb.createReadStream({
+    gt: 'circleDegraded:', lt: 'circleDegraded:~',
+  })) {
+    persistedDegraded.add(key.slice('circleDegraded:'.length))
+  }
+  if (persistedDegraded.size) mark('circle:degraded-persisted', { count: persistedDegraded.size })
+
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced
   // and their Autobases reopened on every boot.
@@ -3396,7 +3460,14 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   })) {
     if (!value || !value.circleId) continue
     if (value.bootstrap) {
-      try { await mountCircleAutobase(value.circleId, value.bootstrap, value.encryptionKey) } catch (e) {
+      const heal = persistedDegraded.has(value.circleId)
+      if (heal) mark('circle:nuketip-on-boot', { circleId: value.circleId.slice(0, 8) })
+      try {
+        await mountCircleAutobase(value.circleId, value.bootstrap, value.encryptionKey, { nukeTip: heal })
+        // Clean mount of a previously-degraded circle: presume healed and
+        // clear the flag. If it re-wedges, the next timeout re-flags it.
+        if (heal) clearDegraded(value.circleId)
+      } catch (e) {
         console.warn('[bare] failed to mount circle', value.circleId, e?.message)
       }
     }

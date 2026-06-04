@@ -1,4 +1,4 @@
-const { raceAppend, APPEND_TIMEOUT_MS } = require('../src/lib/appendTimeout')
+const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('../src/lib/appendTimeout')
 
 // Proposal 2026-06-03-autobase-append-hang: a base.append() that never
 // resolves must not be able to hang the caller (which would freeze the whole
@@ -34,4 +34,30 @@ test('the timeout timer is cleared on the fast path (no dangling handle)', async
 test('default timeout is a sane bound', () => {
   expect(APPEND_TIMEOUT_MS).toBeGreaterThanOrEqual(5000)
   expect(APPEND_TIMEOUT_MS).toBeLessThanOrEqual(30000)
+})
+
+// Proposal 2026-06-03c: reads hang too. withTimeout bounds any read
+// (snapshotCircle, trips view streams) so a corrupt base can't freeze them.
+
+test('withTimeout returns the resolved value on the fast path', async () => {
+  const r = await withTimeout(Promise.resolve([1, 2, 3]), 1000)
+  expect(r).toEqual({ value: [1, 2, 3], timedOut: false })
+})
+
+test('withTimeout flags a never-resolving read as timed out', async () => {
+  const never = new Promise(() => {}) // a wedged view stream drain
+  const r = await withTimeout(never, 20)
+  expect(r).toEqual({ value: undefined, timedOut: true })
+})
+
+test('withTimeout surfaces a rejection as not-timed-out', async () => {
+  const r = await withTimeout(Promise.reject(new Error('boom')), 1000)
+  expect(r.timedOut).toBe(false)
+  expect(r.value).toBeUndefined()
+  expect(r.error).toBeInstanceOf(Error)
+})
+
+test('READ_TIMEOUT_MS is a sane, generous bound (>= append timeout)', () => {
+  expect(READ_TIMEOUT_MS).toBeGreaterThanOrEqual(APPEND_TIMEOUT_MS)
+  expect(READ_TIMEOUT_MS).toBeLessThanOrEqual(30000)
 })
