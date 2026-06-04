@@ -10,6 +10,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.content.IntentFilter
 import android.location.Location
+import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -27,6 +28,8 @@ import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.facebook.react.modules.core.PermissionAwareActivity
 import com.facebook.react.modules.core.PermissionListener
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
@@ -175,26 +178,132 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
     @ReactMethod
     fun requestSingleFix(promise: Promise) {
         if (!hasFineLocation()) { promise.resolve(false); return }
+        // Fused requires Google Play Services. On de-Googled ROMs
+        // (LineageOS/GrapheneOS without microG) it never delivers a fix,
+        // so fall back to the platform LocationManager. Proposal
+        // 2026-06-03.
+        if (gmsAvailable(ctx)) {
+            fusedSingleFix(promise)
+        } else {
+            platformSingleFix(promise)
+        }
+    }
+
+    private fun fusedSingleFix(promise: Promise) {
         val client = LocationServices.getFusedLocationProviderClient(ctx)
         val request = CurrentLocationRequest.Builder()
             .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
             .setMaxUpdateAgeMillis(0L)
             .build()
         val cts = CancellationTokenSource()
+        // Single-settle guard + hard timeout. On GrapheneOS with sandboxed
+        // Play the fused getCurrentLocation can fire but never call back at
+        // all (the OsLocationProvider can't lock indoors and reports
+        // nothing), which left requestSingleFix hanging and the last-known
+        // fallback unreachable. If neither listener fires within
+        // GET_FIX_TIMEOUT_MS, cancel the request and fall back to the
+        // platform last-known fix. settled ensures the promise resolves
+        // exactly once whichever path wins. Proposal 2026-06-03 (getfix
+        // timeout).
+        val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val handler = Handler(Looper.getMainLooper())
+        val onTimeout = Runnable {
+            if (settled.compareAndSet(false, true)) {
+                try { cts.cancel() } catch (_: Throwable) {}
+                emitLastKnownOrFalse(promise)
+            }
+        }
+        handler.postDelayed(onTimeout, GET_FIX_TIMEOUT_MS)
         try {
             client.getCurrentLocation(request, cts.token)
                 .addOnSuccessListener { loc ->
+                    if (!settled.compareAndSet(false, true)) return@addOnSuccessListener
+                    handler.removeCallbacks(onTimeout)
                     if (loc != null) {
                         emitToJs(loc)
                         promise.resolve(true)
                     } else {
-                        // Provider couldn't produce a fix in time (no
-                        // signal indoors, etc.); the next service callback
-                        // will refresh when one is available.
-                        promise.resolve(false)
+                        // Provider returned no fresh fix (common on
+                        // GrapheneOS sandboxed Play / GPS-only indoors).
+                        // Republish the platform last-known so peers stop
+                        // seeing a days-old position. Proposal 2026-06-03
+                        // (last-known fallback).
+                        emitLastKnownOrFalse(promise)
                     }
                 }
-                .addOnFailureListener { promise.resolve(false) }
+                .addOnFailureListener {
+                    if (!settled.compareAndSet(false, true)) return@addOnFailureListener
+                    handler.removeCallbacks(onTimeout)
+                    emitLastKnownOrFalse(promise)
+                }
+        } catch (e: SecurityException) {
+            if (settled.compareAndSet(false, true)) {
+                handler.removeCallbacks(onTimeout)
+                promise.resolve(false)
+            }
+        }
+    }
+
+    // Emit the freshest platform last-known fix if one exists, else
+    // resolve false. Shared fallback for both the fused and platform
+    // one-shot paths when an active fix can't be acquired (indoors /
+    // GPS-only / no network provider). Republishing a last-known fix is
+    // strictly better than emitting nothing: a stationary user keeps
+    // showing their real last position instead of freezing for days.
+    // The fix's own loc.time is preserved (honest staleness), so peers
+    // see when it was actually taken. Proposal 2026-06-03.
+    private fun emitLastKnownOrFalse(promise: Promise) {
+        val last = platformLastKnown()
+        if (last != null) { emitToJs(last); promise.resolve(true) }
+        else promise.resolve(false)
+    }
+
+    // Freshest getLastKnownLocation across GPS + NETWORK. Null when no
+    // provider has ever produced a fix this boot.
+    private fun platformLastKnown(): Location? {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+        var best: Location? = null
+        for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            if (!lm.allProviders.contains(p)) continue
+            try {
+                val loc = lm.getLastKnownLocation(p) ?: continue
+                if (best == null || loc.time > best!!.time) best = loc
+            } catch (e: SecurityException) { /* skip provider */ }
+        }
+        return best
+    }
+
+    // GMS-free one-shot fix via the platform LocationManager. GPS is
+    // primary; NETWORK is used only when GPS is absent (on de-Googled
+    // devices NETWORK usually has no backend). API 30+ uses the active,
+    // timeout-bounded getCurrentLocation; API 29 emits the freshest
+    // last-known fix so the map shows something immediately, and leaves
+    // fresh streaming fixes to the foreground service. Resolve false
+    // (non-fatal) on any miss — the service stream is authoritative.
+    private fun platformSingleFix(promise: Promise) {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (lm == null) { promise.resolve(false); return }
+        val provider = when {
+            lm.allProviders.contains(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+            lm.allProviders.contains(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+            else -> { promise.resolve(false); return }
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                lm.getCurrentLocation(
+                    provider,
+                    null,
+                    ContextCompat.getMainExecutor(ctx),
+                    java.util.function.Consumer { loc ->
+                        if (loc != null) { emitToJs(loc); promise.resolve(true) }
+                        else emitLastKnownOrFalse(promise)
+                    },
+                )
+            } else {
+                val last = lm.getLastKnownLocation(provider)
+                if (last != null) { emitToJs(last); promise.resolve(true) }
+                else promise.resolve(false)
+            }
         } catch (e: SecurityException) {
             promise.resolve(false)
         }
@@ -423,6 +532,22 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         private const val REQ_BACKGROUND = 4712
         private const val REQ_NOTIFICATIONS = 4713
         private const val DEBOUNCE_MS = 2000L
+        // Hard cap on the fused one-shot before we fall back to last-known.
+        // The fused provider can hang indefinitely on de-Googled ROMs.
+        private const val GET_FIX_TIMEOUT_MS = 8000L
         @JvmStatic var instance: PearCircleLocationModule? = null
+
+        // True only when Google Play Services is present and usable, so
+        // FusedLocationProvider will actually deliver fixes. The detection
+        // code lives in play-services-base (bundled in our APK), so this
+        // runs even on devices where GMS is not installed; it returns
+        // false there, routing callers to the LocationManager fallback.
+        // Proposal 2026-06-03.
+        @JvmStatic
+        fun gmsAvailable(ctx: Context): Boolean = try {
+            GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(ctx) == ConnectionResult.SUCCESS
+        } catch (e: Throwable) {
+            false
+        }
     }
 }

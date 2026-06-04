@@ -10,7 +10,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
@@ -34,6 +38,8 @@ class PearCircleLocationService : Service() {
 
     private lateinit var client: FusedLocationProviderClient
     private var callback: LocationCallback? = null
+    private var locationManager: LocationManager? = null
+    private var platformListener: LocationListener? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -82,13 +88,26 @@ class PearCircleLocationService : Service() {
     override fun onDestroy() {
         callback?.let { client.removeLocationUpdates(it) }
         callback = null
+        platformListener?.let { locationManager?.removeUpdates(it) }
+        platformListener = null
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startLocationUpdates() {
-        if (callback != null) return
+        if (callback != null || platformListener != null) return
+        // Fused requires Google Play Services. On de-Googled ROMs it never
+        // delivers callbacks, so stream from the platform LocationManager
+        // instead. Proposal 2026-06-03.
+        if (PearCircleLocationModule.gmsAvailable(this)) {
+            startFusedUpdates()
+        } else {
+            startPlatformUpdates()
+        }
+    }
+
+    private fun startFusedUpdates() {
         val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10_000L)
             .setMinUpdateIntervalMillis(5_000L)
             // Movement gate (storage-growth remediation, proposal
@@ -113,6 +132,40 @@ class PearCircleLocationService : Service() {
             client.requestLocationUpdates(req, cb, Looper.getMainLooper())
         } catch (e: SecurityException) {
             // ACCESS_FINE_LOCATION revoked while we were running.
+            stopSelf()
+        }
+    }
+
+    // GMS-free streaming via the platform LocationManager. Same cadence
+    // as the fused path (10s / 10m) so the worklet's lastSeen gating and
+    // geofence math behave identically. GPS is primary; NETWORK is used
+    // only when GPS is absent (on de-Googled devices NETWORK usually has
+    // no backend). Proposal 2026-06-03.
+    private fun startPlatformUpdates() {
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (lm == null) { stopSelf(); return }
+        locationManager = lm
+        val provider = when {
+            lm.allProviders.contains(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+            lm.allProviders.contains(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+            else -> { stopSelf(); return }
+        }
+        val listener = object : LocationListener {
+            override fun onLocationChanged(loc: Location) {
+                PearCircleLocationModule.instance?.emitToJs(loc)
+            }
+            // onProviderEnabled/Disabled/onStatusChanged gained default
+            // implementations in API 30 but are abstract on API 29 (our
+            // minSdk), so override them as no-ops to compile and run there.
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {}
+            @Deprecated("Deprecated in API 29")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+        }
+        platformListener = listener
+        try {
+            lm.requestLocationUpdates(provider, 10_000L, 10f, listener, Looper.getMainLooper())
+        } catch (e: SecurityException) {
             stopSelf()
         }
     }
