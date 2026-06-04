@@ -1272,31 +1272,29 @@ const handlers = {
     const { bootstrap, encryptionKey } = record.value
     const newGen = (typeof record.value.rebuildGen === 'number' ? record.value.rebuildGen : 0) + 1
     mark('circle:repair:start', { circleId: circleId.slice(0, 8), newGen })
-    // 1. Close + drop the wedged base (bounded — a hung close must not freeze
-    //    this handler too).
-    const existing = _circleBases.get(circleId)
-    if (existing) {
-      _circleBases.delete(circleId)
-      const T = Symbol('t')
-      const closed = await Promise.race([
-        existing.close().then(() => true, () => true),
-        new Promise((r) => setTimeout(() => r(T), APPEND_TIMEOUT_MS)),
-      ])
-      if (closed === T) mark('circle:repair:close-timeout', { circleId: circleId.slice(0, 8) })
-    }
+    // 1. Abandon the wedged base WITHOUT Autobase.close(). Closing a wedged
+    //    base hangs, and a close running concurrently with the fresh mount
+    //    deadlocks it in-process (validated on-device 2026-06-04: the in-app
+    //    repair hung at the new mount, but a reboot — no dangling close —
+    //    mounted gen+1 cleanly). Just drop it from the map; its orphaned
+    //    gen-{old} cores are reclaimed on the next boot, and the fresh
+    //    namespace uses different local cores so there is no session conflict.
+    _circleBases.delete(circleId)
     // 2. Clear the bootstrap's autobase/local pin. A fresh namespace alone
     //    re-opens the SAME corrupt writer, because the shared bootstrap core
     //    pins our local writer key in its autobase/local userData (boot.js
     //    reads it before falling back to the namespace-derived name:'local').
     //    Clearing it makes the gen+1 mount derive a brand-new local writer.
-    try {
+    //    Bounded so a hung core open can't freeze the handler.
+    const pinRes = await withTimeout((async () => {
       const bc = _store.get({ key: b4a.from(bootstrap, 'hex'), active: false })
       await bc.ready()
       await bc.setUserData('autobase/local', null)
       await bc.close()
-    } catch (e) {
-      mark('circle:repair:pin-clear-failed', { circleId: circleId.slice(0, 8), err: e?.message })
-    }
+      return true
+    })(), APPEND_TIMEOUT_MS)
+    if (pinRes.timedOut) mark('circle:repair:pin-clear-timeout', { circleId: circleId.slice(0, 8) })
+    else if (pinRes.error) mark('circle:repair:pin-clear-failed', { circleId: circleId.slice(0, 8), err: pinRes.error?.message })
     // 3. Persist the new generation so a crash mid-repair still boots into the
     //    fresh namespace, not the corrupt one.
     await _localDb.put('circles:joined:' + circleId, { ...record.value, rebuildGen: newGen }).catch(() => {})
