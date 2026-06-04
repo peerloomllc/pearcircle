@@ -1100,8 +1100,14 @@ function RepairBanner ({ count, circleName, onRepair, onDismiss }) {
 // the actual re-sync from the seeder + writer re-admission run async and can
 // take a long time, so this persists (via the worklet's `repairing` flag)
 // until the rebuilt base is functional again. No action -- it's in progress.
-function RepairingBanner ({ count, circleName }) {
-  const label = count > 1 ? `Repairing ${count} circles…` : `Repairing ${circleName || 'circle'}…`
+function RepairingBanner ({ count, circleName, needsRestart = false }) {
+  const target = count > 1 ? `${count} circles` : (circleName || 'circle')
+  const label = needsRestart
+    ? `Finishing repair of ${target}`
+    : (count > 1 ? `Repairing ${count} circles…` : `Repairing ${circleName || 'circle'}…`)
+  const sub = needsRestart
+    ? 'Reopen the app to finish repairing.'
+    : 'This can take a while. Your circle will catch up in the background.'
   return (
     <div style={{
       position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
@@ -1110,15 +1116,17 @@ function RepairingBanner ({ count, circleName }) {
       borderBottom: `1px solid ${colors.border}`,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, padding: `0 ${spacing.lg}px` }}>
-        <span style={{
-          width: 15, height: 15, borderRadius: '50%', flexShrink: 0,
-          border: `2px solid ${colors.border}`, borderTopColor: colors.primary,
-          animation: 'pearcircle-focus-spin 0.8s linear infinite', display: 'inline-block',
-        }} />
-        <div style={{ textAlign: 'left' }}>
+        {!needsRestart && (
+          <span style={{
+            width: 15, height: 15, borderRadius: '50%', flexShrink: 0,
+            border: `2px solid ${colors.border}`, borderTopColor: colors.primary,
+            animation: 'pearcircle-focus-spin 0.8s linear infinite', display: 'inline-block',
+          }} />
+        )}
+        <div style={{ textAlign: needsRestart ? 'center' : 'left' }}>
           <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{label}</div>
           <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
-            This can take a while. Your circle will catch up in the background.
+            {sub}
           </div>
         </div>
       </div>
@@ -1979,9 +1987,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const placeCount = data.places.length
   const isSingleCircle = activeCircles.length === 1
   // Repair surfaces span ALL circles (a wedged circle may not be the selected
-  // one). repairing takes priority over needs-repair for a circle in flight.
-  const repairingCircles = circles.filter((c) => c.repairing)
-  const needRepairCircles = circles.filter((c) => c.needsRepair && !c.repairing)
+  // one). A repair in flight (repairing) or staged-for-restart (repairStaged)
+  // takes priority over the needs-repair nudge.
+  const repairingCircles = circles.filter((c) => c.repairing || c.repairStaged)
+  const repairStagedPending = repairingCircles.some((c) => c.repairStaged)
+  const needRepairCircles = circles.filter((c) => c.needsRepair && !c.repairing && !c.repairStaged)
   // Where to write per-place / per-circle actions. With "All" selected
   // and multiple circles we don't have a single target for membership-
   // post / read-only-warning lines. Place creation handles the
@@ -2269,6 +2279,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         <RepairingBanner
           count={repairingCircles.length}
           circleName={repairingCircles[0]?.circle?.name}
+          needsRestart={repairStagedPending}
         />
       ) : (!tourActive && !repairBannerDismissed && needRepairCircles.length > 0 && (
         <RepairBanner
@@ -2290,6 +2301,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           }}
         />
       )}
+
 
 
       {/* Slide-down member-focus top bar. Always mounted so the slide

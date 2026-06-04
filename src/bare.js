@@ -116,6 +116,7 @@ const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
+const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
 const _lastGoodSnapshot = new Map() // circleId → last successful snapshotCircle result, served when a bounded snapshot times out so the UI stays populated (proposal 2026-06-03c)
 const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
 // Seed-mode only: per-circle replication state. Each entry holds the
@@ -1277,24 +1278,12 @@ const handlers = {
     const { bootstrap, encryptionKey } = record.value
     const newGen = (typeof record.value.rebuildGen === 'number' ? record.value.rebuildGen : 0) + 1
     mark('circle:repair:start', { circleId: circleId.slice(0, 8), newGen })
-    // Mark repairing up front so the UI shows "Repairing…" for the whole
-    // (long, async) re-sync, not just the few seconds this handler runs.
-    // Cleared in circles:getAll once the rebuilt base is writable again.
-    setRepairing(circleId)
-    // 1. Abandon the wedged base WITHOUT Autobase.close(). Closing a wedged
-    //    base hangs, and a close running concurrently with the fresh mount
-    //    deadlocks it in-process (validated on-device 2026-06-04: the in-app
-    //    repair hung at the new mount, but a reboot — no dangling close —
-    //    mounted gen+1 cleanly). Just drop it from the map; its orphaned
-    //    gen-{old} cores are reclaimed on the next boot, and the fresh
-    //    namespace uses different local cores so there is no session conflict.
-    _circleBases.delete(circleId)
-    // 2. Clear the bootstrap's autobase/local pin. A fresh namespace alone
-    //    re-opens the SAME corrupt writer, because the shared bootstrap core
-    //    pins our local writer key in its autobase/local userData (boot.js
-    //    reads it before falling back to the namespace-derived name:'local').
-    //    Clearing it makes the gen+1 mount derive a brand-new local writer.
-    //    Bounded so a hung core open can't freeze the handler.
+    // 1. Clear the bootstrap's autobase/local pin so the gen+1 mount derives a
+    //    BRAND-NEW local writer. A fresh namespace alone re-opens the same
+    //    corrupt writer, which boot.js finds via the shared bootstrap core's
+    //    autobase/local userData. Bounded so a hung core open can't freeze us.
+    //    Safe to clear while the old base is still mounted: that base already
+    //    booted its writer and won't re-read the pin.
     const pinRes = await withTimeout((async () => {
       const bc = _store.get({ key: b4a.from(bootstrap, 'hex'), active: false })
       await bc.ready()
@@ -1304,31 +1293,53 @@ const handlers = {
     })(), APPEND_TIMEOUT_MS)
     if (pinRes.timedOut) mark('circle:repair:pin-clear-timeout', { circleId: circleId.slice(0, 8) })
     else if (pinRes.error) mark('circle:repair:pin-clear-failed', { circleId: circleId.slice(0, 8), err: pinRes.error?.message })
-    // 3. Persist the new generation so a crash mid-repair still boots into the
-    //    fresh namespace, not the corrupt one.
+    // 2. Persist the new generation so the next launch boots into the fresh
+    //    namespace even if everything below is interrupted.
     await _localDb.put('circles:joined:' + circleId, { ...record.value, rebuildGen: newGen }).catch(() => {})
-    // 4. Reset per-circle state. clearDegraded drops the in-memory skip + the
-    //    persisted circleDegraded flag (we're rebuilding now).
-    clearDegraded(circleId)
-    _firstLastSeenWriteMarked.delete(circleId)
-    _firstWriterMarked.delete(circleId)
-    _lastAppendedPos.delete(circleId)
-    _lastGoodSnapshot.delete(circleId)
-    // 5. Mount the fresh namespace, bounded so a still-broken base reports an
-    //    error rather than hanging.
-    let base
+    // 3. BUILD the rebuilt base WITHOUT touching the live one, bounded. The old
+    //    base stays mounted the whole time, so a hung build can never leave the
+    //    circle unmounted ("not in any circles"). The in-app remount of a fresh
+    //    namespace can still hang while the old base is around; if it does we
+    //    fall through to staging it for the next launch.
+    let newBase = null
     try {
-      base = await Promise.race([
-        mountCircleAutobase(circleId, bootstrap, encryptionKey || null, { rebuildGen: newGen }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('repair_mount_timeout')), 20000)),
+      newBase = await Promise.race([
+        buildCircleAutobase(circleId, bootstrap, encryptionKey || null, newGen),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('repair_mount_timeout')), 18000)),
       ])
     } catch (e) {
-      mark('circle:repair:failed', { circleId: circleId.slice(0, 8), err: e?.message })
-      return { ok: false, reason: e?.message || 'mount_failed' }
+      mark('circle:repair:mount-staged', { circleId: circleId.slice(0, 8), newGen, err: e?.message })
     }
-    mark('circle:repair:done', { circleId: circleId.slice(0, 8), newGen, writable: !!base?.writable })
-    send({ event: 'circle:repaired', data: { circleId } })
-    return { ok: true, writable: !!base?.writable }
+    if (newBase) {
+      // 4a. Built in-process — swap atomically. Abandon the old base (no
+      //     Autobase.close(); it hangs) and install the rebuilt one. Mark
+      //     repairing so the indicator runs until it is writable again.
+      _circleBases.delete(circleId)
+      _circleBases.set(circleId, newBase)
+      openPairChannelsForCircle(circleId, newBase)
+      clearDegraded(circleId)
+      _firstLastSeenWriteMarked.delete(circleId)
+      _firstWriterMarked.delete(circleId)
+      _lastAppendedPos.delete(circleId)
+      _lastGoodSnapshot.delete(circleId)
+      _repairStaged.delete(circleId)
+      setRepairing(circleId)
+      mark('circle:repair:done', { circleId: circleId.slice(0, 8), newGen, writable: !!newBase.writable })
+      send({ event: 'circle:repaired', data: { circleId, restartRequired: false } })
+      return { ok: true, writable: !!newBase.writable }
+    }
+    // 4b. In-app remount hung. Keep the OLD base mounted (circle stays visible)
+    //     and stage the rebuild for the next launch, where the boot mount loop
+    //     opens gen+1 cleanly. clearDegraded so the old base's stalls don't read
+    //     as "needs repair"; _repairStaged surfaces "reopen to finish"; the
+    //     persisted circleRepairing flag resumes "Repairing…" after the restart.
+    //     We do NOT add to _repairingCircles now — the old base is writable,
+    //     which would clear it prematurely in circles:getAll.
+    clearDegraded(circleId)
+    _repairStaged.add(circleId)
+    _localDb.put('circleRepairing:' + circleId, { ts: Date.now() }).catch(() => {})
+    send({ event: 'circle:repaired', data: { circleId, restartRequired: true } })
+    return { ok: true, staged: true, restartRequired: true }
   },
 
   'circles:list': async () => {
@@ -1932,6 +1943,10 @@ function circleIdForBase (base) {
 // in-memory set short-circuits further appends until repaired.
 function flagDegraded (circleId, label) {
   if (!circleId || _degradedCircles.has(circleId)) return
+  // A repair already in flight (mounted-and-syncing, or staged for restart):
+  // don't re-flag needsRepair from the old base's stalls, or the UI would
+  // flip back to "needs repair" while the rebuild is underway.
+  if (_repairingCircles.has(circleId) || _repairStaged.has(circleId)) return
   _degradedCircles.add(circleId)
   mark('circle:degraded', { circleId: circleId.slice(0, 8), label })
   _localDb.put('circleDegraded:' + circleId, { ts: Date.now(), label: label || null }).catch(() => {})
@@ -2192,6 +2207,10 @@ async function snapshotCircle (circleId, base) {
     // awaiting writer re-admission). Drives the indeterminate "Repairing…"
     // indicator; supersedes needsRepair in the UI.
     repairing: _repairingCircles.has(circleId),
+    // True when the rebuild was staged because the in-app remount hung: the
+    // old base is still mounted and the rebuild applies on the next launch.
+    // The UI shows "reopen the app to finish".
+    repairStaged: _repairStaged.has(circleId),
   }
 }
 
@@ -2680,8 +2699,11 @@ function circleNamespaceKey (circleId, rebuildGen) {
   return rebuildGen ? circleId + ':r' + rebuildGen : circleId
 }
 
-async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, { rebuildGen = 0 } = {}) {
-  if (_circleBases.has(circleId)) return _circleBases.get(circleId)
+// Build (but do not register) a circle's Autobase under its rebuildGen
+// namespace. Split out so circle:repair can build the rebuilt base BEFORE
+// swapping out the old one — a hung build then never leaves the circle
+// unmounted (it just keeps the old base).
+async function buildCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, rebuildGen = 0) {
   const ns = _store.namespace(circleNamespaceKey(circleId, rebuildGen))
   const baseOpts = {
     open: openCircleView,
@@ -2691,6 +2713,12 @@ async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, { 
   if (encryptionKeyHex) baseOpts.encryptionKey = b4a.from(encryptionKeyHex, 'hex')
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
+  return base
+}
+
+async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, { rebuildGen = 0 } = {}) {
+  if (_circleBases.has(circleId)) return _circleBases.get(circleId)
+  const base = await buildCircleAutobase(circleId, bootstrapHex, encryptionKeyHex, rebuildGen)
   _circleBases.set(circleId, base)
   openPairChannelsForCircle(circleId, base)
   return base
