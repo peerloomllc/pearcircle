@@ -31,7 +31,7 @@ This is the load-bearing section because peers do not upgrade together.
 
 - **Two-phase rollout.**
   - *Phase 1 (interop):* upgraded peers DUAL-WRITE - they still append `lastSeen` to the autobase (so old peers, which only read the view, keep seeing them) AND publish live ephemerally + persist to the per-member core. Upgraded peers read by the precedence above. This ships safely into a mixed fleet but does NOT yet stop growth.
-  - *Phase 2 (growth-stop):* once the fleet has upgraded, a flag flips off the autobase `lastSeen` write. This is the actual fix; it is gated behind fleet adoption because an old peer would otherwise stop seeing upgraded peers' positions.
+  - *Phase 2 (growth-stop):* **capability handshake (decided 2026-06-04).** Peers advertise new-path support on the ephemeral channel handshake; a writer auto-stops its autobase `lastSeen` write for a circle once all of that circle's current writers have advertised support. Self-driving and per-circle (no manual fleet-wide flag, no release coordination); growth stops for each circle as its members converge. A keep-writing kill-switch stays for safety. This is gated on per-circle writer support because an old peer would otherwise stop seeing upgraded peers' positions.
 - **Existing bloated circles are not shrunk by this change.** Dual-write only stops *future* growth (phase 2). A circle already at ~340k nodes stays wedged. Remediation (decided 2026-06-04): the owner re-creates the circle for a fresh empty autobase and re-invites members; an automated compaction tool was considered and rejected as not worth the complexity for the handful of affected circles. ABFG/`VLRwUprk` will be re-created by its owner.
 - **Presence** migrates the same way.
 
@@ -44,8 +44,11 @@ This is the load-bearing section because peers do not upgrade together.
 - Phase 1 is additive (new channel + new core + dual-write); reverting restores autobase-only lastSeen, no peer-visible break.
 - Phase 2 is a single flag; flip it back on to resume autobase writes if an interop problem surfaces.
 
+## Decisions (2026-06-04)
+- **Persisted last-known: a dedicated per-member single-writer Hypercore**, truncated to the latest fix, replicated like the existing circle cores so the blind seeder serves offline last-known. Chosen over a gossiped local slot (which can't give the seeder an offline last-known to serve).
+- **Phase-2 cutover: capability handshake** (see Compat), not a manual fleet-wide flag.
+- **Existing bloated circles:** owner re-creates (see Compat).
+
 ## Open questions
-- Persisted last-known: a dedicated per-member Hypercore vs a small fixed-size slot in the existing local store that is gossiped. Core is cleaner for seeder replication; evaluate plumbing cost.
-- How aggressively to truncate the per-member core (latest-only vs a short trail for a breadcrumb view).
-- Phase-2 trigger: an explicit version gate / capability handshake vs a manual fleet-wide flip once telemetry shows adoption.
+- How aggressively to truncate the per-member core (latest-only vs a short trail for a breadcrumb view). Starting latest-only.
 - Should the durable ops (trips especially) also get checkpoint/truncation as a belt-and-suspenders bound, or is their volume low enough to ignore.
