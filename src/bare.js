@@ -34,6 +34,7 @@ const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const { setupLiveChannel, LIVE_PROTOCOL } = require('./liveLocation')
 const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
+const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLastKnown')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
@@ -56,6 +57,9 @@ const { TRIP_RETENTION_MS, tripIsExpired } = require('./lib/tripRetention')
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
 const FUTURE_TS_TOLERANCE_MS = 5 * 60 * 1000
+// Bound a background peer last-known tip fetch so a never-served block can't
+// leave a get() pending forever (proposal 2026-06-04-lastseen-ephemeral 2a).
+const PEER_TIP_FETCH_TIMEOUT_MS = 15000
 
 // Avatar base64 cap. Per DECISIONS 2026-05-03 the byte-budget is ~30KB,
 // which is ~40KB after base64 inflation. We leave a small headroom.
@@ -109,6 +113,8 @@ const _firstLastSeenWriteMarked = new Set()   // circleIds with our first own la
 const _firstLastSeenRemoteMarked = new Set()  // circleIds where a non-self lastSeen has applied
 const _firstLiveBroadcastMarked = new Set()   // circleIds where we first broadcast a live fix (proposal 2026-06-04 phase 1)
 const _firstLiveRecvMarked = new Set()        // circleIds where we first received a peer's live fix
+const _firstLastKnownWriteMarked = new Set()  // circleIds where we first appended our last-known core fix (proposal 2026-06-04 slice 2a)
+const _firstPeerLastKnownMarked = new Set()   // circleIds where we first cached a peer's last-known core tip
 
 let _store = null
 let _localDb = null
@@ -134,6 +140,20 @@ const _circleBases = new Map()    // circleId → Autobase instance
 // conn → Map<circleId, send(value)> for broadcasting our fix to that peer.
 const _liveLastSeen = new Map()
 const _liveChannels = new Map()
+// Per-member last-known cores (proposal 2026-06-04-lastseen-ephemeral, slice 2a).
+// The bounded, persisted offline fallback that will replace the Autobase
+// lastSeen oplog write. _lastKnownSelfCores: circleId → our own single-writer
+// Hypercore (append latest + clear earlier blocks). _lastKnownPeerCores:
+// circleId → Map<pubkeyHex, core> opened by each peer's announced key.
+// _lastKnownCache: circleId → Map<pubkeyHex, signed value> of the freshest tip
+// we have downloaded, read into snapshotCircle's precedence overlay.
+// _circleEncKeys: circleId → circle enc key hex (for opening the cores).
+// _lastKnownAnnounced: circleIds whose self core key is published in the view.
+const _lastKnownSelfCores = new Map()
+const _lastKnownPeerCores = new Map()
+const _lastKnownCache = new Map()
+const _circleEncKeys = new Map()
+const _lastKnownAnnounced = new Set()
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
@@ -1343,6 +1363,9 @@ const handlers = {
       _lastAppendedPos.delete(circleId)
       _lastGoodSnapshot.delete(circleId)
       _repairStaged.delete(circleId)
+      // Re-announce the (namespace-stable) last-known core key into the rebuilt
+      // view, which starts empty (proposal 2026-06-04 slice 2a).
+      _lastKnownAnnounced.delete(circleId)
       setRepairing(circleId)
       mark('circle:repair:done', { circleId: circleId.slice(0, 8), newGen, writable: !!newBase.writable })
       send({ event: 'circle:repaired', data: { circleId, restartRequired: false } })
@@ -1529,6 +1552,12 @@ const handlers = {
     for (const circleId of _circleBases.keys()) {
       if (!getCircleSharing(circleId).enabled) continue
       broadcastLive(circleId, value)
+      // Persist the bounded last-known fix to our per-member core (slice 2a).
+      // The offline fallback that will replace the Autobase write in phase 2;
+      // append + clear keeps on-disk DATA O(1), unlike the oplog.
+      appendSelfLastKnown(circleId, value).catch((e) => {
+        console.warn('[bare] appendSelfLastKnown failed', circleId, e?.message)
+      })
     }
 
     // After lastSeen lands, run the JS-side geofence check. Any flips
@@ -2220,11 +2249,17 @@ async function snapshotCircle (circleId, base) {
   })) {
     if (value) transitions.push(value)
   }
-  // Overlay ephemeral live positions (proposal 2026-06-04 phase 1). Freshest
-  // ts wins; restricted to visible members so a stale live entry for a
+  // Overlay last-known core tips then ephemeral live positions (proposal
+  // 2026-06-04 phase 1, precedence live > core > view). mergeLiveLastSeen is
+  // freshest-ts-wins, so composing it twice (view←core, then ←live) yields the
+  // freshest of the three. Restricted to visible members so a stale entry for a
   // left/removed member (already filtered out of `members`) can't reappear.
   const allowedMemberKeys = new Set(members.map((m) => m.value?.pubkey).filter(Boolean))
-  const mergedLastSeen = mergeLiveLastSeen(lastSeen, _liveLastSeen.get(circleId), allowedMemberKeys)
+  // Kick a background refresh of peers' last-known cores; the result lands in
+  // the cache for a later poll (slice 2a). Non-blocking — never awaited here.
+  refreshPeerLastKnown(circleId).catch(() => {})
+  const withCore = mergeLiveLastSeen(lastSeen, _lastKnownCache.get(circleId), allowedMemberKeys)
+  const mergedLastSeen = mergeLiveLastSeen(withCore, _liveLastSeen.get(circleId), allowedMemberKeys)
   return {
     circle: circleRow ? circleRow.value : null,
     members,
@@ -2304,6 +2339,24 @@ async function tearDownCircleLocally (circleId) {
   // Drop ephemeral live state for the circle (proposal 2026-06-04 phase 1).
   _liveLastSeen.delete(circleId)
   for (const perConn of _liveChannels.values()) perConn.delete(circleId)
+  // Close + drop per-member last-known cores for the circle (slice 2a).
+  const selfCore = _lastKnownSelfCores.get(circleId)
+  if (selfCore) {
+    try { await selfCore.close() } catch (e) { console.warn('[bare] self last-known close failed', e?.message) }
+    _lastKnownSelfCores.delete(circleId)
+  }
+  const peerCores = _lastKnownPeerCores.get(circleId)
+  if (peerCores) {
+    for (const c of peerCores.values()) {
+      try { await c.close() } catch (e) { console.warn('[bare] peer last-known close failed', e?.message) }
+    }
+    _lastKnownPeerCores.delete(circleId)
+  }
+  _lastKnownCache.delete(circleId)
+  _circleEncKeys.delete(circleId)
+  _lastKnownAnnounced.delete(circleId)
+  _firstLastKnownWriteMarked.delete(circleId)
+  _firstPeerLastKnownMarked.delete(circleId)
   for (const key of Array.from(_circlePlaces.keys())) {
     if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
   }
@@ -2455,6 +2508,22 @@ async function applyCircleNodes (nodes, view, base, circleId) {
             mark('lastseen:first-remote', { circleId, from: keyPubkey.slice(0, 8) })
           }
         }
+        continue
+      }
+      // `lastknownCore:{pubkey}` (proposal 2026-06-04-lastseen-ephemeral
+      // slice 2a): a one-time announce of the author's per-member last-known
+      // Hypercore key, signed by the user-identity in `pubkey`. Peers read it
+      // to open + replicate that member's bounded last-known core. Same
+      // pubkey-match rule as lastSeen so a writer can't announce a core under
+      // another member's key. A negligible low-frequency op (one per member,
+      // re-emitted only if the core key changes).
+      if (op.key.startsWith('lastknownCore:')) {
+        const incoming = op.value
+        if (!verifyValue(incoming)) continue
+        if (typeof incoming.coreKey !== 'string') continue
+        const keyPubkey = op.key.slice('lastknownCore:'.length)
+        if (keyPubkey !== incoming.pubkey) continue
+        await view.put(op.key, incoming)
         continue
       }
       // `presence:{pubkey}` (proposal §3 / §4): signed by the user-
@@ -3065,6 +3134,120 @@ function broadcastLive (circleId, value) {
     reshipTrace()
   }
   return sent
+}
+
+// --- Per-member last-known cores (proposal 2026-06-04-lastseen-ephemeral slice 2a) ---
+
+// Resolve a circle's enc key hex, caching it. Falls back to the local
+// circles:joined record so callers don't have to thread it from the mount site
+// (legacy unencrypted circles resolve to null, which openSelf/PeerCore handle).
+async function circleEncKeyHex (circleId) {
+  if (_circleEncKeys.has(circleId)) return _circleEncKeys.get(circleId)
+  const rec = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+  const k = rec?.value?.encryptionKey || null
+  _circleEncKeys.set(circleId, k)
+  return k
+}
+
+// Open (creating on first use) our own last-known core for a circle, cached.
+async function ensureSelfLastKnownCore (circleId) {
+  let core = _lastKnownSelfCores.get(circleId)
+  if (core) return core
+  const encKey = await circleEncKeyHex(circleId)
+  core = openSelfCore(_store, circleId, encKey)
+  _lastKnownSelfCores.set(circleId, core)
+  return core
+}
+
+// Persist the latest signed fix to our per-member core (append + clear earlier
+// blocks so on-disk DATA stays O(1)). Runs alongside the live broadcast and the
+// Autobase dual-write on every accepted location:update. Independent of base
+// writability: the core is single-writer and entirely ours.
+async function appendSelfLastKnown (circleId, value) {
+  const core = await ensureSelfLastKnownCore(circleId)
+  await appendFix(core, value)
+  if (!_firstLastKnownWriteMarked.has(circleId)) {
+    _firstLastKnownWriteMarked.add(circleId)
+    mark('lastknown:first-write', { circleId: circleId.slice(0, 8) })
+    reshipTrace()
+  }
+}
+
+// Announce our last-known core key in the Autobase once per circle, so peers
+// can discover and replicate the core. Writable-only (the announce is an
+// Autobase op) and idempotent: skipped once the view already carries our
+// current key. A single low-frequency op per member.
+async function announceLastKnownCore (circleId) {
+  if (_lastKnownAnnounced.has(circleId)) return
+  const base = _circleBases.get(circleId)
+  if (!base || !base.writable) return
+  const core = await ensureSelfLastKnownCore(circleId)
+  await core.ready()
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const coreKeyHex = b4a.toString(core.key, 'hex')
+  const existing = await base.view.get('lastknownCore:' + ourKey).catch(() => null)
+  if (existing?.value?.coreKey === coreKeyHex) { _lastKnownAnnounced.add(circleId); return }
+  const announce = signValue({ pubkey: ourKey, coreKey: coreKeyHex, v: 1 }, _identity.secretKey)
+  if (await safeAppend(base, { type: 'put', key: 'lastknownCore:' + ourKey, value: announce }, 'lastknownCore')) {
+    _lastKnownAnnounced.add(circleId)
+    mark('lastknown:announced', { circleId: circleId.slice(0, 8), coreKey: coreKeyHex.slice(0, 8) })
+    reshipTrace()
+  }
+}
+
+// Read peers' announced core keys from the view, open their cores (cached), and
+// pull each tip into _lastKnownCache. Non-blocking with respect to snapshot: a
+// not-yet-downloaded tip triggers a background fetch and lands on a later poll.
+async function refreshPeerLastKnown (circleId) {
+  const base = _circleBases.get(circleId)
+  if (!base) return
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const encKey = await circleEncKeyHex(circleId)
+  let peerCores = _lastKnownPeerCores.get(circleId)
+  if (!peerCores) { peerCores = new Map(); _lastKnownPeerCores.set(circleId, peerCores) }
+  if (!_lastKnownCache.has(circleId)) _lastKnownCache.set(circleId, new Map())
+  for await (const { key, value } of base.view.createReadStream({ gt: 'lastknownCore:', lt: 'lastknownCore:~' })) {
+    const pubkey = key.slice('lastknownCore:'.length)
+    if (pubkey === ourKey) continue
+    if (!value || typeof value.coreKey !== 'string') continue
+    if (value.pubkey !== pubkey || !verifyValue(value)) continue
+    let core = peerCores.get(pubkey)
+    if (!core) {
+      core = openPeerCore(_store, value.coreKey, encKey)
+      peerCores.set(pubkey, core)
+    }
+    pullPeerTip(circleId, pubkey, core).catch(() => {})
+  }
+}
+
+// Download + cache a peer core's tip. readTip is non-blocking, so on a cold
+// core we fire a bounded background fetch of the tip block and return; the next
+// refresh reads it. Validates the signed value (signature + pubkey match) so a
+// blind/forged block can't poison the cache, and is LWW on ts.
+async function pullPeerTip (circleId, pubkey, core) {
+  await core.ready()
+  try { await core.update({ wait: false }) } catch {}
+  if (core.length === 0) return
+  const tip = await readTip(core)
+  if (!tip) {
+    // Tip not local yet: request it in the background (bounded), cache later.
+    core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS }).catch(() => {})
+    return
+  }
+  if (tip.pubkey !== pubkey || !verifyValue(tip)) return
+  const cache = _lastKnownCache.get(circleId)
+  if (!cache) return
+  const cur = cache.get(pubkey)
+  if (cur && typeof cur.ts === 'number' && typeof tip.ts === 'number' && tip.ts <= cur.ts) return
+  cache.set(pubkey, tip)
+  // One-shot observability: the first peer tip we replicate + decrypt + cache
+  // for a circle confirms the full last-known read path (announce → open core →
+  // download tip → verify → cache), the slice-2a payoff (proposal 2026-06-04).
+  if (!_firstPeerLastKnownMarked.has(circleId)) {
+    _firstPeerLastKnownMarked.add(circleId)
+    mark('lastknown:peer-tip:first', { circleId: circleId.slice(0, 8), from: pubkey.slice(0, 8) })
+    reshipTrace()
+  }
 }
 
 // Register a protomux pair() notify on every conn so an OPEN frame
@@ -3754,6 +3937,10 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
     for (const [circleId] of _circleBases) {
       autoAppendMemberRow(circleId).catch(() => {})
       autoAppendSelfLastSeen(circleId).catch(() => {})
+      // Publish our last-known core key once (idempotent) and pull peers'
+      // announced cores into the cache (proposal 2026-06-04 slice 2a).
+      announceLastKnownCore(circleId).catch(() => {})
+      refreshPeerLastKnown(circleId).catch(() => {})
     }
   }, 5000)
 
