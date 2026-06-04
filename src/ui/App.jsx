@@ -312,6 +312,14 @@ export function App () {
   // per-session, mirroring the iOS permission banner.
   const [battery, setBattery] = useState({ supported: null, exempt: false })
   const [batteryBannerDismissed, setBatteryBannerDismissed] = useState(false)
+  // GrapheneOS / de-Googled Android: the OS network-location provider can be
+  // off, which freezes a stationary indoor phone's shared position. The shell
+  // emits networkLocation:status on foreground (Android only; the event never
+  // fires on iOS). Combined with the user's own location being stale, this
+  // drives a dismissible banner. Default off = no banner until we hear
+  // otherwise, so no cold-start flash.
+  const [networkLocationOff, setNetworkLocationOff] = useState(false)
+  const [networkBannerDismissed, setNetworkBannerDismissed] = useState(false)
   useEffect(() => {
     let cancelled = false
     const refresh = async () => {
@@ -469,6 +477,11 @@ export function App () {
     pear.on('permission:status', ({ status }) => {
       if (typeof status === 'string') setPermissionStatus(status)
     })
+    // Android network-location provider state (off = potential frozen
+    // position on GrapheneOS). Only emitted on Android; iOS never fires it.
+    pear.on('networkLocation:status', ({ enabled }) => {
+      if (typeof enabled === 'boolean') setNetworkLocationOff(!enabled)
+    })
     // Pull the current status once on mount. The shell also emits on
     // startUpdates and on AppState.active, but on a cold launch the
     // shell's emit fires before the WebView finishes loading and the
@@ -596,6 +609,9 @@ export function App () {
         batteryBannerDismissed={batteryBannerDismissed}
         onBatteryBannerDismiss={() => setBatteryBannerDismissed(true)}
         onOpenBatteryAdvanced={() => setSheet({ name: 'settings', expand: 'battery' })}
+        networkLocationOff={networkLocationOff}
+        networkBannerDismissed={networkBannerDismissed}
+        onNetworkBannerDismiss={() => setNetworkBannerDismissed(true)}
         tourActive={onboardingLoaded && onboardingComplete && tourPending && !sheet}
       />
       <SheetContainer open={sheet?.name === 'settings'}>
@@ -967,6 +983,60 @@ function BatteryOptBanner ({ onOpenSettings, onDismiss }) {
           }}
         >
           Open Settings
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Show the network-location nudge only when the user's own position has been
+// stale this long (1h). Gating on staleness, not just "network off", keeps it
+// from nagging de-Googled users who are mobile / near a window and fine.
+const NETWORK_BANNER_STALE_MS = 60 * 60 * 1000
+
+// Android-only banner for de-Googled ROMs (notably GrapheneOS) where the OS
+// network-location provider is off, so a stationary indoor phone can't get a
+// fix and its shared position freezes. Surfaced only when the user's own
+// location has actually gone stale. Network location is a deliberate privacy
+// choice on these ROMs, so the copy is informational and honest about the
+// tradeoff rather than prescriptive, and the banner is dismissible.
+function NetworkLocationBanner ({ onOpenSettings, onDismiss }) {
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+    }}>
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+          right: spacing.sm,
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
+        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>Your location isn't updating</div>
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+          Network location is off, so your phone can't place you indoors without GPS. Turning it on in Settings lets your circle see you again.
+        </div>
+        <button
+          onClick={onOpenSettings}
+          style={{
+            display: 'inline-block',
+            marginTop: spacing.sm,
+            padding: '6px 14px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.sm,
+            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+            cursor: 'pointer',
+          }}
+        >
+          Open Location settings
         </button>
       </div>
     </div>
@@ -1536,7 +1606,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, tourActive = false }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
   // peerCount used to be a separate piece of state, summed across every
@@ -2029,6 +2099,21 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         <BatteryOptBanner
           onOpenSettings={onOpenBatteryAdvanced}
           onDismiss={onBatteryBannerDismiss}
+        />
+      )}
+
+      {/* GrapheneOS / de-Googled network-location nudge. Gated on STALENESS,
+          not just "network off": a de-Googled user who is mobile or near a
+          window is fine, so we only surface it when their own location has
+          actually gone stale (or never arrived). Mutually exclusive with the
+          battery banner so two Android nudges don't stack. Dismissible
+          per-session. */}
+      {networkLocationOff && !networkBannerDismissed && !tourActive &&
+        !(battery.supported === true && !battery.exempt && !batteryBannerDismissed) &&
+        (!selfSeen || (Date.now() - (selfSeen.ts ?? 0)) > NETWORK_BANNER_STALE_MS) && (
+        <NetworkLocationBanner
+          onOpenSettings={() => { pear.call('shell:location:openSettings').catch(() => {}) }}
+          onDismiss={onNetworkBannerDismiss}
         />
       )}
 

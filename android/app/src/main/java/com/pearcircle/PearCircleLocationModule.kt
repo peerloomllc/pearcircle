@@ -10,6 +10,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.content.IntentFilter
 import android.location.Location
+import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -121,6 +122,42 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
             ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
                 PackageManager.PERMISSION_GRANTED
         promise.resolve(if (bgGranted) "always" else "whenInUse")
+    }
+
+    // Whether the OS network-location provider is on. On de-Googled / privacy
+    // ROMs (notably GrapheneOS) it ships OFF, so a stationary indoor phone
+    // gets no fix and its shared position freezes (GPS can't lock inside).
+    // The UI uses this (gated on the user's own location being stale) to
+    // surface a dismissible "turn on network location" banner. Resolves true
+    // (= don't nag) when we can't read the provider. iOS has no equivalent
+    // and omits this method entirely, so the banner is Android-only.
+    @ReactMethod
+    fun isNetworkLocationEnabled(promise: Promise) {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (lm == null) { promise.resolve(true); return }
+        val enabled = try {
+            lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        } catch (e: Exception) {
+            true
+        }
+        promise.resolve(enabled)
+    }
+
+    // Open the system Location settings page (where network location is
+    // toggled), for the banner's action button. Distinct from openSettings
+    // (the app's permission page) -- this lands directly on the OS Location
+    // screen.
+    @ReactMethod
+    fun openLocationSettings(promise: Promise) {
+        val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            ctx.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Throwable) {
+            promise.resolve(false)
+        }
     }
 
     // Direct path to upgrade from "Allow only while using the app" to

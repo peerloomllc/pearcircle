@@ -474,6 +474,16 @@ export default function Index() {
           emitEvent('permission:status', { status })
         }).catch(() => {})
       }
+      // Android-only: re-check whether the OS network-location provider is on
+      // (GrapheneOS ships it off, freezing a stationary phone's position).
+      // Refreshing on foreground means the banner auto-dismisses after the
+      // user flips it in Settings and returns. iOS lacks this method, so the
+      // event never fires there and the banner stays Android-only.
+      if (s === 'active' && PearCircleLocation?.isNetworkLocationEnabled) {
+        PearCircleLocation.isNetworkLocationEnabled().then((enabled: boolean) => {
+          emitEvent('networkLocation:status', { enabled: !!enabled })
+        }).catch(() => {})
+      }
       // Force one fresh location fix on every foreground
       // (foreground-refresh, 2026-05-29). On iOS the adaptive pipeline
       // only writes lastSeen on movement past distanceFilter / a ~500m
@@ -1026,6 +1036,17 @@ export default function Index() {
           } catch {}
           if (!landed) await Linking.openSettings()
         }
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:location:openSettings') {
+      // Android-only: open the OS Location settings page (where network
+      // location is toggled) for the network-location banner's action.
+      try {
+        await PearCircleLocation?.openLocationSettings?.()
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
