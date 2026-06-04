@@ -50,5 +50,5 @@ Autobase 7.27.3 (matches the app's `node_modules` and the local source mirror us
 - [ ] Land the lastSeen-ephemeral fix proposal (`proposals/2026-06-04-lastseen-ephemeral.md`) - the actual cure.
 - [ ] Add oplog-size telemetry + a pre-threshold warning (control 3).
 - [ ] Update `proposals/2026-06-03-autobase-append-hang.md` "Root cause - still open" to point here.
-- [ ] Decide migration/compaction story for existing bloated circles (owner re-create vs an automated compaction).
+- [x] Migration story for existing bloated circles: owner re-creates the circle (decided 2026-06-04); ABFG/`VLRwUprk` to be re-created by its owner. Automated compaction rejected as not worth the complexity.
 - [ ] Keep `tools/repro-vlrwuprk.js` as the reusable reproduction for any future wedged circle.

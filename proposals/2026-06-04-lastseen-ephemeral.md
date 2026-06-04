@@ -32,7 +32,7 @@ This is the load-bearing section because peers do not upgrade together.
 - **Two-phase rollout.**
   - *Phase 1 (interop):* upgraded peers DUAL-WRITE - they still append `lastSeen` to the autobase (so old peers, which only read the view, keep seeing them) AND publish live ephemerally + persist to the per-member core. Upgraded peers read by the precedence above. This ships safely into a mixed fleet but does NOT yet stop growth.
   - *Phase 2 (growth-stop):* once the fleet has upgraded, a flag flips off the autobase `lastSeen` write. This is the actual fix; it is gated behind fleet adoption because an old peer would otherwise stop seeing upgraded peers' positions.
-- **Existing bloated circles are not shrunk by this change.** Dual-write only stops *future* growth (phase 2). A circle already at ~340k nodes stays wedged. Remediation for those is a separate decision (owner re-creates the circle for a fresh empty autobase, or a dedicated compaction tool) - tracked as an RCA action item, not solved here.
+- **Existing bloated circles are not shrunk by this change.** Dual-write only stops *future* growth (phase 2). A circle already at ~340k nodes stays wedged. Remediation (decided 2026-06-04): the owner re-creates the circle for a fresh empty autobase and re-invites members; an automated compaction tool was considered and rejected as not worth the complexity for the handful of affected circles. ABFG/`VLRwUprk` will be re-created by its owner.
 - **Presence** migrates the same way.
 
 ## Verify
@@ -48,5 +48,4 @@ This is the load-bearing section because peers do not upgrade together.
 - Persisted last-known: a dedicated per-member Hypercore vs a small fixed-size slot in the existing local store that is gossiped. Core is cleaner for seeder replication; evaluate plumbing cost.
 - How aggressively to truncate the per-member core (latest-only vs a short trail for a breadcrumb view).
 - Phase-2 trigger: an explicit version gate / capability handshake vs a manual fleet-wide flip once telemetry shows adoption.
-- Existing-circle remediation: owner re-create (simple, loses history) vs an automated owner-side compaction that rewrites a fresh autobase from the current view (complex, preserves trips/places/transitions). Decide separately.
 - Should the durable ops (trips especially) also get checkpoint/truncation as a belt-and-suspenders bound, or is their volume low enough to ignore.
