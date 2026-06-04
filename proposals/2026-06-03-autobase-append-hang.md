@@ -116,6 +116,15 @@ Part A is additive (timeout wrapper + a snapshot flag) — single-commit
 revert. Part B is a new IPC never called automatically; leaving it unused is
 inert, and a failed repair leaves the base no worse (still wedged).
 
+## On-device validation status (2026-06-03)
+Part A and Part B are implemented (commits on `feature/autobase-append-hang-recovery`) and unit-tested (`tests/appendTimeout.test.js`: a never-resolving append times out, fast path ok, rejection != timeout). A combined build (this branch + the location fallback) was installed on Benjamin's Pixel 7 as v1.0.12.
+
+Observed: the worklet stays **responsive** — `trips:listFor` completed (7 local trips) at +53s on a boot where the old build would have hung. No freeze.
+
+Not yet observed on-device: an actual `append:timeout` -> `circle:degraded` -> Repair-button -> `circle:repair` (nukeTip) cycle. Blocked by the device's location stack: the fused `getCurrentLocation` one-shot **fires but its callback never returns** on this GrapheneOS + sandboxed-Play device, so the last-known fallback (which only runs in the null/failure callback) never emits a `location:update`, and the auto-appends early-return because the member/lastSeen rows already exist. With no append attempted, the wedge never manifests and the circle is never flagged for repair, so the Repair button never appears. This is an environmental block, not a logic gap.
+
+Follow-up that unblocks validation AND fixes the location fallback for real: add a hard timeout to `requestSingleFix` so that if `getCurrentLocation` hasn't called back within ~8s, cancel it (CancellationToken) and emit `getLastKnownLocation`. Today the fallback is unreachable whenever the fused provider hangs (exactly this device). Belongs on the location branch.
+
 ## Open questions
 - Auto-repair on repeated `append:timeout`, or always user-triggered?
 - Should `circle:repair` snapshot the corrupt cores aside (for later root-
