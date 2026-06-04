@@ -154,6 +154,9 @@ const _lastKnownPeerCores = new Map()
 const _lastKnownCache = new Map()
 const _circleEncKeys = new Map()
 const _lastKnownAnnounced = new Set()
+// circleId → signature of the last-known core-key set last pushed to seeders,
+// so the periodic re-push (slice 2b) only sends on a real delta.
+const _lastSentLastknownSig = new Map()
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
@@ -2890,7 +2893,9 @@ async function mountSeederCircle (enrollment) {
   const topicHex = b4a.toString(topic, 'hex')
   _topicToCircle.set(topicHex, circleId)
   const discovery = _swarm.join(topic, { server: true, client: true })
-  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload })
+  // lastknownCores: pubkeyHex → that member's last-known core (opened blind,
+  // tip-only, served to offline-last-known requesters). Proposal 2026-06-04 2b.
+  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload, lastknownCores: new Map() })
   mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8), authorityLength: core.length, contiguousLength: core.contiguousLength })
   // Open the seed-role admission channel for this circle on every
   // existing connection. New connections get it via onSeederSwarmConnection;
@@ -2905,6 +2910,7 @@ async function mountSeederCircle (enrollment) {
       circleId,
       seederPubkey: seederPubkeyHex,
       onRevoked: handleSeederRevocationNotice,
+      onLastknownCores: handleSeederLastknownCores,
       mark,
     })
     mark('seeder:announce-channel-open', { circleId, remote: 'post-mount' })
@@ -2972,8 +2978,66 @@ async function leaveSeederCircle (circleId) {
     try { entry.core.off('download', entry.onDownload) } catch {}
   }
   try { await entry.core.close() } catch {}
+  // Close + forget this circle's last-known cores and their persisted keys (2b).
+  if (entry.lastknownCores) {
+    for (const c of entry.lastknownCores.values()) { try { await c.close() } catch {} }
+    entry.lastknownCores.clear()
+  }
+  for await (const { key } of _localDb.createReadStream({
+    gt: 'seeder:lastknownCore:' + circleId + ':', lt: 'seeder:lastknownCore:' + circleId + ':~',
+  })) {
+    await _localDb.del(key).catch(() => {})
+  }
   _seederCircles.delete(circleId)
   mark('seeder:left', { circleId })
+}
+
+// Seed-mode handler for a member's last-known core-key list. The blind seeder
+// can't read the encrypted view, so members push these keys here; we open each
+// core (no enc key — we replicate ciphertext, never decrypt) and serve its tip
+// to peers wanting offline last-known. Only for enrolled circles, persisted so
+// a restart re-opens them. Proposal 2026-06-04-lastseen-ephemeral slice 2b.
+async function handleSeederLastknownCores ({ circleId, cores }) {
+  const entry = _seederCircles.get(circleId)
+  if (!entry) return // not enrolled — ignore (channel is per-circle, belt-and-suspenders)
+  if (!entry.lastknownCores) entry.lastknownCores = new Map()
+  for (const { pubkey, coreKey } of cores) {
+    const existing = entry.lastknownCores.get(pubkey)
+    if (existing && b4a.toString(existing.key, 'hex') === coreKey) continue // already serving this exact core
+    await openSeederLastknownCore(entry, circleId, pubkey, coreKey)
+    await _localDb.put('seeder:lastknownCore:' + circleId + ':' + pubkey, {
+      circleId, pubkey, coreKey, addedAt: Date.now(),
+    }).catch((e) => console.warn('[bare] seeder lastknown persist failed', e?.message))
+  }
+}
+
+// Open one peer last-known core blind and keep its tip downloaded + bounded.
+async function openSeederLastknownCore (entry, circleId, pubkey, coreKey) {
+  if (!entry.lastknownCores) entry.lastknownCores = new Map()
+  const prev = entry.lastknownCores.get(pubkey)
+  if (prev) { try { await prev.close() } catch {} } // key changed: drop the old one
+  const core = openPeerCore(_store, coreKey, null)
+  await core.ready()
+  entry.lastknownCores.set(pubkey, core)
+  // Follow the member's appends: download each new tip, then clear the prior
+  // blocks so the seeder's copy stays O(1) (mirrors the member's appendFix).
+  const onAppend = () => { refreshSeederLastknownTip(core).catch(() => {}) }
+  core.on('append', onAppend)
+  refreshSeederLastknownTip(core).catch(() => {})
+  mark('seeder:lastknown-opened', { circleId, pubkey: pubkey.slice(0, 8), coreKey: coreKey.slice(0, 8) })
+}
+
+// Download a seeder-held last-known core's tip block, then clear earlier blocks
+// so storage stays bounded to the latest fix (we never decrypt — the seeder
+// only stores + serves ciphertext). Best-effort throughout.
+async function refreshSeederLastknownTip (core) {
+  await core.ready()
+  try { await core.update({ wait: false }) } catch {}
+  if (core.length === 0) return
+  try {
+    await core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
+  } catch { return } // tip not served yet; the 'append'/next push retries
+  if (core.length > 1) { try { await core.clear(0, core.length - 1) } catch {} }
 }
 
 // Open pair channels for a newly-added circle on every currently-live
@@ -3013,7 +3077,9 @@ function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
     perConn = new Map()
     _memberAdmissionChannels.set(conn, perConn)
   }
-  perConn.set(circleId, { pubkeyHex, sendRevoked: result.sendRevoked })
+  // isSeeder flips true once this peer's announce arrives (handleSeederAnnounce);
+  // last-known core keys are pushed only to confirmed seeders (slice 2b).
+  perConn.set(circleId, { pubkeyHex, isSeeder: false, sendRevoked: result.sendRevoked, sendLastknownCores: result.sendLastknownCores })
 }
 
 // Push a revocation notice to any live connection to `pubkey` for this
@@ -3250,6 +3316,65 @@ async function pullPeerTip (circleId, pubkey, core) {
   }
 }
 
+// Collect the per-member last-known core keys known for a circle: our own self
+// core plus every peer's announced `lastknownCore:` row from the view (which we
+// can read but the blind seeder can't). Returned to the seeder over the
+// admission channel so it can replicate + serve them (slice 2b).
+async function collectLastknownCores (circleId) {
+  const out = []
+  const seen = new Set()
+  try {
+    const core = await ensureSelfLastKnownCore(circleId)
+    await core.ready()
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    out.push({ pubkey: ourKey, coreKey: b4a.toString(core.key, 'hex') })
+    seen.add(ourKey)
+  } catch (e) { console.warn('[bare] collectLastknownCores self failed', e?.message) }
+  const base = _circleBases.get(circleId)
+  if (base) {
+    try {
+      for await (const { key, value } of base.view.createReadStream({ gt: 'lastknownCore:', lt: 'lastknownCore:~' })) {
+        const pubkey = key.slice('lastknownCore:'.length)
+        if (seen.has(pubkey)) continue
+        if (!value || typeof value.coreKey !== 'string') continue
+        if (value.pubkey !== pubkey || !verifyValue(value)) continue
+        out.push({ pubkey, coreKey: value.coreKey })
+        seen.add(pubkey)
+      }
+    } catch (e) { console.warn('[bare] collectLastknownCores view failed', e?.message) }
+  }
+  return out
+}
+
+// Re-push the circle's last-known core keys to every connected, confirmed
+// seeder, but only when the set has changed since the last push (cheap
+// signature compare) so the 5s sweep isn't chatty. The first push to a freshly
+// confirmed seeder is driven by pushLastknownCoresToSeeder on its announce;
+// this covers peer cores discovered afterward (slice 2b).
+async function repushLastknownCoresToSeeders (circleId) {
+  if (_memberAdmissionChannels.size === 0) return
+  const cores = await collectLastknownCores(circleId)
+  if (cores.length === 0) return
+  const sig = cores.map((c) => c.pubkey + ':' + c.coreKey).sort().join('|')
+  if (_lastSentLastknownSig.get(circleId) === sig) return
+  let sent = 0
+  for (const perConn of _memberAdmissionChannels.values()) {
+    const entry = perConn.get(circleId)
+    if (entry?.isSeeder && entry.sendLastknownCores && entry.sendLastknownCores(cores)) sent++
+  }
+  if (sent > 0) _lastSentLastknownSig.set(circleId, sig)
+}
+
+// Push the circle's current last-known core keys to one just-confirmed seeder
+// (its admission entry). Used when a seeder's announce arrives so it gets the
+// keys immediately, independent of the per-circle delta dedup (slice 2b).
+async function pushLastknownCoresToSeeder (circleId, conn) {
+  const entry = conn ? _memberAdmissionChannels.get(conn)?.get(circleId) : null
+  if (!entry?.sendLastknownCores) return
+  const cores = await collectLastknownCores(circleId)
+  if (cores.length > 0) entry.sendLastknownCores(cores)
+}
+
 // Register a protomux pair() notify on every conn so an OPEN frame
 // from a peer for ANY circle id we know about gets a matching
 // channel created lazily. Protomux behavior: when a remote opens a
@@ -3379,9 +3504,11 @@ async function approveSeederRow (circleId, pubkey, label) {
 async function handleSeederAnnounce (circleId, base, { pubkey, label }, conn) {
   const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
   const existing = existingNode?.value ?? null
-  // Already admitted (non-revoked): nothing to do.
+  // Already admitted (non-revoked): nothing to admit, but this announce
+  // confirms the peer is a live seeder, so hand it our last-known core keys.
   if (existing && existing.revoked !== true) {
     mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
+    markConnSeederAndPush(circleId, conn)
     return
   }
   // Already revoked: keep the revocation, re-send the notice, do not admit.
@@ -3402,9 +3529,19 @@ async function handleSeederAnnounce (circleId, base, { pubkey, label }, conn) {
     await approveSeederRow(circleId, pubkey, label ?? undefined)
     mark('admission:auto-admitted', { circleId, seeder: pubkey.slice(0, 8) })
     send({ event: 'seeder:admitted', data: { circleId, pubkey } })
+    markConnSeederAndPush(circleId, conn)
   } catch (e) {
     mark('admission:auto-admit-failed', { circleId, err: e?.message ?? String(e) })
   }
+}
+
+// Mark a connection's admission entry as a confirmed seeder and immediately
+// push the circle's last-known core keys to it (slice 2b).
+function markConnSeederAndPush (circleId, conn) {
+  const entry = conn ? _memberAdmissionChannels.get(conn)?.get(circleId) : null
+  if (!entry) return
+  entry.isSeeder = true
+  pushLastknownCoresToSeeder(circleId, conn).catch(() => {})
 }
 
 // Write seeder:{pubkey} admission rows for every followed seeder into a
@@ -3465,6 +3602,7 @@ function onSeederSwarmConnection (conn, info) {
       seederPubkey: seederPubkeyHex,
       label: enrollment?.label,
       onRevoked: handleSeederRevocationNotice,
+      onLastknownCores: handleSeederLastknownCores,
       mark,
     })
     if (remotePublicKey) {
@@ -3795,6 +3933,25 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
     }
     mark('init:circles-mounted', { mode: 'seed', count: mountedCount })
 
+    // Re-open each persisted per-member last-known core so a restart keeps
+    // serving offline last-known (proposal 2026-06-04-lastseen-ephemeral 2b).
+    // Only for circles that actually remounted; orphaned rows are skipped.
+    let lastknownReopened = 0
+    for await (const { value } of _localDb.createReadStream({
+      gt: 'seeder:lastknownCore:', lt: 'seeder:lastknownCore:~',
+    })) {
+      if (!value || !value.circleId || !value.pubkey || !value.coreKey) continue
+      const entry = _seederCircles.get(value.circleId)
+      if (!entry) continue
+      try {
+        await openSeederLastknownCore(entry, value.circleId, value.pubkey, value.coreKey)
+        lastknownReopened++
+      } catch (e) {
+        console.warn('[bare] seeder lastknown reopen failed', value.circleId, e?.message)
+      }
+    }
+    if (lastknownReopened > 0) mark('seeder:lastknown-reopened', { count: lastknownReopened })
+
     // Schedule the retention sweep. Once on boot to claw back disk from
     // anything that aged past the cutoff while the seeder was down, then
     // on a 24h cadence. Fire-and-forget per the existing trip-prune
@@ -3941,6 +4098,8 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
       // announced cores into the cache (proposal 2026-06-04 slice 2a).
       announceLastKnownCore(circleId).catch(() => {})
       refreshPeerLastKnown(circleId).catch(() => {})
+      // Push any newly-known last-known core keys to connected seeders (2b).
+      repushLastknownCoresToSeeders(circleId).catch(() => {})
     }
   }, 5000)
 
