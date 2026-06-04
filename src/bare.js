@@ -44,6 +44,7 @@ const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAccept
 const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
+const { raceAppend, APPEND_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
@@ -113,6 +114,7 @@ let _seedMode = false
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
+const _degradedCircles = new Set() // circleIds whose base.append() timed out (wedged local Autobase); surfaced as needsRepair, cleared by circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
 // Seed-mode only: per-circle replication state. Each entry holds the
 // bootstrap Hypercore session + the swarm discovery handle so leave can
@@ -1244,6 +1246,58 @@ const handlers = {
     return { ok: true }
   },
 
+  // Local recovery for a wedged circle Autobase (proposal
+  // 2026-06-03-autobase-append-hang). When appends to a circle have timed
+  // out (it shows needsRepair), the local Autobase tip is corrupt and every
+  // append hangs in the advance loop, which freezes the whole worklet. Heal
+  // it in place: close the base, re-mount with nukeTip so the corrupt local
+  // tip + view rewind to their last indexed length and re-replicate from the
+  // seeder / peers. Same corestore namespace -> same writer key, so write
+  // access survives; identity, membership and the seeder's authoritative
+  // history are untouched. User-triggered only (never automatic) so it can't
+  // loop. Every await is bounded so a still-corrupt base surfaces an error
+  // instead of re-wedging the worklet.
+  'circle:repair': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const record = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+    if (!record?.value?.bootstrap) return { ok: false, reason: 'unknown_circle' }
+    const { bootstrap, encryptionKey } = record.value
+    mark('circle:repair:start', { circleId: circleId.slice(0, 8) })
+    // 1. Close + drop the wedged base (bounded — a hung close must not freeze
+    //    this handler too).
+    const existing = _circleBases.get(circleId)
+    if (existing) {
+      _circleBases.delete(circleId)
+      const T = Symbol('t')
+      const closed = await Promise.race([
+        existing.close().then(() => true, () => true),
+        new Promise((r) => setTimeout(() => r(T), APPEND_TIMEOUT_MS)),
+      ])
+      if (closed === T) mark('circle:repair:close-timeout', { circleId: circleId.slice(0, 8) })
+    }
+    // 2. Reset per-circle in-memory state so the rebuilt base starts clean.
+    _degradedCircles.delete(circleId)
+    _firstLastSeenWriteMarked.delete(circleId)
+    _firstWriterMarked.delete(circleId)
+    _lastAppendedPos.delete(circleId)
+    // 3. Re-mount with nukeTip, bounded so a still-corrupt base reports an
+    //    error rather than hanging.
+    let base
+    try {
+      base = await Promise.race([
+        mountCircleAutobase(circleId, bootstrap, encryptionKey || null, { nukeTip: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('repair_mount_timeout')), 20000)),
+      ])
+    } catch (e) {
+      mark('circle:repair:failed', { circleId: circleId.slice(0, 8), err: e?.message })
+      return { ok: false, reason: e?.message || 'mount_failed' }
+    }
+    mark('circle:repair:done', { circleId: circleId.slice(0, 8), writable: !!base?.writable })
+    send({ event: 'circle:repaired', data: { circleId } })
+    return { ok: true, writable: !!base?.writable }
+  },
+
   'circles:list': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const circles = []
@@ -1389,8 +1443,10 @@ const handlers = {
       // app always publishes a current fix even when stationary. The
       // classifier and trip detector below run on every fix regardless.
       if (!shouldAppendLastSeen(_lastAppendedPos.get(circleId), lat, lon)) continue
-      try {
-        await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
+      // safeAppend bounds a wedged base so one stuck append can't freeze the
+      // whole worklet (proposal 2026-06-03-autobase-append-hang). Only record
+      // the write / first-write mark when it actually landed.
+      if (await safeAppend(base, { type: 'put', key: 'lastSeen:' + ourKey, value }, 'lastSeen')) {
         _lastAppendedPos.set(circleId, { lat, lon })
         written++
         if (!_firstLastSeenWriteMarked.has(circleId)) {
@@ -1398,8 +1454,6 @@ const handlers = {
           const peers = _circlePeers.get(circleId)?.size ?? 0
           mark('lastseen:first-write', { circleId, peers })
         }
-      } catch {
-        // base closed mid-flight, etc.
       }
     }
 
@@ -1626,11 +1680,8 @@ const handlers = {
         const existing = await base.view.get(replicatedKey)
         if (!existing?.value) continue  // never replicated to this circle
         if (existing.value.deleted === true) continue  // already deleted
-        try {
-          await base.append({ type: 'put', key: replicatedKey, value: tombstone })
+        if (await safeAppend(base, { type: 'put', key: replicatedKey, value: tombstone }, 'trip:delete')) {
           circlesTombstoned++
-        } catch {
-          // base closed mid-flight, etc.
         }
       }
     }
@@ -1707,11 +1758,7 @@ async function replicateTripToOptedInCircles (ourKey, trip) {
     if (!getCircleSharing(circleId).enabled) continue
     const row = await _localDb.get('trips:sharing:' + circleId)
     if (!shouldReplicateTrip(row)) continue
-    try {
-      await base.append({ type: 'put', key, value: signedValue })
-    } catch (e) {
-      console.warn('[bare] trip replicate to', circleId, 'failed', e?.message)
-    }
+    await safeAppend(base, { type: 'put', key, value: signedValue }, 'trip')
   }
 }
 
@@ -1722,11 +1769,7 @@ async function writePresenceToCircle (circleId, state, expiresAt = null) {
   const payload = { pubkey: ourKey, state, setAt: Date.now(), v: 1 }
   if (typeof expiresAt === 'number') payload.expiresAt = expiresAt
   const value = signValue(payload, _identity.secretKey)
-  try {
-    await base.append({ type: 'put', key: 'presence:' + ourKey, value })
-  } catch {
-    // base closed mid-flight, etc.
-  }
+  await safeAppend(base, { type: 'put', key: 'presence:' + ourKey, value }, 'presence')
 }
 
 // Per-circle sharing helpers. _circleSharing stores explicit entries
@@ -1833,6 +1876,30 @@ async function loadPersistedSharing () {
   for (const cid of _circleSharing.keys()) armCircleExpiryTimer(cid)
 }
 
+function circleIdForBase (base) {
+  for (const [cid, b] of _circleBases) if (b === base) return cid
+  return null
+}
+
+// Drop-in for `await base.append(op)` on the automatic/background write paths.
+// Bounds the append (raceAppend) so it cannot wedge the dispatcher: on timeout
+// it flags the circle degraded (surfaced to the UI as needsRepair), skips
+// further appends to that base until circle:repair rebuilds it, and returns
+// false. A normal rejection (base closed mid-flight) returns false WITHOUT
+// degrading. Returns true iff the row was appended. Proposal
+// 2026-06-03-autobase-append-hang.
+async function safeAppend (base, op, label) {
+  const cid = circleIdForBase(base)
+  if (cid && _degradedCircles.has(cid)) return false
+  const { ok, timedOut } = await raceAppend(base.append(op), APPEND_TIMEOUT_MS)
+  if (timedOut && cid && !_degradedCircles.has(cid)) {
+    _degradedCircles.add(cid)
+    mark('append:timeout', { circleId: cid.slice(0, 8), label })
+    send({ event: 'circle:degraded', data: { circleId: cid } })
+  }
+  return ok
+}
+
 async function appendTransition (base, placeId, kind, ts) {
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const value = signValue(
@@ -1842,11 +1909,11 @@ async function appendTransition (base, placeId, kind, ts) {
   // Key shape per proposal §3 amended 2026-05-04: ts:pubkey:placeId.
   // The placeId suffix prevents same-tick collisions when one
   // location:update produces multiple transitions.
-  await base.append({
+  await safeAppend(base, {
     type: 'put',
     key: 'transition:' + ts + ':' + ourKey + ':' + placeId,
     value,
-  })
+  }, 'transition')
   return value
 }
 
@@ -1865,7 +1932,7 @@ async function appendLastSeen (base, lat, lon, accuracy, ts, battery = null, isC
     isCharging: charging,
     v: 1,
   }, _identity.secretKey)
-  await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value })
+  await safeAppend(base, { type: 'put', key: 'lastSeen:' + ourKey, value }, 'lastSeen:transition')
 }
 
 // Shared body for region:enter / region:exit IPC handlers. Splits the
@@ -2016,6 +2083,10 @@ async function snapshotCircle (circleId, base) {
     transitions,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
+    // True once an append to this circle timed out (wedged local Autobase);
+    // the UI offers a "repair" action that calls circle:repair. Cleared by a
+    // successful repair (proposal 2026-06-03-autobase-append-hang).
+    needsRepair: _degradedCircles.has(circleId),
   }
 }
 
@@ -2466,15 +2537,12 @@ async function autoAppendMemberRow (circleId) {
   const profile = await readProfileForMemberRow(ourKey)
   const memberValue = { pubkey: ourKey, displayName: profile.displayName, joinedAt: Date.now(), v: 1 }
   if (profile.avatar) memberValue.avatar = profile.avatar
-  try {
-    await base.append({ type: 'put', key: 'member:' + ourKey, value: memberValue })
+  if (await safeAppend(base, { type: 'put', key: 'member:' + ourKey, value: memberValue }, 'member')) {
     if (!_firstWriterMarked.has(circleId)) {
       _firstWriterMarked.add(circleId)
       mark('writer:first-added', { circleId })
     }
     send({ event: 'circle:writer:added', data: { circleId, writerKey: ourKey } })
-  } catch {
-    // base closed / already appended via race; harmless
   }
 }
 
@@ -2495,14 +2563,10 @@ async function autoAppendSelfLastSeen (circleId) {
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const existing = await base.view.get('lastSeen:' + ourKey)
   if (existing && existing.value) return
-  try {
-    await base.append({ type: 'put', key: 'lastSeen:' + ourKey, value: _selfLastSeen })
-  } catch {
-    // base closed / raced an organic location:update; the 5s sweep retries
-  }
+  await safeAppend(base, { type: 'put', key: 'lastSeen:' + ourKey, value: _selfLastSeen }, 'lastSeen:boot')
 }
 
-async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex) {
+async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, { nukeTip = false } = {}) {
   if (_circleBases.has(circleId)) return _circleBases.get(circleId)
   const ns = _store.namespace(circleId)
   const baseOpts = {
@@ -2510,6 +2574,12 @@ async function mountCircleAutobase (circleId, bootstrapHex, encryptionKeyHex) {
     apply: (nodes, view, b) => applyCircleNodes(nodes, view, b, circleId),
     valueEncoding: 'json',
   }
+  // nukeTip rewinds the local writer's unindexed tip and the view/system
+  // cores to their last indexed length on open, discarding a corrupt local
+  // tip that wedges append() (proposal 2026-06-03-autobase-append-hang).
+  // Same namespace -> same writer key, so write access is preserved; the
+  // seeder's authoritative blocks re-replicate the trimmed state.
+  if (nukeTip) baseOpts.nukeTip = true
   if (encryptionKeyHex) baseOpts.encryptionKey = b4a.from(encryptionKeyHex, 'hex')
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
