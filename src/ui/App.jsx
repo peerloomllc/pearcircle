@@ -1022,7 +1022,7 @@ function NetworkLocationBanner ({ onOpenSettings, onDismiss }) {
       <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
         <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>Your location isn't updating</div>
         <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
-          Network location is off, so your phone can't place you indoors without GPS. Turning it on in Settings lets your circle see you again.
+          Network location is off, so your phone can't place you indoors without GPS. Open Settings, then turn on <strong style={{ fontWeight: 500, color: colors.text.primary }}>Location services &rarr; Network location</strong> to be seen again.
         </div>
         <button
           onClick={onOpenSettings}
