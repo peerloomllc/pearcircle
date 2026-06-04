@@ -1049,6 +1049,131 @@ function NetworkLocationBanner ({ onOpenSettings, onDismiss }) {
   )
 }
 
+// Top-of-map nudge when one or more circles are wedged (needsRepair) and not
+// already repairing. Primary, discoverable surface for the rebuild -- the
+// per-avatar member-sheet button is too hidden for most users to find. The
+// action opens a confirm-with-explainer first (repair pauses sharing and
+// rebuilds from peers), it isn't a one-tap toggle. Dismissible per session;
+// the persisted degraded flag re-surfaces it next launch.
+function RepairBanner ({ count, circleName, onRepair, onDismiss }) {
+  const headline = count > 1 ? `${count} circles need repair` : `${circleName || 'A circle'} needs repair`
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+    }}>
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+          right: spacing.sm,
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
+        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{headline}</div>
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+          {count > 1 ? 'Their data is stuck' : "This circle's data is stuck"}, so members' locations may be out of sync. Repairing rebuilds {count > 1 ? 'them' : 'it'} from your peers.
+        </div>
+        <button
+          onClick={onRepair}
+          style={{
+            display: 'inline-block', marginTop: spacing.sm, padding: '6px 14px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.sm,
+            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400, cursor: 'pointer',
+          }}
+        >
+          Repair
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Indeterminate "Repairing…" indicator. circle:repair returns in seconds but
+// the actual re-sync from the seeder + writer re-admission run async and can
+// take a long time, so this persists (via the worklet's `repairing` flag)
+// until the rebuilt base is functional again. No action -- it's in progress.
+function RepairingBanner ({ count, circleName }) {
+  const label = count > 1 ? `Repairing ${count} circles…` : `Repairing ${circleName || 'circle'}…`
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, padding: `0 ${spacing.lg}px` }}>
+        <span style={{
+          width: 15, height: 15, borderRadius: '50%', flexShrink: 0,
+          border: `2px solid ${colors.border}`, borderTopColor: colors.primary,
+          animation: 'pearcircle-focus-spin 0.8s linear infinite', display: 'inline-block',
+        }} />
+        <div style={{ textAlign: 'left' }}>
+          <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{label}</div>
+          <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+            This can take a while. Your circle will catch up in the background.
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Confirm-with-explainer before a rebuild, since it pauses sharing and runs a
+// long re-sync. Repairs every wedged circle on confirm.
+function RepairConfirmModal ({ circles, onConfirm, onCancel }) {
+  const single = circles.length === 1
+  const name = single ? (circles[0]?.circle?.name || 'this circle') : `${circles.length} circles`
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 360,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(0,0,0,0.7)', padding: spacing.lg,
+    }}>
+      <div style={{
+        width: '100%', maxWidth: 360,
+        background: colors.surface.card, borderRadius: radius.lg,
+        padding: spacing.lg, boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+      }}>
+        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary }}>
+          Repair {name}?
+        </h2>
+        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
+          This rebuilds {single ? 'the circle' : 'these circles'} from your peers to fix the stuck data. Your sharing pauses briefly and it can take a while to catch up. Your identity and history are kept.
+        </p>
+        <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.base }}>
+          <button
+            onClick={onCancel}
+            style={{
+              flex: 1, padding: '12px', background: 'transparent',
+              color: colors.text.secondary, border: `1px solid ${colors.border}`,
+              borderRadius: radius.md, fontFamily: typography.fontFamily, fontSize: 14, cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{
+              flex: 1, padding: '12px', background: colors.primary, color: colors.text.onPrimary,
+              border: 'none', borderRadius: radius.md, fontFamily: typography.fontFamily, fontSize: 14, fontWeight: 400, cursor: 'pointer',
+            }}
+          >
+            Repair
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // Modal alert shown when a circle leaves the user involuntarily: the
 // owner deleted it (kind 'deleted', circle:deleted) or the owner removed
 // this member (kind 'removed', circle:removed-self). One-shot per circle:
@@ -1615,6 +1740,11 @@ function mergeCircleSnapshots (circles) {
 function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   const [selfSeen, setSelfSeen] = useState(null)
+  // Circle-repair banner state. repairConfirmOpen gates the explainer modal;
+  // repairBannerDismissed hides the needs-repair nudge for the session (it
+  // re-surfaces next launch since the worklet persists the degraded flag).
+  const [repairConfirmOpen, setRepairConfirmOpen] = useState(false)
+  const [repairBannerDismissed, setRepairBannerDismissed] = useState(false)
   // peerCount used to be a separate piece of state, summed across every
   // circle's peersByCircle entry — which double-counted a peer in N
   // circles and never narrowed to the active filter. It's now derived
@@ -1675,6 +1805,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     pear.on('peer:connected', refresh)
     pear.on('peer:disconnected', refresh)
     pear.on('circle:writer:added', refresh)
+    // Repair lifecycle: refresh promptly so the needs-repair / Repairing…
+    // banners flip without waiting for the next ~3s poll.
+    pear.on('circle:degraded', refresh)
+    pear.on('circle:repairing', refresh)
+    pear.on('circle:repaired', refresh)
     pear.on('ready', refresh)
     // Load mute set from the shell once on mount; toggleMute keeps state
     // in sync after that without re-fetching.
@@ -1843,6 +1978,10 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const memberCount = data.members.length
   const placeCount = data.places.length
   const isSingleCircle = activeCircles.length === 1
+  // Repair surfaces span ALL circles (a wedged circle may not be the selected
+  // one). repairing takes priority over needs-repair for a circle in flight.
+  const repairingCircles = circles.filter((c) => c.repairing)
+  const needRepairCircles = circles.filter((c) => c.needsRepair && !c.repairing)
   // Where to write per-place / per-circle actions. With "All" selected
   // and multiple circles we don't have a single target for membership-
   // post / read-only-warning lines. Place creation handles the
@@ -2120,6 +2259,35 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         <NetworkLocationBanner
           onOpenSettings={() => { pear.call('shell:location:openSettings').catch(() => {}) }}
           onDismiss={onNetworkBannerDismiss}
+        />
+      )}
+
+      {/* Circle-repair surfaces. A repair in flight (Repairing…) takes
+          priority over the needs-repair nudge. The nudge is the discoverable
+          entry point; tapping Repair opens the confirm-with-explainer. */}
+      {!tourActive && repairingCircles.length > 0 ? (
+        <RepairingBanner
+          count={repairingCircles.length}
+          circleName={repairingCircles[0]?.circle?.name}
+        />
+      ) : (!tourActive && !repairBannerDismissed && needRepairCircles.length > 0 && (
+        <RepairBanner
+          count={needRepairCircles.length}
+          circleName={needRepairCircles[0]?.circle?.name}
+          onRepair={() => setRepairConfirmOpen(true)}
+          onDismiss={() => setRepairBannerDismissed(true)}
+        />
+      ))}
+      {repairConfirmOpen && needRepairCircles.length > 0 && (
+        <RepairConfirmModal
+          circles={needRepairCircles}
+          onCancel={() => setRepairConfirmOpen(false)}
+          onConfirm={() => {
+            setRepairConfirmOpen(false)
+            for (const c of needRepairCircles) {
+              pear.call('circle:repair', { circleId: c.circleId }).catch(() => {})
+            }
+          }}
         />
       )}
 

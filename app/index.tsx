@@ -563,6 +563,11 @@ export default function Index() {
       catch (e: any) { console.warn('setMode failed', e?.message ?? String(e)) }
     })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
+    // Circle-repair lifecycle, so the UI's repair / Repairing… banners flip
+    // promptly instead of waiting on the next circles:getAll poll.
+    onEvent('circle:degraded', (data) => emitEvent('circle:degraded', data))
+    onEvent('circle:repairing', (data) => emitEvent('circle:repairing', data))
+    onEvent('circle:repaired', (data) => emitEvent('circle:repaired', data))
     // Blind-seeder admission events. The approval prompt was dropped
     // (proposal amendment 2026-05-20) — seeders auto-admit, so there is
     // no seeder:announced. seeder:admitted / seeder:revoked are still

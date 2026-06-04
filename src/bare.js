@@ -115,6 +115,7 @@ const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
+const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _lastGoodSnapshot = new Map() // circleId → last successful snapshotCircle result, served when a bounded snapshot times out so the UI stays populated (proposal 2026-06-03c)
 const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
 // Seed-mode only: per-circle replication state. Each entry holds the
@@ -731,6 +732,10 @@ const handlers = {
       try {
         const snap = await safeSnapshot(circleId, base)
         out.push({ circleId, ...snap })
+        // A repairing circle is "done enough" once its rebuilt base is
+        // writable again (re-admitted as a writer == functional). Historical
+        // catch-up continues as normal replication after this.
+        if (_repairingCircles.has(circleId) && base.writable) clearRepairing(circleId)
         // Maintenance: every refresh, ensure our member row exists in
         // every writable circle. Idempotent: skips if a row already
         // exists. This is the reliable path that catches cases the
@@ -1272,6 +1277,10 @@ const handlers = {
     const { bootstrap, encryptionKey } = record.value
     const newGen = (typeof record.value.rebuildGen === 'number' ? record.value.rebuildGen : 0) + 1
     mark('circle:repair:start', { circleId: circleId.slice(0, 8), newGen })
+    // Mark repairing up front so the UI shows "Repairing…" for the whole
+    // (long, async) re-sync, not just the few seconds this handler runs.
+    // Cleared in circles:getAll once the rebuilt base is writable again.
+    setRepairing(circleId)
     // 1. Abandon the wedged base WITHOUT Autobase.close(). Closing a wedged
     //    base hangs, and a close running concurrently with the fresh mount
     //    deadlocks it in-process (validated on-device 2026-06-04: the in-app
@@ -1936,6 +1945,28 @@ function clearDegraded (circleId) {
   _localDb.del('circleDegraded:' + circleId).catch(() => {})
 }
 
+// Repair-in-progress state. circle:repair returns right after the fresh-
+// namespace remount, but the actual re-sync from the seeder + writer re-
+// admission run asynchronously and can take a long time (hours on a big
+// circle / slow link, observed on-device). Track it so the UI can show an
+// indeterminate "Repairing…" indicator. Persisted so it survives an app
+// restart mid-repair. Cleared once the rebuilt base is writable again (re-
+// admitted == functional); see circles:getAll.
+function setRepairing (circleId) {
+  if (!circleId || _repairingCircles.has(circleId)) return
+  _repairingCircles.add(circleId)
+  _localDb.put('circleRepairing:' + circleId, { ts: Date.now() }).catch(() => {})
+  send({ event: 'circle:repairing', data: { circleId, repairing: true } })
+}
+
+function clearRepairing (circleId) {
+  if (!_repairingCircles.has(circleId)) return
+  _repairingCircles.delete(circleId)
+  _localDb.del('circleRepairing:' + circleId).catch(() => {})
+  mark('circle:repair:settled', { circleId: circleId.slice(0, 8) })
+  send({ event: 'circle:repairing', data: { circleId, repairing: false } })
+}
+
 // Drop-in for `await base.append(op)` on the automatic/background write paths.
 // Bounds the append (raceAppend) so it cannot wedge the dispatcher: on timeout
 // it flags the circle degraded (surfaced to the UI as needsRepair), skips
@@ -2157,6 +2188,10 @@ async function snapshotCircle (circleId, base) {
     // the UI offers a "repair" action that calls circle:repair. Cleared by a
     // successful repair (proposal 2026-06-03-autobase-append-hang).
     needsRepair: _degradedCircles.has(circleId),
+    // True while a circle:repair is in flight (rebuilt, still re-syncing /
+    // awaiting writer re-admission). Drives the indeterminate "Repairing…"
+    // indicator; supersedes needsRepair in the UI.
+    repairing: _repairingCircles.has(circleId),
   }
 }
 
@@ -3474,6 +3509,16 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
     _degradedCircles.add(key.slice('circleDegraded:'.length))
   }
   if (_degradedCircles.size) mark('circle:degraded-persisted', { count: _degradedCircles.size })
+
+  // A repair can take a long time, so it may span an app restart. Re-arm the
+  // in-flight repairing state so the "Repairing…" indicator persists; the
+  // circles:getAll poll clears it once the rebuilt base is writable again.
+  for await (const { key } of _localDb.createReadStream({
+    gt: 'circleRepairing:', lt: 'circleRepairing:~',
+  })) {
+    _repairingCircles.add(key.slice('circleRepairing:'.length))
+  }
+  if (_repairingCircles.size) mark('circle:repairing-persisted', { count: _repairingCircles.size })
 
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced
