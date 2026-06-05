@@ -49,7 +49,7 @@ export function App () {
       {error && <div class="toast error">{error}</div>}
 
       {update && update.updateAvailable && (
-        <UpdateBanner update={update} version={version} applyState={applyState} setApplyState={setApplyState} />
+        <UpdateBanner update={update} applyState={applyState} setApplyState={setApplyState} />
       )}
 
       <Status status={status} />
@@ -63,7 +63,7 @@ export function App () {
 // 2026-06-05-seeder-update slices 2+3a). Self-apply platforms restart the
 // service; platforms that need the privileged helper (macOS .pkg / Linux .deb,
 // slice 3b) or that can't self-apply fall back to a verified download link.
-function UpdateBanner ({ update, version, applyState, setApplyState }) {
+function UpdateBanner ({ update, applyState, setApplyState }) {
   const [busy, setBusy] = useState(false)
   const onUpdate = async () => {
     setBusy(true)
@@ -74,22 +74,24 @@ function UpdateBanner ({ update, version, applyState, setApplyState }) {
   const st = applyState?.status
   const downloadHref = update.assetUrl || update.releaseUrl
   return (
-    <div class="toast update">
-      Update available: v{update.latestVersion} (you have v{version || update.currentVersion}).{' '}
-      {st === 'restarting' && <span>Updating — the seeder will restart on v{update.latestVersion}.</span>}
-      {st === 'applying-via-helper' && <span>Installing v{update.latestVersion} — the seeder will restart shortly.</span>}
+    <div class="toast update" style={{ textAlign: 'center' }}>
+      <div>Update available: v{update.latestVersion}</div>
+      {st === 'restarting' && <div>Updating — the seeder will restart on v{update.latestVersion}.</div>}
+      {st === 'applying-via-helper' && <div>Installing v{update.latestVersion} — the seeder will restart shortly.</div>}
       {(st === 'needs-helper') && (
-        <span>This build installs with a system installer.{' '}
-          <a href={downloadHref} target="_blank" rel="noreferrer">Download v{update.latestVersion}</a></span>
+        <div>This build installs with a system installer.{' '}
+          <a href={downloadHref} target="_blank" rel="noreferrer">Download v{update.latestVersion}</a></div>
       )}
       {st === 'error' && (
-        <span>Update failed ({applyState.error}).{' '}
-          <a href={downloadHref} target="_blank" rel="noreferrer">Download instead</a></span>
+        <div>Update failed ({applyState.error}).{' '}
+          <a href={downloadHref} target="_blank" rel="noreferrer">Download instead</a></div>
       )}
       {(st !== 'restarting' && st !== 'applying-via-helper') && (
-        <button onClick={onUpdate} disabled={busy || st === 'running'} style={{ marginLeft: 8 }}>
-          {busy || st === 'running' ? 'Updating…' : 'Update now'}
-        </button>
+        <div style={{ marginTop: 8 }}>
+          <button onClick={onUpdate} disabled={busy || st === 'running'}>
+            {busy || st === 'running' ? 'Updating…' : 'Update now'}
+          </button>
+        </div>
       )}
     </div>
   )
