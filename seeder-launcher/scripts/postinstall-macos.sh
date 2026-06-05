@@ -79,6 +79,14 @@ if [ "$IS_UPDATE" = "1" ]; then
   exit 0
 fi
 
+# From here down is best-effort first-run convenience (open the browser, offer a
+# Desktop shortcut). None of it may fail the install — in a sandboxed / headless
+# installer context (e.g. an auto-update via the privileged daemon, or any
+# install without Full Disk Access) writing to ~/Desktop is TCC-blocked and
+# would otherwise abort the whole package with `set -e`. Drop the strict flags.
+# Proposal 2026-06-05-seeder-update slice 3b (hardening).
+set +e
+
 # Wait up to ~15s for the host to bind and log the UI URL.
 URL=""
 for i in $(seq 1 30); do
