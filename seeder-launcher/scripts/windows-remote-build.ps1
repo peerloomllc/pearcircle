@@ -60,6 +60,18 @@ if ($LASTEXITCODE -ne 0) { Fail "ui build failed ($LASTEXITCODE)" }
 Pop-Location
 
 # --- 3. esbuild the host into a single CJS file ------------------------------
+# Stamp the build version first (proposal 2026-06-05-seeder-update slice 1).
+# The macOS/Linux builds inject it via build-host-sea.sh's esbuild --define;
+# this build rolls its own esbuild, so instead set the launcher package.json
+# version (host/version.js reads it as its precedence-2 source, and esbuild
+# inlines the require('../package.json') at bundle time). Writing the file dodges
+# PowerShell's native-arg quote mangling that an esbuild --define would hit.
+# Without this the Windows seeder always reported package.json's default version.
+Step "stamp build version $Version"
+$pkgPath = Join-Path $launcher 'package.json'
+$stamped = (Get-Content -Raw -LiteralPath $pkgPath) -replace '("version"\s*:\s*")[^"]*(")', "`${1}$Version`${2}"
+Set-Content -NoNewline -Encoding UTF8 -LiteralPath $pkgPath -Value $stamped
+
 Step "bundle host (esbuild)"
 Push-Location $launcher
 & npx esbuild host/index.js --bundle --platform=node --target=node20 --format=cjs --outfile=dist/host-bundled.js
