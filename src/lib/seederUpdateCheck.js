@@ -50,11 +50,14 @@ function archTokens (arch) {
 // Pick this platform+arch's installer asset from a GitHub release's `assets`
 // array. platform is process.platform ('darwin' | 'win32' | 'linux'), arch is
 // process.arch ('x64' | 'arm64'). macOS `.pkg` and Windows `.exe` ship as a
-// single (universal) asset, so arch is not required there. Linux prefers the
-// .AppImage (a no-privilege self-apply path) over the .deb, but only an
-// arch-matching one - returns null rather than a wrong-arch binary. .sha256
+// single (universal) asset, so arch is not required there. On Linux the
+// `installKind` hint decides which artifact a running seeder gets so the apply
+// path matches how it was installed: a `.deb`-installed service must be offered
+// the `.deb` (its pkexec helper applies it) and an AppImage the `.AppImage` (the
+// no-privilege self-apply). Only an arch-matching asset is returned - a
+// wrong-arch binary is worse than none, so we fall back to null. .sha256
 // sidecars are never returned as the primary asset.
-function selectAsset (assets, platform, arch) {
+function selectAsset (assets, platform, arch, installKind) {
   if (!Array.isArray(assets)) return null
   const named = assets.filter((a) => a && typeof a.name === 'string' && !a.name.endsWith('.sha256'))
   const lower = (a) => a.name.toLowerCase()
@@ -64,7 +67,14 @@ function selectAsset (assets, platform, arch) {
   if (platform === 'linux') {
     const toks = archTokens(arch)
     const matchArch = (list) => list.find((a) => toks.some((t) => lower(a).includes(t))) || null
-    return matchArch(bySuffix('.appimage')) || matchArch(bySuffix('.deb')) || null
+    const appimage = () => matchArch(bySuffix('.appimage'))
+    const deb = () => matchArch(bySuffix('.deb'))
+    // A deb install prefers the .deb; otherwise (AppImage or unknown) prefer the
+    // AppImage self-apply. Either way fall back to the other so an out-of-band
+    // install kind still gets *an* arch-matching asset.
+    return installKind === 'deb'
+      ? (deb() || appimage())
+      : (appimage() || deb())
   }
   return null
 }
@@ -77,11 +87,11 @@ function selectSha256For (assets, assetName) {
 
 // Evaluate a GitHub `/releases/latest` JSON against the running version for a
 // platform. Returns a stable shape the host route + UI consume.
-function evaluateRelease (release, { currentVersion, platform, arch } = {}) {
+function evaluateRelease (release, { currentVersion, platform, arch, installKind } = {}) {
   const latestVersion = typeof release?.tag_name === 'string'
     ? release.tag_name.replace(/^v/i, '')
     : null
-  const asset = selectAsset(release?.assets, platform, arch)
+  const asset = selectAsset(release?.assets, platform, arch, installKind)
   const sha = asset ? selectSha256For(release?.assets, asset.name) : null
   return {
     currentVersion: currentVersion ?? null,

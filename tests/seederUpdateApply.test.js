@@ -40,17 +40,18 @@ test('sha256File matches node crypto', async () => {
 
 describe('planApply', () => {
   const base = { updateAvailable: true, assetUrl: 'u/a', sha256Url: 'u/a.sha', latestVersion: '1.0.11' }
-  test('linux AppImage -> appimage, no helper', () => {
+  test('linux AppImage -> appimage, no helper, needs a target', () => {
     const p = planApply({ ...base, assetName: 'PearCircleSeeder-x86_64.AppImage' }, 'linux')
-    expect(p.applier).toBe('appimage'); expect(p.requiresHelper).toBe(false)
+    expect(p.applier).toBe('appimage'); expect(p.requiresHelper).toBe(false); expect(p.requiresTarget).toBe(true)
   })
-  test('linux .deb -> deb, needs helper', () => {
+  test('linux .deb -> deb, needs helper, no target', () => {
     const p = planApply({ ...base, assetName: 'pearcircle-seeder_1.0.11_amd64.deb' }, 'linux')
-    expect(p.applier).toBe('deb'); expect(p.requiresHelper).toBe(true)
+    expect(p.applier).toBe('deb'); expect(p.requiresHelper).toBe(true); expect(p.requiresTarget).toBe(false)
   })
-  test('darwin -> macpkg needs helper; win32 -> windows', () => {
+  test('darwin -> macpkg needs helper; win32 -> windows self-applies (no helper, no target)', () => {
     expect(planApply({ ...base, assetName: 'X.pkg' }, 'darwin').requiresHelper).toBe(true)
-    expect(planApply({ ...base, assetName: 'X.exe' }, 'win32').applier).toBe('windows')
+    const w = planApply({ ...base, assetName: 'X.exe' }, 'win32')
+    expect(w.applier).toBe('windows'); expect(w.requiresHelper).toBe(false); expect(w.requiresTarget).toBe(false)
   })
   test('throws when nothing to apply', () => {
     expect(() => planApply({ updateAvailable: false }, 'linux')).toThrow()
@@ -187,6 +188,82 @@ describe('macOS privileged-helper handoff (slice 3b)', () => {
     const s = await a.apply()
     expect(s.status).toBe('needs-helper')
     expect(s.reason).toBe('privileged-installer')
+  })
+})
+
+describe('Windows applier (slice 3c)', () => {
+  const bytes = Buffer.from('seeder v1.0.12 setup.exe')
+  const good = sha256(bytes)
+  const update = {
+    updateAvailable: true, latestVersion: '1.0.12', releaseUrl: 'rel',
+    assetUrl: 'u/exe', sha256Url: 'u/exe.sha', assetName: 'PearCircleSeeder-Setup-1.0.12.exe',
+  }
+  const fetchImpl = stubFetch({ assetUrl: 'u/exe', bytes, shaUrl: 'u/exe.sha', shaText: `${good}  PearCircleSeeder-Setup-1.0.12.exe` })
+
+  test('verifies then launches the NSIS installer silently, detached via WMI', async () => {
+    const cmds = []
+    const r = await applyUpdate(update, { platform: 'win32', workDir: tmp(), fetchImpl, exec: async (c) => cmds.push(c) })
+    expect(r.applier).toBe('windows'); expect(r.restarted).toBe(true)
+    expect(cmds).toHaveLength(1)
+    const argv = cmds[0]
+    expect(argv[0]).toBe('powershell')
+    const ps = argv[argv.length - 1]
+    expect(ps).toMatch(/Win32_Process/)         // detached so NSSM's stop can't reap it
+    expect(ps).toMatch(/\.exe" \/S/)            // the verified installer, silent
+  })
+
+  test('a hash mismatch aborts BEFORE launching the installer', async () => {
+    const cmds = []
+    const badFetch = stubFetch({ assetUrl: 'u/exe', bytes, shaUrl: 'u/exe.sha', shaText: `${sha256(Buffer.from('evil'))}  x` })
+    await expect(applyUpdate(update, { platform: 'win32', workDir: tmp(), fetchImpl: badFetch, exec: async (c) => cmds.push(c) }))
+      .rejects.toThrow(VerifyError)
+    expect(cmds).toEqual([])
+  })
+
+  test('UpdateApplier: Windows self-applies without a target -> restarting', async () => {
+    const a = new UpdateApplier({ getUpdate: () => update, platform: 'win32', target: null, workDir: tmp(), fetchImpl, exec: async () => {} })
+    expect((await a.apply()).status).toBe('restarting')
+  })
+})
+
+describe('Linux .deb applier (slice 3c)', () => {
+  const bytes = Buffer.from('seeder v1.0.12 deb')
+  const good = sha256(bytes)
+  const update = {
+    updateAvailable: true, latestVersion: '1.0.12', releaseUrl: 'rel',
+    assetUrl: 'u/deb', sha256Url: 'u/deb.sha', assetName: 'pearcircle-seeder_1.0.12_amd64.deb',
+  }
+  const fetchImpl = stubFetch({ assetUrl: 'u/deb', bytes, shaUrl: 'u/deb.sha', shaText: `${good}  pearcircle-seeder_1.0.12_amd64.deb` })
+
+  test('pkexecs the root helper with the verified file, digest, user + version', async () => {
+    const helper = path.join(tmp(), 'updater-helper.sh'); fs.writeFileSync(helper, '#!/bin/bash\n')
+    const cmds = []
+    const r = await applyUpdate(update, {
+      platform: 'linux', helperPath: helper, user: 'seeder', workDir: tmp(),
+      fetchImpl, exec: async (c) => cmds.push(c),
+    })
+    expect(r.applier).toBe('deb'); expect(r.restarted).toBe(true)
+    expect(cmds).toHaveLength(1)
+    const [bin, h, file, digest, user, version] = cmds[0]
+    expect(bin).toBe('pkexec'); expect(h).toBe(helper)
+    expect(digest).toBe(good); expect(user).toBe('seeder'); expect(version).toBe('1.0.12')
+    expect(fs.existsSync(file)).toBe(true)
+  })
+
+  test('falls back to NeedsHelperError when the helper script is absent (old build)', async () => {
+    await expect(applyUpdate(update, {
+      platform: 'linux', helperPath: '/no/such/updater-helper.sh', user: 'seeder', workDir: tmp(),
+      fetchImpl, exec: async () => {},
+    })).rejects.toThrow(NeedsHelperError)
+  })
+
+  test('UpdateApplier: deb with helper present -> restarting; absent -> needs-helper', async () => {
+    const helper = path.join(tmp(), 'updater-helper.sh'); fs.writeFileSync(helper, '#!/bin/bash\n')
+    const ok = new UpdateApplier({ getUpdate: () => update, platform: 'linux', helperPath: helper, user: 'seeder', workDir: tmp(), fetchImpl, exec: async () => {} })
+    expect((await ok.apply()).status).toBe('restarting')
+    const old = new UpdateApplier({ getUpdate: () => update, platform: 'linux', helperPath: '/no/such', user: 'seeder', workDir: tmp(), fetchImpl, exec: async () => {} })
+    const s = await old.apply()
+    expect(s.status).toBe('needs-helper'); expect(s.reason).toBe('privileged-installer')
   })
 })
 

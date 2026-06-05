@@ -13,6 +13,8 @@ case "$1" in
         rm -f "$TARGET_HOME/.config/systemd/user/pearcircle-seeder.service"
       fi
     fi
+    # Drop the passwordless-pkexec polkit rule for the auto-updater (slice 3c).
+    rm -f /etc/polkit-1/rules.d/49-pearcircle-seeder-updater.rules
     ;;
 esac
 

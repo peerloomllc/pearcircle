@@ -54,12 +54,23 @@ describe('selectAsset (real release asset naming)', () => {
     expect(selectAsset(assets, 'darwin', 'arm64').browser_download_url).toBe('u/pkg')
     expect(selectAsset(assets, 'win32', 'x64').browser_download_url).toBe('u/exe')
   })
-  test('linux picks the ARCH-matching AppImage (prefer) then deb', () => {
+  test('linux defaults to the ARCH-matching AppImage (prefer) then deb', () => {
     expect(selectAsset(assets, 'linux', 'x64').browser_download_url).toBe('u/app-x64')
     expect(selectAsset(assets, 'linux', 'arm64').browser_download_url).toBe('u/app-arm64')
     const noApp = assets.filter((a) => !a.name.endsWith('.AppImage'))
     expect(selectAsset(noApp, 'linux', 'x64').browser_download_url).toBe('u/deb-amd64')
     expect(selectAsset(noApp, 'linux', 'arm64').browser_download_url).toBe('u/deb-arm64')
+  })
+  test('installKind=deb prefers the ARCH-matching .deb so the pkexec helper applies it', () => {
+    // A .deb-installed seeder must be offered the .deb even though an AppImage
+    // exists in the same release (proposal slice 3c).
+    expect(selectAsset(assets, 'linux', 'x64', 'deb').browser_download_url).toBe('u/deb-amd64')
+    expect(selectAsset(assets, 'linux', 'arm64', 'deb').browser_download_url).toBe('u/deb-arm64')
+    // installKind=appimage keeps the AppImage self-apply.
+    expect(selectAsset(assets, 'linux', 'x64', 'appimage').browser_download_url).toBe('u/app-x64')
+    // A deb install with only an AppImage published still gets the AppImage.
+    const noDeb = assets.filter((a) => !a.name.endsWith('.deb'))
+    expect(selectAsset(noDeb, 'linux', 'x64', 'deb').browser_download_url).toBe('u/app-x64')
   })
   test('never hands a wrong-arch binary: null when no arch match', () => {
     const onlyArm = assets.filter((a) => /aarch64|arm64/.test(a.name))

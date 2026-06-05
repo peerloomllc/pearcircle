@@ -4,11 +4,15 @@
 // integrity boundary — a tampered or wrong asset is rejected and nothing is
 // installed), then dispatches to a per-platform applier.
 //
-// Self-apply paths that need no extra privilege (Linux AppImage; Windows via the
-// LocalSystem service) are handled here. The macOS .pkg / Linux .deb paths need
-// root and go through an install-once privileged helper (slice 3b) — their
-// appliers throw `NeedsHelperError` until 3b lands, so the route can fall back to
-// "download + open" rather than silently doing nothing.
+// Self-apply paths that need no extra privilege are handled inline: the Linux
+// AppImage (swap the image, restart the user service) and Windows (the NSIS
+// installer, driven by the already-privileged LocalSystem service). The macOS
+// .pkg and Linux .deb need root and go through an install-once privileged
+// helper installed at first install (slice 3b/3c): macOS drops a request for a
+// root LaunchDaemon; Linux runs a root updater via a passwordless polkit/pkexec
+// rule. When that helper isn't present (an old build) the applier throws
+// `NeedsHelperError` so the route falls back to a verified download rather than
+// silently doing nothing.
 
 const fs = require('node:fs')
 const os = require('node:os')
@@ -67,8 +71,12 @@ function planApply (update, platform) {
       : platform === 'linux' ? (update.assetName && /\.appimage$/i.test(update.assetName) ? 'appimage' : 'deb')
         : null
   if (!applier) throw new Error('unsupported platform: ' + platform)
+  // requiresHelper: needs an install-once privileged helper (macOS daemon /
+  // Linux pkexec). requiresTarget: a self-apply that swaps a known payload path
+  // up front (the AppImage) — the Windows installer self-applies with no target.
   const requiresHelper = applier === 'macpkg' || applier === 'deb'
-  return { applier, requiresHelper, assetUrl: update.assetUrl, sha256Url: update.sha256Url, assetName: update.assetName }
+  const requiresTarget = applier === 'appimage'
+  return { applier, requiresHelper, requiresTarget, assetUrl: update.assetUrl, sha256Url: update.sha256Url, assetName: update.assetName }
 }
 
 // Download `url` to `destPath` (streamed via fetch). Returns destPath.
@@ -112,12 +120,20 @@ const APPLIERS = {
     await exec(['systemctl', '--user', 'restart', 'pearcircle-seeder'])
     return { restarted: true }
   },
-  // The Windows NSSM service runs as LocalSystem and can swap+restart itself.
-  // Command construction lives here; on-device validation is slice 3b/Windows.
+  // Windows: run the verified NSIS installer silently. The installer's upgrade
+  // path stops the service -> overwrites the payload -> re-registers -> starts
+  // it, which releases the running node.exe lock that a plain file copy can't.
+  // The NSSM service runs as LocalSystem, so the installer inherits elevation
+  // (no UAC) and `/S` suppresses every UI page (no browser/finish-page popup on
+  // an unattended update). We must NOT spawn the installer as a child of the
+  // service: NSSM reaps the service's process tree on stop, and the installer
+  // *itself* stops the service — a child would be killed mid-swap. So launch it
+  // detached via WMI (Win32_Process.Create re-parents it under WmiPrvSE), then
+  // return; the host process is replaced when the installer restarts the service.
   windows: async ({ file, exec }) => {
-    await exec(['nssm', 'stop', 'PearCircleSeeder'])
-    await exec(['__swap_payload__', file]) // host helper expands this to the file moves
-    await exec(['nssm', 'start', 'PearCircleSeeder'])
+    const cmdLine = `\"${file}\" /S`
+    const ps = `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='${cmdLine}'} | Out-Null`
+    await exec(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps])
     return { restarted: true }
   },
   // macOS: hand the verified .pkg to the privileged updater LaunchDaemon by
@@ -138,19 +154,33 @@ const APPLIERS = {
     f.renameSync(tmp, dst)
     return { handedToHelper: true }
   },
-  deb: async ({ platform }) => { throw new NeedsHelperError(platform || 'linux') },
+  // Linux .deb: the systemd *user* service is unprivileged and `dpkg -i` needs
+  // root. The .deb's postinst installs a root-owned updater script plus a polkit
+  // rule that lets this seeder's user run it via pkexec with no password
+  // (proposal slice 3c). The helper re-verifies the sha256 (trust anchor =
+  // HTTPS + the release .sha256; debs are unsigned), runs `dpkg -i`, then
+  // restarts the user service — restart LAST, so the cgroup teardown can't
+  // interrupt an in-flight dpkg. If the helper script is absent (an old build)
+  // fall back to a verified download. `user` is the seeder's username, handed to
+  // the helper so it restarts the right --user unit.
+  deb: async ({ file, digest, version, platform, helperPath, user, exec, fsImpl }) => {
+    const f = fsImpl || fs
+    if (!helperPath || !f.existsSync(helperPath)) throw new NeedsHelperError(platform || 'linux')
+    await exec(['pkexec', helperPath, file, digest, user || '', version || ''])
+    return { restarted: true }
+  },
 }
 
 // Full orchestration: plan -> download+verify -> apply. `exec`/`fetchImpl`/
 // `fsImpl` are injectable. Aborts (and applies nothing) if verification fails.
-async function applyUpdate (update, { platform = process.platform, target, requestDir, workDir, fetchImpl, exec, fsImpl, log = () => {} } = {}) {
+async function applyUpdate (update, { platform = process.platform, target, requestDir, helperPath, user, workDir, fetchImpl, exec, fsImpl, log = () => {} } = {}) {
   const plan = planApply(update, platform)
   log('update', `applying v${update.latestVersion} via ${plan.applier}`)
   const { file, digest } = await downloadAndVerify(plan, { workDir, fetchImpl })
   log('update', `verified ${plan.assetName} (${digest.slice(0, 12)}…)`)
   const applier = APPLIERS[plan.applier]
   if (!applier) throw new Error('no applier for ' + plan.applier)
-  const result = await applier({ file, digest, version: update.latestVersion, target, platform, requestDir, exec, fsImpl })
+  const result = await applier({ file, digest, version: update.latestVersion, target, platform, requestDir, helperPath, user, exec, fsImpl })
   return { ...result, applier: plan.applier, version: update.latestVersion, file, digest }
 }
 
@@ -162,11 +192,13 @@ async function applyUpdate (update, { platform = process.platform, target, reque
 // service manager brings us back on the new version); helper/no-target/unknown
 // platforms land on `needs-helper` so the UI offers a verified download instead.
 class UpdateApplier {
-  constructor ({ getUpdate, platform = process.platform, target = null, requestDir = null, exec, fetchImpl, log = () => {} } = {}) {
+  constructor ({ getUpdate, platform = process.platform, target = null, requestDir = null, helperPath = null, user = null, exec, fetchImpl, log = () => {} } = {}) {
     this._getUpdate = getUpdate
     this._platform = platform
-    this._target = target        // self-apply payload path (Linux AppImage / Windows)
+    this._target = target        // self-apply payload path (Linux AppImage)
     this._requestDir = requestDir // macOS privileged-helper drop dir (slice 3b)
+    this._helperPath = helperPath // Linux .deb root updater run via pkexec (slice 3c)
+    this._user = user            // seeder username (Linux: restart the --user unit)
     this._exec = exec
     this._fetchImpl = fetchImpl
     this._log = log
@@ -183,13 +215,15 @@ class UpdateApplier {
     const downloadFallback = { status: 'needs-helper', version: update.latestVersion, assetUrl: update.assetUrl, releaseUrl: update.releaseUrl }
     try {
       const plan = planApply(update, this._platform)
-      // Self-apply platforms need a payload target up front; without one we
-      // can't swap, so offer the verified download instead.
-      if (!plan.requiresHelper && !this._target) {
+      // Target-based self-apply (the AppImage) needs a payload path up front;
+      // without one we can't swap, so offer the verified download instead. The
+      // Windows installer self-applies with no target, so it is exempt.
+      if (plan.requiresTarget && !this._target) {
         this._state = { ...downloadFallback, reason: 'no-install-target' }; return this._state
       }
       const result = await applyUpdate(update, {
         platform: this._platform, target: this._target, requestDir: this._requestDir,
+        helperPath: this._helperPath, user: this._user,
         exec: this._exec, fetchImpl: this._fetchImpl, log: this._log,
       })
       // macOS hands off to the privileged daemon (installs + restarts the agent

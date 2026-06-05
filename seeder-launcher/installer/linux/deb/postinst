@@ -7,6 +7,37 @@ set -e
 INSTALL_ROOT=/opt/pearcircle-seeder
 UNIT_SRC="$INSTALL_ROOT/pearcircle-seeder.service"
 
+# Install the privileged auto-updater for a known install user: the root-owned
+# helper (run via pkexec) + a passwordless polkit rule scoped to that user and
+# this one script. Best-effort and on its own subshell with set +e — a missing
+# polkit, an odd filesystem, or a re-run during an unattended update must NEVER
+# fail the package install. Proposal 2026-06-05-seeder-update slice 3c
+# (mirroring the macOS "first-run/update steps never fail an install" rule).
+install_updater () {
+  local user="$1"
+  ( set +e
+    chown root:root "$INSTALL_ROOT/updater-helper.sh" 2>/dev/null
+    chmod 0755 "$INSTALL_ROOT/updater-helper.sh" 2>/dev/null
+    local rule_src="$INSTALL_ROOT/updater-helper.rules.in"
+    local rule_dir="/etc/polkit-1/rules.d"
+    local rule_dst="$rule_dir/49-pearcircle-seeder-updater.rules"
+    if [ -f "$rule_src" ] && [ -d "$rule_dir" ]; then
+      sed "s|__USER__|$user|g" "$rule_src" > "$rule_dst" 2>/dev/null
+      chmod 0644 "$rule_dst" 2>/dev/null
+      echo "pearcircle-seeder: one-click auto-update enabled for $user (polkit rule installed)."
+    else
+      echo "pearcircle-seeder: polkit rules.d not found; one-click .deb auto-update unavailable."
+      echo "  Updates still work via the dashboard's verified-download fallback."
+    fi
+  )
+  return 0
+}
+
+# Resolve the human install user from `sudo dpkg -i` / `apt`. A pkexec-driven
+# unattended auto-update sets no SUDO_USER, so this branch is skipped on that
+# path and the postinst stays a no-op for user/systemctl actions — the updater
+# helper owns the service restart there, and the polkit rule + helper are already
+# in place from the original (human) install. Proposal slice 3c.
 TARGET_USER="${SUDO_USER:-}"
 if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
   echo "pearcircle-seeder: no non-root install user detected; skipping service setup."
@@ -48,5 +79,8 @@ else
   echo "  It starts automatically on $TARGET_USER's next login, or start it now with:"
   echo "    systemctl --user enable --now pearcircle-seeder.service"
 fi
+
+# Enable one-click .deb auto-updates for this user (best-effort; never fails).
+install_updater "$TARGET_USER"
 
 exit 0

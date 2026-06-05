@@ -44,6 +44,13 @@ BARE_HOST="$BARE_HOST" OUT_DIR="$INSTALL_DIR" bash "$SCRIPT_DIR/stage-payload-li
 # 2. Ship the systemd user unit template; the postinst templates __EXEC__.
 cp "$INSTALLER/pearcircle-seeder.service" "$INSTALL_DIR/pearcircle-seeder.service"
 
+# 2b. Privileged auto-updater (proposal 2026-06-05-seeder-update slice 3c): the
+#     root-run helper + the polkit rule template. The postinst installs the rule
+#     (templated to the install user) and ensures the helper is root-owned 0755.
+cp "$INSTALLER/updater-helper.sh" "$INSTALL_DIR/updater-helper.sh"
+chmod 0755 "$INSTALL_DIR/updater-helper.sh"
+cp "$INSTALLER/com.pearcircle.seeder.update.rules.in" "$INSTALL_DIR/updater-helper.rules.in"
+
 # 3. CLI symlink on PATH.
 ln -s /opt/pearcircle-seeder/pearcircle-seeder "$PKGROOT/usr/bin/pearcircle-seeder"
 

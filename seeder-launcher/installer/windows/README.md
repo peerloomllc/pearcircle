@@ -15,7 +15,9 @@ Open **PearCircle Seeder** from the Start Menu. It opens the monitoring UI (`htt
 
 ## Update
 
-Run the newer `PearCircleSeeder-Setup-<version>.exe`. It stops the old service, replaces the files, and re-registers the service. The seeder identity and circle enrollments under `C:\ProgramData\PearCircle Seeder` are preserved.
+The seeder checks GitHub Releases hourly and surfaces a newer version in the monitoring dashboard (and in the mobile app's seeder list). Click **Update now** to apply it one-click: the LocalSystem service (already privileged) downloads the new `Setup.exe`, verifies its SHA-256 against the release's `.sha256` sidecar, and runs it silently (`/S`). The installer stops the old service, overwrites the files - silent mode shows no UI and never launches the browser - re-registers the service, and starts it again. It is launched detached (via WMI) so the service stop the installer itself triggers can't reap it mid-swap. The integrity boundary is HTTPS to GitHub plus the release `.sha256` (Windows artifacts are unsigned).
+
+You can still update by hand: run the newer `PearCircleSeeder-Setup-<version>.exe`. Either way the seeder identity and circle enrollments under `C:\ProgramData\PearCircle Seeder` are preserved.
 
 ## Uninstall
 

@@ -71,9 +71,28 @@ journalctl --user -u pearcircle-seeder -f
 
 ## Update
 
-Re-run `apt install` with the newer `.deb`, or replace the `.AppImage` file
-in place. The seeder identity and circle enrollments under
-`~/.local/share/pearcircle-seeder` are preserved.
+The seeder checks GitHub Releases hourly and surfaces a newer version in the
+monitoring dashboard (and in the mobile app's seeder list). Click **Update
+now** to apply it one-click - no manual download:
+
+- **`.deb`:** the unprivileged service runs the root updater
+  (`/opt/pearcircle-seeder/updater-helper.sh`) through `pkexec`. A polkit rule
+  installed by the package (`/etc/polkit-1/rules.d/49-pearcircle-seeder-updater.rules`)
+  lets your user run *only that one root-owned script* with no password, so the
+  background service can apply updates unattended. The helper re-verifies the
+  download's SHA-256 against the release's `.sha256` sidecar before `dpkg -i`,
+  then restarts the service. Requires polkit >= 0.106 (modern Debian/Ubuntu).
+  If polkit is missing the dashboard falls back to a verified download link.
+- **`.AppImage`:** the running image is swapped in place and the user service is
+  restarted - no privilege needed.
+
+The integrity boundary is HTTPS to GitHub plus the release `.sha256` (Linux
+artifacts are unsigned). The one-click apply is operator-gated - nothing
+self-updates without a click.
+
+You can still update by hand: re-run `apt install` with the newer `.deb`, or
+replace the `.AppImage` file in place. The seeder identity and circle
+enrollments under `~/.local/share/pearcircle-seeder` are preserved either way.
 
 ## Uninstall
 
