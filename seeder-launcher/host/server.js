@@ -19,9 +19,9 @@ const MIME = {
 // the result out over WS so clients have something current to render.
 const SNAPSHOT_INTERVAL_MS = 5000
 
-function createServer ({ worklet, token, uiDir, log, version = null, updateChecker = null }) {
+function createServer ({ worklet, token, uiDir, log, version = null, updateChecker = null, updateApplier = null }) {
   const routeTable = routes()
-  const ctx = { worklet, version, updateChecker }
+  const ctx = { worklet, version, updateChecker, updateApplier }
 
   const srv = http.createServer(async (req, res) => {
     try {
@@ -82,7 +82,7 @@ function createServer ({ worklet, token, uiDir, log, version = null, updateCheck
     log('ws', 'client connected')
     ws.on('close', () => log('ws', 'client disconnected'))
     try {
-      const snap = await snapshot(worklet, version, updateChecker)
+      const snap = await snapshot(worklet, version, updateChecker, updateApplier)
       ws.send(JSON.stringify({ type: 'snapshot', ...snap }))
     } catch (e) {
       ws.send(JSON.stringify({ type: 'snapshot:error', error: e.message }))
@@ -104,7 +104,7 @@ function createServer ({ worklet, token, uiDir, log, version = null, updateCheck
     if (snapTimer) return
     snapTimer = setInterval(async () => {
       try {
-        const snap = await snapshot(worklet, version, updateChecker)
+        const snap = await snapshot(worklet, version, updateChecker, updateApplier)
         broadcast({ type: 'snapshot', ...snap })
       } catch (e) {
         broadcast({ type: 'snapshot:error', error: e.message })
@@ -116,19 +116,21 @@ function createServer ({ worklet, token, uiDir, log, version = null, updateCheck
   return { srv, wss, broadcast, startPolling, stopPolling }
 }
 
-async function snapshot (worklet, version = null, updateChecker = null) {
+async function snapshot (worklet, version = null, updateChecker = null, updateApplier = null) {
   const [status, circles] = await Promise.all([
     worklet.call('seeder:status').catch((e) => ({ error: e.message })),
     worklet.call('seeder:enrolled:list').catch((e) => ({ error: e.message })),
   ])
   // launcherVersion is the host's own build version (proposal 2026-06-05-seeder
   // -update slice 1), distinct from status.version which the worklet echoes back.
-  // update is the cached GitHub-Releases check (slice 2), or null when disabled.
+  // update is the cached GitHub-Releases check (slice 2); applyState is the
+  // one-click apply progress (slice 3a).
   return {
     status,
     circles,
     launcherVersion: version,
     update: updateChecker ? updateChecker.get() : null,
+    applyState: updateApplier ? updateApplier.getState() : null,
     at: Date.now(),
   }
 }

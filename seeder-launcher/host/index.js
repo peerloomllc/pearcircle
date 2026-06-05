@@ -8,6 +8,7 @@ const { Worklet } = require('./worklet')
 const { createServer } = require('./server')
 const { SEEDER_VERSION } = require('./version')
 const { UpdateChecker } = require('./updateCheck')
+const { UpdateApplier } = require('./updateApply')
 
 function parseArgs (argv) {
   const out = { dev: false, port: 8730 }
@@ -130,7 +131,25 @@ async function main () {
   // slice 2). Fail-open; surfaced via /api/update + the WS snapshot.
   const updateChecker = new UpdateChecker({ currentVersion: SEEDER_VERSION, log }).start()
 
-  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker })
+  // One-click apply (slice 3a). Self-apply on Linux AppImage when launched as
+  // one (process.env.APPIMAGE is the running image path to swap) + Windows;
+  // macOS .pkg / Linux .deb land on `needs-helper` (download fallback) until the
+  // privileged helper ships (slice 3b). The actual child commands are spawned by
+  // `exec`; a failure leaves the running service untouched.
+  const { spawn: spawnChild } = require('node:child_process')
+  const exec = (argv) => new Promise((resolve, reject) => {
+    const p = spawnChild(argv[0], argv.slice(1), { stdio: 'ignore' })
+    p.on('error', reject)
+    p.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${argv[0]} exited ${code}`)))
+  })
+  const updateApplier = new UpdateApplier({
+    getUpdate: () => updateChecker.get(),
+    target: process.env.APPIMAGE || null,
+    exec,
+    log,
+  })
+
+  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker, updateApplier })
   srv.on('error', (err) => {
     log('host', `server error: ${err.message}`)
     if (err.code === 'EADDRINUSE') process.exit(2)
