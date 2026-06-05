@@ -3,7 +3,8 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const {
-  NeedsHelperError, VerifyError, UpdateApplier, parseSha256Sidecar, sha256File, planApply, downloadAndVerify, applyUpdate,
+  NeedsHelperError, VerifyError, UpdateApplier, APPLE_TEAM_ID, parsePkgutilTeam,
+  parseSha256Sidecar, sha256File, planApply, downloadAndVerify, applyUpdate,
 } = require('../seeder-launcher/host/updateApply')
 
 // Proposal 2026-06-05-seeder-update slice 3a: the verifiable apply core.
@@ -156,5 +157,46 @@ describe('UpdateApplier state machine', () => {
     const s = await a.apply()
     expect(s.status).toBe('restarting')
     expect(cmds.length).toBeGreaterThan(0)
+  })
+})
+
+describe('macOS privileged-helper handoff (slice 3b)', () => {
+  const fs = require('node:fs')
+  const bytes = Buffer.from('seeder v1.0.11 pkg')
+  const good = sha256(bytes)
+  const pkgUpdate = {
+    updateAvailable: true, latestVersion: '1.0.11', releaseUrl: 'rel',
+    assetUrl: 'u/pkg', sha256Url: 'u/pkg.sha', assetName: 'PearCircleSeeder-1.0.11.pkg',
+  }
+  const fetchImpl = stubFetch({ assetUrl: 'u/pkg', bytes, shaUrl: 'u/pkg.sha', shaText: `${good}  PearCircleSeeder-1.0.11.pkg` })
+
+  test('drops a verified apply request for the daemon when the request dir exists', async () => {
+    const reqDir = tmp()
+    const a = new UpdateApplier({ getUpdate: () => pkgUpdate, platform: 'darwin', requestDir: reqDir, fetchImpl, exec: async () => {} })
+    const s = await a.apply()
+    expect(s.status).toBe('applying-via-helper')
+    const req = JSON.parse(fs.readFileSync(path.join(reqDir, 'apply.json'), 'utf8'))
+    expect(req.sha256).toBe(good)
+    expect(req.version).toBe('1.0.11')
+    expect(req.teamId).toBe(APPLE_TEAM_ID)
+    expect(fs.existsSync(req.pkgPath)).toBe(true)
+  })
+
+  test('falls back to needs-helper when the daemon dir is absent (helper not installed)', async () => {
+    const a = new UpdateApplier({ getUpdate: () => pkgUpdate, platform: 'darwin', requestDir: '/no/such/dir', fetchImpl, exec: async () => {} })
+    const s = await a.apply()
+    expect(s.status).toBe('needs-helper')
+    expect(s.reason).toBe('privileged-installer')
+  })
+})
+
+describe('parsePkgutilTeam', () => {
+  test('extracts the team id from both pkgutil output shapes', () => {
+    expect(parsePkgutilTeam('   1. Developer ID Installer: PeerLoom LLC (G79ALD29NA)\n')).toBe('G79ALD29NA')
+    expect(parsePkgutilTeam('Status: signed\n   Team identifier: G79ALD29NA\n')).toBe('G79ALD29NA')
+  })
+  test('returns null when no team id present', () => {
+    expect(parsePkgutilTeam('Status: no signature')).toBeNull()
+    expect(parsePkgutilTeam(null)).toBeNull()
   })
 })

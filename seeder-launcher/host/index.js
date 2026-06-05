@@ -142,9 +142,17 @@ async function main () {
     p.on('error', reject)
     p.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${argv[0]} exited ${code}`)))
   })
+  // macOS privileged-helper drop dir (slice 3b): the host (unprivileged
+  // LaunchAgent) drops a verified-pkg request here and the root
+  // com.pearcircle.seeder.updater LaunchDaemon installs it. Absent when the
+  // helper isn't installed (old build) -> apply falls back to a download.
+  const macRequestDir = process.platform === 'darwin'
+    ? '/Library/Application Support/PearCircle Seeder/updates/requests'
+    : null
   const updateApplier = new UpdateApplier({
     getUpdate: () => updateChecker.get(),
     target: process.env.APPIMAGE || null,
+    requestDir: macRequestDir,
     exec,
     log,
   })

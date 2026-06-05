@@ -18,6 +18,13 @@ LOG_PATH="$DATA_DIR/launchd.log"
 PLIST_SRC="/usr/local/lib/pearcircle-seeder/installer/com.pearcircle.seeder.plist"
 PLIST_DST="$USER_HOME/Library/LaunchAgents/com.pearcircle.seeder.plist"
 
+# Update vs fresh install: if the LaunchAgent already exists this is a
+# re-install / one-click auto-update, so skip the first-run UI (open browser,
+# Desktop-shortcut prompt) — an auto-update must not pop dialogs.
+# Proposal 2026-06-05-seeder-update slice 3b.
+IS_UPDATE=0
+[ -f "$PLIST_DST" ] && IS_UPDATE=1
+
 mkdir -p "$DATA_DIR"
 mkdir -p "$USER_HOME/Library/LaunchAgents"
 chown "$USER_NAME" "$DATA_DIR" "$USER_HOME/Library/LaunchAgents"
@@ -31,6 +38,54 @@ chmod 0644 "$PLIST_DST"
 # session so the daemon lives there, not in the root session.
 launchctl asuser "$USER_UID" launchctl unload "$PLIST_DST" 2>/dev/null || true
 launchctl asuser "$USER_UID" launchctl load "$PLIST_DST"
+
+# --- Privileged updater LaunchDaemon (proposal 2026-06-05-seeder-update 3b) ---
+# Installs the root auto-updater that applies one-click updates without sudo.
+# The unprivileged seeder drops a verified-pkg request into REQ_DIR; the daemon's
+# WatchPaths fires the helper, which re-verifies (sha256 + team + notarization)
+# and installs. We do NOT bootout an already-loaded updater here: during an
+# auto-update THIS postinstall runs *inside* the helper, and booting it out
+# would kill the in-flight install.
+UPDATES_DIR="/Library/Application Support/PearCircle Seeder/updates"
+REQ_DIR="$UPDATES_DIR/requests"
+mkdir -p "$REQ_DIR"
+chown root:wheel "$UPDATES_DIR" "$REQ_DIR"
+chmod 0755 "$UPDATES_DIR"
+# 0733: root rwx; the console-user seeder can write+traverse to drop apply.json
+# but cannot list other requests. The helper re-verifies, so a hostile drop is
+# rejected at install time anyway.
+chmod 0733 "$REQ_DIR"
+
+DAEMON_SRC="/usr/local/lib/pearcircle-seeder/installer/com.pearcircle.seeder.updater.plist"
+DAEMON_DST="/Library/LaunchDaemons/com.pearcircle.seeder.updater.plist"
+if [ -f "$DAEMON_SRC" ]; then
+  cp "$DAEMON_SRC" "$DAEMON_DST"
+  chown root:wheel "$DAEMON_DST"
+  chmod 0644 "$DAEMON_DST"
+  # The helper must be root-owned + not group/world-writable (it runs as root).
+  chown root:wheel /usr/local/lib/pearcircle-seeder/updater-helper.sh 2>/dev/null || true
+  chmod 0755 /usr/local/lib/pearcircle-seeder/updater-helper.sh 2>/dev/null || true
+  # Bootstrap only if not already loaded (no bootout — see above).
+  launchctl bootstrap system "$DAEMON_DST" 2>/dev/null \
+    || launchctl load "$DAEMON_DST" 2>/dev/null || true
+fi
+
+# On an auto-update / re-install, the seeder is already set up and the operator
+# isn't watching — skip the browser-open + shortcut prompt entirely so the
+# update stays silent (slice 3b). The LaunchAgent reload above already brought
+# the new version up.
+if [ "$IS_UPDATE" = "1" ]; then
+  echo "PearCircle Seeder updated; LaunchAgent reloaded (silent update)."
+  exit 0
+fi
+
+# From here down is best-effort first-run convenience (open the browser, offer a
+# Desktop shortcut). None of it may fail the install — in a sandboxed / headless
+# installer context (e.g. an auto-update via the privileged daemon, or any
+# install without Full Disk Access) writing to ~/Desktop is TCC-blocked and
+# would otherwise abort the whole package with `set -e`. Drop the strict flags.
+# Proposal 2026-06-05-seeder-update slice 3b (hardening).
+set +e
 
 # Wait up to ~15s for the host to bind and log the UI URL.
 URL=""

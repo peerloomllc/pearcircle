@@ -15,6 +15,23 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 
+// The Apple Developer Team that signs + notarizes PearCircle (reused from
+// PearCal/PearGuard). The privileged macOS updater LaunchDaemon (slice 3b) only
+// installs a .pkg signed by this team and notarized — the trust anchor that
+// makes the host->helper drop-folder handoff safe even on a multi-user box.
+const APPLE_TEAM_ID = 'G79ALD29NA'
+
+// Pull the signing Team Identifier out of `pkgutil --check-signature <pkg>`
+// output. macOS prints a line like `   1. Developer ID Installer: Name (TEAMID)`
+// or an explicit `Team identifier: TEAMID`. Returns the id or null. Pure.
+function parsePkgutilTeam (output) {
+  if (typeof output !== 'string') return null
+  const explicit = output.match(/Team identifier:\s*([A-Z0-9]{10})/i)
+  if (explicit) return explicit[1].toUpperCase()
+  const paren = output.match(/Developer ID Installer:[^\n(]*\(([A-Z0-9]{10})\)/i)
+  return paren ? paren[1].toUpperCase() : null
+}
+
 class NeedsHelperError extends Error {
   constructor (platform) { super(`apply on ${platform} needs the privileged helper (slice 3b)`); this.code = 'NEEDS_HELPER' }
 }
@@ -103,20 +120,37 @@ const APPLIERS = {
     await exec(['nssm', 'start', 'PearCircleSeeder'])
     return { restarted: true }
   },
-  macpkg: async ({ platform }) => { throw new NeedsHelperError(platform || 'darwin') },
+  // macOS: hand the verified .pkg to the privileged updater LaunchDaemon by
+  // dropping a request into its watched directory (slice 3b). The host is
+  // unprivileged, so it cannot run `installer -pkg` itself; the root daemon
+  // re-verifies (sha256 + Developer-ID/notarization) and installs. If the
+  // daemon dir is absent (helper not installed — old build), fall back to the
+  // download path. The .pkg's own postinstall restarts the LaunchAgent.
+  macpkg: async ({ file, digest, version, platform, requestDir, fsImpl }) => {
+    const f = fsImpl || fs
+    if (!requestDir || !f.existsSync(requestDir)) throw new NeedsHelperError(platform || 'darwin')
+    const req = { pkgPath: file, sha256: digest, version: version || null, teamId: APPLE_TEAM_ID, ts: Date.now() }
+    // Write to a temp name then rename, so the daemon's WatchPaths never sees a
+    // half-written request.
+    const tmp = path.join(requestDir, '.apply.json.tmp')
+    const dst = path.join(requestDir, 'apply.json')
+    f.writeFileSync(tmp, JSON.stringify(req))
+    f.renameSync(tmp, dst)
+    return { handedToHelper: true }
+  },
   deb: async ({ platform }) => { throw new NeedsHelperError(platform || 'linux') },
 }
 
-// Full orchestration: plan -> download+verify -> apply. `exec` and `fetchImpl`
-// are injectable. Aborts (and applies nothing) if verification fails.
-async function applyUpdate (update, { platform = process.platform, target, workDir, fetchImpl, exec, log = () => {} } = {}) {
+// Full orchestration: plan -> download+verify -> apply. `exec`/`fetchImpl`/
+// `fsImpl` are injectable. Aborts (and applies nothing) if verification fails.
+async function applyUpdate (update, { platform = process.platform, target, requestDir, workDir, fetchImpl, exec, fsImpl, log = () => {} } = {}) {
   const plan = planApply(update, platform)
   log('update', `applying v${update.latestVersion} via ${plan.applier}`)
   const { file, digest } = await downloadAndVerify(plan, { workDir, fetchImpl })
   log('update', `verified ${plan.assetName} (${digest.slice(0, 12)}…)`)
   const applier = APPLIERS[plan.applier]
   if (!applier) throw new Error('no applier for ' + plan.applier)
-  const result = await applier({ file, target, platform, exec })
+  const result = await applier({ file, digest, version: update.latestVersion, target, platform, requestDir, exec, fsImpl })
   return { ...result, applier: plan.applier, version: update.latestVersion, file, digest }
 }
 
@@ -128,10 +162,11 @@ async function applyUpdate (update, { platform = process.platform, target, workD
 // service manager brings us back on the new version); helper/no-target/unknown
 // platforms land on `needs-helper` so the UI offers a verified download instead.
 class UpdateApplier {
-  constructor ({ getUpdate, platform = process.platform, target = null, exec, fetchImpl, log = () => {} } = {}) {
+  constructor ({ getUpdate, platform = process.platform, target = null, requestDir = null, exec, fetchImpl, log = () => {} } = {}) {
     this._getUpdate = getUpdate
     this._platform = platform
-    this._target = target
+    this._target = target        // self-apply payload path (Linux AppImage / Windows)
+    this._requestDir = requestDir // macOS privileged-helper drop dir (slice 3b)
     this._exec = exec
     this._fetchImpl = fetchImpl
     this._log = log
@@ -148,11 +183,23 @@ class UpdateApplier {
     const downloadFallback = { status: 'needs-helper', version: update.latestVersion, assetUrl: update.assetUrl, releaseUrl: update.releaseUrl }
     try {
       const plan = planApply(update, this._platform)
-      if (plan.requiresHelper) { this._state = { ...downloadFallback, reason: 'privileged-installer' }; return this._state }
-      if (!this._target) { this._state = { ...downloadFallback, reason: 'no-install-target' }; return this._state }
-      await applyUpdate(update, { platform: this._platform, target: this._target, exec: this._exec, fetchImpl: this._fetchImpl, log: this._log })
-      this._state = { status: 'restarting', version: update.latestVersion }
+      // Self-apply platforms need a payload target up front; without one we
+      // can't swap, so offer the verified download instead.
+      if (!plan.requiresHelper && !this._target) {
+        this._state = { ...downloadFallback, reason: 'no-install-target' }; return this._state
+      }
+      const result = await applyUpdate(update, {
+        platform: this._platform, target: this._target, requestDir: this._requestDir,
+        exec: this._exec, fetchImpl: this._fetchImpl, log: this._log,
+      })
+      // macOS hands off to the privileged daemon (installs + restarts the agent
+      // asynchronously); self-apply platforms restart the service directly.
+      this._state = result.handedToHelper
+        ? { status: 'applying-via-helper', version: update.latestVersion }
+        : { status: 'restarting', version: update.latestVersion }
     } catch (e) {
+      // NeedsHelperError = the privileged helper isn't installed (old build) or
+      // the platform isn't wired yet -> fall back to a verified download.
       this._state = e.code === 'NEEDS_HELPER'
         ? { ...downloadFallback, reason: 'privileged-installer' }
         : { status: 'error', version: update.latestVersion, error: e.message }
@@ -163,6 +210,6 @@ class UpdateApplier {
 }
 
 module.exports = {
-  NeedsHelperError, VerifyError, UpdateApplier,
+  NeedsHelperError, VerifyError, UpdateApplier, APPLE_TEAM_ID, parsePkgutilTeam,
   parseSha256Sidecar, sha256File, planApply, downloadTo, downloadAndVerify, applyUpdate, APPLIERS,
 }
