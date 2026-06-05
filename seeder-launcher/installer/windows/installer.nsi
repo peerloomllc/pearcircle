@@ -26,6 +26,12 @@ ManifestDPIAware true
 Name "${APP_NAME}"
 OutFile "PearCircleSeeder-Setup-${VERSION}.exe"
 InstallDir "$PROGRAMFILES64\${APP_NAME}"
+; One-click auto-update runs this installer silently (`/S`): the host's Windows
+; applier (updateApply.js) launches it detached, and `/S` suppresses every UI
+; page including the finish-page browser launch, so an unattended update is
+; silent. Read the prior install location so a silent upgrade lands exactly
+; where the first install did rather than the default. Proposal slice 3c.
+InstallDirRegKey HKLM "${UNINST_KEY}" "InstallLocation"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show

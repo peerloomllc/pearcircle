@@ -12,6 +12,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 LAUNCHER=$(pwd)
+REPO=$(cd "$LAUNCHER/.." && pwd)
 SCRIPT_DIR="$LAUNCHER/scripts"
 INSTALLER="$LAUNCHER/installer/linux"
 
@@ -38,11 +39,36 @@ INSTALL_DIR="$PKGROOT/opt/pearcircle-seeder"
 rm -rf "$STAGE"
 mkdir -p "$INSTALL_DIR" "$PKGROOT/usr/bin" "$PKGROOT/DEBIAN"
 
-# 1. Stage the flat payload under /opt/pearcircle-seeder.
-BARE_HOST="$BARE_HOST" OUT_DIR="$INSTALL_DIR" bash "$SCRIPT_DIR/stage-payload-linux.sh"
+# 1. Stage the flat payload under /opt/pearcircle-seeder. Pass SEEDER_VERSION so
+#    the runtime version (host/version.js, surfaced in /api + the update check)
+#    matches the package version. Without it build-host-sea.sh falls back to
+#    `git describe`, which mis-stamps any build whose VERSION != the latest tag.
+SEEDER_VERSION="$VERSION" BARE_HOST="$BARE_HOST" OUT_DIR="$INSTALL_DIR" bash "$SCRIPT_DIR/stage-payload-linux.sh"
 
 # 2. Ship the systemd user unit template; the postinst templates __EXEC__.
 cp "$INSTALLER/pearcircle-seeder.service" "$INSTALL_DIR/pearcircle-seeder.service"
+
+# 2b. Privileged auto-updater (proposal 2026-06-05-seeder-update slice 3c): the
+#     root-run helper + the polkit rule template. The postinst installs the rule
+#     (templated to the install user) and ensures the helper is root-owned 0755.
+cp "$INSTALLER/updater-helper.sh" "$INSTALL_DIR/updater-helper.sh"
+chmod 0755 "$INSTALL_DIR/updater-helper.sh"
+cp "$INSTALLER/com.pearcircle.seeder.update.rules.in" "$INSTALL_DIR/updater-helper.rules.in"
+
+# 2c. Desktop integration: a dashboard-opener script + a system-wide .desktop
+#     entry so the seeder is searchable + clickable in the apps menu, and an
+#     icon. The postinst opens the dashboard on a fresh interactive install.
+cp "$INSTALLER/open-dashboard.sh" "$INSTALL_DIR/open-dashboard.sh"
+chmod 0755 "$INSTALL_DIR/open-dashboard.sh"
+install -D -m 0644 "$INSTALLER/pearcircle-seeder-dashboard.desktop" \
+  "$PKGROOT/usr/share/applications/pearcircle-seeder.desktop"
+ICON_SRC="$REPO/assets/images/icon.png"
+if [ -f "$ICON_SRC" ]; then
+  install -D -m 0644 "$ICON_SRC" \
+    "$PKGROOT/usr/share/icons/hicolor/256x256/apps/pearcircle-seeder.png"
+else
+  echo "build-deb: warning: $ICON_SRC missing; app entry will use a generic icon" >&2
+fi
 
 # 3. CLI symlink on PATH.
 ln -s /opt/pearcircle-seeder/pearcircle-seeder "$PKGROOT/usr/bin/pearcircle-seeder"

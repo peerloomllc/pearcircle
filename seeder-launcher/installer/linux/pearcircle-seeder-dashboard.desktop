@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PearCircle Seeder
+GenericName=Seeder Dashboard
+Comment=Open the PearCircle Seeder monitoring dashboard
+Exec=/opt/pearcircle-seeder/open-dashboard.sh
+Icon=pearcircle-seeder
+Terminal=false
+Categories=Network;Utility;
+Keywords=pearcircle;seeder;p2p;circle;dashboard;location;

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { resolveDataDir, ensureDir } = require('./dataDir')
@@ -149,10 +150,18 @@ async function main () {
   const macRequestDir = process.platform === 'darwin'
     ? '/Library/Application Support/PearCircle Seeder/updates/requests'
     : null
+  // Linux .deb privileged updater (slice 3c): the .deb postinst drops this
+  // root-owned helper and a passwordless polkit rule for the seeder user. Absent
+  // on an AppImage install or an old .deb -> apply falls back to a download.
+  const debHelperPath = process.platform === 'linux'
+    ? '/opt/pearcircle-seeder/updater-helper.sh'
+    : null
   const updateApplier = new UpdateApplier({
     getUpdate: () => updateChecker.get(),
     target: process.env.APPIMAGE || null,
     requestDir: macRequestDir,
+    helperPath: debHelperPath,
+    user: process.platform === 'linux' ? os.userInfo().username : null,
     exec,
     log,
   })
