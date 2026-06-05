@@ -91,7 +91,14 @@ Trigger: user-initiated from the degraded-circle affordance in Part A. Auto-
 repair on `append:timeout` is deferred (open question) to avoid a rebuild
 loop masking a deeper bug.
 
-## Root cause — still open
+## Root cause — RESOLVED 2026-06-04 (see `rca/2026-06-04-lastseen-oplog-bloat.md`)
+Pinned down: it is not local-writer corruption at all. The circle's Autobase
+oplog grew unbounded from retained `lastSeen` location ops (~340k nodes,
+99.85% lastSeen on `VLRwUprk`), so `base.update()` stopped finishing within
+the worklet's append/read timeouts. Reproduced deterministically off the live
+history with `tools/repro-vlrwuprk.js`. The fix (move live position off the
+oplog) is `proposals/2026-06-04-lastseen-ephemeral.md`. Original notes below.
+
 Why the local writer core wedges `append()` in Autobase 7.25.1 is not yet
 pinned down (corrupt oplog? linearizer stall waiting on a missing
 referenced node? a half-applied storage-reclaim?). Part B recovers the
