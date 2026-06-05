@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Privileged updater LaunchDaemon (proposal 2026-06-05-seeder-update slice 3b).
+     Installed to /Library/LaunchDaemons by the .pkg postinstall and runs as ROOT
+     (a LaunchDaemon with no UserName). It is triggered by WatchPaths when the
+     unprivileged seeder LaunchAgent drops a verified-pkg request into the watched
+     directory; the helper re-verifies the .pkg (sha256 + Developer-ID team +
+     notarization) before installing. The seeder itself stays unprivileged. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pearcircle.seeder.updater</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/lib/pearcircle-seeder/updater-helper.sh</string>
+  </array>
+
+  <!-- Fire whenever the request directory changes (a request dropped). -->
+  <key>WatchPaths</key>
+  <array>
+    <string>/Library/Application Support/PearCircle Seeder/updates/requests</string>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>/Library/Application Support/PearCircle Seeder/updates/updater.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Library/Application Support/PearCircle Seeder/updates/updater.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

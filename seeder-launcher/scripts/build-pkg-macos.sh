@@ -45,8 +45,10 @@ mkdir -p "$PAYLOAD_LIB/installer" "$PAYLOAD_LIB/worklet" "$PAYLOAD_LIB/ui/dist" 
 # 1. UI bundle (mandatory artifact for the host to serve).
 node ui/build.js
 
-# 2. Host SEA binary.
-bash scripts/build-host-sea.sh
+# 2. Host SEA binary. Pass the build VERSION through so host/version.js is
+#    stamped with the release version even though the Mac builds from an
+#    unpacked tarball (no git) — proposal 2026-06-05-seeder-update slice 1/3b.
+SEEDER_VERSION="$VERSION" bash scripts/build-host-sea.sh
 
 # 3. bare-runtime native binary.
 ARCH=$(uname -m)
@@ -93,6 +95,14 @@ cp ui/dist/style.css "$PAYLOAD_LIB/ui/dist/style.css"
 # 6. Installer metadata: ship the LaunchAgent template so postinstall can
 #    template it per-user.
 cp installer/macos/com.pearcircle.seeder.plist "$PAYLOAD_LIB/installer/"
+
+# 6a1. Privileged updater (proposal 2026-06-05-seeder-update slice 3b): ship the
+#      root LaunchDaemon plist + the helper script so postinstall can install the
+#      one-click auto-updater. The helper lands beside pearcircle-seeder; the
+#      daemon plist is templated/installed to /Library/LaunchDaemons.
+cp installer/macos/com.pearcircle.seeder.updater.plist "$PAYLOAD_LIB/installer/"
+cp installer/macos/updater-helper.sh "$PAYLOAD_LIB/updater-helper.sh"
+chmod +x "$PAYLOAD_LIB/updater-helper.sh"
 
 # 6b. Build the PearCircle .icns icon from the repo's 1024x1024 png. iconutil
 #     needs an .iconset directory with the standard 10 size variants.

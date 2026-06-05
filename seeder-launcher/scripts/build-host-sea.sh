@@ -28,8 +28,14 @@ mkdir -p "$OUT_DIR" dist
 #    running launcher knows its own version. SEEDER_VERSION overrides; otherwise
 #    take the release git tag (vX.Y.Z -> X.Y.Z), else package.json's version.
 #    host/version.js reads the PEARCIRCLE_SEEDER_VERSION global esbuild injects.
-SEEDER_VERSION="${SEEDER_VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
-if [ -z "$SEEDER_VERSION" ]; then
+# Resolve robustly: an explicit SEEDER_VERSION wins; else the release git tag
+# (only when this IS a git repo — the macOS/Windows remote builds run from an
+# unpacked tarball, so `git describe` there must not abort the script); else
+# package.json. Each step is guarded so `set -euo pipefail` never trips.
+if [ -z "${SEEDER_VERSION:-}" ]; then
+  SEEDER_VERSION="$( (git describe --tags --abbrev=0 2>/dev/null || true) | sed 's/^v//' )"
+fi
+if [ -z "${SEEDER_VERSION:-}" ]; then
   SEEDER_VERSION="$(node -p "require('./package.json').version" 2>/dev/null || echo 0.0.0)"
 fi
 echo "build-host-sea: stamping version $SEEDER_VERSION"

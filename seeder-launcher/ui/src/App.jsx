@@ -77,6 +77,7 @@ function UpdateBanner ({ update, version, applyState, setApplyState }) {
     <div class="toast update">
       Update available: v{update.latestVersion} (you have v{version || update.currentVersion}).{' '}
       {st === 'restarting' && <span>Updating — the seeder will restart on v{update.latestVersion}.</span>}
+      {st === 'applying-via-helper' && <span>Installing v{update.latestVersion} — the seeder will restart shortly.</span>}
       {(st === 'needs-helper') && (
         <span>This build installs with a system installer.{' '}
           <a href={downloadHref} target="_blank" rel="noreferrer">Download v{update.latestVersion}</a></span>
@@ -85,7 +86,7 @@ function UpdateBanner ({ update, version, applyState, setApplyState }) {
         <span>Update failed ({applyState.error}).{' '}
           <a href={downloadHref} target="_blank" rel="noreferrer">Download instead</a></span>
       )}
-      {(st !== 'restarting') && (
+      {(st !== 'restarting' && st !== 'applying-via-helper') && (
         <button onClick={onUpdate} disabled={busy || st === 'running'} style={{ marginLeft: 8 }}>
           {busy || st === 'running' ? 'Updating…' : 'Update now'}
         </button>
