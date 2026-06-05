@@ -8,7 +8,13 @@
 const { evaluateRelease } = require('../../src/lib/seederUpdateCheck')
 
 const REPO = process.env.PEARCIRCLE_UPDATE_REPO || 'peerloomllc/pearcircle'
-const LATEST_URL = `https://api.github.com/repos/${REPO}/releases/latest`
+// PEARCIRCLE_UPDATE_LATEST_URL overrides the release-check endpoint. Its primary
+// use is on-device update validation: point a seeder at a local "fake release"
+// server (scripts/serve-local-release.js) serving GitHub-shaped JSON for a
+// locally-built installer, so the full check -> download -> verify -> apply path
+// runs without publishing a real release. It also allows a self-hosted release
+// mirror (consistent with the no-central-infra principle). Unset = real GitHub.
+const LATEST_URL = process.env.PEARCIRCLE_UPDATE_LATEST_URL || `https://api.github.com/repos/${REPO}/releases/latest`
 const DEFAULT_INTERVAL_MS = 60 * 60 * 1000 // hourly; GitHub's unauthenticated limit is 60/h
 
 // How this seeder was installed, which decides the Linux artifact it is offered
