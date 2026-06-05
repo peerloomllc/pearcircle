@@ -110,7 +110,8 @@ describe('applyUpdate orchestration', () => {
     })
     expect(r.applier).toBe('appimage')
     expect(cmds[0][0]).toBe('install')
-    expect(cmds[cmds.length - 1]).toEqual(['systemctl', '--user', 'restart', 'pearcircle-seeder'])
+    // --no-block so a successful self-restart reports `restarting`, not `error`.
+    expect(cmds[cmds.length - 1]).toEqual(['systemctl', '--user', 'restart', '--no-block', 'pearcircle-seeder'])
   })
 
   test('a hash mismatch aborts BEFORE any exec (nothing applied)', async () => {

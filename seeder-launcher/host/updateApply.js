@@ -117,7 +117,12 @@ const APPLIERS = {
   appimage: async ({ file, target, exec }) => {
     if (!target) throw new Error('appimage applier needs a target path')
     await exec(['install', '-m', '0755', file, target])
-    await exec(['systemctl', '--user', 'restart', 'pearcircle-seeder'])
+    // `--no-block`: enqueue the restart and return immediately. A plain restart
+    // tears down this service's cgroup, killing the `systemctl` child (and us)
+    // before it exits 0 — which surfaced as a bogus `error` state on a
+    // successful self-update. With --no-block systemctl returns 0, we report
+    // `restarting`, then systemd brings us back on the new image.
+    await exec(['systemctl', '--user', 'restart', '--no-block', 'pearcircle-seeder'])
     return { restarted: true }
   },
   // Windows: run the verified NSIS installer silently. The installer's upgrade

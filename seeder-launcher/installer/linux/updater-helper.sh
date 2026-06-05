@@ -57,8 +57,12 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
   TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || true)"
   if [ -n "$TARGET_UID" ]; then
     log "restarting pearcircle-seeder for $TARGET_USER (uid $TARGET_UID)"
+    # --no-block: enqueue the restart and return at once. Restarting the unit
+    # tears down its cgroup (this helper + the calling host run in it), so a
+    # blocking restart would have systemd kill us mid-call; --no-block lets the
+    # host report `restarting` cleanly before systemd brings it back.
     runuser -u "$TARGET_USER" -- env "XDG_RUNTIME_DIR=/run/user/$TARGET_UID" \
-      systemctl --user restart pearcircle-seeder.service 2>/dev/null || true
+      systemctl --user restart --no-block pearcircle-seeder.service 2>/dev/null || true
   fi
 else
   log "no target user to restart; the new version starts on next service restart"
