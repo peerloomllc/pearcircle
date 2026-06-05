@@ -47,6 +47,7 @@ const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAccept
 const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
+const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -158,6 +159,13 @@ const _lastKnownAnnounced = new Set()
 // circleId → signature of the last-known core-key set last pushed to seeders,
 // so the periodic re-push (slice 2b) only sends on a real delta.
 const _lastSentLastknownSig = new Map()
+// Phase-2 cutover (slice 3): circleIds whose Autobase lastSeen write we have
+// stopped because every visible member announced a last-known core. Recomputed
+// off the hot path (5s sweep); the location:update + appendLastSeen paths
+// consult it. _forceAutobaseLastSeen is the keep-writing safety kill-switch.
+const _lastSeenCutoverCircles = new Set()
+const _cutoverBlockedMarked = new Set() // circleIds we've logged a cutover-blocked diagnostic for (re-armed on engage)
+let _forceAutobaseLastSeen = false
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
@@ -1429,6 +1437,25 @@ const handlers = {
     return { sharing, anyEnabled: anyCircleEnabled() }
   },
 
+  // Phase-2 cutover controls (proposal 2026-06-04 slice 3). `get` reports the
+  // keep-writing kill-switch and which circles have stopped the Autobase
+  // lastSeen write. `set` flips the kill-switch (true = force the durable write
+  // back on everywhere) and persists it.
+  'lastSeen:cutover:get': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    return {
+      forceAutobaseLastSeen: _forceAutobaseLastSeen,
+      cutoverCircles: Array.from(_lastSeenCutoverCircles),
+    }
+  },
+
+  'lastSeen:cutover:setForceWrite': async ({ enabled } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean')
+    const now = await setForceAutobaseLastSeen(enabled)
+    return { forceAutobaseLastSeen: now }
+  },
+
   'tripNotifications:get': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     return { enabled: _tripNotificationsEnabled }
@@ -1525,6 +1552,13 @@ const handlers = {
       // classification + trip detection below still run so the user
       // sees their own arrivals/trips.
       if (!getCircleSharing(circleId).enabled) continue
+      // Phase-2 cutover (proposal 2026-06-04 slice 3): once every member of
+      // this circle supports the new read path (live + last-known core), the
+      // durable Autobase write is redundant, so skip it and let the oplog stop
+      // growing. The live broadcast + core append below still run. The last
+      // value we wrote stays in the view, so even a brand-new old joiner sees a
+      // position until the cutover reverts and we refresh it.
+      if (_lastSeenCutoverCircles.has(circleId)) continue
       // Movement gate (storage-growth remediation, proposal 2026-05-29):
       // skip the append when we haven't moved far enough since the last
       // one we wrote for this circle. lastSeen is LWW current position,
@@ -2098,6 +2132,11 @@ async function appendTransition (base, placeId, kind, ts) {
 
 async function appendLastSeen (base, lat, lon, accuracy, ts, battery = null, isCharging = null) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return
+  // Phase-2 cutover (proposal 2026-06-04 slice 3): skip the durable write once
+  // the circle has converged on the new read path. Covers the geofence-flip and
+  // region:enter/exit lastSeen refreshes, not just the location:update path.
+  const cutoverCid = circleIdForBase(base)
+  if (cutoverCid && _lastSeenCutoverCircles.has(cutoverCid)) return
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const batt = (typeof battery === 'number' && battery >= 0 && battery <= 100) ? battery : null
   const charging = typeof isCharging === 'boolean' ? isCharging : null
@@ -2361,6 +2400,9 @@ async function tearDownCircleLocally (circleId) {
   _lastKnownAnnounced.delete(circleId)
   _firstLastKnownWriteMarked.delete(circleId)
   _firstPeerLastKnownMarked.delete(circleId)
+  _lastSeenCutoverCircles.delete(circleId)
+  _cutoverBlockedMarked.delete(circleId)
+  _lastSentLastknownSig.delete(circleId)
   for (const key of Array.from(_circlePlaces.keys())) {
     if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
   }
@@ -3383,6 +3425,88 @@ async function pushLastknownCoresToSeeder (circleId, conn) {
   if (cores.length > 0) entry.sendLastknownCores(cores)
 }
 
+// Currently-visible member identity pubkeys for a circle (left/removed filtered
+// out, same rule as snapshotCircle). Lean — only the pubkeys, for the cutover
+// check. Proposal 2026-06-04 slice 3.
+async function circleVisibleMemberPubkeys (view) {
+  const leftAt = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'left:', lt: 'left:~' })) {
+    if (typeof value?.leftAt === 'number') leftAt.set(key.slice('left:'.length), value.leftAt)
+  }
+  const removedAt = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'removed:', lt: 'removed:~' })) {
+    if (typeof value?.ts === 'number') removedAt.set(key.slice('removed:'.length), value.ts)
+  }
+  const out = []
+  for await (const { value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+    const pubkey = value?.pubkey
+    if (typeof pubkey !== 'string') continue
+    if (memberHiddenByRemoved(removedAt.get(pubkey), value?.joinedAt)) continue
+    if (memberHiddenByLeft(leftAt.get(pubkey), value?.joinedAt)) continue
+    out.push(pubkey)
+  }
+  return out
+}
+
+// Recompute the phase-2 lastSeen-write cutover for a circle (off the hot path,
+// from the 5s sweep). Stops the Autobase write once every visible member has
+// announced a last-known core; reverts the moment an unsupported member appears
+// or the keep-writing kill-switch is on. Proposal 2026-06-04 slice 3.
+async function updateLastSeenCutover (circleId, base) {
+  const wasActive = _lastSeenCutoverCircles.has(circleId)
+  let active = false
+  let members = []
+  let announced = new Set()
+  if (!_forceAutobaseLastSeen) {
+    try {
+      members = await circleVisibleMemberPubkeys(base.view)
+      for await (const { key } of base.view.createReadStream({ gt: 'lastknownCore:', lt: 'lastknownCore:~' })) {
+        announced.add(key.slice('lastknownCore:'.length))
+      }
+      active = allMembersAnnouncedCore(members, announced)
+    } catch (e) {
+      console.warn('[bare] updateLastSeenCutover failed', circleId, e?.message)
+      active = false
+    }
+  }
+  // One-shot diagnostic when the gate is held open: show how many members still
+  // lack a core announce, so an operator can see why a circle hasn't stopped
+  // growing yet (the unsupported peers). Re-armed when cutover later engages.
+  if (!active && !_forceAutobaseLastSeen && members.length > 0 && !_cutoverBlockedMarked.has(circleId)) {
+    const missing = members.filter((pk) => !announced.has(pk)).length
+    if (missing > 0) {
+      _cutoverBlockedMarked.add(circleId)
+      mark('lastseen:cutover-blocked', { circleId: circleId.slice(0, 8), members: members.length, announced: announced.size, missing })
+      reshipTrace()
+    }
+  }
+  if (active === wasActive) return
+  if (active) {
+    _lastSeenCutoverCircles.add(circleId)
+    _cutoverBlockedMarked.delete(circleId) // re-arm the blocked diagnostic
+    mark('lastseen:cutover', { circleId: circleId.slice(0, 8), members: members.length })
+  } else {
+    _lastSeenCutoverCircles.delete(circleId)
+    mark('lastseen:cutover-reverted', { circleId: circleId.slice(0, 8), reason: _forceAutobaseLastSeen ? 'kill-switch' : 'member-unsupported' })
+  }
+  reshipTrace()
+}
+
+// Flip the keep-writing kill-switch and persist it. When enabled, the Autobase
+// lastSeen write resumes for every circle (cutover reverts on the next sweep).
+async function setForceAutobaseLastSeen (enabled) {
+  _forceAutobaseLastSeen = !!enabled
+  await _localDb.put('config:forceAutobaseLastSeen', { enabled: _forceAutobaseLastSeen, setAt: Date.now() }).catch(() => {})
+  if (_forceAutobaseLastSeen) {
+    for (const circleId of Array.from(_lastSeenCutoverCircles)) {
+      _lastSeenCutoverCircles.delete(circleId)
+      mark('lastseen:cutover-reverted', { circleId: circleId.slice(0, 8), reason: 'kill-switch' })
+    }
+  }
+  mark('lastseen:force-autobase', { enabled: _forceAutobaseLastSeen })
+  return _forceAutobaseLastSeen
+}
+
 // Register a protomux pair() notify on every conn so an OPEN frame
 // from a peer for ANY circle id we know about gets a matching
 // channel created lazily. Protomux behavior: when a remote opens a
@@ -4099,7 +4223,7 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   // background) so a fresh-joined circle gets our member row appended
   // promptly regardless of HomeMapView's polling cadence.
   setInterval(() => {
-    for (const [circleId] of _circleBases) {
+    for (const [circleId, base] of _circleBases) {
       autoAppendMemberRow(circleId).catch(() => {})
       autoAppendSelfLastSeen(circleId).catch(() => {})
       // Publish our last-known core key once (idempotent) and pull peers'
@@ -4108,6 +4232,8 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
       refreshPeerLastKnown(circleId).catch(() => {})
       // Push any newly-known last-known core keys to connected seeders (2b).
       repushLastknownCoresToSeeders(circleId).catch(() => {})
+      // Recompute the phase-2 lastSeen-write cutover (slice 3).
+      updateLastSeenCutover(circleId, base).catch(() => {})
     }
   }, 5000)
 
@@ -4117,6 +4243,14 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
   try { await loadPersistedSharing() } catch (e) {
     console.warn('[bare] loadPersistedSharing failed', e?.message)
   }
+
+  // Restore the keep-writing kill-switch (proposal 2026-06-04 slice 3). Default
+  // off (cutover allowed). The 5s sweep computes per-circle cutover from here.
+  try {
+    const row = await _localDb.get('config:forceAutobaseLastSeen').catch(() => null)
+    _forceAutobaseLastSeen = !!row?.value?.enabled
+    if (_forceAutobaseLastSeen) mark('lastseen:force-autobase', { enabled: true, source: 'boot' })
+  } catch (e) { console.warn('[bare] load forceAutobaseLastSeen failed', e?.message) }
 
   // Cold-boot self-position preload. Loads the most recent lastSeen
   // we previously wrote into any writable circle so the home-screen
