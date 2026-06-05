@@ -14,6 +14,7 @@ export function App () {
   const [circles, setCircles] = useState([])
   const [error, setError] = useState(null)
   const [wsConnected, setWsConnected] = useState(false)
+  const [version, setVersion] = useState(null)
 
   useEffect(() => {
     const ws = openWs({
@@ -22,6 +23,7 @@ export function App () {
         if (msg.type === 'snapshot') {
           if (msg.status && !msg.status.error) setStatus(msg.status)
           if (msg.circles && !msg.circles.error) setCircles(msg.circles.circles ?? [])
+          if (msg.launcherVersion) setVersion(msg.launcherVersion)
         } else if (msg.type === 'snapshot:error' || msg.type === 'exit') {
           setError(msg.error || `worklet exited (code=${msg.code})`)
         }
@@ -37,6 +39,7 @@ export function App () {
       <div class="sub">
         <span class={'dot ' + (wsConnected ? 'good' : 'bad')} />
         {wsConnected ? 'connected to worklet' : 'connecting…'}
+        {version && <span class="version"> · v{version}</span>}
       </div>
 
       {error && <div class="toast error">{error}</div>}

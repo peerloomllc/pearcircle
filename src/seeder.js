@@ -147,12 +147,15 @@ async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
  *   Called by seeder:leave before the persistence rows are deleted so the host can
  *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), mountCircle, leaveCircle, getReplicatedBytes }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
     'seeder:status': async () => ({
       pubkey: pubkeyHex,
+      // Build version stamped in by the launcher host at init (proposal
+      // 2026-06-05-seeder-update slice 1); null when run without one.
+      version: typeof version === 'string' && version.length > 0 ? version : null,
       uptime: Date.now() - bootTs,
       // Live tally across every mounted seeder core. The host wires the
       // getReplicatedBytes callback from its _seederCircles map; tests

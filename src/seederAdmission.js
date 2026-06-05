@@ -53,7 +53,7 @@ function normalizeLastknownCores (msg) {
   return out
 }
 
-function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, label, onAnnounce, onRevoked, revokedNotice, onLastknownCores, mark }) {
+function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, label, version, onAnnounce, onRevoked, revokedNotice, onLastknownCores, mark }) {
   if (role !== 'seed' && role !== 'member') {
     throw new Error('role must be "seed" or "member"')
   }
@@ -114,6 +114,10 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
         try {
           const payload = { pubkey: seederPubkey }
           if (typeof label === 'string' && label.length > 0) payload.label = label
+          // Seeder build version (proposal 2026-06-05-seeder-update slice 1), so
+          // members can surface "update available". Additive + optional: an old
+          // member ignores the unknown field, an old seeder simply omits it.
+          if (typeof version === 'string' && version.length > 0) payload.version = version.slice(0, 64)
           announceMessage.send(payload)
           trace('admission:announce-sent')
         } catch (e) {
@@ -147,10 +151,11 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
         return
       }
       const label = typeof msg.label === 'string' ? msg.label.slice(0, 128) : null
-      trace('admission:announce-received', { pubkey: msg.pubkey.slice(0, 8) })
+      const version = typeof msg.version === 'string' ? msg.version.slice(0, 64) : null
+      trace('admission:announce-received', { pubkey: msg.pubkey.slice(0, 8), version })
       try {
         if (typeof onAnnounce === 'function') {
-          await onAnnounce({ circleId, pubkey: msg.pubkey, label })
+          await onAnnounce({ circleId, pubkey: msg.pubkey, label, version })
         }
       } catch (e) {
         trace('admission:onannounce-failed', { err: e?.message ?? String(e) })

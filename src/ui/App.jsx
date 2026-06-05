@@ -1583,6 +1583,20 @@ function SeedersSection ({ active = true }) {
                         Revoked from {seeder.revokedCircles.length} {seeder.revokedCircles.length === 1 ? 'circle' : 'circles'}: {revokedNames}
                       </div>
                     )}
+                    {/* Seeder build version (proposal 2026-06-05-seeder-update slice 1).
+                        A non-null version shows the build; null means connected but on a
+                        pre-version (out-of-date) build; undefined means not seen this
+                        session, so we say nothing. */}
+                    {typeof seeder.version === 'string' && (
+                      <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                        Version {seeder.version}
+                      </div>
+                    )}
+                    {seeder.version === null && (
+                      <div style={{ ...typography.caption, color: colors.warn }}>
+                        Version unknown — update recommended
+                      </div>
+                    )}
                   </div>
                   {seeder.liveCircles.length > 0 && (
                     <button

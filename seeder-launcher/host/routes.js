@@ -22,6 +22,16 @@ function routes () {
       handler: async (req, ctx) => ctx.worklet.call('seeder:status'),
     },
     {
+      // Launcher build version + the worklet's echoed version (proposal
+      // 2026-06-05-seeder-update slice 1). The update-check + apply hang off this.
+      method: 'GET',
+      match: (url) => url.pathname === '/api/version',
+      handler: async (req, ctx) => {
+        const status = await ctx.worklet.call('seeder:status').catch(() => ({}))
+        return { version: ctx.version ?? null, workletVersion: status?.version ?? null }
+      },
+    },
+    {
       method: 'GET',
       match: (url) => url.pathname === '/api/circles',
       handler: async (req, ctx) => ctx.worklet.call('seeder:enrolled:list'),

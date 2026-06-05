@@ -6,6 +6,7 @@ const { resolveDataDir, ensureDir } = require('./dataDir')
 const { loadOrCreateToken } = require('./auth')
 const { Worklet } = require('./worklet')
 const { createServer } = require('./server')
+const { SEEDER_VERSION } = require('./version')
 
 function parseArgs (argv) {
   const out = { dev: false, port: 8730 }
@@ -108,7 +109,7 @@ async function main () {
   const logPath = path.join(dataDir, 'seeder.log')
   const log = rotatingLogger(logPath)
 
-  log('host', `launcher starting (dev=${opts.dev}, dataDir=${dataDir})`)
+  log('host', `launcher starting v${SEEDER_VERSION} (dev=${opts.dev}, dataDir=${dataDir})`)
   log('host', `bare=${paths.barePath} bundle=${paths.bundleEntry}`)
   if (freshToken) log('host', `generated fresh auth token at ${path.join(dataDir, 'auth.token')}`)
 
@@ -116,6 +117,7 @@ async function main () {
     barePath: paths.barePath,
     bundleEntry: paths.bundleEntry,
     dataDir,
+    version: SEEDER_VERSION,
     onLog: log,
   })
   worklet.on('exit', ({ code, signal }) => log('worklet', `exited code=${code} signal=${signal}`))
@@ -123,7 +125,7 @@ async function main () {
   await worklet.start()
   log('host', 'worklet ready')
 
-  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log })
+  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION })
   srv.on('error', (err) => {
     log('host', `server error: ${err.message}`)
     if (err.code === 'EADDRINUSE') process.exit(2)
