@@ -15,6 +15,9 @@ case "$1" in
     fi
     # Drop the passwordless-pkexec polkit rule for the auto-updater (slice 3c).
     rm -f /etc/polkit-1/rules.d/49-pearcircle-seeder-updater.rules
+    # Refresh the desktop entry cache (dpkg already removed the .desktop + icon).
+    command -v update-desktop-database >/dev/null 2>&1 && \
+      update-desktop-database -q /usr/share/applications 2>/dev/null || true
     ;;
 esac
 

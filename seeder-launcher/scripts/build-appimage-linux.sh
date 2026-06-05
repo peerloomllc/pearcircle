@@ -54,7 +54,9 @@ APPDIR="$LAUNCHER/dist/linux/AppDir-$ARCH"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/lib/pearcircle-seeder"
 
-BARE_HOST="$BARE_HOST" OUT_DIR="$APPDIR/usr/lib/pearcircle-seeder" \
+# SEEDER_VERSION makes the stamped runtime version match the AppImage version
+# (else build-host-sea.sh falls back to `git describe`). See build-deb-linux.sh.
+SEEDER_VERSION="$VERSION" BARE_HOST="$BARE_HOST" OUT_DIR="$APPDIR/usr/lib/pearcircle-seeder" \
   bash "$SCRIPT_DIR/stage-payload-linux.sh"
 
 cp "$INSTALLER/AppRun"                   "$APPDIR/AppRun"
