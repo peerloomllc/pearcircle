@@ -6,6 +6,9 @@ const { resolveDataDir, ensureDir } = require('./dataDir')
 const { loadOrCreateToken } = require('./auth')
 const { Worklet } = require('./worklet')
 const { createServer } = require('./server')
+const { SEEDER_VERSION } = require('./version')
+const { UpdateChecker } = require('./updateCheck')
+const { UpdateApplier } = require('./updateApply')
 
 function parseArgs (argv) {
   const out = { dev: false, port: 8730 }
@@ -108,7 +111,7 @@ async function main () {
   const logPath = path.join(dataDir, 'seeder.log')
   const log = rotatingLogger(logPath)
 
-  log('host', `launcher starting (dev=${opts.dev}, dataDir=${dataDir})`)
+  log('host', `launcher starting v${SEEDER_VERSION} (dev=${opts.dev}, dataDir=${dataDir})`)
   log('host', `bare=${paths.barePath} bundle=${paths.bundleEntry}`)
   if (freshToken) log('host', `generated fresh auth token at ${path.join(dataDir, 'auth.token')}`)
 
@@ -116,6 +119,7 @@ async function main () {
     barePath: paths.barePath,
     bundleEntry: paths.bundleEntry,
     dataDir,
+    version: SEEDER_VERSION,
     onLog: log,
   })
   worklet.on('exit', ({ code, signal }) => log('worklet', `exited code=${code} signal=${signal}`))
@@ -123,7 +127,29 @@ async function main () {
   await worklet.start()
   log('host', 'worklet ready')
 
-  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log })
+  // Background GitHub-Releases update check (proposal 2026-06-05-seeder-update
+  // slice 2). Fail-open; surfaced via /api/update + the WS snapshot.
+  const updateChecker = new UpdateChecker({ currentVersion: SEEDER_VERSION, log }).start()
+
+  // One-click apply (slice 3a). Self-apply on Linux AppImage when launched as
+  // one (process.env.APPIMAGE is the running image path to swap) + Windows;
+  // macOS .pkg / Linux .deb land on `needs-helper` (download fallback) until the
+  // privileged helper ships (slice 3b). The actual child commands are spawned by
+  // `exec`; a failure leaves the running service untouched.
+  const { spawn: spawnChild } = require('node:child_process')
+  const exec = (argv) => new Promise((resolve, reject) => {
+    const p = spawnChild(argv[0], argv.slice(1), { stdio: 'ignore' })
+    p.on('error', reject)
+    p.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${argv[0]} exited ${code}`)))
+  })
+  const updateApplier = new UpdateApplier({
+    getUpdate: () => updateChecker.get(),
+    target: process.env.APPIMAGE || null,
+    exec,
+    log,
+  })
+
+  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker, updateApplier })
   srv.on('error', (err) => {
     log('host', `server error: ${err.message}`)
     if (err.code === 'EADDRINUSE') process.exit(2)

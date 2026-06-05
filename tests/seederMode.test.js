@@ -138,6 +138,17 @@ describe('createSeederHandlers', () => {
       expect(result.uptime).toBeGreaterThanOrEqual(0)
       expect(result.totalBytesReplicated).toBe(0)
     })
+
+    // Proposal 2026-06-05-seeder-update slice 1: the launcher stamps a build
+    // version into init; seeder:status echoes it (null when run without one).
+    test('echoes the build version when given, null otherwise', async () => {
+      const db = makeFakeLocalDb()
+      const identity = { publicKey: b4a.from('a'.repeat(64), 'hex'), secretKey: b4a.from('b'.repeat(128), 'hex') }
+      const withV = createSeederHandlers({ localDb: db, identity, bootTs: 1000, version: '1.2.3' })
+      expect((await withV['seeder:status']()).version).toBe('1.2.3')
+      const without = createSeederHandlers({ localDb: db, identity, bootTs: 1000 })
+      expect((await without['seeder:status']()).version).toBeNull()
+    })
   })
 
   describe('seeder:enroll', () => {

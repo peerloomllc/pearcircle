@@ -40,6 +40,8 @@ export const api = {
   retentionSet: (circleId, pruneOlderThan) => jsonFetch(`/api/retention/${encodeURIComponent(circleId)}`, {
     method: 'PUT', body: JSON.stringify({ pruneOlderThan }),
   }),
+  update: () => jsonFetch('/api/update'),
+  applyUpdate: () => jsonFetch('/api/update/apply', { method: 'POST' }),
 }
 
 export function openWs ({ onMessage, onClose }) {

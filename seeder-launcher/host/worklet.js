@@ -16,11 +16,12 @@ const { EventEmitter } = require('node:events')
 //   wl.on('exit', (code) => …)             // subprocess died
 //   wl.stop()
 class Worklet extends EventEmitter {
-  constructor ({ barePath, bundleEntry, dataDir, args = ['--seed'], onLog }) {
+  constructor ({ barePath, bundleEntry, dataDir, version = null, args = ['--seed'], onLog }) {
     super()
     this._barePath = barePath
     this._bundleEntry = bundleEntry
     this._dataDir = dataDir
+    this._version = version
     this._args = args
     this._onLog = onLog || (() => {})
     this._proc = null
@@ -52,7 +53,7 @@ class Worklet extends EventEmitter {
       this.emit('error', err)
     })
 
-    this._readyP = this.call('init', { mode: 'seed', dataDir: this._dataDir })
+    this._readyP = this.call('init', { mode: 'seed', dataDir: this._dataDir, version: this._version })
       .then((result) => {
         this._ready = true
         this.emit('ready', result)

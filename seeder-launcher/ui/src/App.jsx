@@ -14,6 +14,9 @@ export function App () {
   const [circles, setCircles] = useState([])
   const [error, setError] = useState(null)
   const [wsConnected, setWsConnected] = useState(false)
+  const [version, setVersion] = useState(null)
+  const [update, setUpdate] = useState(null)
+  const [applyState, setApplyState] = useState(null)
 
   useEffect(() => {
     const ws = openWs({
@@ -22,6 +25,9 @@ export function App () {
         if (msg.type === 'snapshot') {
           if (msg.status && !msg.status.error) setStatus(msg.status)
           if (msg.circles && !msg.circles.error) setCircles(msg.circles.circles ?? [])
+          if (msg.launcherVersion) setVersion(msg.launcherVersion)
+          if (msg.update) setUpdate(msg.update)
+          if (msg.applyState) setApplyState(msg.applyState)
         } else if (msg.type === 'snapshot:error' || msg.type === 'exit') {
           setError(msg.error || `worklet exited (code=${msg.code})`)
         }
@@ -37,13 +43,53 @@ export function App () {
       <div class="sub">
         <span class={'dot ' + (wsConnected ? 'good' : 'bad')} />
         {wsConnected ? 'connected to worklet' : 'connecting…'}
+        {version && <span class="version"> · v{version}</span>}
       </div>
 
       {error && <div class="toast error">{error}</div>}
 
+      {update && update.updateAvailable && (
+        <UpdateBanner update={update} version={version} applyState={applyState} setApplyState={setApplyState} />
+      )}
+
       <Status status={status} />
       <Enroll onEnrolled={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <Circles circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
+    </div>
+  )
+}
+
+// Update-available banner with the one-click "Update now" action (proposal
+// 2026-06-05-seeder-update slices 2+3a). Self-apply platforms restart the
+// service; platforms that need the privileged helper (macOS .pkg / Linux .deb,
+// slice 3b) or that can't self-apply fall back to a verified download link.
+function UpdateBanner ({ update, version, applyState, setApplyState }) {
+  const [busy, setBusy] = useState(false)
+  const onUpdate = async () => {
+    setBusy(true)
+    try { setApplyState(await api.applyUpdate()) }
+    catch (e) { setApplyState({ status: 'error', error: String(e?.message ?? e) }) }
+    finally { setBusy(false) }
+  }
+  const st = applyState?.status
+  const downloadHref = update.assetUrl || update.releaseUrl
+  return (
+    <div class="toast update">
+      Update available: v{update.latestVersion} (you have v{version || update.currentVersion}).{' '}
+      {st === 'restarting' && <span>Updating — the seeder will restart on v{update.latestVersion}.</span>}
+      {(st === 'needs-helper') && (
+        <span>This build installs with a system installer.{' '}
+          <a href={downloadHref} target="_blank" rel="noreferrer">Download v{update.latestVersion}</a></span>
+      )}
+      {st === 'error' && (
+        <span>Update failed ({applyState.error}).{' '}
+          <a href={downloadHref} target="_blank" rel="noreferrer">Download instead</a></span>
+      )}
+      {(st !== 'restarting') && (
+        <button onClick={onUpdate} disabled={busy || st === 'running'} style={{ marginLeft: 8 }}>
+          {busy || st === 'running' ? 'Updating…' : 'Update now'}
+        </button>
+      )}
     </div>
   )
 }

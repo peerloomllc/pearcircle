@@ -132,6 +132,14 @@ let _initialized = false
 // mode is fixed at process launch and not mixable).
 let _activeHandlers = null
 let _seedMode = false
+// Seeder build version, passed in by the launcher host at init (proposal
+// 2026-06-05-seeder-update slice 1). Reported via seeder:status and announced
+// to members so the app can surface "update available". null when unknown.
+let _seederVersion = null
+// Member-side: remote seeder pubkey hex → its reported build version, learned
+// from the admission announce. Advisory + in-memory; surfaced by
+// circle:seeders:list so the mobile app can flag out-of-date seeders.
+const _seederVersions = new Map()
 
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
@@ -1021,6 +1029,10 @@ const handlers = {
         addedAt: value.addedAt,
         updatedAt: value.updatedAt,
         label: typeof value.label === 'string' ? value.label : null,
+        // Build version learned from the seeder's admission announce (proposal
+        // 2026-06-05-seeder-update slice 1). undefined → never connected this
+        // session; null → connected but pre-version (old) seeder.
+        version: _seederVersions.has(value.pubkey) ? _seederVersions.get(value.pubkey) : undefined,
       })
     }
     return { seeders }
@@ -1071,6 +1083,10 @@ const handlers = {
           }
           if (!entry.label && typeof value.label === 'string') entry.label = value.label
           entry.circles.push({ circleId, name: circleName, revoked: value.revoked === true })
+          // Build version learned from this seeder's admission announce (proposal
+          // 2026-06-05-seeder-update slice 1). undefined = not connected this
+          // session; null = connected but pre-version (out-of-date) seeder.
+          if (_seederVersions.has(value.pubkey)) entry.version = _seederVersions.get(value.pubkey)
         }
       } catch {}
     }
@@ -2952,6 +2968,7 @@ async function mountSeederCircle (enrollment) {
       role: 'seed',
       circleId,
       seederPubkey: seederPubkeyHex,
+      version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
       onLastknownCores: handleSeederLastknownCores,
       mark,
@@ -3633,7 +3650,14 @@ async function approveSeederRow (circleId, pubkey, label) {
 // revocation notice — this both keeps the revoke in force and closes the
 // race where the seeder mounted the circle after we connected and so
 // missed the connect-time notice.
-async function handleSeederAnnounce (circleId, base, { pubkey, label }, conn) {
+async function handleSeederAnnounce (circleId, base, { pubkey, label, version }, conn) {
+  // Record the seeder's reported build version regardless of admission state
+  // (proposal 2026-06-05-seeder-update slice 1). Advisory + in-memory; surfaced
+  // by circle:seeders:list for the app's "update available" flag.
+  if (typeof pubkey === 'string') {
+    if (typeof version === 'string' && version.length > 0) _seederVersions.set(pubkey, version)
+    else if (!_seederVersions.has(pubkey)) _seederVersions.set(pubkey, null)
+  }
   const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
   const existing = existingNode?.value ?? null
   // Already admitted (non-revoked): nothing to admit, but this announce
@@ -3733,6 +3757,7 @@ function onSeederSwarmConnection (conn, info) {
       circleId,
       seederPubkey: seederPubkeyHex,
       label: enrollment?.label,
+      version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
       onLastknownCores: handleSeederLastknownCores,
       mark,
@@ -3970,7 +3995,8 @@ async function onSwarmConnection (conn, info) {
   })
 }
 
-async function init ({ dataDir, mode } = {}, attempt = 0) {
+async function init ({ dataDir, mode, version } = {}, attempt = 0) {
+  if (typeof version === 'string' && version.length > 0) _seederVersion = version.slice(0, 64)
   if (_initialized) {
     const pubkey = _seedMode
       ? b4a.toString(_identity.publicKey, 'hex')
@@ -4022,6 +4048,7 @@ async function init ({ dataDir, mode } = {}, attempt = 0) {
     _activeHandlers = createSeederHandlers({
       localDb: _localDb,
       identity: seederIdentity,
+      version: _seederVersion,
       mountCircle: mountSeederCircle,
       leaveCircle: leaveSeederCircle,
       // Sum byteLength across every mounted seeder core. Hypercore 11's

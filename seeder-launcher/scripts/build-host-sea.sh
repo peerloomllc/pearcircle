@@ -23,8 +23,19 @@ mkdir -p "$OUT_DIR" dist
 # 1. Bundle host into a single CJS file. ws bundles fine because its
 #    native optional deps (bufferutil / utf-8-validate) are imported via
 #    try/catch and fall back to pure JS when absent.
+#
+#    Stamp the build version (proposal 2026-06-05-seeder-update slice 1) so the
+#    running launcher knows its own version. SEEDER_VERSION overrides; otherwise
+#    take the release git tag (vX.Y.Z -> X.Y.Z), else package.json's version.
+#    host/version.js reads the PEARCIRCLE_SEEDER_VERSION global esbuild injects.
+SEEDER_VERSION="${SEEDER_VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
+if [ -z "$SEEDER_VERSION" ]; then
+  SEEDER_VERSION="$(node -p "require('./package.json').version" 2>/dev/null || echo 0.0.0)"
+fi
+echo "build-host-sea: stamping version $SEEDER_VERSION"
 node_modules/.bin/esbuild host/index.js \
   --bundle --platform=node --target=node20 --format=cjs \
+  --define:PEARCIRCLE_SEEDER_VERSION="\"$SEEDER_VERSION\"" \
   --outfile=dist/host-bundled.js
 
 cp dist/host-bundled.js "$OUT_DIR/host-bundled.js"

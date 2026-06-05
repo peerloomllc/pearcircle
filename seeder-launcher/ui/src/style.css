@@ -95,5 +95,8 @@ button.ghost.danger { color: var(--bad); border-color: var(--bad); background: t
 .toast { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
 .toast.error { background: rgba(239, 83, 80, 0.12); border: 1px solid var(--bad); color: var(--bad); }
 .toast.success { background: rgba(126, 199, 122, 0.12); border: 1px solid var(--good); color: var(--good); }
+.toast.update { background: rgba(96, 165, 250, 0.12); border: 1px solid #60a5fa; color: #93c5fd; }
+.toast.update a { color: inherit; font-weight: 600; }
+.version { color: var(--muted, #8b95a5); font-size: 12px; }
 
 .empty { color: var(--muted); font-style: italic; font-size: 13px; text-align: center; }
