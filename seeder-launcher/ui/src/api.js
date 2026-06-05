@@ -44,14 +44,29 @@ export const api = {
   applyUpdate: () => jsonFetch('/api/update/apply', { method: 'POST' }),
 }
 
+// Open the snapshot WebSocket with auto-reconnect. The connection drops whenever
+// the host restarts — notably during a one-click update (the old process exits,
+// the new one binds a moment later). Without reconnect the UI would sit on
+// "connecting…" forever; instead we retry every 2s until the new host answers,
+// so the page comes back on its own showing the updated version. The auth token
+// survives the update (same data dir), so reconnecting with it keeps working.
 export function openWs ({ onMessage, onClose }) {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-  const ws = new WebSocket(`${scheme}://${location.host}/ws?t=${TOKEN}`)
-  ws.onmessage = (ev) => {
-    try { onMessage(JSON.parse(ev.data)) } catch {}
+  let ws = null
+  let stopped = false
+  let retry = null
+  const connect = () => {
+    if (stopped) return
+    ws = new WebSocket(`${scheme}://${location.host}/ws?t=${TOKEN}`)
+    ws.onmessage = (ev) => { try { onMessage(JSON.parse(ev.data)) } catch {} }
+    ws.onclose = () => {
+      if (onClose) onClose()
+      if (!stopped) retry = setTimeout(connect, 2000)
+    }
+    ws.onerror = () => { try { ws.close() } catch {} }
   }
-  if (onClose) ws.onclose = onClose
-  return ws
+  connect()
+  return { close: () => { stopped = true; if (retry) clearTimeout(retry); if (ws) try { ws.close() } catch {} } }
 }
 
 export function formatBytes (n) {
