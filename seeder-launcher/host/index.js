@@ -7,6 +7,7 @@ const { loadOrCreateToken } = require('./auth')
 const { Worklet } = require('./worklet')
 const { createServer } = require('./server')
 const { SEEDER_VERSION } = require('./version')
+const { UpdateChecker } = require('./updateCheck')
 
 function parseArgs (argv) {
   const out = { dev: false, port: 8730 }
@@ -125,7 +126,11 @@ async function main () {
   await worklet.start()
   log('host', 'worklet ready')
 
-  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION })
+  // Background GitHub-Releases update check (proposal 2026-06-05-seeder-update
+  // slice 2). Fail-open; surfaced via /api/update + the WS snapshot.
+  const updateChecker = new UpdateChecker({ currentVersion: SEEDER_VERSION, log }).start()
+
+  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker })
   srv.on('error', (err) => {
     log('host', `server error: ${err.message}`)
     if (err.code === 'EADDRINUSE') process.exit(2)

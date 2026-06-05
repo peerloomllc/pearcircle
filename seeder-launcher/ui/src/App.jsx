@@ -15,6 +15,7 @@ export function App () {
   const [error, setError] = useState(null)
   const [wsConnected, setWsConnected] = useState(false)
   const [version, setVersion] = useState(null)
+  const [update, setUpdate] = useState(null)
 
   useEffect(() => {
     const ws = openWs({
@@ -24,6 +25,7 @@ export function App () {
           if (msg.status && !msg.status.error) setStatus(msg.status)
           if (msg.circles && !msg.circles.error) setCircles(msg.circles.circles ?? [])
           if (msg.launcherVersion) setVersion(msg.launcherVersion)
+          if (msg.update) setUpdate(msg.update)
         } else if (msg.type === 'snapshot:error' || msg.type === 'exit') {
           setError(msg.error || `worklet exited (code=${msg.code})`)
         }
@@ -43,6 +45,13 @@ export function App () {
       </div>
 
       {error && <div class="toast error">{error}</div>}
+
+      {update && update.updateAvailable && (
+        <div class="toast update">
+          Update available: v{update.latestVersion} (you have v{version || update.currentVersion}).{' '}
+          <a href={update.assetUrl || update.releaseUrl} target="_blank" rel="noreferrer">Download</a>
+        </div>
+      )}
 
       <Status status={status} />
       <Enroll onEnrolled={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />

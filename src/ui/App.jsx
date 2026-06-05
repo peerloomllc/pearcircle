@@ -9,6 +9,7 @@ import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import { computeFanOffsets } from '../lib/fanOut.js'
+import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
 import appConfig from '../../app.json'
@@ -1394,6 +1395,11 @@ function SeedersSection ({ active = true }) {
   const [minting, setMinting] = useState(false)
   const [confirmingRevoke, setConfirmingRevoke] = useState(null)
   const [pending, setPending] = useState(null)
+  // Latest published seeder release tag, fetched once from GitHub so we can flag
+  // out-of-date seeders (proposal 2026-06-05-seeder-update slice 2). The phone
+  // does the compare; the seeder wire stays unchanged (it only reports its own
+  // version). Best-effort: a fetch failure just means no "update available" hint.
+  const [latestVersion, setLatestVersion] = useState(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -1413,6 +1419,22 @@ function SeedersSection ({ active = true }) {
     const id = setInterval(refresh, 5000)
     return () => clearInterval(id)
   }, [active, refresh])
+
+  // Fetch the latest published seeder version once per open of the section.
+  useEffect(() => {
+    if (!active) return
+    let cancelled = false
+    fetch('https://api.github.com/repos/peerloomllc/pearcircle/releases/latest', {
+      headers: { accept: 'application/vnd.github+json' },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((rel) => {
+        if (cancelled || !rel?.tag_name) return
+        setLatestVersion(String(rel.tag_name).replace(/^v/i, ''))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [active])
 
   const mintBundle = async () => {
     setMinting(true)
@@ -1583,14 +1605,22 @@ function SeedersSection ({ active = true }) {
                         Revoked from {seeder.revokedCircles.length} {seeder.revokedCircles.length === 1 ? 'circle' : 'circles'}: {revokedNames}
                       </div>
                     )}
-                    {/* Seeder build version (proposal 2026-06-05-seeder-update slice 1).
-                        A non-null version shows the build; null means connected but on a
-                        pre-version (out-of-date) build; undefined means not seen this
-                        session, so we say nothing. */}
+                    {/* Seeder build version + update flag (proposal 2026-06-05
+                        -seeder-update slices 1+2). A non-null version shows the
+                        build, and an "update available" hint when the latest
+                        published release is newer; null means connected but on a
+                        pre-version (out-of-date) build; undefined means not seen
+                        this session, so we say nothing. */}
                     {typeof seeder.version === 'string' && (
-                      <div style={{ ...typography.caption, color: colors.text.secondary }}>
-                        Version {seeder.version}
-                      </div>
+                      isSeederVersionNewer(latestVersion, seeder.version) ? (
+                        <div style={{ ...typography.caption, color: colors.warn }}>
+                          Version {seeder.version} — update available (v{latestVersion})
+                        </div>
+                      ) : (
+                        <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                          Version {seeder.version}{latestVersion ? ' — up to date' : ''}
+                        </div>
+                      )
                     )}
                     {seeder.version === null && (
                       <div style={{ ...typography.caption, color: colors.warn }}>

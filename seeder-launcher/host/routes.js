@@ -32,6 +32,14 @@ function routes () {
       },
     },
     {
+      // Cached GitHub-Releases update check (proposal 2026-06-05-seeder-update
+      // slice 2). Returns { updateAvailable, latestVersion, releaseUrl,
+      // assetUrl, sha256Url, checkedAt, error }. Notify-only at this slice.
+      method: 'GET',
+      match: (url) => url.pathname === '/api/update',
+      handler: async (req, ctx) => ctx.updateChecker ? ctx.updateChecker.get() : { error: 'update check disabled' },
+    },
+    {
       method: 'GET',
       match: (url) => url.pathname === '/api/circles',
       handler: async (req, ctx) => ctx.worklet.call('seeder:enrolled:list'),
