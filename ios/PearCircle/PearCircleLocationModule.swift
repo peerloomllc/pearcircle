@@ -548,7 +548,18 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // in Info.plist (set) and Always authorization at runtime; iOS
     // silently ignores the flag otherwise.
     m.allowsBackgroundLocationUpdates = true
-    m.showsBackgroundLocationIndicator = true
+    // Hidden (was true, 2026-06-05): the blue status-bar location pill is
+    // a single shared system indicator, and tapping it returns to the app
+    // that displays it. With this true, PearCircle's continuous-tracking
+    // mode owned the pill while the user was driving with Google Maps or
+    // ordering on the Chick-fil-A app, so tapping the pill to jump back to
+    // that app opened PearCircle instead. Only continuous startUpdatingLocation
+    // shows the pill (SLC, visits, and region monitoring never do), which is
+    // why apps like Life360 that lean on those pipelines never steal it.
+    // Setting false removes us from owning/displaying the pill (allowed
+    // under Always authorization) while continuous background tracking and
+    // trip polylines keep working unchanged.
+    m.showsBackgroundLocationIndicator = false
     manager = m
     return m
   }
