@@ -3106,9 +3106,35 @@ const TWEEN_MAX_METERS = 500
 // ring, collapses back to a stack, or rotates its cycling front. Short
 // so the spread feels snappy rather than floaty.
 const OFFSET_TWEEN_MS = 320
-// Faint connector drawn from each spread avatar back to its true shared
-// location. Literal color (SVG presentation attribute, not a CSS var).
-const LEADER_LINE_COLOR = 'rgba(126,196,207,0.55)'
+// Spread-cluster connectors reuse the avatar focus-ring palette: the
+// brand green and its dark companion (see renderBubble's conic-gradient
+// focus ring). Each spoke is a green->dark gradient running from the
+// avatar pin in to the cored hub, and the hub is a dark core ringed in
+// the same green. Literal hex (SVG presentation attributes, not CSS
+// vars) and theme-independent, matching the focus ring.
+const PIN_GREEN = '#9FE15A'
+const PIN_DARK = '#1a1a1a'
+// Spoke pulse: a green band travels pin -> hub -> pin on this period.
+const SPOKE_PULSE_MS = 2400
+// Green band half-width as a fraction of the spoke's length.
+const SPOKE_BAND_W = 0.16
+
+// Build the gradient stops for a spoke's traveling band. bandPos in
+// [0, 1] is the band centre along the gradient (0 = avatar pin end, 1 =
+// hub end). Offsets stay ascending and clamped, so it is a green blip on
+// an otherwise dark line that we slide by re-emitting per frame.
+function spokeBandStops (bandPos) {
+  const lo = Math.max(0, bandPos - SPOKE_BAND_W)
+  const hi = Math.min(1, bandPos + SPOKE_BAND_W)
+  const mid = Math.max(lo, Math.min(hi, bandPos))
+  return (
+    `<stop offset="0" stop-color="${PIN_DARK}" />` +
+    `<stop offset="${lo.toFixed(3)}" stop-color="${PIN_DARK}" />` +
+    `<stop offset="${mid.toFixed(3)}" stop-color="${PIN_GREEN}" />` +
+    `<stop offset="${hi.toFixed(3)}" stop-color="${PIN_DARK}" />` +
+    `<stop offset="1" stop-color="${PIN_DARK}" />`
+  )
+}
 
 const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3)
 
@@ -3253,6 +3279,10 @@ const CircleMap = React.forwardRef(function CircleMap (
       for (const state of markerStatesRef.current.values()) {
         if (state.offAnim) { stillAnimating = true; break }
       }
+      // Keep the loop alive while a cluster is spread so the spoke pulse
+      // (drawn each frame in drawLeaderLines) keeps animating. Stops on
+      // collapse, when expandedClusterRef clears.
+      if (layoutCtxRef.current?.expandedClusterRef?.current) stillAnimating = true
       rafRef.current = stillAnimating ? requestAnimationFrame(tick) : null
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -3911,10 +3941,20 @@ function drawLeaderLines (map, states, ctx) {
     pointMap.set(id, { x: p.x, y: p.y })
   }
   const c = clusterCentroid(memberIds, pointMap)
-  const parts = []
-  // Stop each spoke just shy of the avatar's edge so the faint line reads
-  // as a connector from the shared centre rather than crossing the face.
+  // A green band travels each spoke pin -> hub -> pin, driven by a single
+  // clock-derived phase so every spoke pulses in sync (the rAF loop is
+  // kept alive while expanded). Each spoke gets its own userSpaceOnUse
+  // gradient since directions differ. defs first, then lines, then hub.
+  const ph = (performance.now() % SPOKE_PULSE_MS) / SPOKE_PULSE_MS
+  // Smooth 0 -> 1 -> 0 (sine) so the band eases at each end.
+  const bandPos = (1 - Math.cos(2 * Math.PI * ph)) / 2
+  const bandStops = spokeBandStops(bandPos)
+  const defs = []
+  const lines = []
+  // Stop each spoke just shy of the avatar's edge so the line reads as a
+  // connector from the shared centre rather than crossing the face.
   const stopShort = 28
+  let i = 0
   for (const id of memberIds) {
     const st = states.get(id)
     const own = pointMap.get(id)
@@ -3929,15 +3969,27 @@ function drawLeaderLines (map, states, ctx) {
     if (len <= stopShort) continue
     const x2 = c.x + dx * (1 - stopShort / len)
     const y2 = c.y + dy * (1 - stopShort / len)
-    parts.push(`<line x1="${c.x}" y1="${c.y}" x2="${x2}" y2="${y2}" stroke="${LEADER_LINE_COLOR}" stroke-width="2" stroke-linecap="round" />`)
+    const gid = `pearcircle-spoke-${i++}`
+    // Gradient vector runs avatar-pin (offset 0) -> hub (offset 1); the
+    // band centre is at bandPos along it.
+    defs.push(
+      `<linearGradient id="${gid}" gradientUnits="userSpaceOnUse" x1="${ax}" y1="${ay}" x2="${c.x}" y2="${c.y}">` +
+      bandStops +
+      `</linearGradient>`
+    )
+    // Faint static green underlay keeps the connector visible between
+    // pulses; the gradient line carries the moving bright band on top.
+    lines.push(`<line x1="${c.x}" y1="${c.y}" x2="${x2}" y2="${y2}" stroke="${PIN_GREEN}" stroke-opacity="0.22" stroke-width="2.5" stroke-linecap="round" />`)
+    lines.push(`<line x1="${c.x}" y1="${c.y}" x2="${x2}" y2="${y2}" stroke="url(#${gid})" stroke-width="2.5" stroke-linecap="round" />`)
   }
-  // Hub where the spokes meet: marks the cluster's shared location. Drawn
-  // last so it sits on top of the spoke ends. Faint halo + solid core.
-  if (parts.length) {
-    parts.push(`<circle cx="${c.x}" cy="${c.y}" r="9" fill="${LEADER_LINE_COLOR}" opacity="0.25" />`)
-    parts.push(`<circle cx="${c.x}" cy="${c.y}" r="4.5" fill="#0f1417" stroke="${LEADER_LINE_COLOR}" stroke-width="2" />`)
-  }
-  svg.innerHTML = parts.join('')
+  // Hub where the spokes meet: a dark core ringed in the brand green,
+  // with a faint green halo. Drawn last so it sits on top of the spoke
+  // ends, matching the avatar pin's green-on-dark look.
+  const hub = lines.length ? (
+    `<circle cx="${c.x}" cy="${c.y}" r="9" fill="${PIN_GREEN}" opacity="0.22" />` +
+    `<circle cx="${c.x}" cy="${c.y}" r="4.5" fill="${PIN_DARK}" stroke="${PIN_GREEN}" stroke-width="2" />`
+  ) : ''
+  svg.innerHTML = (defs.length ? `<defs>${defs.join('')}</defs>` : '') + lines.join('') + hub
 }
 
 // Screen-space centroid of a cluster's true projected points. Markers in
