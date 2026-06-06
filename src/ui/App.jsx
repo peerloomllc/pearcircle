@@ -8,7 +8,11 @@ import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork,
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
-import { computeFanOffsets } from '../lib/fanOut.js'
+import {
+  computeClusters,
+  clusterKey,
+  computeRingOffsets,
+} from '../lib/fanOut.js'
 import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
@@ -3098,6 +3102,15 @@ function haversineMeters (lat1, lon1, lat2, lon2) {
 // real movement worth visualizing).
 const TWEEN_MS = 700
 const TWEEN_MAX_METERS = 500
+// Duration of the layout-offset ease used when a cluster expands into a
+// ring, collapses back to a stack, or rotates its cycling front. Short
+// so the spread feels snappy rather than floaty.
+const OFFSET_TWEEN_MS = 320
+// Faint connector drawn from each spread avatar back to its true shared
+// location. Literal color (SVG presentation attribute, not a CSS var).
+const LEADER_LINE_COLOR = 'rgba(126,196,207,0.55)'
+
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3)
 
 // Approximate a geofence circle as a 64-vertex polygon in lat/lon space.
 // Earth-as-sphere math is fine for radii up to a few km; the polygon
@@ -3137,6 +3150,20 @@ const CircleMap = React.forwardRef(function CircleMap (
   const markerStatesRef = useRef(new Map())
   const rafRef = useRef(null)
   const [mapReadyTick, setMapReadyTick] = useState(0)
+  // Two-stage avatar clustering (collapsed stack -> tap -> equidistant
+  // ring -> tap one -> focus + sheet). expandedClusterRef holds the
+  // clusterKey of the single cluster currently spread open, or null.
+  // cycleTickRef advances on a 3s interval so collapsed stacks rotate
+  // which member is the visible front. leaderSvgRef is the screen-space
+  // overlay that draws faint lines from each spread avatar back to its
+  // true location (ring offsets are pixel-space, so this can't be a
+  // GeoJSON layer). markerTapRef routes a marker tap to either expand
+  // its cluster or focus the member.
+  const expandedClusterRef = useRef(null)
+  const cycleTickRef = useRef(0)
+  const leaderSvgRef = useRef(null)
+  const markerTapRef = useRef(null)
+  const layoutCtxRef = useRef(null)
 
   // Keep refs current so the layer click handler (registered once on
   // load) and the imperative fitAll always see the latest props.
@@ -3197,21 +3224,78 @@ const CircleMap = React.forwardRef(function CircleMap (
       const now = performance.now()
       let stillAnimating = false
       for (const state of markerStatesRef.current.values()) {
-        if (!state.anim) continue
-        const t = Math.min(1, (now - state.anim.start) / state.anim.duration)
-        const lng = state.anim.fromLng + (state.anim.toLng - state.anim.fromLng) * t
-        const lat = state.anim.fromLat + (state.anim.toLat - state.anim.fromLat) * t
-        state.marker.setLngLat([lng, lat])
-        state.lng = lng
-        state.lat = lat
-        if (t >= 1) state.anim = null
-        else stillAnimating = true
+        // Position tween (lastSeen -> lastSeen movement).
+        if (state.anim) {
+          const t = Math.min(1, (now - state.anim.start) / state.anim.duration)
+          const lng = state.anim.fromLng + (state.anim.toLng - state.anim.fromLng) * t
+          const lat = state.anim.fromLat + (state.anim.toLat - state.anim.fromLat) * t
+          state.marker.setLngLat([lng, lat])
+          state.lng = lng
+          state.lat = lat
+          if (t >= 1) state.anim = null
+          else stillAnimating = true
+        }
+        // Layout-offset ease (collapse <-> expand, cycling reshuffle).
+        if (state.offAnim) {
+          const t = Math.min(1, (now - state.offAnim.start) / state.offAnim.duration)
+          const e = easeOutCubic(t)
+          const dx = state.offAnim.from[0] + (state.offAnim.to[0] - state.offAnim.from[0]) * e
+          const dy = state.offAnim.from[1] + (state.offAnim.to[1] - state.offAnim.from[1]) * e
+          state.layoutOffset = [dx, dy]
+          state.marker.setOffset([dx, dy])
+          if (t >= 1) state.offAnim = null
+          else stillAnimating = true
+        }
       }
-      applyFanOut(mapRef.current, markerStatesRef.current)
+      // Recompute targets from the (possibly mid-tween) positions and
+      // redraw leader lines against the eased offsets.
+      applyLayout(mapRef.current, markerStatesRef.current, layoutCtxRef.current)
+      for (const state of markerStatesRef.current.values()) {
+        if (state.offAnim) { stillAnimating = true; break }
+      }
       rafRef.current = stillAnimating ? requestAnimationFrame(tick) : null
     }
     rafRef.current = requestAnimationFrame(tick)
   }, [])
+
+  // Shared context handed to the imperative layout helpers. Built from
+  // stable refs/callbacks, so the object identity changing per render is
+  // harmless (helpers read .current fields at call time).
+  layoutCtxRef.current = {
+    expandedClusterRef,
+    cycleTickRef,
+    leaderSvgRef,
+    ensureRaf,
+  }
+
+  // Route a marker tap. If the tapped avatar sits in a collapsed cluster
+  // of 2+, the first tap spreads that cluster into a ring (and collapses
+  // any other open cluster). Otherwise -- a solo pin, or a member of the
+  // already-expanded cluster -- it falls through to the normal focus +
+  // detail-sheet flow.
+  const handleMarkerTap = useCallback((pubkey) => {
+    const map = mapRef.current
+    const states = markerStatesRef.current
+    if (!map || !pubkey) return
+    const points = []
+    for (const [pk, st] of states) {
+      let p
+      try { p = map.project([st.lng, st.lat]) } catch { continue }
+      points.push({ id: pk, x: p.x, y: p.y })
+    }
+    const bucket = computeClusters(points).find((ids) => ids.includes(pubkey))
+    if (bucket && bucket.length >= 2) {
+      const key = clusterKey(bucket)
+      if (expandedClusterRef.current !== key) {
+        expandedClusterRef.current = key
+        applyLayout(map, states, layoutCtxRef.current)
+        ensureRaf()
+        return
+      }
+    }
+    onMemberClickRef.current?.(pubkey)
+  }, [ensureRaf])
+  markerTapRef.current = handleMarkerTap
 
   // One-time map init. Sources/layers are added on the 'load' event so
   // setData calls in the data-sync effect below always find them.
@@ -3245,9 +3329,21 @@ const CircleMap = React.forwardRef(function CircleMap (
     map.on('zoomend', publishViewport)
     publishViewport()
 
-    // Re-fan overlapping member avatars on camera moves; zoom changes
-    // which avatars collide in screen space.
-    map.on('move', () => applyFanOut(map, markerStatesRef.current))
+    // Re-lay-out overlapping member avatars on camera moves; zoom changes
+    // which avatars collide in screen space. Also redraws leader lines so
+    // an expanded cluster's connectors track the camera.
+    map.on('move', () => applyLayout(map, markerStatesRef.current, layoutCtxRef.current))
+
+    // A tap on empty map collapses the open cluster (marker taps
+    // stopPropagation, so this only fires for the map background -- which
+    // also covers re-tapping the empty centre of a spread cluster).
+    map.on('click', () => {
+      if (expandedClusterRef.current) {
+        expandedClusterRef.current = null
+        applyLayout(map, markerStatesRef.current, layoutCtxRef.current)
+        ensureRaf()
+      }
+    })
 
     map.on('load', () => {
       map.addSource('places', { type: 'geojson', data: emptyFC() })
@@ -3339,6 +3435,19 @@ const CircleMap = React.forwardRef(function CircleMap (
     }
   }, [])
 
+  // Cycle which member is the visible front of each collapsed stack every
+  // 3s, so a pile of avatars reveals everyone in it over time. Cheap: it
+  // just advances a counter and re-runs the layout, which cross-fades the
+  // new front in (CSS opacity transition) and eases the cascade.
+  useEffect(() => {
+    const id = setInterval(() => {
+      cycleTickRef.current += 1
+      applyLayout(mapRef.current, markerStatesRef.current, layoutCtxRef.current)
+      ensureRaf()
+    }, 3000)
+    return () => clearInterval(id)
+  }, [ensureRaf])
+
   // Hot-swap the MapLibre style when the user changes the tile-provider
   // override in Settings. Skips on mount (the initial style is set in
   // the map constructor) and any time the URL didn't actually change.
@@ -3361,7 +3470,7 @@ const CircleMap = React.forwardRef(function CircleMap (
     if (!map || !data) return
     const apply = () => {
       syncFeatures(map, data, fittedRef)
-      syncMembers(map, data, selectedPubkey, connectedPubkeys, myPubkey, markerStatesRef.current, onMemberClickRef, ensureRaf)
+      syncMembers(map, data, selectedPubkey, connectedPubkeys, myPubkey, markerStatesRef.current, markerTapRef, ensureRaf, layoutCtxRef.current)
     }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
@@ -3370,6 +3479,10 @@ const CircleMap = React.forwardRef(function CircleMap (
   return (
     <div style={s.mapWrap}>
       <div ref={containerRef} style={s.mapCanvas} />
+      {/* Leader lines for a spread cluster. Screen-space overlay because
+          ring offsets are pixel-space, not geographic. pointer-events
+          none so it never eats map/marker taps. */}
+      <svg ref={leaderSvgRef} style={s.leaderOverlay} />
       <EdgeIndicators
         map={mapRef.current}
         ready={mapReadyTick > 0}
@@ -3561,6 +3674,32 @@ function buildBubbleElement (clickRef) {
   root.style.cursor = 'pointer'
   root.style.userSelect = 'none'
   root.style.webkitUserSelect = 'none'
+  // Opacity-only transition so a stack's back members fade as the front
+  // cycles. Must NOT be `all`: MapLibre animates the element's transform
+  // for positioning, and transitioning that would lag the marker behind
+  // the camera. The fan-out offset is eased in JS, not via CSS.
+  root.style.transition = 'opacity 350ms ease'
+  // Two persistent children: `content` is rewritten by renderBubble on
+  // each data sync; `badge` (the cluster count) is owned by the layout
+  // pass. Keeping them separate means a renderBubble innerHTML rewrite
+  // never wipes the badge, and a layout-only update never re-renders the
+  // avatar.
+  const content = document.createElement('div')
+  content.style.position = 'relative'
+  content.style.width = '100%'
+  content.style.height = '100%'
+  const badge = document.createElement('div')
+  badge.style.cssText =
+    'position:absolute;bottom:-6px;right:-6px;min-width:20px;height:20px;' +
+    'padding:0 5px;box-sizing:border-box;border-radius:10px;background:#0f1417;' +
+    `border:1px solid #2a3338;color:#cfe;font-size:12px;font-weight:600;` +
+    `font-family:${typography.fontFamily};display:none;align-items:center;` +
+    'justify-content:center;line-height:1;z-index:4;pointer-events:none;' +
+    'box-shadow:0 1px 3px rgba(0,0,0,0.5);'
+  root.appendChild(content)
+  root.appendChild(badge)
+  root._content = content
+  root._badge = badge
   root.addEventListener('click', (e) => {
     e.stopPropagation()
     const pk = root.dataset.pubkey
@@ -3650,18 +3789,18 @@ function renderBubble (root, member, selected, last, connected) {
     `</div>`
   )
 
-  // Root carries positioning and the drop-shadow; the inner div carries
-  // the circular clip + ring border. This restructure lets the battery
-  // badge overflow below without being clipped by the avatar's circle.
+  // Root carries the marker size (MapLibre centers the anchor against it)
+  // and stays overflow-visible so the badge, glow, and badges can spill
+  // past the avatar circle. The `content` child carries the drop-shadow
+  // and the avatar visuals; the sibling `badge` (cluster count) is owned
+  // by the layout pass, so writing content.innerHTML here never wipes it.
+  const content = root._content || root
   root.dataset.pubkey = pubkey
   root.style.width = size + 'px'
   root.style.height = size + 'px'
-  root.style.borderRadius = '0'
   root.style.overflow = 'visible'
   root.style.boxSizing = 'border-box'
-  root.style.border = 'none'
-  root.style.background = 'transparent'
-  root.style.filter = selected
+  content.style.filter = selected
     ? 'drop-shadow(0 0 10px rgba(159,225,90,0.7)) drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
     : 'drop-shadow(0 2px 4px rgba(0,0,0,0.4))'
   // Rotating focus ring: only present when selected. Sits behind the
@@ -3695,7 +3834,7 @@ function renderBubble (root, member, selected, last, connected) {
     `<div style="position:absolute;z-index:3;top:-1px;left:-1px;width:14px;height:14px;border-radius:50%;background:${connected ? '#7ec77a' : '#666'};border:2px solid #0d0d0d;box-sizing:border-box;pointer-events:none;"></div>`
   )
 
-  root.innerHTML =
+  content.innerHTML =
     focusRingHtml +
     `<div style="position:relative;z-index:1;width:100%;height:100%;border-radius:50%;overflow:hidden;border:${avatarBorder};background:#fc7;box-sizing:border-box;">${inner}</div>` +
     battHtml +
@@ -3703,32 +3842,197 @@ function renderBubble (root, member, selected, last, connected) {
     onlineHtml
 }
 
-// Spread overlapping member avatars apart. Member markers are anchored
-// to exact coordinates, so members sharing a location stack on a single
-// pixel and hide each other. Project every marker to screen space, get a
-// per-marker fan-out offset from the pure helper, and push it onto the
-// marker with setOffset. Cheap enough to run on every camera move and
-// tween frame; the per-state guard skips redundant setOffset calls.
-function applyFanOut (map, states) {
-  if (!map) return
+// Point a marker at a new layout offset. If it differs from the marker's
+// current target, start an eased offAnim from where it sits now so the
+// move (collapse <-> expand, cycling reshuffle) animates rather than
+// snaps. Returns true if a new ease was started.
+function setLayoutTarget (state, target) {
+  if (!state.layoutOffset) state.layoutOffset = [0, 0]
+  const cur = state.targetOffset
+  if (cur && cur[0] === target[0] && cur[1] === target[1]) return false
+  state.targetOffset = target
+  state.offAnim = {
+    start: performance.now(),
+    duration: OFFSET_TWEEN_MS,
+    from: [state.layoutOffset[0], state.layoutOffset[1]],
+    to: [target[0], target[1]],
+  }
+  return true
+}
+
+// Apply the non-positional stack chrome to a marker: stacking order,
+// dimming of back members, and the cluster-count badge on the front.
+// Guarded so unchanged values don't touch the DOM.
+function applyStackMeta (state, meta) {
+  const el = state.marker.getElement()
+  if (!el) return
+  const z = meta.expanded ? 30 : meta.isFront ? 25 : Math.max(1, 15 - meta.rank)
+  if (state.metaZ !== z) { el.style.zIndex = String(z); state.metaZ = z }
+  // Collapsed back members sit exactly under the front, so hide them
+  // outright (opacity 0): only the front avatar shows, and the cycling
+  // swap cross-fades the new front in over the old. Expanded members and
+  // any front/solo marker are fully opaque.
+  const op = (meta.expanded || meta.isFront) ? 1 : 0
+  if (state.metaOp !== op) { el.style.opacity = String(op); state.metaOp = op }
+  const showBadge = !meta.expanded && meta.isFront && meta.count > 1
+  const badge = el._badge
+  if (badge) {
+    if (showBadge) {
+      if (state.metaBadge !== meta.count) { badge.textContent = String(meta.count); state.metaBadge = meta.count }
+      if (state.metaBadgeShown !== true) { badge.style.display = 'flex'; state.metaBadgeShown = true }
+    } else if (state.metaBadgeShown !== false) {
+      badge.style.display = 'none'
+      state.metaBadgeShown = false
+    }
+  }
+}
+
+// Draw faint connectors from each spread avatar back to its true shared
+// location. Screen-space SVG because the ring uses pixel offsets, not
+// geographic coordinates. Cleared when nothing is expanded.
+function drawLeaderLines (map, states, ctx) {
+  const svg = ctx?.leaderSvgRef?.current
+  if (!svg) return
+  const key = ctx.expandedClusterRef.current
+  if (!key) {
+    if (svg.childNodes.length) svg.textContent = ''
+    return
+  }
+  const memberIds = key.split(',')
+  // Project member anchors and take their centroid: the shared best-guess
+  // centre every spoke radiates from (members sit a few px apart, so any
+  // single member's point would leave the spokes not quite meeting).
+  const pointMap = new Map()
+  for (const id of memberIds) {
+    const st = states.get(id)
+    if (!st) continue
+    let p
+    try { p = map.project([st.lng, st.lat]) } catch { continue }
+    pointMap.set(id, { x: p.x, y: p.y })
+  }
+  const c = clusterCentroid(memberIds, pointMap)
+  const parts = []
+  // Stop each spoke just shy of the avatar's edge so the faint line reads
+  // as a connector from the shared centre rather than crossing the face.
+  const stopShort = 28
+  for (const id of memberIds) {
+    const st = states.get(id)
+    const own = pointMap.get(id)
+    if (!st || !own) continue
+    const off = st.layoutOffset || [0, 0]
+    // Avatar's current displayed position = its anchor + eased offset.
+    const ax = own.x + off[0]
+    const ay = own.y + off[1]
+    const dx = ax - c.x
+    const dy = ay - c.y
+    const len = Math.hypot(dx, dy)
+    if (len <= stopShort) continue
+    const x2 = c.x + dx * (1 - stopShort / len)
+    const y2 = c.y + dy * (1 - stopShort / len)
+    parts.push(`<line x1="${c.x}" y1="${c.y}" x2="${x2}" y2="${y2}" stroke="${LEADER_LINE_COLOR}" stroke-width="2" stroke-linecap="round" />`)
+  }
+  // Hub where the spokes meet: marks the cluster's shared location. Drawn
+  // last so it sits on top of the spoke ends. Faint halo + solid core.
+  if (parts.length) {
+    parts.push(`<circle cx="${c.x}" cy="${c.y}" r="9" fill="${LEADER_LINE_COLOR}" opacity="0.25" />`)
+    parts.push(`<circle cx="${c.x}" cy="${c.y}" r="4.5" fill="#0f1417" stroke="${LEADER_LINE_COLOR}" stroke-width="2" />`)
+  }
+  svg.innerHTML = parts.join('')
+}
+
+// Screen-space centroid of a cluster's true projected points. Markers in
+// a cluster sit at slightly different coordinates (within a bubble
+// width), so we pin both the collapsed stack and the expanded ring to
+// this shared best-guess centre. That makes a collapsed pile land exactly
+// on one another and gives the expanded spokes a common origin to meet
+// at.
+function clusterCentroid (ids, pointMap) {
+  let sx = 0
+  let sy = 0
+  let n = 0
+  for (const id of ids) {
+    const p = pointMap.get(id)
+    if (!p) continue
+    sx += p.x; sy += p.y; n++
+  }
+  return n ? { x: sx / n, y: sy / n } : { x: 0, y: 0 }
+}
+
+// Lay out every cluster: solo markers settle at zero, the one expanded
+// cluster fans into an equidistant polygon, and every other multi-member
+// cluster collapses into a fully-stacked pile (only the cycling front is
+// visible). Offsets are pixel deltas from each marker's own anchor, so
+// pinning to the shared centroid means a member's target is
+// (centroid - ownPoint) plus its ring slot. Runs on camera moves and
+// tween frames; per-state guards keep it cheap. Clears the expanded
+// cluster if it no longer overlaps (e.g. the user zoomed in until the
+// members separated).
+function applyLayout (map, states, ctx) {
+  if (!map || !ctx) return
   const points = []
+  const pointMap = new Map()
   for (const [pubkey, state] of states) {
     let p
     try { p = map.project([state.lng, state.lat]) } catch { continue }
     points.push({ id: pubkey, x: p.x, y: p.y })
+    pointMap.set(pubkey, { x: p.x, y: p.y })
   }
-  const offsets = computeFanOffsets(points)
-  for (const [pubkey, state] of states) {
-    const off = offsets.get(pubkey)
-    if (!off) continue
-    const cur = state.fanOffset
-    if (cur && cur[0] === off[0] && cur[1] === off[1]) continue
-    state.fanOffset = off
-    state.marker.setOffset(off)
+  const buckets = computeClusters(points)
+  const liveKeys = new Set()
+  for (const ids of buckets) if (ids.length >= 2) liveKeys.add(clusterKey(ids))
+
+  let expandedKey = ctx.expandedClusterRef.current
+  if (expandedKey && !liveKeys.has(expandedKey)) {
+    // The spread cluster dissolved (zoomed in, or members moved/left).
+    ctx.expandedClusterRef.current = null
+    expandedKey = null
   }
+
+  let startedEase = false
+  const cycleTick = ctx.cycleTickRef.current
+  for (const ids of buckets) {
+    if (ids.length < 2) {
+      const st = states.get(ids[0])
+      if (!st) continue
+      if (setLayoutTarget(st, [0, 0])) startedEase = true
+      applyStackMeta(st, { expanded: false, isFront: true, rank: 0, count: 0 })
+      continue
+    }
+    const key = clusterKey(ids)
+    const c = clusterCentroid(ids, pointMap)
+    if (key === expandedKey) {
+      // Wider gap + a radius floor so the equidistant polygon spreads far
+      // enough to read the connector spokes clearly.
+      const ring = computeRingOffsets(ids, { gap: 1.5, minRadius: 120 })
+      for (const id of ids) {
+        const st = states.get(id)
+        const own = pointMap.get(id)
+        if (!st || !own) continue
+        const slot = ring.get(id)
+        if (setLayoutTarget(st, [c.x - own.x + slot[0], c.y - own.y + slot[1]])) startedEase = true
+        applyStackMeta(st, { expanded: true, isFront: true, rank: 0, count: ids.length })
+      }
+    } else {
+      // Collapsed pile: every member lands exactly on the centroid so
+      // only the front shows. The cycle counter rotates which member is
+      // the front, cross-fading the pile through everyone over time.
+      const front = cycleTick % ids.length
+      const ordered = ids.slice(front).concat(ids.slice(0, front))
+      ordered.forEach((id, rank) => {
+        const st = states.get(id)
+        const own = pointMap.get(id)
+        if (!st || !own) return
+        if (setLayoutTarget(st, [c.x - own.x, c.y - own.y])) startedEase = true
+        applyStackMeta(st, { expanded: false, isFront: rank === 0, rank, count: ids.length })
+      })
+    }
+  }
+
+  drawLeaderLines(map, states, ctx)
+  if (startedEase) ctx.ensureRaf()
 }
 
-function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, states, clickRef, ensureRaf) {
+function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, states, clickRef, ensureRaf, ctx) {
   const seen = new Set()
   for (const m of data?.members ?? []) {
     const pubkey = m.value?.pubkey
@@ -3742,7 +4046,7 @@ function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, sta
       const el = buildBubbleElement(clickRef)
       const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
       marker.setLngLat([last.lon, last.lat]).addTo(map)
-      state = { marker, lng: last.lon, lat: last.lat, anim: null }
+      state = { marker, lng: last.lon, lat: last.lat, anim: null, layoutOffset: [0, 0], targetOffset: [0, 0], offAnim: null }
       states.set(pubkey, state)
     } else {
       // Tween from where the marker currently sits (mid-animation
@@ -3780,7 +4084,7 @@ function syncMembers (map, data, selectedPubkey, connectedPubkeys, myPubkey, sta
       states.delete(pubkey)
     }
   }
-  applyFanOut(map, states)
+  applyLayout(map, states, ctx)
 }
 
 function fitTo (map, lonLatPairs) {
@@ -6685,6 +6989,7 @@ const s = {
   status: { fontSize: typography.caption.fontSize, color: colors.success, marginTop: spacing.xs, fontWeight: 400 },
   mapWrap: { position: 'relative', height: '100%', width: '100%', background: colors.surface.base },
   mapCanvas: { height: '100%', width: '100%' },
+  leaderOverlay: { position: 'absolute', top: 0, left: 0, height: '100%', width: '100%', pointerEvents: 'none', zIndex: 1, overflow: 'visible' },
   // Attribution stays white-on-translucent-black: it overlays map tiles
   // (any theme) and the dark scrim makes it readable against any tile.
   mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: radius.sm, pointerEvents: 'none' },
