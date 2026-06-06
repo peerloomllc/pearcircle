@@ -4816,7 +4816,7 @@ function CircleSharingRow ({ circle, state, isPending, expanded, error, isLast, 
   const subText = paused
     ? (remainingMs && remainingMs > 0
         ? `Paused. Resumes in ${formatRemaining(remainingMs)}.`
-        : 'Stopped. Other members see your last known location.')
+        : 'Location sharing stopped. Other members cannot see you on the map.')
     : 'Sharing your live location with this circle.'
   return (
     <div style={{
