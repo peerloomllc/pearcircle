@@ -1,4 +1,11 @@
-const { computeFanOffsets, DEFAULT_BUBBLE_PX, DEFAULT_GAP } = require('../src/lib/fanOut')
+const {
+  computeFanOffsets,
+  computeClusters,
+  clusterKey,
+  computeRingOffsets,
+  DEFAULT_BUBBLE_PX,
+  DEFAULT_GAP,
+} = require('../src/lib/fanOut')
 
 describe('computeFanOffsets', () => {
   test('empty input returns an empty map', () => {
@@ -103,5 +110,107 @@ describe('computeFanOffsets', () => {
   test('DEFAULT_BUBBLE_PX and DEFAULT_GAP are exported', () => {
     expect(DEFAULT_BUBBLE_PX).toBe(60)
     expect(typeof DEFAULT_GAP).toBe('number')
+  })
+})
+
+describe('computeClusters', () => {
+  test('empty input returns no buckets', () => {
+    expect(computeClusters([])).toEqual([])
+  })
+
+  test('non-overlapping markers each form a singleton bucket', () => {
+    const buckets = computeClusters([
+      { id: 'a', x: 0, y: 0 },
+      { id: 'b', x: 500, y: 500 },
+    ])
+    expect(buckets).toHaveLength(2)
+    expect(buckets.every((b) => b.length === 1)).toBe(true)
+  })
+
+  test('overlapping markers land in one bucket, sorted by id', () => {
+    const buckets = computeClusters([
+      { id: 'c', x: 1, y: 1 },
+      { id: 'a', x: 0, y: 0 },
+      { id: 'b', x: 2, y: 2 },
+    ])
+    expect(buckets).toHaveLength(1)
+    expect(buckets[0]).toEqual(['a', 'b', 'c'])
+  })
+
+  test('overlap is transitive via single linkage', () => {
+    const buckets = computeClusters([
+      { id: 'a', x: 0, y: 0 },
+      { id: 'b', x: 40, y: 0 },
+      { id: 'c', x: 80, y: 0 },
+      { id: 'far', x: 800, y: 800 },
+    ])
+    const big = buckets.find((b) => b.length > 1)
+    expect(big).toEqual(['a', 'b', 'c'])
+    expect(buckets.some((b) => b.length === 1 && b[0] === 'far')).toBe(true)
+  })
+})
+
+describe('clusterKey', () => {
+  test('is stable regardless of id order', () => {
+    expect(clusterKey(['b', 'a', 'c'])).toBe(clusterKey(['c', 'b', 'a']))
+    expect(clusterKey(['a', 'b'])).toBe('a,b')
+  })
+})
+
+describe('computeRingOffsets', () => {
+  test('a single id gets a zero offset', () => {
+    expect(computeRingOffsets(['a']).get('a')).toEqual([0, 0])
+  })
+
+  test('two ids fan apart symmetrically', () => {
+    const o = computeRingOffsets(['a', 'b'])
+    const a = o.get('a')
+    const b = o.get('b')
+    expect(Math.hypot(...a)).toBeGreaterThan(0)
+    expect(a[0]).toBeCloseTo(-b[0])
+    expect(a[1]).toBeCloseTo(-b[1])
+  })
+
+  test('slots are stable regardless of input order', () => {
+    const a = computeRingOffsets(['c', 'a', 'b'])
+    const b = computeRingOffsets(['b', 'c', 'a'])
+    for (const id of ['a', 'b', 'c']) {
+      expect(a.get(id)[0]).toBeCloseTo(b.get(id)[0])
+      expect(a.get(id)[1]).toBeCloseTo(b.get(id)[1])
+    }
+  })
+
+  test('two members form a horizontal line, not a vertical one', () => {
+    const o = computeRingOffsets(['a', 'b'])
+    const a = o.get('a')
+    const b = o.get('b')
+    // Same y (horizontal), opposite x.
+    expect(a[1]).toBeCloseTo(0)
+    expect(b[1]).toBeCloseTo(0)
+    expect(a[0]).toBeCloseTo(-b[0])
+    expect(Math.abs(a[0])).toBeGreaterThan(0)
+  })
+
+  test('three members make a triangle with one apex at the top', () => {
+    const o = computeRingOffsets(['a', 'b', 'c'])
+    const ys = ['a', 'b', 'c'].map((id) => o.get(id)[1])
+    // One member sits above the centre (most-negative y), two below it.
+    const top = Math.min(...ys)
+    expect(ys.filter((y) => y < top + 1)).toHaveLength(1)
+    expect(ys.filter((y) => y > 0)).toHaveLength(2)
+  })
+
+  test('four members make a cross (up/right/down/left)', () => {
+    const o = computeRingOffsets(['a', 'b', 'c', 'd'])
+    const vecs = ['a', 'b', 'c', 'd'].map((id) => o.get(id))
+    // Each member lies on an axis: one of its components is ~0.
+    for (const [x, y] of vecs) {
+      expect(Math.min(Math.abs(x), Math.abs(y))).toBeCloseTo(0)
+    }
+  })
+
+  test('minRadius floors the spread for small clusters', () => {
+    const o = computeRingOffsets(['a', 'b'], { minRadius: 200 })
+    expect(Math.hypot(...o.get('a'))).toBeCloseTo(200)
   })
 })
