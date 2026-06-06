@@ -119,6 +119,7 @@ const _firstPeerLastKnownMarked = new Set()   // circleIds where we first cached
 const _seederLastknownTipMarked = new Set()   // coreKeyHex of peer last-known cores whose tip the seeder has replicated (slice 2b)
 
 let _store = null
+let _storePath = null // corestore root on disk; set in init, used by the storage diagnostic
 let _localDb = null
 let _identity = null
 let _swarm = null
@@ -475,6 +476,12 @@ function runLocationModeDriver () {
 
 const handlers = {
   'ping': async () => ({ ok: true, ts: Date.now() }),
+
+  // Read-only storage diagnostic (2026-06-06). Returns the on-disk fs
+  // split, per-circle view-prefix byte totals, writer-oplog sizes, and
+  // avatar stats. Safe to call any time; used to size storage concerns
+  // before changing the wire protocol.
+  'storage:diag': async () => computeStorageDiag(),
 
   // RN AppState foreground/background, forwarded from app/index.tsx.
   // Foreground pins the adaptive location mode to "tracking" (proposal
@@ -1857,6 +1864,65 @@ const handlers = {
 
     return { ok: true, scope, circlesTombstoned }
   },
+}
+
+// Storage diagnostic (2026-06-06). Read-only. Attributes on-disk usage so
+// we can size the avatar-inlining and lastSeen-oplog concerns with real
+// numbers before changing the wire protocol. Three lenses:
+//   - fs:      RocksDB file-size split (.sst vs .blob vs info LOGs) so we
+//              see where the bytes physically are.
+//   - view:    per-key-prefix key count + value bytes in each circle's
+//              materialized view (current footprint per category).
+//   - oplog:   each circle's local writer-core block + byte count. The
+//              writer log is append-only and never compacts, so this is
+//              the real history bloat indicator (lastSeen lived here).
+//   - avatars: member-row avatar count, total bytes, and unique-image
+//              count (cross-member dedup) per circle.
+async function computeStorageDiag () {
+  const out = { ts: Date.now(), circles: [], fs: null, totals: { viewBytes: 0, localOplogBytes: 0, avatarBytes: 0 } }
+  for (const [circleId, base] of _circleBases) {
+    const c = { id: circleId.slice(0, 8), prefixes: {}, avatars: { count: 0, bytes: 0, unique: 0 }, oplog: {} }
+    try {
+      const seen = new Set()
+      for await (const { key, value } of base.view.createReadStream()) {
+        const prefix = String(key).split(':')[0]
+        const bytes = b4a.byteLength(JSON.stringify(value))
+        const p = c.prefixes[prefix] || (c.prefixes[prefix] = { keys: 0, bytes: 0 })
+        p.keys++; p.bytes += bytes
+        out.totals.viewBytes += bytes
+        if (prefix === 'member' && value && typeof value.avatar === 'string') {
+          c.avatars.count++; c.avatars.bytes += value.avatar.length
+          out.totals.avatarBytes += value.avatar.length
+          seen.add(value.avatar)
+        }
+      }
+      c.avatars.unique = seen.size
+    } catch (e) { c.error = e?.message }
+    try {
+      c.oplog.localBlocks = base.local?.length ?? null
+      c.oplog.localBytes = base.local?.byteLength ?? null
+      c.oplog.viewBlocks = base.view?.core?.length ?? null
+      if (typeof base.local?.byteLength === 'number') out.totals.localOplogBytes += base.local.byteLength
+    } catch {}
+    out.circles.push(c)
+  }
+  try {
+    const fs = require('bare-fs')
+    const dir = _storePath + '/db'
+    const split = {}
+    let total = 0
+    for (const name of fs.readdirSync(dir)) {
+      let st
+      try { st = fs.statSync(dir + '/' + name) } catch { continue }
+      const ext = name.startsWith('LOG')
+        ? 'LOG(info)'
+        : (name.includes('.') ? name.slice(name.lastIndexOf('.')) : 'other')
+      const e = split[ext] || (split[ext] = { files: 0, bytes: 0 })
+      e.files++; e.bytes += st.size; total += st.size
+    }
+    out.fs = { dir, total, split }
+  } catch (e) { out.fs = { error: e?.message } }
+  return out
 }
 
 // Worklet-side trip retention sweep (proposal 2026-05-10 follow-up).
@@ -4012,7 +4078,8 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // Retry on lock errors: BareKit may restart the worklet before the prior
   // instance has released the corestore lock file.
   try {
-    _store = new Corestore(dataDir + '/pearcircle/store')
+    _storePath = dataDir + '/pearcircle/store'
+    _store = new Corestore(_storePath)
     await _store.ready()
   } catch (e) {
     if (e?.message?.includes('lock') && attempt < 20) {
@@ -4329,6 +4396,15 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   const TRIP_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
   pruneOldTrips().then((r) => mark('trip:prune:boot', r))
     .catch((e) => console.warn('[bare] pruneOldTrips boot failed', e?.message))
+
+  // One-shot storage diagnostic, deferred ~5s so sync settles first.
+  // Read-only; marks the result so it lands in the cold-start trace /
+  // logcat. Temporary boot hook for the 2026-06 storage audit; the
+  // 'storage:diag' IPC method is the durable surface.
+  setTimeout(() => {
+    computeStorageDiag().then((d) => mark('storage:diag', d))
+      .catch((e) => console.warn('[bare] storage:diag failed', e?.message))
+  }, 5000)
   setInterval(() => {
     pruneOldTrips().then((r) => mark('trip:prune:interval', r))
       .catch((e) => console.warn('[bare] pruneOldTrips interval failed', e?.message))
