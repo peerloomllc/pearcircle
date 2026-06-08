@@ -226,6 +226,10 @@ function ensureMapLibreCss () {
 // to Protomaps or any other MapLibre-style URL via Settings -> Map tiles
 // without rebuilding the app.
 const DEFAULT_TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
+// Shown in place of a circle name before its `circle` row has replicated
+// (the joined record exists a beat before the name syncs). Beats a bare
+// "..." in the pill, the circle switcher, and the Settings list.
+const CIRCLE_NAME_PENDING = 'Loading…'
 
 // Sharing state helpers. Worklet returns either:
 //   { sharing: { [circleId]: { enabled, expiresAt } }, anyEnabled }
@@ -2255,10 +2259,19 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       ? activeCircles[0]
       : null
 
-  // Title is the current filter label.
-  const filterLabel = selectedCircleId
-    ? (activeCircles[0]?.circle?.name ?? '...')
-    : (circles.length === 0 ? 'PearCircle' : circles.length === 1 ? (circles[0]?.circle?.name ?? '...') : 'All circles')
+  // Title is the current filter label. A selectedCircleId can outlive its
+  // circle (e.g. right after leaving the last circle), so resolve the name
+  // from the live snapshot and fall through to the no-/multi-circle labels
+  // when it's gone -- otherwise the pill shows a bare "..." placeholder.
+  // CIRCLE_NAME_PENDING covers a circle whose `circle` row hasn't replicated
+  // yet (name arrives a beat after the join).
+  const selectedCircleName = selectedCircleId ? activeCircles[0]?.circle?.name : null
+  const filterLabel = selectedCircleName
+    || (circles.length === 0
+          ? 'No circles'
+          : circles.length === 1
+            ? (circles[0]?.circle?.name || CIRCLE_NAME_PENDING)
+            : 'All circles')
 
   return (
     <div style={s.mapFirstRoot}>
@@ -2505,12 +2518,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                   setMenuOpen(false)
                 }}
               >
-                {c.circle?.name ?? '...'}
+                {c.circle?.name || CIRCLE_NAME_PENDING}
               </button>
               <button
                 onClick={() => {
                   setMenuOpen(false)
-                  setSheet({ name: 'invite', circleId: c.circleId, circleName: c.circle?.name ?? 'Circle' })
+                  setSheet({ name: 'invite', circleId: c.circleId, circleName: c.circle?.name || 'Circle' })
                 }}
                 aria-label='Share invite'
                 style={{
@@ -2950,7 +2963,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
                 }}
                 onClick={() => setTargetCircleId(c.circleId)}
               >
-                {c.circle?.name ?? '...'}
+                {c.circle?.name || CIRCLE_NAME_PENDING}
               </button>
             ))}
           </div>
@@ -4196,7 +4209,7 @@ function CirclesSection ({ active = true, onChanged }) {
         .filter(c => !c.error && !c.circle?.deleted)
         .map(c => ({
           circleId: c.circleId,
-          name: c.circle?.name ?? '...',
+          name: c.circle?.name || CIRCLE_NAME_PENDING,
           isOwner: c.circle?.ownerKey === ourKey,
           memberCount: (c.members ?? []).length,
         }))
@@ -4266,7 +4279,14 @@ function CirclesSection ({ active = true, onChanged }) {
     }
   }
 
-  if (loading || list.length === 0) return null
+  if (loading) return null
+  if (list.length === 0) {
+    return (
+      <p style={s.muted}>
+        You're not in any circles yet. Create or join one from the circle menu on the map.
+      </p>
+    )
+  }
 
   return (
     <>
@@ -4340,7 +4360,7 @@ function CirclesSection ({ active = true, onChanged }) {
               borderBottom: `1px solid ${colors.divider}`,
             }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</div>
+                <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name || CIRCLE_NAME_PENDING}</div>
                 <div style={{ ...typography.caption, color: colors.text.secondary }}>
                   {c.isOwner ? 'You own this · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
                 </div>
@@ -4742,7 +4762,7 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
       const snap = await pear.call('circles:getAll')
       const next = (snap?.circles ?? [])
         .filter((c) => !c.error && !c.circle?.deleted)
-        .map((c) => ({ circleId: c.circleId, name: c.circle?.name ?? '...' }))
+        .map((c) => ({ circleId: c.circleId, name: c.circle?.name || CIRCLE_NAME_PENDING }))
       setList(next)
     } catch {
       // Empty list keeps the section in its "no circles yet" copy.
@@ -4941,7 +4961,7 @@ function TripsSharingSection ({ active = true }) {
       ])
       const next = (snap?.circles ?? [])
         .filter((c) => !c.error && !c.circle?.deleted)
-        .map((c) => ({ circleId: c.circleId, name: c.circle?.name ?? '...' }))
+        .map((c) => ({ circleId: c.circleId, name: c.circle?.name || CIRCLE_NAME_PENDING }))
       setList(next)
       setSharing(sharingR?.sharing ?? {})
     } catch {

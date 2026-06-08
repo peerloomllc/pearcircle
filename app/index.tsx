@@ -138,6 +138,15 @@ async function ensureNotifications() {
       description: 'Notifications when circle members finish a trip',
       lightColor: '#0E413A',
     })
+    // Membership changes (someone joined / left a circle). Informational,
+    // so DEFAULT importance and no custom sound -- and its own channel so
+    // users can mute it from system settings independently of the others.
+    await Notifications.setNotificationChannelAsync('membership', {
+      name: 'Circle membership',
+      importance: Notifications.AndroidImportance.DEFAULT,
+      description: 'Notifications when members join or leave a circle',
+      lightColor: '#0E413A',
+    })
   }
   const settings = await Notifications.getPermissionsAsync()
   if (settings.status !== 'granted') {
@@ -232,6 +241,44 @@ async function fireTransitionNotification(payload: any) {
     })
   } catch (e: any) {
     console.warn('fire transition notification failed: ' + e?.message)
+  }
+}
+
+// Member joined / left a circle. The worklet already gates freshness,
+// dedup, self-suppression, and the post-dates-our-join anchor; the shell
+// just formats the body and posts it on the membership channel. The
+// short-TTL dedup mirrors fireTransitionNotification -- belt-and-braces
+// against a double emit from autobase re-applies racing the worklet set.
+async function fireMembershipNotification(payload: any, kind: 'memberJoined' | 'memberLeft') {
+  if (!payload) return
+  const { circleId, pubkey, displayName, circleName } = payload
+  if (typeof pubkey !== 'string') return
+  // Defense in depth: worklet already drops self, but never bug the user
+  // about their own join/leave if an old worklet build lets it through.
+  if (_ourPubkey && pubkey === _ourPubkey) return
+  const name = (typeof displayName === 'string' && displayName.length > 0) ? displayName : pubkey.slice(0, 8)
+  const circle = (typeof circleName === 'string' && circleName.length > 0) ? circleName : 'a circle'
+  const verb = kind === 'memberJoined' ? 'joined' : 'left'
+  const dedupKey = kind + ':' + pubkey + ':' + (circleId ?? '')
+  const lastTs = _recentNotifications.get(dedupKey)
+  const now = Date.now()
+  if (lastTs != null && now - lastTs < NOTIF_DEDUP_TTL_MS) return
+  _recentNotifications.set(dedupKey, now)
+  const cutoff = now - NOTIF_DEDUP_TTL_MS
+  for (const [k, ts] of _recentNotifications) {
+    if (ts < cutoff) _recentNotifications.delete(k)
+  }
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'PearCircle',
+        body: `${name} ${verb} ${circle}`,
+        data: { kind, circleId: circleId ?? null, pubkey },
+      },
+      trigger: Platform.OS === 'android' ? { channelId: 'membership' } : null,
+    })
+  } catch (e: any) {
+    console.warn('fire membership notification failed: ' + e?.message)
   }
 }
 
@@ -606,6 +653,10 @@ export default function Index() {
     // distance/duration threshold; the shell formats with the user's
     // distance-unit preference and gates on the local mute toggle.
     onEvent('peerTrip:completed', (data) => { firePeerTripNotification(data) })
+    // Member joined / left a circle ("Jane joined Family"). Worklet owns
+    // the freshness / dedup / self / anchor gates; shell just posts it.
+    onEvent('member:joined', (data) => { fireMembershipNotification(data, 'memberJoined') })
+    onEvent('member:left', (data) => { fireMembershipNotification(data, 'memberLeft') })
     onEvent('tripNotifications:changed', (data) => {
       if (data && typeof data.enabled === 'boolean') _tripNotificationsEnabled = data.enabled
       emitEvent('tripNotifications:changed', data)
@@ -646,10 +697,12 @@ export default function Index() {
     // through addNotificationResponseReceivedListener. Both deliver via
     // deliverNotificationFocus, which mirrors the deeplink pending-flush
     // pattern so a tap that lands before the WebView is ready isn't lost.
-    // Two notification kinds carry focus-routing payloads:
-    //   - transition: { kind: 'transition', circleId, pubkey } from geofence enter/exit
-    //   - peerTrip:   { kind: 'peerTrip', circleId, authorPubkey } from trip-completion
-    // Both resolve to the same WebView event so the UI can switch circle
+    // These notification kinds carry focus-routing payloads:
+    //   - transition:  { kind: 'transition', circleId, pubkey } from geofence enter/exit
+    //   - peerTrip:     { kind: 'peerTrip', circleId, authorPubkey } from trip-completion
+    //   - memberJoined: { kind: 'memberJoined', circleId, pubkey } from a circle join
+    //   - memberLeft:   { kind: 'memberLeft', circleId, pubkey } from a circle leave/remove
+    // All resolve to the same WebView event so the UI can switch circle
     // filter and focus the member uniformly.
     const routeNotificationData = (data: any) => {
       if (!data) return
@@ -657,6 +710,9 @@ export default function Index() {
         deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
       } else if (data.kind === 'peerTrip' && typeof data.circleId === 'string' && typeof data.authorPubkey === 'string') {
         deliverNotificationFocus({ circleId: data.circleId, pubkey: data.authorPubkey })
+      } else if ((data.kind === 'memberJoined' || data.kind === 'memberLeft') &&
+                 typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
+        deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
       }
     }
     Notifications.getLastNotificationResponseAsync().then((resp) => {
