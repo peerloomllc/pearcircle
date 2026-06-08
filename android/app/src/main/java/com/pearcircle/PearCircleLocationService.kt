@@ -1,11 +1,13 @@
 package com.pearcircle
 
 import android.Manifest
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.os.SystemClock
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -62,19 +64,72 @@ class PearCircleLocationService : Service() {
         }
         ensureChannel()
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        // When this runs from the onTaskRemoved restart alarm the process is
+        // starting in the background. On Android 12+ promoting to a location
+        // FGS from the background is only allowed under an exemption (exact
+        // alarm / battery-opt); if it is not, startForeground throws
+        // ForegroundServiceStartNotAllowedException. Swallow it and bail
+        // cleanly instead of crashing -- this is the genuine "OEM won't let us
+        // come back" case, not something we can force.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
         startLocationUpdates()
         // START_STICKY: if the OS kills us under memory pressure, retry
         // when resources free up. Cold-start-from-boot is a separate slice.
         return START_STICKY
+    }
+
+    // The user swiping the app out of recents kills our process and, on many
+    // OEMs, tears this foreground service down with it -- so live location
+    // stops until the app is manually reopened. START_STICKY alone does not
+    // cover this on aggressive ROMs. Reschedule ourselves via an exact alarm:
+    // an exact-alarm firing is one of the documented exemptions that lets an
+    // app start a location foreground service from the background on
+    // Android 12+ (the battery-optimization exemption we already request is a
+    // second backstop). This mitigates the swipe-away case only; a genuine
+    // Settings > Force stop puts the package in the stopped state and no
+    // app-side mechanism (alarm, broadcast, FCM) can revive it until the user
+    // relaunches -- an Android design limit, covered instead by the seeder
+    // serving this device's last-known position to the rest of the circle.
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Only reschedule if we were legitimately running (sharing on). If
+        // permission was revoked the restarted onStartCommand would just
+        // stopSelf, so skip the pointless wakeup.
+        if (hasLocationPermission()) {
+            val restartIntent = Intent(applicationContext, PearCircleLocationService::class.java)
+            val pi = PendingIntent.getService(
+                this, RESTART_REQUEST_CODE, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+            val triggerAt = SystemClock.elapsedRealtime() + RESTART_DELAY_MS
+            // Prefer an exact alarm: an exact alarm firing is the documented
+            // exemption that lets us start the location FGS from the
+            // background. It needs no SCHEDULE_EXACT_ALARM permission while we
+            // hold the battery-optimization exemption, but if that exemption
+            // is absent the call throws on Android 12+, so fall back to an
+            // inexact allow-while-idle alarm (always permitted) rather than
+            // crash. We deliberately do not add USE_EXACT_ALARM (Play limits
+            // it to alarm/calendar apps).
+            try {
+                am?.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+            } catch (e: SecurityException) {
+                am?.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+            }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun hasLocationPermission(): Boolean {
@@ -206,6 +261,8 @@ class PearCircleLocationService : Service() {
     companion object {
         private const val CHANNEL_ID = "pearcircle_location"
         private const val NOTIFICATION_ID = 4710
+        private const val RESTART_REQUEST_CODE = 4711
+        private const val RESTART_DELAY_MS = 2_000L
 
         fun start(ctx: Context) {
             val intent = Intent(ctx, PearCircleLocationService::class.java)
