@@ -177,6 +177,7 @@ let _forceAutobaseLastSeen = false
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
+const _leavingCircles = new Set() // circleIds with a voluntary circle:leave in flight. Set before we append our left: tombstone, cleared on local teardown. Suppresses autoAppendMemberRow so the membership sweep doesn't mistake our just-written self-leave for a stale tombstone and resurrect our member row with a fresh joinedAt -- which would un-leave us on every peer (and fire a spurious member:joined).
 const _lastGoodSnapshot = new Map() // circleId → last successful snapshotCircle result, served when a bounded snapshot times out so the UI stays populated (proposal 2026-06-03c)
 const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
 // Seed-mode only: per-circle replication state. Each entry holds the
@@ -196,6 +197,30 @@ const _memberAdmissionChannels = new Map()
 // conn → remote pubkey hex. Lets openPairChannelsForCircle key the
 // registry above by seeder pubkey when all it has is the connection.
 const _connPubkey = new Map()
+// Per-circle Protomux channels (pair / member-admission / live) opened on
+// the active connections. Tracked so tearDownCircleLocally can close them on
+// leave: Protomux.createChannel refuses a duplicate protocol+id, so if a
+// leave leaves these open on a still-live connection, an immediate rejoin in
+// the same session can't recreate them (pair/admission/live:create-failed) --
+// and the stale channels stay bound to the now-closed base. That breaks
+// writer re-admission (the joiner can't re-advertise its writer key) and live
+// presence on the rejoined circle. circleId → Set<channel>.
+const _circleProtoChannels = new Map()
+function trackCircleChannel (circleId, channel) {
+  if (!channel) return
+  let set = _circleProtoChannels.get(circleId)
+  if (!set) { set = new Set(); _circleProtoChannels.set(circleId, set) }
+  // Drop refs to channels that have since closed (e.g. their connection
+  // dropped) so the set doesn't accumulate across reconnects.
+  for (const ch of set) { if (ch.closed) set.delete(ch) }
+  set.add(channel)
+}
+function closeCircleChannels (circleId) {
+  const set = _circleProtoChannels.get(circleId)
+  if (!set) return
+  for (const ch of set) { try { ch.close() } catch {} }
+  _circleProtoChannels.delete(circleId)
+}
 // Active Hyperswarm connections (post-handshake, pre-close). Tracked so
 // circle:join can open the pair channel for a newly-added circle on
 // every live connection. Hyperswarm reuses one connection per peer
@@ -305,6 +330,20 @@ const PEER_TRIP_FRESHNESS_MS = 10 * 60 * 1000
 // gates the OS notification.
 const PEER_TRIP_MIN_DISTANCE_M = 500
 const PEER_TRIP_MIN_DURATION_MS = 5 * 60 * 1000
+
+// Member join / leave OS notifications ("Jane joined Family" / "Jane
+// left Family"). Same dual gate the transition and peer-trip emits use:
+// an in-session dedup set absorbs autobase re-applies, and a freshness
+// window keeps a fresh device's historical-roster replay quiet. A join
+// is a member: row whose joinedAt is fresh; a leave is a fresh left: /
+// removed: tombstone. joinedAt is stable across profile edits (see the
+// profile:set handler, which preserves it on a displayName/avatar
+// change), so {circleId}:{pubkey}:{joinedAt} uniquely identifies one
+// join and a rename never re-notifies.
+const _emittedMemberJoinKeys = new Set()
+const _emittedMemberLeaveKeys = new Set()
+const _EMITTED_MEMBER_MAX = 1024
+const MEMBER_NOTIF_FRESHNESS_MS = 10 * 60 * 1000
 
 // User pref. Default on; off mutes peer-trip OS notifications entirely.
 // Persisted in _localDb under `tripNotifications`; loaded on init below.
@@ -1268,6 +1307,14 @@ const handlers = {
       return { ok: true, alreadyLeft: true }
     }
     const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    // Guard the resurrection race: the 5s membership sweep / circles:getAll
+    // poll both call autoAppendMemberRow, which rewrites our member row
+    // with a fresh joinedAt whenever a left:/removed: tombstone currently
+    // hides us (the rejoin-recovery path). Our own just-written left: row
+    // trips that exact condition, so without this flag the sweep would
+    // out-date our leave and replicate a fresh member row to peers --
+    // un-leaving us. Set before the append, cleared in tearDownCircleLocally.
+    _leavingCircles.add(circleId)
     const value = signValue({
       pubkey: ourKeyHex,
       leftAt: Date.now(),
@@ -2377,6 +2424,10 @@ function joinCircleTopic (circleId, circleKey) {
 // appended and given a brief replication window. Idempotent — repeated
 // calls on an already-cleaned-up circle are no-ops.
 async function tearDownCircleLocally (circleId) {
+  // Leave finished (or circle otherwise gone): drop the resurrection
+  // guard so a later rejoin of the same circleId can publish a member
+  // row again. Harmless no-op for teardown paths that never set it.
+  _leavingCircles.delete(circleId)
   const record = await _localDb.get('circles:joined:' + circleId).catch(() => null)
   if (record?.value?.circleKey && _swarm) {
     try {
@@ -2395,6 +2446,14 @@ async function tearDownCircleLocally (circleId) {
     _circleBases.delete(circleId)
   }
   _circlePeers.delete(circleId)
+  // Close the per-circle pair/admission/live Protomux channels on every
+  // active connection, then drop their registry entries. Without this an
+  // immediate rejoin in the same session can't recreate them (Protomux
+  // refuses a duplicate protocol+id) and they stay bound to the base we're
+  // about to close -- breaking writer re-admission and live presence on
+  // the rejoined circle (the warm leave->rejoin "join did nothing" path).
+  closeCircleChannels(circleId)
+  for (const perConn of _memberAdmissionChannels.values()) perConn.delete(circleId)
   // Drop ephemeral live state for the circle (proposal 2026-06-04 phase 1).
   _liveLastSeen.delete(circleId)
   for (const perConn of _liveChannels.values()) perConn.delete(circleId)
@@ -2440,6 +2499,97 @@ function openCircleView (store) {
     keyEncoding: 'utf-8',
     valueEncoding: 'json',
   })
+}
+
+// FIFO-on-overflow bound for the member notify dedup sets: when full,
+// drop the oldest half. Cheap and keeps memory flat over long sessions
+// -- same eviction the transition / peer-trip emits inline.
+function rememberEmitted (set, key, max) {
+  if (set.size >= max) {
+    const arr = [...set]
+    set.clear()
+    for (let i = arr.length >> 1; i < arr.length; i++) set.add(arr[i])
+  }
+  set.add(key)
+}
+
+// Our own identity + the joinedAt on our member row in this circle's
+// view. Used to anchor join/leave notifications to events that post-
+// date our own arrival: a brand-new circle's owner row carries a fresh
+// joinedAt too, and without this anchor the peer who actually just
+// joined would be told the owner "joined". Returns nulls when we have
+// no identity yet or no member row (e.g. a read-only observer) -- the
+// callers fall back to the freshness gate alone in that case.
+async function memberSelfAnchor (view) {
+  const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
+  if (!ourKeyHex) return { ourKeyHex: null, joinedAt: null }
+  const row = await view.get('member:' + ourKeyHex)
+  return { ourKeyHex, joinedAt: typeof row?.value?.joinedAt === 'number' ? row.value.joinedAt : null }
+}
+
+// Emit member:joined so the shell can post an OS notification. Gated by:
+// self-suppression, the freshness window, the post-dates-our-join anchor,
+// per-(circle,pubkey,joinedAt) in-session dedup, and a circle-deleted
+// check. memberValue is the stored member: row.
+async function emitMemberJoined (view, circleId, memberValue, priorValue) {
+  try {
+    const joinedAt = memberValue && memberValue.joinedAt
+    const pubkey = memberValue && memberValue.pubkey
+    if (!circleId || typeof joinedAt !== 'number' || typeof pubkey !== 'string') return
+    if (Date.now() - joinedAt > MEMBER_NOTIF_FRESHNESS_MS) return
+    // Only a genuinely new member row notifies. If we already held a row
+    // for this pubkey with the same-or-newer joinedAt, this is an autobase
+    // re-apply (indexer reorg) or a profile edit (joinedAt preserved) --
+    // not a join. View-backed, so it holds even on a fresh session with an
+    // empty dedup set, unlike the in-session set alone.
+    if (priorValue && typeof priorValue.joinedAt === 'number' && priorValue.joinedAt >= joinedAt) return
+    const { ourKeyHex, joinedAt: ourJoinedAt } = await memberSelfAnchor(view)
+    if (pubkey === ourKeyHex) return
+    if (typeof ourJoinedAt === 'number' && joinedAt <= ourJoinedAt) return
+    const dedupKey = circleId + ':' + pubkey + ':' + joinedAt
+    if (_emittedMemberJoinKeys.has(dedupKey)) return
+    rememberEmitted(_emittedMemberJoinKeys, dedupKey, _EMITTED_MEMBER_MAX)
+    const circleRow = await view.get('circle')
+    if (circleRow?.value?.deleted) return
+    const displayName = (typeof memberValue.displayName === 'string' && memberValue.displayName.length > 0)
+      ? memberValue.displayName : pubkey.slice(0, 8)
+    send({ event: 'member:joined', data: {
+      circleId,
+      pubkey,
+      displayName,
+      circleName: circleRow?.value?.name || 'Circle',
+    }})
+  } catch (e) { console.warn('[bare] member:joined emit failed', e?.message) }
+}
+
+// Emit member:left for a voluntary `left:` or owner `removed:` tombstone.
+// Same gates as the join path; leftTs is the tombstone's leftAt (left:)
+// or ts (removed:). The leaver themselves is suppressed -- they already
+// get circle:removed-self / their own teardown. displayName is read off
+// the still-present member: row (tombstones hide the member at snapshot
+// time, they don't delete the row).
+async function emitMemberLeft (view, circleId, pubkey, leftTs) {
+  try {
+    if (!circleId || typeof pubkey !== 'string' || typeof leftTs !== 'number') return
+    if (Date.now() - leftTs > MEMBER_NOTIF_FRESHNESS_MS) return
+    const { ourKeyHex, joinedAt: ourJoinedAt } = await memberSelfAnchor(view)
+    if (pubkey === ourKeyHex) return
+    if (typeof ourJoinedAt === 'number' && leftTs <= ourJoinedAt) return
+    const dedupKey = circleId + ':' + pubkey + ':' + leftTs
+    if (_emittedMemberLeaveKeys.has(dedupKey)) return
+    rememberEmitted(_emittedMemberLeaveKeys, dedupKey, _EMITTED_MEMBER_MAX)
+    const circleRow = await view.get('circle')
+    if (circleRow?.value?.deleted) return
+    const memberRow = await view.get('member:' + pubkey)
+    const displayName = (typeof memberRow?.value?.displayName === 'string' && memberRow.value.displayName.length > 0)
+      ? memberRow.value.displayName : pubkey.slice(0, 8)
+    send({ event: 'member:left', data: {
+      circleId,
+      pubkey,
+      displayName,
+      circleName: circleRow?.value?.name || 'Circle',
+    }})
+  } catch (e) { console.warn('[bare] member:left emit failed', e?.message) }
 }
 
 async function applyCircleNodes (nodes, view, base, circleId) {
@@ -2505,6 +2655,7 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         const keyPubkey = op.key.slice('left:'.length)
         if (keyPubkey !== incoming.pubkey) continue
         await view.put(op.key, incoming)
+        await emitMemberLeft(view, circleId, keyPubkey, incoming.leftAt)
         continue
       }
       // `removed:{pubkey}` (proposal 2026-05-03 §3): owner-only kick
@@ -2526,6 +2677,10 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (existingRemoved && typeof existingRemoved.ts === 'number' &&
             typeof op.value?.ts === 'number' && op.value.ts <= existingRemoved.ts) continue
         await view.put(op.key, op.value)
+        // Other members see "X left Family". emitMemberLeft self-
+        // suppresses, so the removed member gets only circle:removed-self
+        // below, not a "you left" notification about themselves.
+        await emitMemberLeft(view, circleId, keyPubkey, op.value?.ts)
         if (circleId && typeof op.value?.ts === 'number') {
           const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
           if (ourKeyHex && keyPubkey === ourKeyHex) {
@@ -2548,7 +2703,16 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       // fresh member: row with a newer joinedAt; storing it is what
       // overrides the removed: tombstone (see snapshotCircle).
       if (op.key.startsWith('member:')) {
+        // Capture the row we had BEFORE this put so emitMemberJoined can
+        // tell a genuine (re)join from an autobase re-apply or a profile
+        // edit (which re-puts the row with an unchanged joinedAt).
+        const priorMember = await view.get(op.key)
         await view.put(op.key, op.value)
+        // A fresh member: row whose joinedAt post-dates our own join is a
+        // real join (or rejoin -- autoAppendMemberRow rewrites with a new
+        // joinedAt to out-date a stale tombstone). emitMemberJoined owns
+        // the freshness / dedup / self / new-row gates.
+        await emitMemberJoined(view, circleId, op.value, priorMember?.value)
         continue
       }
       // `lastSeen:{pubkey}`: signed by the user-identity in `pubkey`
@@ -2807,6 +2971,10 @@ async function applyCircleNodes (nodes, view, base, circleId) {
 }
 
 async function autoAppendMemberRow (circleId) {
+  // A voluntary leave is in flight: do not resurrect our member row. The
+  // rejoin-recovery below would otherwise read our own left: tombstone as
+  // a stale one and out-date it, cancelling the leave on every peer.
+  if (_leavingCircles.has(circleId)) return
   const base = _circleBases.get(circleId)
   if (!base || !base.writable) return
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
@@ -3137,6 +3305,7 @@ function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
     mark,
   })
   if (!result || typeof result.sendRevoked !== 'function') return
+  trackCircleChannel(circleId, result.channel)
   const pubkeyHex = _connPubkey.get(conn)
   if (!pubkeyHex) return
   let perConn = _memberAdmissionChannels.get(conn)
@@ -3176,7 +3345,7 @@ function openPairChannelsForCircle (circleId, base) {
       },
       mark,
     })
-    if (ch) opened++
+    if (ch) { opened++; trackCircleChannel(circleId, ch) }
     // Member-role admission channel — without this a seeder that
     // auto-enrolls (or is invited to) a circle created after the
     // connection formed could never have its announce received.
@@ -3200,6 +3369,7 @@ function setupLiveChannelFor (conn, circleId) {
     onPosition: (value) => { handleLivePosition(circleId, value).catch(() => {}) },
   })
   if (!handle) return
+  trackCircleChannel(circleId, handle.channel)
   let perConn = _liveChannels.get(conn)
   if (!perConn) { perConn = new Map(); _liveChannels.set(conn, perConn) }
   perConn.set(circleId, handle.send)
@@ -3546,7 +3716,7 @@ function registerPairNotify (conn) {
       return
     }
     mark('pair:remote-open-matched', { cid: circleIdStr.slice(0, 8), writable: !!base.writable })
-    setupPairChannel({
+    const ch = setupPairChannel({
       conn,
       circleId: circleIdStr,
       base,
@@ -3555,6 +3725,7 @@ function registerPairNotify (conn) {
       },
       mark,
     })
+    trackCircleChannel(circleIdStr, ch)
   })
 }
 
@@ -3899,7 +4070,7 @@ async function onSwarmConnection (conn, info) {
   // when both sides open the same protocol+id, and unmatched channels
   // don't affect corestore replication.
   for (const [circleId, base] of _circleBases) {
-    setupPairChannel({
+    const ch = setupPairChannel({
       conn,
       circleId,
       base,
@@ -3908,6 +4079,7 @@ async function onSwarmConnection (conn, info) {
       },
       mark,
     })
+    trackCircleChannel(circleId, ch)
     // Seeder admission receiver. Proposal 2026-05-19 slice 3d. Unmatched
     // channels (peer isn't a seeder) close harmlessly. The announce
     // handler dedupes / auto-approves / emits seeder:announced.
