@@ -1829,6 +1829,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // RN shell; this is a local cache loaded on mount and updated on toggle.
   const [mutedPlaces, setMutedPlaces] = useState(() => new Set())
   const mapApiRef = useRef(null)
+  // True while an avatar cluster is fanned out into its equidistant ring.
+  // CircleMap owns the actual expand state (a ref driving the off-React
+  // layout loop); this mirror lets the hardware-back handler take
+  // precedence and collapse the fan-out before clearing focus / exiting.
+  const [clusterSpread, setClusterSpread] = useState(false)
   // Set by focusMember just before its flyTo. The auto-recenter
   // effect skips its first run after a focus so we don't override
   // the cinematic flyTo with an immediate panTo. Subsequent lastSeen
@@ -1990,8 +1995,19 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       if (pubkey === myPubkey) continue
       if (effectivePresenceMuted(pres)) delete out.lastSeen[pubkey]
     }
-    if (myPubkey && selfSeen && !out.lastSeen[myPubkey]) {
-      out.lastSeen[myPubkey] = selfSeen
+    // Overlay our own freshest fix (the worklet's in-memory `_selfLastSeen`,
+    // delivered out-of-band via circles:getAll). Freshest-ts wins, NOT
+    // fill-if-absent: after the phase-2 lastSeen cutover engages the worklet
+    // stops dual-writing our own `lastSeen:{self}` to the Autobase view, and
+    // neither the live channel (drops self-echoes) nor the last-known core
+    // refresh (skips self) puts our own row back into the snapshot. So the
+    // snapshot carries a FROZEN self entry, and a fill-if-absent guard let it
+    // shadow the live `selfSeen` -- pinning our own marker + "last seen" string
+    // to the moment cutover engaged while peers saw us live. Compare ts so the
+    // fresh value wins. (regression from proposal 2026-06-04 slice 3)
+    if (myPubkey && selfSeen) {
+      const cur = out.lastSeen[myPubkey]
+      if (!cur || (selfSeen.ts ?? 0) > (cur.ts ?? 0)) out.lastSeen[myPubkey] = selfSeen
     }
     if (myPubkey && !out.members.some(m => m.value?.pubkey === myPubkey)) {
       out.members.push({
@@ -2144,16 +2160,19 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     mapApiRef.current?.fitAll()
   }, [])
 
-  // Back gesture clears member focus and returns the camera to the all-
-  // fit baseline. Only active while a member is focused, so back at
-  // idle (no sheets, no focus) falls through to shell:exitApp. Member
-  // detail sheet (a BottomSheet) registers a handler of its own that
-  // pops first if it's open.
+  // Back-gesture precedence on the map. A fanned-out avatar cluster
+  // collapses back to its stacked pile FIRST -- that's the user's mental
+  // "back" out of fan-out, and it must win over the focus-clear / camera-
+  // refit (and over the shell's zoom-out / exit-app fallthrough). Only when
+  // nothing is spread does back clear member focus and refit to the all-fit
+  // baseline. Both arms are gated by `active` so back at idle (no fan-out,
+  // no focus, no sheets) falls through to shell:exitApp. The member detail
+  // sheet (a BottomSheet) registers a handler of its own that pops first.
   useBackHandler(useCallback(() => {
-    if (!selectedPubkey) return false
-    clearFocus()
-    return true
-  }, [selectedPubkey, clearFocus]), !!selectedPubkey)
+    if (clusterSpread && mapApiRef.current?.collapseCluster()) return true
+    if (selectedPubkey) { clearFocus(); return true }
+    return false
+  }, [clusterSpread, selectedPubkey, clearFocus]), clusterSpread || !!selectedPubkey)
 
   // Notification-tap focus delivered via prop from App. Each tap arrives
   // with a fresh seq so we can detect new taps even on repeat-tap of the
@@ -2272,6 +2291,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           tileStyleUrl={tileStyleUrl}
           onMemberClick={onPinTap}
           onLongPress={onMapLongPress}
+          onClusterSpreadChange={setClusterSpread}
         />
       </div>
 
@@ -3155,7 +3175,7 @@ function circlePolygon (lat, lon, radiusMeters, steps = 64) {
 }
 
 const CircleMap = React.forwardRef(function CircleMap (
-  { data, selectedPubkey, connectedPubkeys, myPubkey, tileStyleUrl, onMemberClick, onLongPress },
+  { data, selectedPubkey, connectedPubkeys, myPubkey, tileStyleUrl, onMemberClick, onLongPress, onClusterSpreadChange },
   apiRef,
 ) {
   // Initial style at mount time. We can't read this from a ref/prop on
@@ -3190,12 +3210,24 @@ const CircleMap = React.forwardRef(function CircleMap (
   const leaderSvgRef = useRef(null)
   const markerTapRef = useRef(null)
   const layoutCtxRef = useRef(null)
+  const onClusterSpreadChangeRef = useRef(onClusterSpreadChange)
 
   // Keep refs current so the layer click handler (registered once on
   // load) and the imperative fitAll always see the latest props.
   useEffect(() => { onMemberClickRef.current = onMemberClick }, [onMemberClick])
   useEffect(() => { onLongPressRef.current = onLongPress }, [onLongPress])
+  useEffect(() => { onClusterSpreadChangeRef.current = onClusterSpreadChange }, [onClusterSpreadChange])
   useEffect(() => { dataRef.current = data }, [data])
+
+  // Single mutation point for the spread-cluster ref: keep the off-React
+  // layout ref and the parent's reactive mirror in lockstep so the back
+  // handler activates/deactivates exactly when the fan-out opens/closes.
+  // Stable identity ([] deps) so the once-registered map-click handler and
+  // the imperative collapse can capture it safely.
+  const setExpandedCluster = useCallback((key) => {
+    expandedClusterRef.current = key
+    onClusterSpreadChangeRef.current?.(!!key)
+  }, [])
 
   // Expose imperative flyTo/panTo/fitAll to the parent. Direct camera
   // moves avoid state/effect round-trips that could be batched or
@@ -3239,6 +3271,20 @@ const CircleMap = React.forwardRef(function CircleMap (
       if (!m || !Number.isFinite(lng) || !Number.isFinite(lat)) return false
       try { return m.getBounds().contains([lng, lat]) } catch { return false }
     },
+    // Collapse a fanned-out cluster back to its stacked pile. Returns true
+    // when there was a spread cluster to close (so the back handler knows
+    // whether it consumed the gesture), false otherwise.
+    collapseCluster: () => {
+      if (!expandedClusterRef.current) return false
+      setExpandedCluster(null)
+      applyLayout(mapRef.current, markerStatesRef.current, layoutCtxRef.current)
+      ensureRaf()
+      return true
+    },
+    // Stable handle: setExpandedCluster and ensureRaf are stable useCallbacks,
+    // so the factory's closures stay valid for the map's lifetime. Keep the
+    // deps array empty -- listing ensureRaf here evaluates it during render,
+    // before its `const` below, which is a temporal-dead-zone ReferenceError.
   }), [])
 
   // Single rAF loop driving all in-flight marker tweens. Started
@@ -3296,6 +3342,9 @@ const CircleMap = React.forwardRef(function CircleMap (
     cycleTickRef,
     leaderSvgRef,
     ensureRaf,
+    // Called when applyLayout auto-dissolves the spread cluster (zoom-in or
+    // members separating) so the parent's mirror clears without a tap.
+    onCollapse: () => onClusterSpreadChangeRef.current?.(false),
   }
 
   // Route a marker tap. If the tapped avatar sits in a collapsed cluster
@@ -3317,14 +3366,14 @@ const CircleMap = React.forwardRef(function CircleMap (
     if (bucket && bucket.length >= 2) {
       const key = clusterKey(bucket)
       if (expandedClusterRef.current !== key) {
-        expandedClusterRef.current = key
+        setExpandedCluster(key)
         applyLayout(map, states, layoutCtxRef.current)
         ensureRaf()
         return
       }
     }
     onMemberClickRef.current?.(pubkey)
-  }, [ensureRaf])
+  }, [setExpandedCluster, ensureRaf])
   markerTapRef.current = handleMarkerTap
 
   // One-time map init. Sources/layers are added on the 'load' event so
@@ -3369,7 +3418,7 @@ const CircleMap = React.forwardRef(function CircleMap (
     // also covers re-tapping the empty centre of a spread cluster).
     map.on('click', () => {
       if (expandedClusterRef.current) {
-        expandedClusterRef.current = null
+        setExpandedCluster(null)
         applyLayout(map, markerStatesRef.current, layoutCtxRef.current)
         ensureRaf()
       }
@@ -4038,6 +4087,7 @@ function applyLayout (map, states, ctx) {
     // The spread cluster dissolved (zoomed in, or members moved/left).
     ctx.expandedClusterRef.current = null
     expandedKey = null
+    ctx.onCollapse?.()
   }
 
   let startedEase = false
