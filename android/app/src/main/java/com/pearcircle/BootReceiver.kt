@@ -49,7 +49,10 @@ class BootReceiver : BroadcastReceiver() {
         }
 
         try {
-            PearCircleLocationService.start(context)
+            // fromBoot = true: no Activity behind this start, so the FGS must
+            // bring the worklet up headlessly (BackendHeadlessTaskService),
+            // otherwise location streams into a dead bridge. Proposal 2026-06-09.
+            PearCircleLocationService.start(context, fromBoot = true)
             Log.i(TAG, "resumed foreground service after $action")
         } catch (e: Exception) {
             // ForegroundServiceStartNotAllowedException (API 31+) or a

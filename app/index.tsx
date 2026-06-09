@@ -10,6 +10,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Notifications from 'expo-notifications'
 import * as Haptics from 'expo-haptics'
 import AsyncStorage from '@react-native-async-storage/async-storage'
+import { makeStartLock, autostartGateValue } from '@/src/lib/backendBootstrap'
 
 const { PearCircleLocation } = NativeModules
 
@@ -310,6 +311,34 @@ let _locationListenerSet = false
 // enough; the region event is the one-shot signal that matters.
 let _pendingRegionEvents: object[] = []
 
+// WebView ref holder. emitEvent forwards worklet events to the UI, but the
+// backend now also runs without an Activity (the headless boot/update task,
+// proposal 2026-06-09) where there is no WebView at all. Module-scoping the
+// ref lets the native-action event handlers live at module scope and call
+// emitEvent unconditionally: it no-ops when no WebView is attached (headless)
+// and forwards when the Index component has mounted one. The Index component
+// points this at its ref on mount and clears it on unmount.
+let _webViewRef: { current: WebView | null } | null = null
+
+// Notification setup (channels + permission). Hoisted to module scope so the
+// headless path can kick it off and the `ready` FGS-start flow can await it
+// before startUpdates, exactly as the Activity path did via a component ref.
+let _notifSetupReady: Promise<void> = Promise.resolve()
+
+// iOS first-run location priming gate (Activity path only; iOS never runs
+// headless). Module-scoped because the `ready` native handler sets it and the
+// WebView's shell:permission:proceed clears it -- both now outside the Index
+// component's closure.
+let _pendingLocationStart = false
+
+function emitEvent(event: string, data: any) {
+  // Optional-chains through a possibly-null ref/current so a headless backend
+  // (no WebView) is a safe no-op rather than a crash.
+  _webViewRef?.current?.injectJavaScript(
+    `window.__pearEvent(${JSON.stringify(event)}, ${JSON.stringify(data ?? null)}); true;`
+  )
+}
+
 function ensureLocationListener() {
   if (_locationListenerSet) return
   if (!PearCircleLocation) return
@@ -435,6 +464,154 @@ async function startWorklet() {
   }
 }
 
+// The one-time FGS / location-permission bring-up, fired off the worklet's
+// `ready` event. Factored to module scope (was the Index component's
+// onReadyOnce) so the headless boot/update path runs it too. iOS keeps the
+// first-run priming-modal gate; Android awaits notification setup first so
+// the POST_NOTIFICATIONS and FINE_LOCATION dialogs don't race a shared
+// PermissionListener. On Android it also mirrors sharing state into the
+// native autostart gate so a subsequent reboot can resume without the JS
+// context (proposal 2026-06-09).
+async function onBackendReady(data: any) {
+  if (Platform.OS === 'android') {
+    const gate = autostartGateValue(data, 'sharingAnyEnabled')
+    if (gate.write) PearCircleLocation?.setAutostartEnabled?.(gate.value).catch(() => {})
+  }
+  if (data?.sharingAnyEnabled === false) return
+  if (Platform.OS === 'ios') {
+    try {
+      const status: string = await PearCircleLocation.getAuthorizationStatus?.()
+      if (status === 'notDetermined') {
+        // Stash the resolver; WebView's Continue button triggers the actual start.
+        _pendingLocationStart = true
+        emitEvent('permission:prime', { reason: 'first-time' })
+        return  // wait for shell:permission:proceed
+      }
+      // Already determined (any state): start updates, then publish status.
+      await PearCircleLocation.startUpdates?.()
+      const post: string = await PearCircleLocation.getAuthorizationStatus?.()
+      emitEvent('permission:status', { status: post })
+    } catch (e: any) {
+      console.warn('startUpdates failed', e?.message)
+    }
+    return
+  }
+  // Android: existing flow. Emit permission:status after the request
+  // resolves so the home banner can nudge "Allow only while using the app"
+  // users toward Settings -> "Allow all the time". We await notif setup
+  // first so the POST_NOTIFICATIONS dialog resolves before FINE_LOCATION --
+  // otherwise the two share a PermissionListener and the wrong grant result
+  // can start the FGS without location permission, crashing on Android 14+.
+  try {
+    await _notifSetupReady
+    await PearCircleLocation.startUpdates?.()
+    const post: string = await PearCircleLocation.getAuthorizationStatus?.()
+    if (typeof post === 'string') emitEvent('permission:status', { status: post })
+  } catch (e: any) {
+    console.warn('startUpdates failed', e?.message)
+  }
+}
+
+// Native-action worklet handlers: the side of the IPC that touches OS
+// surfaces (foreground service, notifications, CLLocationManager) and the
+// local caches the notification formatters read. Registered once, by the
+// shared bootstrap, so they run in BOTH the Activity path and the headless
+// boot/update path. The WebView/UI-forwarding handlers (emitEvent-only) are
+// attached separately by the Index component and only exist when it mounts.
+function registerNativeActionHandlers() {
+  // ready: capture our pubkey for self-notification suppression and seed the
+  // worklet's adaptive-location app-foreground state (AppState only fires on
+  // change, so without this push the worklet wouldn't know the foreground
+  // state until the first background/foreground cycle).
+  onEvent('ready', (data) => {
+    if (data?.publicKey && typeof data.publicKey === 'string') _ourPubkey = data.publicKey
+    sendToWorklet({ method: 'app:state', args: { state: AppState.currentState } })
+  })
+  onEvent('ready', onBackendReady)
+
+  // FGS lifecycle + autostart gate. When every circle is muted, stop the
+  // native foreground location service so the persistent notification
+  // disappears and the OS can reclaim wake-locks; resume when any circle
+  // flips back on. The worklet computes anyEnabled (including the
+  // zero-circles-default-on case). The UI-side emitEvent('sharing:changed')
+  // is a separate handler in Index.
+  onEvent('sharing:changed', async (data) => {
+    if (Platform.OS === 'android') {
+      const gate = autostartGateValue(data, 'anyEnabled')
+      if (gate.write) PearCircleLocation?.setAutostartEnabled?.(gate.value).catch(() => {})
+    }
+    if (typeof data?.anyEnabled !== 'boolean') return
+    if (Platform.OS !== 'ios' && Platform.OS !== 'android') return
+    try {
+      if (data.anyEnabled) await PearCircleLocation?.startUpdates?.()
+      else await PearCircleLocation?.stopUpdates?.()
+    } catch (e: any) {
+      console.warn('FGS toggle on sharing:changed failed', e?.message ?? String(e))
+    }
+  })
+
+  // Geofence transitions: fire the OS notification for a peer (not us) on an
+  // unmuted place. Trip-completion and membership join/leave notifications
+  // likewise; the worklet owns the freshness / dedup / self / anchor gates,
+  // the shell just formats and posts.
+  onEvent('transition:applied', (data) => { fireTransitionNotification(data) })
+  onEvent('peerTrip:completed', (data) => { firePeerTripNotification(data) })
+  onEvent('member:joined', (data) => { fireMembershipNotification(data, 'memberJoined') })
+  onEvent('member:left', (data) => { fireMembershipNotification(data, 'memberLeft') })
+  // Keep the local trip-notification-enabled cache fresh so headless trip
+  // notifications respect the toggle. The UI forwarding is separate in Index.
+  onEvent('tripNotifications:changed', (data) => {
+    if (data && typeof data.enabled === 'boolean') _tripNotificationsEnabled = data.enabled
+  })
+
+  // Worklet asks the shell to reconcile the iOS CLCircularRegion set with its
+  // current places (iOS-only; Android no-ops here). Capped to <=20 by the
+  // worklet (Apple's limit). Non-fatal: the JS classifier still covers the
+  // foreground / backgrounded case via location:update.
+  onEvent('regions:set', async (data) => {
+    if (Platform.OS !== 'ios' || !PearCircleLocation?.setMonitoredRegions) return
+    const regions = Array.isArray(data?.regions) ? data.regions : []
+    try { await PearCircleLocation.setMonitoredRegions(regions) }
+    catch (e: any) { console.warn('setMonitoredRegions failed', e?.message ?? String(e)) }
+  })
+  // Adaptive location mode (proposal 2026-05-16): worklet flips the native
+  // CLLocationManager between SLC-only ("idle") and SLC+continuous
+  // ("tracking"). iOS only; Android has its own knobs.
+  onEvent('location:mode:set', async (data) => {
+    if (Platform.OS !== 'ios' || !PearCircleLocation?.setMode) return
+    const mode = data?.mode
+    if (mode !== 'idle' && mode !== 'tracking') return
+    try { await PearCircleLocation.setMode(mode) }
+    catch (e: any) { console.warn('setMode failed', e?.message ?? String(e)) }
+  })
+}
+
+// Idempotent, serialized backend bring-up shared by the Activity mount and
+// the headless boot/update task (proposal 2026-06-09). makeStartLock is the
+// process-level start lock on top of the worklet's _workletStarted singleton:
+// a near-simultaneous Activity-mount and headless-task cannot both pass the
+// guard and open the Autobase writer core twice (the single-writer hazard).
+// Registers only the native-action handlers; the WebView/UI-forwarding
+// handlers are attached by Index when it mounts. Also brings up the location
+// IPC listener and the notification channels + local caches the notification
+// formatters read, so a boot-resumed backend can still fire notifications.
+export const ensureBackendStarted = makeStartLock(async () => {
+  ensureLocationListener()
+  registerNativeActionHandlers()
+  // Notification channels + permission. Stash the promise so onBackendReady
+  // can await it before Android startUpdates. Non-fatal.
+  _notifSetupReady = ensureNotifications().catch((e) => {
+    console.warn('notif setup failed', e?.message ?? String(e))
+  })
+  // Local caches read by the notification formatters: muted places and the
+  // distance-unit preference. Safe before the worklet is ready.
+  loadMutes().catch(() => {})
+  AsyncStorage.getItem(DISTANCE_UNIT_KEY).then((raw) => {
+    _distanceUnitPref = raw === 'miles' ? 'miles' : 'km'
+  }).catch(() => {})
+  await startWorklet()
+})
+
 function buildHtml(jsBundle: string) {
   // Platform identifier injected before the JS bundle runs so the WebView
   // can branch on it (e.g. About page hides Support development on iOS
@@ -478,21 +655,10 @@ export default function Index() {
   const webViewLoaded = useRef(false)
   const pendingDeeplink = useRef<string | null>(null)
   const pendingNotificationFocus = useRef<{ circleId: string; pubkey: string } | null>(null)
-  // True while the iOS priming modal is up — startUpdates hasn't been
-  // called yet because we're waiting for the user's Continue tap. The
-  // WebView's shell:permission:proceed IPC flips this back to false and
-  // kicks off the actual permission request + status emit.
-  const pendingLocationStart = useRef<boolean>(false)
   // QR scanner is a JS-driven modal that resolves a pending shell:scanQr
   // IPC call when the camera reads a code (or the user cancels).
   const [scannerVisible, setScannerVisible] = useState(false)
   const scanResolveRef = useRef<((value: string | null) => void) | null>(null)
-  // Promise resolved when ensureNotifications() completes (whether the
-  // user granted, denied, or skipped). The worklet `ready` handler
-  // awaits this on Android before calling startUpdates so the two
-  // runtime permission requests don't race through a single shared
-  // PermissionListener.
-  const notifSetupReadyRef = useRef<Promise<void>>(Promise.resolve())
   // Status bar icon tint. 'light-content' (white icons) is the default
   // because most of the app is dark-themed. The home view with the
   // light map tiles flips it to 'dark-content' via shell:statusBar:set
@@ -502,7 +668,14 @@ export default function Index() {
 
   useEffect(() => {
     shellMark('shell:mount')
-    startWorklet().catch((e) => console.warn('worklet start failed', e))
+    // Point the module-level emitEvent at this WebView so the native-action
+    // handlers (registered by ensureBackendStarted, possibly already running
+    // from a headless start) can forward to the UI once it mounts.
+    _webViewRef = webViewRef
+    // Shared, idempotent backend bring-up. Registers the native-action
+    // worklet handlers and starts the worklet; safe if the headless boot
+    // task already started it (the start lock returns the same promise).
+    ensureBackendStarted().catch((e: any) => console.warn('backend start failed', e))
     loadUiHtml().then((h) => { shellMark('ui:html-ready'); setHtml(h) }).catch((e) => console.warn('UI bundle load failed', e))
 
     const sub = AppState.addEventListener('change', (s) => {
@@ -551,18 +724,14 @@ export default function Index() {
       }
     })
 
-    // Forward worklet events to the WebView so the UI can react.
+    // WebView/UI-forwarding handlers ONLY. The native-action side of these
+    // events (FGS toggle, OS notifications, region/mode native calls, the
+    // ready app:state seed + pubkey capture) is registered by
+    // ensureBackendStarted's registerNativeActionHandlers so it runs in the
+    // headless boot/update path too. Multiple handlers per event are
+    // supported (onEvent appends), so these coexist with the native ones.
     onEvent('ready', (data) => {
       shellMark('worklet:ready-received')
-      // Capture our pubkey so transition:applied can suppress self-notifications.
-      if (data?.publicKey && typeof data.publicKey === 'string') _ourPubkey = data.publicKey
-      // Seed the worklet's adaptive-location app-foreground state
-      // (proposal 2026-05-21). AppState.addEventListener only fires on
-      // change, so without this initial push the worklet wouldn't know
-      // the app is foregrounded until the first background/foreground
-      // cycle -- and a cold launch is exactly when foreground tracking
-      // matters most.
-      sendToWorklet({ method: 'app:state', args: { state: AppState.currentState } })
       emitEvent('ready', data)
     })
     // Phase-4 device verification side-channel: write the worklet's
@@ -584,31 +753,6 @@ export default function Index() {
     })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
-    // Worklet asks the shell to reconcile the iOS CLCircularRegion set
-    // with its current places. Phase 1 is iOS-only; Android no-ops
-    // here (Phase 2 wires GeofencingClient through the same event
-    // shape). data.regions is already capped to <=20 by the worklet
-    // since that's Apple's hard limit. Failure is non-fatal: the JS
-    // classifier still covers the foreground / backgrounded case
-    // through location:update; this path only adds wake-from-killed.
-    onEvent('regions:set', async (data) => {
-      if (Platform.OS !== 'ios' || !PearCircleLocation?.setMonitoredRegions) return
-      const regions = Array.isArray(data?.regions) ? data.regions : []
-      try { await PearCircleLocation.setMonitoredRegions(regions) }
-      catch (e: any) { console.warn('setMonitoredRegions failed', e?.message ?? String(e)) }
-    })
-    // Adaptive location mode (proposal 2026-05-16). Worklet asks the
-    // native CLLocationManager to switch between SLC-only ("idle") and
-    // SLC+continuous ("tracking") based on trip-detection phase. iOS
-    // only; Android FusedLocationProvider has its own knobs and is
-    // tracked separately.
-    onEvent('location:mode:set', async (data) => {
-      if (Platform.OS !== 'ios' || !PearCircleLocation?.setMode) return
-      const mode = data?.mode
-      if (mode !== 'idle' && mode !== 'tracking') return
-      try { await PearCircleLocation.setMode(mode) }
-      catch (e: any) { console.warn('setMode failed', e?.message ?? String(e)) }
-    })
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
     // Circle-repair lifecycle, so the UI's repair / Repairing… banners flip
     // promptly instead of waiting on the next circles:getAll poll.
@@ -621,22 +765,7 @@ export default function Index() {
     // forwarded for any UI that wants an optimistic refresh.
     onEvent('seeder:admitted', (data) => emitEvent('seeder:admitted', data))
     onEvent('seeder:revoked', (data) => emitEvent('seeder:revoked', data))
-    onEvent('sharing:changed', async (data) => {
-      emitEvent('sharing:changed', data)
-      // FGS lifecycle: when every circle is muted, stop the native
-      // foreground location service so the persistent notification
-      // disappears and the OS can reclaim the wake-locks. Resume when
-      // any circle flips back on. Worklet computes anyEnabled for us
-      // (including the zero-circles-default-on case).
-      if (typeof data?.anyEnabled !== 'boolean') return
-      if (Platform.OS !== 'ios' && Platform.OS !== 'android') return
-      try {
-        if (data.anyEnabled) await PearCircleLocation?.startUpdates?.()
-        else await PearCircleLocation?.stopUpdates?.()
-      } catch (e: any) {
-        console.warn('FGS toggle on sharing:changed failed', e?.message ?? String(e))
-      }
-    })
+    onEvent('sharing:changed', (data) => emitEvent('sharing:changed', data))
     // Owner tear-down notice (proposal amendment 2026-05-07). The worklet
     // suppresses this on the owner's own device, so we only see it when
     // a peer's circle has been deleted by its owner. UI surfaces a
@@ -645,44 +774,7 @@ export default function Index() {
     // Owner removed this member from a circle (proposal 2026-05-03 §3).
     // Same UI path as circle:deleted -- one-time notice, then cleanup.
     onEvent('circle:removed-self', (data) => emitEvent('circle:removed-self', data))
-    // Geofence transitions land here; fire OS notification if it's a peer
-    // (not us) and the place isn't muted on this device.
-    onEvent('transition:applied', (data) => { fireTransitionNotification(data) })
-    // Trip-completion notifications for peers in opted-in trip-sharing
-    // circles. The worklet already filters self, freshness, and the
-    // distance/duration threshold; the shell formats with the user's
-    // distance-unit preference and gates on the local mute toggle.
-    onEvent('peerTrip:completed', (data) => { firePeerTripNotification(data) })
-    // Member joined / left a circle ("Jane joined Family"). Worklet owns
-    // the freshness / dedup / self / anchor gates; shell just posts it.
-    onEvent('member:joined', (data) => { fireMembershipNotification(data, 'memberJoined') })
-    onEvent('member:left', (data) => { fireMembershipNotification(data, 'memberLeft') })
-    onEvent('tripNotifications:changed', (data) => {
-      if (data && typeof data.enabled === 'boolean') _tripNotificationsEnabled = data.enabled
-      emitEvent('tripNotifications:changed', data)
-    })
-
-    // Notification setup runs in parallel with worklet startup; it's
-    // independent and either order is fine. We stash the promise so the
-    // worklet's `ready` handler can await it before calling startUpdates
-    // -- on Android, expo-notifications' POST_NOTIFICATIONS dialog and
-    // our native FINE_LOCATION request both go through the activity's
-    // single in-flight PermissionListener, and racing them on fresh
-    // install lets the wrong listener receive the wrong grant result,
-    // which auto-starts the location FGS without permission and crashes
-    // (Android 14+ rejects FGS type=location without runtime grant).
-    // Resolving the notifications grant first eliminates the race.
-    loadMutes().catch(() => {})
-    // Seed the distance-unit cache for firePeerTripNotification. Same
-    // value the WebView hydrates from shell:distanceUnit:get; reading
-    // straight from AsyncStorage avoids a round-trip and is safe before
-    // the worklet is ready.
-    AsyncStorage.getItem(DISTANCE_UNIT_KEY).then((raw) => {
-      _distanceUnitPref = raw === 'miles' ? 'miles' : 'km'
-    }).catch(() => {})
-    notifSetupReadyRef.current = ensureNotifications().catch((e) => {
-      console.warn('notif setup failed', e)
-    })
+    onEvent('tripNotifications:changed', (data) => emitEvent('tripNotifications:changed', data))
 
     // Deep links: pear://pearcircle/join?... and https equivalent.
     Linking.getInitialURL().then((url) => {
@@ -735,7 +827,13 @@ export default function Index() {
       return true
     })
 
-    return () => { sub.remove(); linkSub.remove(); notifSub.remove(); backSub.remove() }
+    return () => {
+      // Detach the UI from the module-level emitEvent so a torn-down WebView
+      // isn't written to. The backend (worklet + native handlers) keeps
+      // running -- the FGS, not the Activity, is its lifecycle anchor.
+      _webViewRef = null
+      sub.remove(); linkSub.remove(); notifSub.remove(); backSub.remove()
+    }
   }, [])
 
   const deliverDeeplink = (url: string) => {
@@ -766,72 +864,6 @@ export default function Index() {
       pendingNotificationFocus.current = null
     }
   }
-
-  useEffect(() => {
-    if (Platform.OS !== 'android' && Platform.OS !== 'ios') return
-    if (!PearCircleLocation) return
-
-    ensureLocationListener()
-
-    // Auto-start the foreground service unless every circle is muted.
-    // The worklet emits `sharingAnyEnabled` on the `ready` event before
-    // any user interaction (zero-circles defaults to true). We listen
-    // once and start (or skip) accordingly. The shell also reacts to
-    // later `sharing:changed` events to start/stop on user toggles.
-    //
-    // On iOS we gate the FIRST startUpdates behind a priming screen:
-    // before the system dialog fires (which can only happen once per
-    // install), we surface a WebView modal explaining why "Always" is
-    // needed. The user taps Continue → shell:permission:proceed IPC →
-    // startUpdates → status emitted to WebView so the home banner can
-    // nudge declined / WhenInUse-stuck users toward Settings.
-    // Android skips the priming (no equivalent permission tier) and
-    // the existing FusedLocation runtime-permission flow handles itself.
-    const onReadyOnce = async (data: any) => {
-      if (data?.sharingAnyEnabled === false) return
-      if (Platform.OS === 'ios') {
-        try {
-          const status: string = await PearCircleLocation.getAuthorizationStatus?.()
-          if (status === 'notDetermined') {
-            // Stash the resolver; WebView's Continue button triggers the actual start.
-            pendingLocationStart.current = true
-            emitEvent('permission:prime', { reason: 'first-time' })
-            return  // wait for shell:permission:proceed
-          }
-          // Already determined (any state): start updates, then publish status.
-          await PearCircleLocation.startUpdates?.()
-          const post: string = await PearCircleLocation.getAuthorizationStatus?.()
-          emitEvent('permission:status', { status: post })
-        } catch (e: any) {
-          console.warn('startUpdates failed', e?.message)
-        }
-        return
-      }
-      // Android: existing flow. Emit permission:status after the
-      // request resolves so the home banner can nudge "Allow only
-      // while using the app" users toward Settings → "Allow all the
-      // time" (background-location parity with iOS Always). We await
-      // notifSetupReadyRef first so the POST_NOTIFICATIONS dialog
-      // resolves before we kick off FINE_LOCATION -- otherwise the
-      // two share a PermissionListener and the wrong grant result can
-      // start the FGS without location permission, crashing the
-      // process on Android 14+.
-      try {
-        await notifSetupReadyRef.current
-        await PearCircleLocation.startUpdates?.()
-        const post: string = await PearCircleLocation.getAuthorizationStatus?.()
-        if (typeof post === 'string') emitEvent('permission:status', { status: post })
-      } catch (e: any) {
-        console.warn('startUpdates failed', e?.message)
-      }
-    }
-    onEvent('ready', onReadyOnce)
-
-    // Deliberately no cleanup: the location listener survives activity
-    // destruction (set up at module scope), and the foreground service
-    // is meant to keep running too. Stopping is an explicit user
-    // action (the sharing toggle).
-  }, [])
 
   const onMessage = async (e: any) => {
     let msg: any
@@ -1046,8 +1078,8 @@ export default function Index() {
       // Don't Allow, Allow Once), we then publish the post-decision
       // status so the home banner can react.
       if (Platform.OS !== 'ios') { respond(msg.id, { ok: false, reason: 'not_ios' }); return }
-      if (!pendingLocationStart.current) { respond(msg.id, { ok: false, reason: 'not_pending' }); return }
-      pendingLocationStart.current = false
+      if (!_pendingLocationStart) { respond(msg.id, { ok: false, reason: 'not_pending' }); return }
+      _pendingLocationStart = false
       try {
         await PearCircleLocation?.startUpdates?.()
         const post: string = await PearCircleLocation?.getAuthorizationStatus?.()
@@ -1276,12 +1308,6 @@ export default function Index() {
   const respond = (id: number, result: any) => {
     webViewRef.current?.injectJavaScript(
       `window.__pearResponse(${id}, ${JSON.stringify(result ?? null)}); true;`
-    )
-  }
-
-  const emitEvent = (event: string, data: any) => {
-    webViewRef.current?.injectJavaScript(
-      `window.__pearEvent(${JSON.stringify(event)}, ${JSON.stringify(data ?? null)}); true;`
     )
   }
 

@@ -72,8 +72,20 @@ class PearCircleLocationService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
         startLocationUpdates()
+        // Boot/update resume (issue #89, proposal 2026-06-09): when started
+        // from the BootReceiver there is no Activity and therefore no React
+        // context or worklet -- location would stream into a dead bridge. Now
+        // that we are a running foreground service (foreground procstate), it
+        // is permitted to start the headless task that brings the worklet up,
+        // even on Android 12+ where a background service start would be
+        // refused. Idempotent: the JS start lock no-ops if the Activity
+        // already started the backend, so the normal app-open path (no
+        // EXTRA_FROM_BOOT) skips this and avoids spinning a redundant task.
+        if (intent?.getBooleanExtra(EXTRA_FROM_BOOT, false) == true) {
+            BackendHeadlessTaskService.ensureStarted(applicationContext)
+        }
         // START_STICKY: if the OS kills us under memory pressure, retry
-        // when resources free up. Cold-start-from-boot is a separate slice.
+        // when resources free up.
         return START_STICKY
     }
 
@@ -206,9 +218,17 @@ class PearCircleLocationService : Service() {
     companion object {
         private const val CHANNEL_ID = "pearcircle_location"
         private const val NOTIFICATION_ID = 4710
+        // Set by the BootReceiver so onStartCommand knows there is no Activity
+        // behind this start and must bring the worklet up headlessly. Absent
+        // (false) on the normal app-open path, where the Activity owns the
+        // worklet. Proposal 2026-06-09.
+        const val EXTRA_FROM_BOOT = "from_boot"
 
-        fun start(ctx: Context) {
+        fun start(ctx: Context) = start(ctx, false)
+
+        fun start(ctx: Context, fromBoot: Boolean) {
             val intent = Intent(ctx, PearCircleLocationService::class.java)
+            if (fromBoot) intent.putExtra(EXTRA_FROM_BOOT, true)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)
             } else {
