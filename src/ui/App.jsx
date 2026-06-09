@@ -2583,7 +2583,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         style={{
           position: 'absolute',
           left: 16,
-          bottom: `calc(env(safe-area-inset-bottom, 0px) + 16px)`,
+          bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 16px)`,
           width: 44, height: 44, borderRadius: '50%',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(26,26,26,0.92)',
@@ -2618,7 +2618,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         style={{
           position: 'absolute',
           right: 16,
-          bottom: `calc(env(safe-area-inset-bottom, 0px) + 16px)`,
+          bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 16px)`,
           width: 44, height: 44, borderRadius: '50%',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(26,26,26,0.92)',
@@ -2650,7 +2650,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         style={{
           position: 'absolute',
           right: 16,
-          bottom: `calc(env(safe-area-inset-bottom, 0px) + 72px)`,
+          bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 72px)`,
           width: 44, height: 44, borderRadius: '50%',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(26,26,26,0.92)',
@@ -6687,9 +6687,10 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
   // this, a ConfirmSheet mounted from inside Settings ends up positioned
   // relative to the SheetContainer rather than the viewport, and the
   // bottom edge can land short of the actual screen bottom).
-  // Bottom padding includes env(safe-area-inset-bottom) so on gesture-nav
-  // devices the sheet's last interactive element doesn't crowd the home
-  // indicator; falls back to a flat 32px on hardware without insets.
+  // Bottom padding clears the system nav bar / home indicator. Uses
+  // max(env(safe-area-inset-bottom), --android-nav-inset): stock Android
+  // WebView reports env() as 0 for the nav bar, so the shell injects the
+  // real inset as --android-nav-inset and we take whichever is larger.
   return createPortal(
     <div
       style={{
@@ -6708,7 +6709,7 @@ function BottomSheet ({ onClose, children, zIndex = 200 }) {
           color: colors.text.primary,
           borderRadius: '20px 20px 0 0',
           maxHeight: '85dvh', overflowY: 'auto', overflowX: 'hidden',
-          padding: `0 16px calc(env(safe-area-inset-bottom, 0px) + 24px)`,
+          padding: `0 16px calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 24px)`,
           transform: `translateY(${translateY})`,
           transition: `transform ${DURATION}ms cubic-bezier(0.32,0.72,0,1)`,
           WebkitOverflowScrolling: 'touch',
@@ -7133,7 +7134,7 @@ const s = {
   // doesn't render dark text on a dark fab.
   fab: {
     position: 'absolute',
-    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)',
+    bottom: 'calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 20px)',
     left: '50%', transform: 'translateX(-50%)',
     padding: '10px 18px',
     background: 'rgba(26,26,26,0.92)', color: colorsRaw.text.primary,
@@ -7192,7 +7193,7 @@ const s = {
     // bottom inset). Inset the sides past the FAB columns so they remain
     // tappable even though the hint shares the same z.
     position: 'absolute', left: 72, right: 72,
-    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 76px)',
+    bottom: 'calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 76px)',
     padding: 14, background: 'rgba(26,26,26,0.92)',
     borderRadius: 10, color: '#ccc', fontSize: 14, lineHeight: 1.4,
     textAlign: 'center',

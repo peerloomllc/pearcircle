@@ -11,6 +11,7 @@ import * as Notifications from 'expo-notifications'
 import * as Haptics from 'expo-haptics'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { makeStartLock, autostartGateValue } from '@/src/lib/backendBootstrap'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 const { PearCircleLocation } = NativeModules
 
@@ -666,6 +667,26 @@ export default function Index() {
   // it knows whether the map is visible (vs a sheet covering it).
   const [statusBarStyle, setStatusBarStyle] = useState<'dark-content' | 'light-content'>('light-content')
 
+  // Android stock WebView reports env(safe-area-inset-bottom) as 0 for the
+  // navigation bar -- only the top (status bar) inset is propagated -- so the
+  // UI's bottom-anchored controls render behind the 3-button nav bar. We read
+  // the real bottom inset natively and inject it into the WebView as the
+  // --android-nav-inset CSS var; the UI takes max(env(), that var). iOS
+  // WKWebView reports env() correctly, so we leave the var unset there.
+  const insets = useSafeAreaInsets()
+  const injectNavInset = (bottom: number) => {
+    if (Platform.OS !== 'android') return
+    webViewRef.current?.injectJavaScript(
+      `document.documentElement.style.setProperty('--android-nav-inset', '${Math.round(bottom)}px'); true;`
+    )
+  }
+
+  // Re-inject when the inset changes after first paint (e.g. nav-mode or
+  // orientation change). The onLoad handler covers the initial injection.
+  useEffect(() => {
+    if (webViewLoaded.current) injectNavInset(insets.bottom)
+  }, [insets.bottom])
+
   useEffect(() => {
     shellMark('shell:mount')
     // Point the module-level emitEvent at this WebView so the native-action
@@ -855,6 +876,7 @@ export default function Index() {
   const onLoad = () => {
     shellMark('webview:loaded')
     webViewLoaded.current = true
+    injectNavInset(insets.bottom)
     if (pendingDeeplink.current) {
       emitEvent('deeplink:invite', { url: pendingDeeplink.current })
       pendingDeeplink.current = null
