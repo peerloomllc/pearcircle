@@ -63,6 +63,19 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         promise.resolve(true)
     }
 
+    // Native-readable mirror of the shell's "sharing enabled anywhere"
+    // state. The boot/update receiver reads this to decide whether to
+    // resume the foreground service without first paying to spin up the
+    // JS context. The shell writes it on every sharing:changed and on
+    // ready. Defaults false until the worklet has run once. Proposal
+    // 2026-06-09 (autostart on boot).
+    @ReactMethod
+    fun setAutostartEnabled(enabled: Boolean, promise: Promise) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_AUTOSTART, enabled).apply()
+        promise.resolve(true)
+    }
+
     // Battery optimization is the OEM/Doze gate that pauses the
     // foreground location service after extended idle. Asking the
     // user to exempt the app keeps sharing reliable but is opt-in
@@ -572,6 +585,15 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         // The fused provider can hang indefinitely on de-Googled ROMs.
         private const val GET_FIX_TIMEOUT_MS = 8000L
         @JvmStatic var instance: PearCircleLocationModule? = null
+
+        // Autostart gate, shared with BootReceiver. Proposal 2026-06-09.
+        const val PREFS = "pearcircle_autostart"
+        const val KEY_AUTOSTART = "autostart_enabled"
+
+        @JvmStatic
+        fun isAutostartEnabled(ctx: Context): Boolean =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_AUTOSTART, false)
 
         // True only when Google Play Services is present and usable, so
         // FusedLocationProvider will actually deliver fixes. The detection
