@@ -2043,6 +2043,17 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     mapApiRef.current?.fitAll()
   }, [data, selectedPubkey])
 
+  // Collapse any fanned-out avatar cluster when the active circle changes.
+  // The expanded cluster's key was computed from the previous circle's
+  // members, so after a pill switch the fan would otherwise linger (and
+  // orphan against markers that no longer exist) while the camera zooms to
+  // the new group. Unconditional and independent of the auto-zoom guard
+  // above so it also fires when a member is focused. collapseCluster no-ops
+  // when nothing is spread, including the initial mount.
+  useEffect(() => {
+    mapApiRef.current?.collapseCluster()
+  }, [selectedCircleId])
+
   const placesById = {}
   for (const p of data.places ?? []) placesById[p.id] = p
 
