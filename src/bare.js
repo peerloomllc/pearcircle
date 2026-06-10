@@ -357,6 +357,18 @@ let _tripNotificationsEnabled = true
 // establishes the baseline silently (no spurious enter on cold start).
 const _circlePlaces = new Map() // "{circleId}|{placeId}" → state
 
+// Last transition kind we actually appended per place, keyed
+// "{circleId}|{placeId}" → 'enter' | 'exit'. The in-memory classifier plus
+// applyRegionEvent already dedup the common case, but they can't span the
+// seams where two writer paths and a cold-boot restore disagree about the
+// running state (observed 2026-06-10: a phantom exit followed by two enters
+// for the same place in one circle, with no exit between). This guard makes
+// the invariant structural — appendTransition refuses to write the same kind
+// twice in a row for a place, so a duplicate enter/exit can never reach the
+// autobase regardless of which path raced. Seeded from the persisted
+// classification on boot; alternating real crossings always pass.
+const _lastAppendedKind = new Map()
+
 function trackPlace (circleId, place) {
   const key = circleId + '|' + place.id
   const existing = _circlePlaces.get(key)
@@ -375,6 +387,7 @@ function trackPlace (circleId, place) {
 
 function untrackPlace (circleId, placeId) {
   _circlePlaces.delete(circleId + '|' + placeId)
+  _lastAppendedKind.delete(circleId + '|' + placeId)
   // Drop the persisted classification too so deleted places don't leave
   // stale geofence: rows on _localDb (proposal 2026-05-30).
   if (_localDb) geofencePersist.deleteClassification(_localDb, circleId, placeId).catch(() => {})
@@ -405,6 +418,11 @@ async function restorePersistedClassification (circleId, placeId) {
     const restored = await geofencePersist.readClassification(_localDb, circleId, placeId)
     if (geofencePersist.shouldRestore(state.lastClassification, restored)) {
       state.lastClassification = restored
+      // Seed the same-kind append guard so a redundant native region:enter (or
+      // a re-baselined classifier) right after boot can't re-emit a transition
+      // we already wrote in the previous session. inside ⟺ last crossing was an
+      // enter; outside ⟺ exit. A genuine crossing flips the kind and passes.
+      _lastAppendedKind.set(circleId + '|' + placeId, restored === 'inside' ? 'enter' : 'exit')
     }
   } catch (e) {
     console.warn('[bare] restorePersistedClassification failed', e?.message)
@@ -997,7 +1015,9 @@ const handlers = {
     if (stamp > Date.now() + FUTURE_TS_TOLERANCE_MS) {
       throw new Error('ts is too far in the future')
     }
-    const transition = await appendTransition(base, placeId, kind, stamp)
+    // Manual fire (debug affordance): bypass the same-kind guard so a tester
+    // can re-emit a kind on demand, but still keep the guard's state in sync.
+    const transition = await appendTransition(base, placeId, kind, stamp, { circleId, force: true })
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
       await appendLastSeen(base, lat, lon, accuracy, stamp)
     }
@@ -2176,7 +2196,15 @@ async function safeSnapshot (circleId, base) {
   return value
 }
 
-async function appendTransition (base, placeId, kind, ts) {
+async function appendTransition (base, placeId, kind, ts, { circleId = circleIdForBase(base), force = false } = {}) {
+  // Same-kind dedup guard (2026-06-10). A place's transitions must strictly
+  // alternate enter/exit; two enters (or two exits) in a row are always a
+  // double-write from racing writer paths or a cold-boot re-baseline, never a
+  // real event. Refuse the redundant write here so the invariant holds no
+  // matter which path called us. `force` is for the manual debug fire, which
+  // is deliberately allowed to repeat a kind.
+  const gkey = (circleId || '') + '|' + placeId
+  if (!force && _lastAppendedKind.get(gkey) === kind) return null
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const value = signValue(
     { pubkey: ourKey, placeId, kind, ts, v: 1 },
@@ -2190,6 +2218,7 @@ async function appendTransition (base, placeId, kind, ts) {
     key: 'transition:' + ts + ':' + ourKey + ':' + placeId,
     value,
   }, 'transition')
+  _lastAppendedKind.set(gkey, kind)
   return value
 }
 
@@ -2244,7 +2273,7 @@ async function handleRegionEvent (kind, id, ts) {
   if (!base || !base.writable) return { ok: false, reason: 'no_base' }
   const stamp = typeof ts === 'number' ? ts : Date.now()
   try {
-    await appendTransition(base, placeId, kind, stamp)
+    await appendTransition(base, placeId, kind, stamp, { circleId })
     return { ok: true }
   } catch (e) {
     return { ok: false, error: e?.message }
@@ -2257,7 +2286,9 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
     if (!base || !base.writable) continue
     const dist = haversineMeters(lat, lon, state.lat, state.lon)
     const prev = state.lastClassification
-    const result = classify(dist, state.radiusMeters, prev)
+    // Pass the fix's accuracy so a low-confidence reading can't bounce an
+    // at-home user out of the radius and back in (phantom exit, 2026-06-10).
+    const result = classify(dist, state.radiusMeters, prev, accuracy)
     state.lastClassification = result.classification
     // Persist on any change of stored state, including the null->baseline
     // establishment, so the inside/outside is on disk to recover a crossing
@@ -2271,7 +2302,7 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
     // append. Peers in muted circles don't see this transition.
     if (!getCircleSharing(state.circleId).enabled) continue
     try {
-      await appendTransition(base, state.placeId, result.kind, ts)
+      await appendTransition(base, state.placeId, result.kind, ts, { circleId: state.circleId })
       // Pass battery so the post-transition lastSeen write stays byte-
       // identical to the location:update one (autobase apply dedupes).
       await appendLastSeen(base, lat, lon, accuracy, ts, battery)
@@ -2480,6 +2511,9 @@ async function tearDownCircleLocally (circleId) {
   _lastSentLastknownSig.delete(circleId)
   for (const key of Array.from(_circlePlaces.keys())) {
     if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
+  }
+  for (const key of Array.from(_lastAppendedKind.keys())) {
+    if (key.startsWith(circleId + '|')) _lastAppendedKind.delete(key)
   }
   // Clear per-circle sharing state so a fresh re-join starts on the
   // default (enabled) and any pending auto-resume timer doesn't fire
@@ -4396,6 +4430,7 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // spurious "arrived". This runs before _initialized flips, so it always
   // completes before any location:update is processed.
   _circlePlaces.clear()
+  _lastAppendedKind.clear()
   for (const [circleId, base] of _circleBases) {
     try {
       for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
