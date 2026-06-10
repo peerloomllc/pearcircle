@@ -31,14 +31,33 @@ function haversineMeters (lat1, lon1, lat2, lon2) {
 //   'inside'   — last observation was within the radius
 //   'outside'  — last observation was outside the radius
 //
+// `accuracy` (optional, metres) is the fix's own horizontal error estimate.
+// When present it becomes a hysteresis margin on the EXIT side: an already-
+// inside user must measure clear of `radius + min(accuracy, radius)` before
+// we register a departure. A single noisy fix (common when a phone sits
+// still at home and the GPS error balloons) reads tens of metres off the
+// real position; without the margin that lone fix bounces the user "outside"
+// and the next clean fix bounces them back, producing the phantom
+// "left … / arrived …" pair seen 2026-06-10. Margin is capped at the radius
+// so a garbage fix can't trap a user inside forever, and it is 0 when no
+// accuracy is supplied (older callers, unit tests) — preserving the plain
+// distance<=radius behaviour. Entry is intentionally NOT damped: we want
+// real arrivals to register promptly.
+//
 // Returns `{ classification, kind }` where kind is 'enter', 'exit', or null.
-function classify (distance, radius, prev) {
-  const inside = distance <= radius
-  const next = inside ? 'inside' : 'outside'
-  if (prev === null) return { classification: next, kind: null }
-  if (prev === 'outside' && inside) return { classification: next, kind: 'enter' }
-  if (prev === 'inside' && !inside) return { classification: next, kind: 'exit' }
-  return { classification: next, kind: null }
+function classify (distance, radius, prev, accuracy) {
+  const margin =
+    Number.isFinite(accuracy) && accuracy > 0 ? Math.min(accuracy, radius) : 0
+  if (prev === 'inside') {
+    if (distance > radius + margin) return { classification: 'outside', kind: 'exit' }
+    return { classification: 'inside', kind: null }
+  }
+  if (prev === 'outside') {
+    if (distance <= radius) return { classification: 'inside', kind: 'enter' }
+    return { classification: 'outside', kind: null }
+  }
+  // prev === null (or any non-inside/outside): silent baseline.
+  return { classification: distance <= radius ? 'inside' : 'outside', kind: null }
 }
 
 // Dedup helper for native CLCircularRegion / GeofencingClient events

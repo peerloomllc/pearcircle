@@ -60,6 +60,34 @@ describe('classify state machine', () => {
     expect(classify(100, 100, 'outside')).toEqual({ classification: 'inside', kind: 'enter' })
   })
 
+  describe('accuracy-aware exit hysteresis', () => {
+    test('a noisy fix just outside the radius does NOT fire a phantom exit', () => {
+      // At home, sitting still; one fix reads 120m off a 100m radius with 60m
+      // accuracy. radius + min(60,100) = 160; 120 <= 160 -> stay inside.
+      expect(classify(120, 100, 'inside', 60)).toEqual({ classification: 'inside', kind: null })
+    })
+
+    test('a confidently-outside fix still fires the exit', () => {
+      // 250m out with 30m accuracy: 250 > 100 + 30 -> real departure.
+      expect(classify(250, 100, 'inside', 30)).toEqual({ classification: 'outside', kind: 'exit' })
+    })
+
+    test('the margin is capped at the radius so a garbage fix cannot trap inside', () => {
+      // 1km accuracy would otherwise push the exit threshold to ~1.1km; the
+      // cap holds it at radius+radius = 200m, so 250m still exits.
+      expect(classify(250, 100, 'inside', 1000)).toEqual({ classification: 'outside', kind: 'exit' })
+    })
+
+    test('entry is not damped by accuracy (real arrivals register promptly)', () => {
+      expect(classify(90, 100, 'outside', 60)).toEqual({ classification: 'inside', kind: 'enter' })
+    })
+
+    test('zero/absent accuracy preserves the plain distance<=radius behaviour', () => {
+      expect(classify(120, 100, 'inside', 0)).toEqual({ classification: 'outside', kind: 'exit' })
+      expect(classify(120, 100, 'inside')).toEqual({ classification: 'outside', kind: 'exit' })
+    })
+  })
+
   test('a sequence simulating a walk produces the right transitions', () => {
     const radius = 100
     const points = [
