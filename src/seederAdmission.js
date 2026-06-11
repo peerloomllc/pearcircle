@@ -3,9 +3,9 @@
 // and the existing pair channel; protomux multiplexes them by protocol name.
 //
 // Wire: protocol 'pearcircle/seeder-admission/1', id = utf-8(circleId).
-// Three messages, added in the same order on both sides so protomux indexes
+// Four messages, added in the same order on both sides so protomux indexes
 // line up: [0] announce (seed -> member), [1] revoked (member -> seed),
-// [2] lastknownCores (member -> seed).
+// [2] lastknownCores (member -> seed), [3] writerCores (member -> seed).
 //
 // Roles:
 //   'seed'   — opened by a seed-mode worklet that has enrolled in this circle.
@@ -21,13 +21,15 @@
 //              caller passes revokedNotice (the circle has revoked this
 //              seeder), sends one { type:'revoked', circleId, revokedAt }
 //              message on channel open. Pushes the circle's per-member
-//              last-known core keys to the (blind) seeder so it can replicate
-//              + serve them for offline last-known; the seeder cannot read
-//              these from the encrypted view, so they travel out-of-band here.
+//              last-known core keys and per-member writer-core keys to the
+//              (blind) seeder so it can replicate + serve them; the seeder
+//              cannot read these from the encrypted view, so they travel
+//              out-of-band here.
 //
 // Proposal 2026-05-19-blind-seeder-peers slice 3d;
 // revocation notice added by proposal 2026-05-21-seeder-revocation-signal;
-// lastknownCores added by proposal 2026-06-04-lastseen-ephemeral slice 2b.
+// lastknownCores added by proposal 2026-06-04-lastseen-ephemeral slice 2b;
+// writerCores added by proposal 2026-05-19 slice 3d completion (2026-06-10).
 
 const Protomux = require('protomux')
 const c = require('compact-encoding')
@@ -53,7 +55,25 @@ function normalizeLastknownCores (msg) {
   return out
 }
 
-function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, label, version, onAnnounce, onRevoked, revokedNotice, onLastknownCores, mark }) {
+// Validate + normalize a writerCores payload into a clean [{ pubkey, coreKey }]
+// array (both hex64), where coreKey is a member's Autobase writer-core public
+// key. Same shape + cap as lastknownCores; kept separate so the two surfaces
+// stay independently testable. Pure. Proposal 2026-05-19 slice 3d completion.
+const WRITER_CORES_MAX = 256
+function normalizeWriterCores (msg) {
+  if (!msg || typeof msg !== 'object' || !Array.isArray(msg.cores)) return null
+  const out = []
+  for (const entry of msg.cores) {
+    if (out.length >= WRITER_CORES_MAX) break
+    if (!entry || typeof entry !== 'object') continue
+    if (typeof entry.pubkey !== 'string' || !HEX_64.test(entry.pubkey)) continue
+    if (typeof entry.coreKey !== 'string' || !HEX_64.test(entry.coreKey)) continue
+    out.push({ pubkey: entry.pubkey, coreKey: entry.coreKey })
+  }
+  return out
+}
+
+function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, label, version, onAnnounce, onRevoked, revokedNotice, onLastknownCores, onWriterCores, mark }) {
   if (role !== 'seed' && role !== 'member') {
     throw new Error('role must be "seed" or "member"')
   }
@@ -68,6 +88,7 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
   let announceMessage = null
   let revokeMessage = null
   let lastknownMessage = null
+  let writerMessage = null
 
   // Send a { cores: [{pubkey, coreKey}] } list on this channel (member role
   // only). Used for the on-open push and for re-pushes when the circle's known
@@ -81,6 +102,24 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
       return true
     } catch (e) {
       trace('admission:lastknown-send-failed', { err: e?.message ?? String(e) })
+      return false
+    }
+  }
+
+  // Send a { cores: [{pubkey, coreKey}] } list of per-member writer-core keys
+  // on this channel (member role only). The blind seeder opens + replicates
+  // each so it mirrors every member's contributions, not just the founder's
+  // bootstrap core. Re-pushed when the circle's writer set changes. Proposal
+  // 2026-05-19 slice 3d completion.
+  function sendWriterCores (cores) {
+    if (role !== 'member' || !writerMessage) return false
+    if (!Array.isArray(cores) || cores.length === 0) return false
+    try {
+      writerMessage.send({ cores })
+      trace('admission:writer-sent', { count: cores.length })
+      return true
+    } catch (e) {
+      trace('admission:writer-send-failed', { err: e?.message ?? String(e) })
       return false
     }
   }
@@ -210,9 +249,33 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
     },
   })
 
+  // [3] writerCores — member -> seed. The blind seeder can't enumerate the
+  // circle's writers from the encrypted view, so members hand it the per-member
+  // writer-core keys to replicate + serve. Without this the seeder mirrors only
+  // the founder's bootstrap core. Validated at the wire boundary; circleId is
+  // the trusted channel id, never carried in the body. Proposal 2026-05-19
+  // slice 3d completion.
+  writerMessage = channel.addMessage({
+    encoding: c.json,
+    onmessage: async (msg) => {
+      if (role !== 'seed') return
+      const cores = normalizeWriterCores(msg)
+      if (!cores || cores.length === 0) {
+        trace('admission:writer-rejected', { reason: 'bad-shape' })
+        return
+      }
+      trace('admission:writer-received', { count: cores.length })
+      try {
+        if (typeof onWriterCores === 'function') await onWriterCores({ circleId, cores })
+      } catch (e) {
+        trace('admission:onwriter-failed', { err: e?.message ?? String(e) })
+      }
+    },
+  })
+
   channel.open()
   trace('admission:channel-opened')
-  return { channel, sendRevoked, sendLastknownCores }
+  return { channel, sendRevoked, sendLastknownCores, sendWriterCores }
 }
 
-module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, normalizeLastknownCores }
+module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, normalizeLastknownCores, normalizeWriterCores }
