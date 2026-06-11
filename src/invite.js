@@ -81,8 +81,19 @@ function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, 
  * @param {string} url
  * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, bootstrap?: string, inviterPublicKey?: string, encryptionKey?: string|null, error?: string }}
  */
+// Tolerate a trailing slash before the query (e.g. ".../circle/join/?circle=..."),
+// which the app's own share links and some browsers/share sheets emit. The
+// deep-link path normalizes it; pasted links hit parse directly, so do it here. Pure.
+function stripPathTrailingSlash (url) {
+  for (const base of [HTTPS_HOST_PATH, PEAR_HOST_PATH, HTTPS_SEED_HOST_PATH, PEAR_SEED_HOST_PATH]) {
+    if (url.startsWith(base + '/?')) return base + '?' + url.slice((base + '/?').length)
+  }
+  return url
+}
+
 function parseInvite (url) {
   if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
+  url = stripPathTrailingSlash(url)
 
   let scheme, qs
   if (url.startsWith(HTTPS_HOST_PATH + '?')) {
@@ -183,6 +194,7 @@ function buildSeedInvite ({ circleId, name, circleKey, bootstrap, inviterPublicK
  */
 function parseSeedInvite (url) {
   if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
+  url = stripPathTrailingSlash(url)
 
   let scheme, qs
   if (url.startsWith(HTTPS_SEED_HOST_PATH + '?')) {

@@ -410,3 +410,28 @@ describe('seed invite bundle', () => {
     }
   })
 })
+
+// Proposal 2026-06-11 follow-up: app share links and some share sheets emit a
+// trailing slash before the query (".../circle/join/?circle=..."). The deep-link
+// path normalizes it; pasted links hit parse directly, so parse must tolerate it.
+describe('trailing-slash tolerance', () => {
+  test('parseInvite accepts a join link with a trailing slash before the query', () => {
+    const slashed = buildInvite({ ...VALID, encryptionKey: VALID_ENC }).replace('/join?', '/join/?')
+    expect(slashed).toContain('/circle/join/?')
+    const p = parseInvite(slashed)
+    expect(p.ok).toBe(true)
+    expect(p.circleId).toBe(VALID.circleId)
+    expect(p.encryptionKey).toBe(VALID_ENC)
+  })
+
+  test('parseSeedInvite accepts a seed link with a trailing slash', () => {
+    const p = parseSeedInvite(buildSeedInvite(VALID).replace('/seed?', '/seed/?'))
+    expect(p.ok).toBe(true)
+    expect(p.circleId).toBe(VALID.circleId)
+  })
+
+  test('the canonical no-slash form still parses', () => {
+    expect(parseInvite(buildInvite(VALID)).ok).toBe(true)
+    expect(parseSeedInvite(buildSeedInvite(VALID)).ok).toBe(true)
+  })
+})
