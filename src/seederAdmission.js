@@ -34,9 +34,30 @@
 const Protomux = require('protomux')
 const c = require('compact-encoding')
 const b4a = require('b4a')
+const sodium = require('sodium-universal')
 
-const SEEDER_ADMISSION_PROTOCOL = 'pearcircle/seeder-admission/1'
+// Bumped 1 -> 2 (proposal 2026-06-11-circleid-channel-binding): the channel id
+// is now derived from the circle's bootstrap, not its arbitrary circleId, so a
+// mislabeled circleId can't cross-pair two circles' admission channels. The id
+// change alone is the version boundary; the string bump just makes it explicit.
+const SEEDER_ADMISSION_PROTOCOL = 'pearcircle/seeder-admission/2'
 const HEX_64 = /^[0-9a-f]{64}$/i
+
+// Domain-separated so the admission channel id can never equal the swarm topic
+// (blake2b(circleKey)) even though both use blake2b.
+const ADMISSION_ID_LABEL = b4a.from('pearcircle/seeder-admission')
+
+// Derive the per-circle admission channel id from the bootstrap (the autobase
+// identity, unique per circle, known to both seed and member). blake2b, 32
+// bytes, matching the topicForCircleKey primitive. Pure.
+function admissionChannelId (bootstrapHex) {
+  if (typeof bootstrapHex !== 'string' || !HEX_64.test(bootstrapHex)) {
+    throw new Error('bootstrap must be a 64-char hex string (32 bytes)')
+  }
+  const out = b4a.allocUnsafe(32)
+  sodium.crypto_generichash(out, b4a.concat([ADMISSION_ID_LABEL, b4a.from(bootstrapHex, 'hex')]))
+  return out
+}
 
 // Validate + normalize a lastknownCores payload into a clean
 // [{ pubkey, coreKey }] array (both hex64). Drops malformed entries and caps
@@ -73,10 +94,13 @@ function normalizeWriterCores (msg) {
   return out
 }
 
-function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, label, version, onAnnounce, onRevoked, revokedNotice, onLastknownCores, onWriterCores, mark }) {
+function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederPubkey, label, version, onAnnounce, onRevoked, revokedNotice, onLastknownCores, onWriterCores, mark }) {
   if (role !== 'seed' && role !== 'member') {
     throw new Error('role must be "seed" or "member"')
   }
+  // Channel id is bound to the bootstrap, not the circleId (proposal
+  // 2026-06-11-circleid-channel-binding). circleId stays as a label for traces.
+  const channelId = admissionChannelId(bootstrap)
   const mux = Protomux.from(conn)
   const cidShort = circleId.slice(0, 8)
   const trace = (name, extra) => {
@@ -146,7 +170,7 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
 
   const channel = mux.createChannel({
     protocol: SEEDER_ADMISSION_PROTOCOL,
-    id: b4a.from(circleId),
+    id: channelId,
     onopen () {
       trace('admission:onopen')
       if (role === 'seed' && announceMessage) {
@@ -278,4 +302,4 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, seederPubkey, labe
   return { channel, sendRevoked, sendLastknownCores, sendWriterCores }
 }
 
-module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, normalizeLastknownCores, normalizeWriterCores }
+module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, admissionChannelId, normalizeLastknownCores, normalizeWriterCores }

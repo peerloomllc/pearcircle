@@ -817,6 +817,27 @@ const handlers = {
       _circlePeers.delete(circleId)
       throw new Error('this circle has been deleted by the owner')
     }
+    // circleId-binding guard (proposal 2026-06-11). The founder wrote the
+    // canonical id into the `circle` row at creation; if the invite's circleId
+    // disagrees, adopting it would diverge this device from every other member
+    // and silently break the per-circle protomux channels (pair / live / admin
+    // all key on circleId). A mismatch is always a malformed or stale invite,
+    // so reject rather than reconcile (reconciling means re-keying all local
+    // state). Only fires on a positive mismatch — if the row hasn't replicated
+    // yet (id undefined) we don't block the join.
+    const canonicalId = circleRow?.value?.id
+    if (typeof canonicalId === 'string' && canonicalId !== circleId) {
+      try {
+        const topic = topicForCircleKey(circleKey)
+        const topicHex = b4a.toString(topic, 'hex')
+        _topicToCircle.delete(topicHex)
+        _swarm?.leave(topic)
+      } catch {}
+      try { await base.close() } catch {}
+      _circleBases.delete(circleId)
+      _circlePeers.delete(circleId)
+      throw new Error('invite does not match this circle (malformed or stale invite)')
+    }
 
     const joinedAt = Date.now()
     const record = {
@@ -3163,7 +3184,10 @@ async function mountSeederCircle (enrollment) {
   // writerCores: coreKeyHex → a member's Autobase writer core (opened blind,
   // full history downloaded, so the seeder mirrors every member's contributions
   // and not just the founder's bootstrap. Proposal 2026-05-19 slice 3d.
-  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload, lastknownCores: new Map(), writerCores: new Map() })
+  // bootstrap kept on the entry so the per-connection admission setup
+  // (onSeederSwarmConnection) can derive the bootstrap-bound channel id without
+  // re-reading the enrolled row. Proposal 2026-06-11-circleid-channel-binding.
+  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload, bootstrap, lastknownCores: new Map(), writerCores: new Map() })
   mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8), authorityLength: core.length, contiguousLength: core.contiguousLength })
   // Open the seed-role admission channel for this circle on every
   // existing connection. New connections get it via onSeederSwarmConnection;
@@ -3176,6 +3200,7 @@ async function mountSeederCircle (enrollment) {
       conn,
       role: 'seed',
       circleId,
+      bootstrap,
       seederPubkey: seederPubkeyHex,
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
@@ -3389,6 +3414,9 @@ function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
     conn,
     role: 'member',
     circleId,
+    // base.key is this circle's bootstrap; the channel id binds to it so a
+    // mislabeled circleId can't cross-pair (2026-06-11-circleid-channel-binding).
+    bootstrap: b4a.toString(base.key, 'hex'),
     onAnnounce: (msg) => handleSeederAnnounce(circleId, base, msg, conn),
     revokedNotice: revokedNotice ?? null,
     mark,
@@ -4070,6 +4098,7 @@ function onSeederSwarmConnection (conn, info) {
       conn,
       role: 'seed',
       circleId,
+      bootstrap: enrollment?.bootstrap,
       seederPubkey: seederPubkeyHex,
       label: enrollment?.label,
       version: _seederVersion,
