@@ -793,7 +793,6 @@ const handlers = {
     // sometimes sits with no peers for tens of seconds and pre-existing
     // members appear "disconnected" until an app restart kicks the DHT.
     _circleBases.set(circleId, base)
-    openPairChannelsForCircle(circleId, base)
     const discovery = joinCircleTopic(circleId, circleKey)
     if (discovery && typeof discovery.flushed === 'function') {
       try { await discovery.flushed() } catch (e) {
@@ -828,6 +827,14 @@ const handlers = {
       _circlePeers.delete(circleId)
       throw new Error('invite does not match this circle (malformed or stale invite)')
     }
+
+    // Only now - the circle is confirmed real and not a franken - advertise our
+    // writer key over the pair channel. Doing this before the canonical-id check
+    // let a rejected franken join (for a circle we share an autobase with) get a
+    // junk writer admitted into the shared autobase before the rollback. The
+    // pair channel isn't needed for base.update above (that replicates over the
+    // connection-level corestore stream). Proposal 2026-06-11 follow-up.
+    openPairChannelsForCircle(circleId, base)
 
     const joinedAt = Date.now()
     const record = {
