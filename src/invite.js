@@ -238,4 +238,14 @@ function parseQuery (qs) {
   return params
 }
 
-module.exports = { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, NAME_MAX }
+// circleId-binding guard (proposal 2026-06-11-circleid-channel-binding). True
+// when a mounted circle's canonical id (the `circle` row's `id`, written by the
+// founder at creation) disproves the invite's circleId. An absent canonical id
+// (row not yet replicated) returns false - we only reject on a POSITIVE
+// mismatch, never block a join just because the view hasn't synced. Pure.
+function inviteCircleIdMismatch (inviteCircleId, circleRowValue) {
+  const canonical = circleRowValue && circleRowValue.id
+  return typeof canonical === 'string' && canonical !== inviteCircleId
+}
+
+module.exports = { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, inviteCircleIdMismatch, NAME_MAX }
