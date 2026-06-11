@@ -28,7 +28,7 @@ const Autobase = require('autobase')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
-const { buildInvite, parseInvite, buildSeedInvite } = require('./invite')
+const { buildInvite, parseInvite, buildSeedInvite, inviteCircleIdMismatch } = require('./invite')
 const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers, enrollSeedInvite } = require('./seeder')
 const { topicForCircleKey } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
@@ -823,10 +823,9 @@ const handlers = {
     // and silently break the per-circle protomux channels (pair / live / admin
     // all key on circleId). A mismatch is always a malformed or stale invite,
     // so reject rather than reconcile (reconciling means re-keying all local
-    // state). Only fires on a positive mismatch — if the row hasn't replicated
+    // state). Only fires on a positive mismatch - if the row hasn't replicated
     // yet (id undefined) we don't block the join.
-    const canonicalId = circleRow?.value?.id
-    if (typeof canonicalId === 'string' && canonicalId !== circleId) {
+    if (inviteCircleIdMismatch(circleId, circleRow?.value)) {
       try {
         const topic = topicForCircleKey(circleKey)
         const topicHex = b4a.toString(topic, 'hex')
