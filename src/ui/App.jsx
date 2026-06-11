@@ -7134,7 +7134,11 @@ const s = {
   // (any theme) and the dark scrim makes it readable against any tile.
   mapAttribution: { position: 'absolute', bottom: 4, right: 6, fontSize: 10, color: '#fff', background: 'rgba(0,0,0,0.5)', padding: '2px 6px', borderRadius: radius.sm, pointerEvents: 'none' },
   mapFirstRoot: { position: 'fixed', inset: 0, color: colors.text.primary, background: colors.surface.base, fontFamily: '-apple-system, system-ui, Roboto, sans-serif', overflow: 'hidden' },
-  mapFill: { position: 'absolute', inset: 0 },
+  // zIndex 0 forces a stacking context so MapLibre's per-marker z-index
+  // (applyStackMeta sets up to 30 for expanded / 25 for front avatars) stays
+  // confined under the floating chrome (pill z20, focus bar z6, gear z5)
+  // instead of leaking into the root context and painting over it.
+  mapFill: { position: 'absolute', inset: 0, zIndex: 0 },
   mapTopBar: {
     position: 'absolute', top: 0, left: 0, right: 0, zIndex: 5,
     display: 'flex', alignItems: 'center', gap: 8,
