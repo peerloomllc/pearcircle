@@ -805,13 +805,9 @@ const handlers = {
     } catch (e) { console.warn('[bare] base.update during join failed', e?.message) }
     const circleRow = await base.view.get('circle')
     if (circleRow?.value?.deleted) {
-      // Roll back: leave swarm, close base, clear in-memory state.
-      try {
-        const topic = topicForCircleKey(circleKey)
-        const topicHex = b4a.toString(topic, 'hex')
-        _topicToCircle.delete(topicHex)
-        _swarm?.leave(topic)
-      } catch {}
+      // Roll back: leave swarm (only if we own the topic), close base, clear
+      // in-memory state.
+      rollbackJoinTopic(circleId, circleKey)
       try { await base.close() } catch {}
       _circleBases.delete(circleId)
       _circlePeers.delete(circleId)
@@ -826,12 +822,7 @@ const handlers = {
     // state). Only fires on a positive mismatch - if the row hasn't replicated
     // yet (id undefined) we don't block the join.
     if (inviteCircleIdMismatch(circleId, circleRow?.value)) {
-      try {
-        const topic = topicForCircleKey(circleKey)
-        const topicHex = b4a.toString(topic, 'hex')
-        _topicToCircle.delete(topicHex)
-        _swarm?.leave(topic)
-      } catch {}
+      rollbackJoinTopic(circleId, circleKey)
       try { await base.close() } catch {}
       _circleBases.delete(circleId)
       _circlePeers.delete(circleId)
@@ -2469,6 +2460,22 @@ function joinCircleTopic (circleId, circleKey) {
   _topicToCircle.set(topicHex, circleId)
   if (!_circlePeers.has(circleId)) _circlePeers.set(circleId, new Set())
   return _swarm.join(topic, { server: true, client: true })
+}
+
+// Undo a joinCircleTopic done during a join that's being rolled back. Only
+// leaves the topic + drops its mapping if THIS circle owns the mapping. If the
+// topic is mapped to a different circle (e.g. a franken invite for a circle we
+// are already in - same circleKey, so joinCircleTopic no-op'd), leaving would
+// disconnect the legit membership. Proposal 2026-06-11 follow-up.
+function rollbackJoinTopic (circleId, circleKey) {
+  try {
+    const topic = topicForCircleKey(circleKey)
+    const topicHex = b4a.toString(topic, 'hex')
+    if (_topicToCircle.get(topicHex) === circleId) {
+      _topicToCircle.delete(topicHex)
+      _swarm?.leave(topic)
+    }
+  } catch {}
 }
 
 // Local teardown for a circle (proposal amendment 2026-05-07): leave the
