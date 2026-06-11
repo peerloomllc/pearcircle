@@ -649,8 +649,12 @@ async function loadUiHtml(): Promise<string> {
 }
 
 function isInviteUrl(url: string) {
-  return url.startsWith('pear://pearcircle/join?') ||
-         url.startsWith('https://peerloomllc.com/circle/join?')
+  // Tolerate an optional trailing slash before the query - app share links emit
+  // ".../circle/join/?circle=...". Without this, a tapped real invite link is
+  // silently dropped (no deeplink:invite event, no Join sheet) and the user just
+  // lands on the map. Mirrors parseInvite's stripPathTrailingSlash. The worklet
+  // re-normalizes on parse, so the slashed URL flows through fine.
+  return /^(pear:\/\/pearcircle\/join|https:\/\/peerloomllc\.com\/circle\/join)\/?\?/.test(url)
 }
 
 export default function Index() {
