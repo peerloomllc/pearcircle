@@ -1729,6 +1729,12 @@ function JoinView ({ onClose, onJoined, initialInvite }) {
       setJoining(false)
       if (r?.circleId) {
         onJoined(r.circleId)
+      } else if (r?.error) {
+        // Surface the worklet's real reason. The most common non-parse failure
+        // is a circleId/circle mismatch (a malformed or stale invite).
+        setError(/does not match/i.test(r.error)
+          ? "This invite doesn't match the circle. It may be malformed or out of date."
+          : r.error)
       } else {
         setError('Invalid invite')
       }

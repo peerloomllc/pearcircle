@@ -397,7 +397,10 @@ function sendToWorklet(msg: object) {
 function call(method: string, args: any = {}): Promise<any> {
   return new Promise((resolve) => {
     const id = _nextId++
-    _pending.set(id, (msg) => resolve(msg.result))
+    // Carry a thrown worklet error through as { error } instead of dropping it,
+    // so the WebView can show the real reason (e.g. an invite/circle mismatch)
+    // rather than a generic message. Proposal 2026-06-11 follow-up.
+    _pending.set(id, (msg) => resolve(msg.error != null ? { ok: false, error: msg.error } : msg.result))
     sendToWorklet({ id, method, args })
   })
 }
