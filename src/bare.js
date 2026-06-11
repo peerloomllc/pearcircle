@@ -167,6 +167,9 @@ const _lastKnownAnnounced = new Set()
 // circleId → signature of the last-known core-key set last pushed to seeders,
 // so the periodic re-push (slice 2b) only sends on a real delta.
 const _lastSentLastknownSig = new Map()
+// circleId → signature of the writer core-key set last pushed to seeders, so the
+// periodic re-push (slice 3d) only sends when the writer set changes.
+const _lastSentWriterSig = new Map()
 // Phase-2 cutover (slice 3): circleIds whose Autobase lastSeen write we have
 // stopped because every visible member announced a last-known core. Recomputed
 // off the hot path (5s sweep); the location:update + appendLastSeen paths
@@ -2509,6 +2512,7 @@ async function tearDownCircleLocally (circleId) {
   _lastSeenCutoverCircles.delete(circleId)
   _cutoverBlockedMarked.delete(circleId)
   _lastSentLastknownSig.delete(circleId)
+  _lastSentWriterSig.delete(circleId)
   for (const key of Array.from(_circlePlaces.keys())) {
     if (key.startsWith(circleId + '|')) _circlePlaces.delete(key)
   }
@@ -3156,7 +3160,10 @@ async function mountSeederCircle (enrollment) {
   const discovery = _swarm.join(topic, { server: true, client: true })
   // lastknownCores: pubkeyHex → that member's last-known core (opened blind,
   // tip-only, served to offline-last-known requesters). Proposal 2026-06-04 2b.
-  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload, lastknownCores: new Map() })
+  // writerCores: coreKeyHex → a member's Autobase writer core (opened blind,
+  // full history downloaded, so the seeder mirrors every member's contributions
+  // and not just the founder's bootstrap. Proposal 2026-05-19 slice 3d.
+  _seederCircles.set(circleId, { core, topicHex, discovery, onDownload, lastknownCores: new Map(), writerCores: new Map() })
   mark('seeder:mounted', { circleId, bootstrap: bootstrap.slice(0, 8), authorityLength: core.length, contiguousLength: core.contiguousLength })
   // Open the seed-role admission channel for this circle on every
   // existing connection. New connections get it via onSeederSwarmConnection;
@@ -3173,6 +3180,7 @@ async function mountSeederCircle (enrollment) {
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
       onLastknownCores: handleSeederLastknownCores,
+      onWriterCores: handleSeederWriterCores,
       mark,
     })
     mark('seeder:announce-channel-open', { circleId, remote: 'post-mount' })
@@ -3250,6 +3258,16 @@ async function leaveSeederCircle (circleId) {
   })) {
     await _localDb.del(key).catch(() => {})
   }
+  // Close + forget this circle's writer cores and their persisted keys (slice 3d).
+  if (entry.writerCores) {
+    for (const c of entry.writerCores.values()) { try { await c.close() } catch {} }
+    entry.writerCores.clear()
+  }
+  for await (const { key } of _localDb.createReadStream({
+    gt: 'seeder:writerCore:' + circleId + ':', lt: 'seeder:writerCore:' + circleId + ':~',
+  })) {
+    await _localDb.del(key).catch(() => {})
+  }
   _seederCircles.delete(circleId)
   mark('seeder:left', { circleId })
 }
@@ -3309,6 +3327,43 @@ async function refreshSeederLastknownTip (core, circleId, pubkey) {
   if (core.length > 1) { try { await core.clear(0, core.length - 1) } catch {} }
 }
 
+// Seed-mode handler for a member's writer-core-key list. The blind seeder can't
+// enumerate the circle's writers from the encrypted view, so members push the
+// per-member writer-core keys here; we open each blind (no enc key — ciphertext
+// only) and download its full history so the seeder mirrors every member's
+// contributions, not just the founder's bootstrap. Only for enrolled circles,
+// persisted so a restart re-opens them. Proposal 2026-05-19 slice 3d.
+async function handleSeederWriterCores ({ circleId, cores }) {
+  const entry = _seederCircles.get(circleId)
+  if (!entry) return // not enrolled — ignore (channel is per-circle, belt-and-suspenders)
+  if (!entry.writerCores) entry.writerCores = new Map()
+  for (const { pubkey, coreKey } of cores) {
+    // The founder's writer core IS the bootstrap, already open + downloading
+    // in mountSeederCircle; skip the redundant second open.
+    if (entry.core && b4a.toString(entry.core.key, 'hex') === coreKey) continue
+    if (entry.writerCores.has(coreKey)) continue // already mirroring this exact core
+    await openSeederWriterCore(entry, circleId, pubkey, coreKey)
+    await _localDb.put('seeder:writerCore:' + circleId + ':' + coreKey, {
+      circleId, pubkey, coreKey, addedAt: Date.now(),
+    }).catch((e) => console.warn('[bare] seeder writer-core persist failed', e?.message))
+  }
+}
+
+// Open one member writer core blind and background-download its full history,
+// mirroring the bootstrap-core treatment in mountSeederCircle. Unlike a
+// last-known core (tip-only), a writer core carries the member's whole signed
+// op log, so we keep all of it for the seeder to serve. Not TTL-pruned in this
+// slice — see the retention note in proposal 2026-05-19 slice 3d completion.
+async function openSeederWriterCore (entry, circleId, pubkey, coreKey) {
+  if (!entry.writerCores) entry.writerCores = new Map()
+  if (entry.writerCores.has(coreKey)) return
+  const core = openPeerCore(_store, coreKey, null)
+  await core.ready()
+  entry.writerCores.set(coreKey, core)
+  core.download({ start: 0, end: -1, linear: false })
+  mark('seeder:writer-opened', { circleId, pubkey: (pubkey || '').slice(0, 8), coreKey: coreKey.slice(0, 8), length: core.length })
+}
+
 // Open pair channels for a newly-added circle on every currently-live
 // swarm connection (joiner-initiated path). The owner side does NOT
 // call this from circle:create — instead the owner relies on the
@@ -3348,8 +3403,8 @@ function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
     _memberAdmissionChannels.set(conn, perConn)
   }
   // isSeeder flips true once this peer's announce arrives (handleSeederAnnounce);
-  // last-known core keys are pushed only to confirmed seeders (slice 2b).
-  perConn.set(circleId, { pubkeyHex, isSeeder: false, sendRevoked: result.sendRevoked, sendLastknownCores: result.sendLastknownCores })
+  // last-known + writer core keys are pushed only to confirmed seeders.
+  perConn.set(circleId, { pubkeyHex, isSeeder: false, sendRevoked: result.sendRevoked, sendLastknownCores: result.sendLastknownCores, sendWriterCores: result.sendWriterCores })
 }
 
 // Push a revocation notice to any live connection to `pubkey` for this
@@ -3646,6 +3701,58 @@ async function pushLastknownCoresToSeeder (circleId, conn) {
   if (cores.length > 0) entry.sendLastknownCores(cores)
 }
 
+// Collect the circle's writer core keys from the live Autobase. Writers are
+// identified by core key in this system (addWriter ops carry the writer key,
+// not an identity pubkey), and the seeder keys its writerCores map by coreKey
+// and uses pubkey only for its log line — so we pass the coreKey for both
+// fields of the { pubkey, coreKey } wire shape. The founder's bootstrap core is
+// included and de-duped seeder-side (it's already open there). Proposal
+// 2026-05-19 slice 3d.
+function collectCircleWriters (circleId) {
+  const base = _circleBases.get(circleId)
+  if (!base) return []
+  const out = []
+  const seen = new Set()
+  const writers = base.activeWriters ? [...base.activeWriters] : []
+  for (const w of writers) {
+    if (!w?.core?.key) continue
+    const coreKey = b4a.toString(w.core.key, 'hex')
+    if (seen.has(coreKey)) continue
+    seen.add(coreKey)
+    out.push({ pubkey: coreKey, coreKey })
+  }
+  return out
+}
+
+// Re-push the circle's writer core keys to every connected, confirmed seeder,
+// but only when the set has changed since the last push (cheap signature
+// compare) so the 5s sweep isn't chatty. This is also the trigger that picks up
+// a newly-added writer: the next sweep after the addWriter op linearizes sees a
+// larger activeWriters set and pushes it. Proposal 2026-05-19 slice 3d.
+function repushWriterCoresToSeeders (circleId) {
+  if (_memberAdmissionChannels.size === 0) return
+  const cores = collectCircleWriters(circleId)
+  if (cores.length === 0) return
+  const sig = cores.map((c) => c.coreKey).sort().join('|')
+  if (_lastSentWriterSig.get(circleId) === sig) return
+  let sent = 0
+  for (const perConn of _memberAdmissionChannels.values()) {
+    const entry = perConn.get(circleId)
+    if (entry?.isSeeder && entry.sendWriterCores && entry.sendWriterCores(cores)) sent++
+  }
+  if (sent > 0) _lastSentWriterSig.set(circleId, sig)
+}
+
+// Push the circle's current writer core keys to one just-confirmed seeder, so it
+// starts mirroring every member's core immediately on announce, independent of
+// the per-circle delta dedup. Proposal 2026-05-19 slice 3d.
+function pushWriterCoresToSeeder (circleId, conn) {
+  const entry = conn ? _memberAdmissionChannels.get(conn)?.get(circleId) : null
+  if (!entry?.sendWriterCores) return
+  const cores = collectCircleWriters(circleId)
+  if (cores.length > 0) entry.sendWriterCores(cores)
+}
+
 // Currently-visible member identity pubkeys for a circle (left/removed filtered
 // out, same rule as snapshotCircle). Lean — only the pubkeys, for the cutover
 // check. Proposal 2026-06-04 slice 3.
@@ -3903,6 +4010,9 @@ function markConnSeederAndPush (circleId, conn) {
   if (!entry) return
   entry.isSeeder = true
   pushLastknownCoresToSeeder(circleId, conn).catch(() => {})
+  // Also hand the seeder every writer core key so it mirrors all members, not
+  // just the founder's bootstrap (slice 3d).
+  try { pushWriterCoresToSeeder(circleId, conn) } catch {}
 }
 
 // Write seeder:{pubkey} admission rows for every followed seeder into a
@@ -3965,6 +4075,7 @@ function onSeederSwarmConnection (conn, info) {
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
       onLastknownCores: handleSeederLastknownCores,
+      onWriterCores: handleSeederWriterCores,
       mark,
     })
     if (remotePublicKey) {
@@ -4317,6 +4428,26 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     }
     if (lastknownReopened > 0) mark('seeder:lastknown-reopened', { count: lastknownReopened })
 
+    // Re-open each persisted per-member writer core so a restart keeps mirroring
+    // every member's contributions, not just the bootstrap (proposal 2026-05-19
+    // slice 3d). Only for circles that actually remounted; orphans are skipped.
+    let writerReopened = 0
+    for await (const { value } of _localDb.createReadStream({
+      gt: 'seeder:writerCore:', lt: 'seeder:writerCore:~',
+    })) {
+      if (!value || !value.circleId || !value.coreKey) continue
+      const entry = _seederCircles.get(value.circleId)
+      if (!entry) continue
+      if (entry.core && b4a.toString(entry.core.key, 'hex') === value.coreKey) continue
+      try {
+        await openSeederWriterCore(entry, value.circleId, value.pubkey, value.coreKey)
+        writerReopened++
+      } catch (e) {
+        console.warn('[bare] seeder writer-core reopen failed', value.circleId, e?.message)
+      }
+    }
+    if (writerReopened > 0) mark('seeder:writer-reopened', { count: writerReopened })
+
     // Schedule the retention sweep. Once on boot to claw back disk from
     // anything that aged past the cutoff while the seeder was down, then
     // on a 24h cadence. Fire-and-forget per the existing trip-prune
@@ -4466,6 +4597,8 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
       refreshPeerLastKnown(circleId).catch(() => {})
       // Push any newly-known last-known core keys to connected seeders (2b).
       repushLastknownCoresToSeeders(circleId).catch(() => {})
+      // Push any newly-added writer core keys to connected seeders (slice 3d).
+      try { repushWriterCoresToSeeders(circleId) } catch {}
       // Recompute the phase-2 lastSeen-write cutover (slice 3).
       updateLastSeenCutover(circleId, base).catch(() => {})
     }
