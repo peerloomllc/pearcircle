@@ -2,10 +2,12 @@
 // Runs over the same Hyperswarm connection that carries corestore replication
 // and the existing pair channel; protomux multiplexes them by protocol name.
 //
-// Wire: protocol 'pearcircle/seeder-admission/1', id = utf-8(circleId).
-// Four messages, added in the same order on both sides so protomux indexes
+// Wire: protocol 'pearcircle/seeder-admission/2', id = blake2b(bootstrap).
+// Five messages, added in the same order on both sides so protomux indexes
 // line up: [0] announce (seed -> member), [1] revoked (member -> seed),
-// [2] lastknownCores (member -> seed), [3] writerCores (member -> seed).
+// [2] lastknownCores (member -> seed), [3] writerCores (member -> seed),
+// [4] admitted (member -> seed). Messages are additive: an older peer that
+// lacks [4] simply ignores that index, so no protocol-version bump is needed.
 //
 // Roles:
 //   'seed'   — opened by a seed-mode worklet that has enrolled in this circle.
@@ -94,7 +96,7 @@ function normalizeWriterCores (msg) {
   return out
 }
 
-function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederPubkey, label, version, onAnnounce, onRevoked, revokedNotice, onLastknownCores, onWriterCores, mark }) {
+function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederPubkey, label, version, onAnnounce, onRevoked, onAdmitted, revokedNotice, admittedNotice, onLastknownCores, onWriterCores, mark }) {
   if (role !== 'seed' && role !== 'member') {
     throw new Error('role must be "seed" or "member"')
   }
@@ -113,6 +115,7 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
   let revokeMessage = null
   let lastknownMessage = null
   let writerMessage = null
+  let admittedMessage = null
 
   // Send a { cores: [{pubkey, coreKey}] } list on this channel (member role
   // only). Used for the on-open push and for re-pushes when the circle's known
@@ -168,6 +171,35 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
     }
   }
 
+  // Send a { type:'admitted' } notice on this channel (member role only).
+  // The explicit, durable counterpart to sendRevoked (proposal
+  // 2026-06-11-seeder-readmit, T2): the seed clears its revoked flag on this
+  // signal, instead of the fragile "any downloaded block clears it" heuristic
+  // that cleared the revoke on the revoke's own replicated block. Sent on
+  // channel open when the circle currently admits this seeder, and on demand
+  // when circle:seeder:approve re-admits an already-open connection.
+  //
+  // Carries the admission row's updatedAt so the (blind) seed can order this
+  // notice against the revoked notices it receives — the seeder row's updatedAt
+  // bumps on every revoke/admit, so it is the monotonic last-writer-wins clock
+  // both verdicts share. Without it, a not-yet-synced member re-asserting a
+  // stale revoked/admitted on channel open could flap the seed's flag.
+  function sendAdmitted (updatedAt) {
+    if (role !== 'member' || !admittedMessage) return false
+    try {
+      admittedMessage.send({
+        type: 'admitted',
+        circleId,
+        updatedAt: typeof updatedAt === 'number' && Number.isFinite(updatedAt) ? updatedAt : null,
+      })
+      trace('admission:admit-sent')
+      return true
+    } catch (e) {
+      trace('admission:admit-send-failed', { err: e?.message ?? String(e) })
+      return false
+    }
+  }
+
   const channel = mux.createChannel({
     protocol: SEEDER_ADMISSION_PROTOCOL,
     id: channelId,
@@ -187,8 +219,13 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
           trace('admission:announce-send-failed', { err: e?.message ?? String(e) })
         }
       }
-      if (role === 'member' && revokedNotice) {
-        sendRevoked(revokedNotice.revokedAt)
+      // On open, push our current verdict on this seeder so its flag converges
+      // even if the live revoke/admit signal was missed (e.g. re-admitted while
+      // disconnected). Mutually exclusive: a seeder row is either revoked or
+      // admitted. Unknown (no row / not a seeder) sends nothing.
+      if (role === 'member') {
+        if (revokedNotice) sendRevoked(revokedNotice.revokedAt)
+        else if (admittedNotice) sendAdmitted(admittedNotice.updatedAt)
       }
       // The member pushes its last-known core keys only once the peer confirms
       // it is a seeder (its announce arrives), not blindly on open — see
@@ -297,9 +334,35 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
     },
   })
 
+  // [4] admitted — member -> seed (proposal 2026-06-11-seeder-readmit, T2).
+  // Explicit re-admission signal; the seed clears its revoked flag on receipt.
+  // Additive after writerCores so protomux indices line up with older peers
+  // (an old seed without this message simply ignores index 4; an old member
+  // never sends it). circleId is the trusted channel id, never the body's.
+  admittedMessage = channel.addMessage({
+    encoding: c.json,
+    onmessage: async (msg) => {
+      if (role !== 'seed') return
+      if (!msg || typeof msg !== 'object' || msg.type !== 'admitted') {
+        trace('admission:admit-rejected', { reason: 'bad-shape' })
+        return
+      }
+      const updatedAt = typeof msg.updatedAt === 'number' && Number.isFinite(msg.updatedAt)
+        ? msg.updatedAt
+        : null
+      trace('admission:admit-received')
+      try {
+        // circleId is the trusted channel id, never msg.circleId.
+        if (typeof onAdmitted === 'function') await onAdmitted({ circleId, updatedAt })
+      } catch (e) {
+        trace('admission:onadmit-failed', { err: e?.message ?? String(e) })
+      }
+    },
+  })
+
   channel.open()
   trace('admission:channel-opened')
-  return { channel, sendRevoked, sendLastknownCores, sendWriterCores }
+  return { channel, sendRevoked, sendAdmitted, sendLastknownCores, sendWriterCores }
 }
 
 module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, admissionChannelId, normalizeLastknownCores, normalizeWriterCores }

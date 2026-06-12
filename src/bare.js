@@ -192,6 +192,15 @@ const _seederCircles = new Map()  // circleId → { core, topicHex, discovery }
 // can clear a revocation cheaply when replication resumes (proposal
 // 2026-05-21 question 4). Populated at boot from loadRevokedCircles.
 const _seederRevokedCircles = new Set()
+// Seed-mode only: last-writer-wins clock per circle, keyed by circleId, value
+// is the updatedAt/revokedAt of the most recent admission verdict we've applied
+// to _seederRevokedCircles. The seeder row's updatedAt bumps on every
+// revoke/admit, so both the `revoked` (revokedAt) and `admitted` (updatedAt)
+// notices carry a value from the same monotonic clock. A notice older than the
+// stored ts is stale — a not-yet-synced member re-asserting its lagging row —
+// and is ignored so it can't flap the flag (proposal 2026-06-11-seeder-readmit).
+// Seeded at boot from the persisted seeder:revoked:* revokedAt.
+const _seederFlagTs = new Map()
 // Member-side: live member-role seeder-admission channels, so
 // circle:seeder:revoke can push a revocation notice to a connected seeder
 // at once instead of waiting for the next connection (proposal 2026-05-21
@@ -232,6 +241,11 @@ function closeCircleChannels (circleId) {
 // circle unless we open it explicitly post-hoc.
 // Proposal 2026-05-18-pair-channel-on-circle-add.
 const _activeConns = new Set()
+// Member connections we've attached corestore replication to. A revoked-
+// everywhere seeder is skipped (onSwarmConnection), so resumeSeederReplication
+// can re-attach it on re-admit without double-attaching to a connection that
+// already replicates (proposal 2026-06-11-seeder-readmit-resume-replication).
+const _replicatingConns = new Set()
 // Seed-mode active connections. Tracked so a circle auto-enrolled after
 // a connection already exists can open its admission channel on that
 // connection — Hyperswarm reuses one connection per peer pair, so a new
@@ -1256,7 +1270,18 @@ const handlers = {
     if (label !== undefined && label !== null && typeof label !== 'string') {
       throw new Error('label must be a string if provided')
     }
-    return approveSeederRow(circleId, pubkey, label)
+    const result = await approveSeederRow(circleId, pubkey, label)
+    // Re-admit of a previously-revoked seeder (proposal 2026-06-11-seeder-readmit):
+    // (1) tell the seeder explicitly so it clears its revoked flag now (the seed
+    // can't read the encrypted row, and we no longer rely on the fragile
+    // any-block-clears-it heuristic), and (2) resume replication so a seeder that
+    // was revoked-everywhere (skipped at connect time) starts receiving blocks
+    // and re-seeds.
+    if (result?.reAdmit) {
+      notifySeederAdmitted(circleId, pubkey, result.updatedAt)
+      resumeSeederReplication(pubkey)
+    }
+    return result
   },
 
   // Owner-only rename. Appends a fresh `circle:` row with the new name
@@ -3283,17 +3308,13 @@ async function mountSeederCircle (enrollment) {
     recordBlockReceived(_localDb, circleId, index, Date.now()).catch((e) => {
       console.warn('[bare] seeder block-track failed', circleId, index, e?.message)
     })
-    // Proposal 2026-05-21 question 4: a downloaded block is unspoofable
-    // proof that this circle's members are replicating to the seeder
-    // again, so clear any stale revocation notice. The in-memory set
-    // keeps the per-block path a cheap has() check; the del runs once,
-    // on the revoked -> active transition.
-    if (_seederRevokedCircles.has(circleId)) {
-      _seederRevokedCircles.delete(circleId)
-      clearRevocationNotice(_localDb, circleId)
-        .then(() => mark('seeder:revocation-cleared', { circleId }))
-        .catch((e) => console.warn('[bare] seeder revocation-clear failed', circleId, e?.message))
-    }
+    // The revocation flag is now cleared ONLY by an explicit `admitted` notice
+    // on the admission channel (handleSeederAdmittedNotice), not by block
+    // downloads (proposal 2026-06-11-seeder-readmit). The old "any download
+    // clears the revoke" heuristic was fundamentally broken: revoking appends a
+    // block to the member's core, and on a still-live connection the seeder
+    // downloaded that very block and cleared the revoke ~12ms after recording
+    // it, so a revoke never stuck. Re-admission is explicit instead.
     // Coarse instrumentation: log every 10th block so the seeder.log
     // shows replication progress without flooding on a fast initial sync.
     if (index % 10 === 0 || index < 5) {
@@ -3338,6 +3359,7 @@ async function mountSeederCircle (enrollment) {
       seederPubkey: seederPubkeyHex,
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
+      onAdmitted: handleSeederAdmittedNotice,
       onLastknownCores: handleSeederLastknownCores,
       onWriterCores: handleSeederWriterCores,
       mark,
@@ -3359,12 +3381,54 @@ async function handleSeederRevocationNotice ({ circleId, revokedAt }) {
     mark('seeder:revocation-notice-unenrolled', { circleId })
     return
   }
+  // Last-writer-wins: ignore a revoked notice older than the verdict we've
+  // already applied for this circle, so a not-yet-synced member re-asserting
+  // its lagging row can't undo a newer re-admit and flap the flag (proposal
+  // 2026-06-11-seeder-readmit). A null revokedAt (legacy member, pre-revokedAt)
+  // can't be ordered, so it always applies — no regression for old peers.
+  if (typeof revokedAt === 'number' && Number.isFinite(revokedAt)) {
+    const applied = _seederFlagTs.get(circleId)
+    if (typeof applied === 'number' && revokedAt < applied) {
+      mark('seeder:revoke-notice-stale', { circleId, revokedAt, applied })
+      return
+    }
+  }
   try {
     await recordRevocationNotice(_localDb, { circleId, revokedAt, now: Date.now() })
     _seederRevokedCircles.add(circleId)
+    if (typeof revokedAt === 'number' && Number.isFinite(revokedAt)) _seederFlagTs.set(circleId, revokedAt)
     mark('seeder:revocation-noticed', { circleId, revokedAt })
   } catch (e) {
     mark('seeder:revocation-record-failed', { circleId, err: e?.message ?? String(e) })
+  }
+}
+
+// Seed-mode handler for an inbound explicit `admitted` notice on the admission
+// channel (proposal 2026-06-11-seeder-readmit). Clears the seeder:revoked
+// flag for this circle so the dashboard stops showing it revoked and the
+// circle re-seeds. Idempotent: a no-op if the circle wasn't flagged revoked.
+async function handleSeederAdmittedNotice ({ circleId, updatedAt }) {
+  // Last-writer-wins: ignore an admitted notice older than the verdict we've
+  // already applied, so a not-yet-synced member re-asserting a stale admitted
+  // can't undo a newer revoke and flap the flag (proposal 2026-06-11-seeder-
+  // readmit). A null updatedAt (legacy member) can't be ordered, so it always
+  // applies. Record the ts even when not currently revoked, so a later stale
+  // revoke is ordered against this admit and rejected.
+  if (typeof updatedAt === 'number' && Number.isFinite(updatedAt)) {
+    const applied = _seederFlagTs.get(circleId)
+    if (typeof applied === 'number' && updatedAt < applied) {
+      mark('seeder:admit-notice-stale', { circleId, updatedAt, applied })
+      return
+    }
+    _seederFlagTs.set(circleId, updatedAt)
+  }
+  if (!_seederRevokedCircles.has(circleId)) return
+  _seederRevokedCircles.delete(circleId)
+  try {
+    await clearRevocationNotice(_localDb, circleId)
+    mark('seeder:admit-noticed', { circleId })
+  } catch (e) {
+    mark('seeder:admit-clear-failed', { circleId, err: e?.message ?? String(e) })
   }
 }
 
@@ -3543,7 +3607,26 @@ async function openSeederWriterCore (entry, circleId, pubkey, coreKey) {
 // channel's revoke-sender in _memberAdmissionChannels keyed by
 // (conn, circleId) so circle:seeder:revoke can push a notice to a live
 // seeder at once. Proposal 2026-05-21-seeder-revocation-signal amendment.
-function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
+async function setupMemberAdmissionChannel (conn, circleId, base) {
+  const pubkeyHex = _connPubkey.get(conn)
+  // Our current verdict on this peer-as-seeder, pushed on channel open so the
+  // seeder's revoked flag converges to ours even if a live signal was missed
+  // (proposal 2026-06-11-seeder-readmit). A seeder row is either revoked or
+  // admitted; no row means not a known seeder, so send nothing (it announces
+  // and gets auto-admitted fresh).
+  let revokedNotice = null
+  let admittedNotice = null
+  if (pubkeyHex) {
+    try {
+      const row = (await base.view.get('seeder:' + pubkeyHex))?.value ?? null
+      revokedNotice = revocationNoticeFor(circleId, row)
+      // Carry the row's updatedAt so the seed can order this admit against the
+      // revoked notices other members push (proposal 2026-06-11-seeder-readmit).
+      if (row && row.revoked !== true) {
+        admittedNotice = { circleId, updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : null }
+      }
+    } catch {}
+  }
   const result = setupSeederAdmissionChannel({
     conn,
     role: 'member',
@@ -3552,12 +3635,12 @@ function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
     // mislabeled circleId can't cross-pair (2026-06-11-circleid-channel-binding).
     bootstrap: b4a.toString(base.key, 'hex'),
     onAnnounce: (msg) => handleSeederAnnounce(circleId, base, msg, conn),
-    revokedNotice: revokedNotice ?? null,
+    revokedNotice,
+    admittedNotice,
     mark,
   })
   if (!result || typeof result.sendRevoked !== 'function') return
   trackCircleChannel(circleId, result.channel)
-  const pubkeyHex = _connPubkey.get(conn)
   if (!pubkeyHex) return
   let perConn = _memberAdmissionChannels.get(conn)
   if (!perConn) {
@@ -3566,7 +3649,7 @@ function setupMemberAdmissionChannel (conn, circleId, base, revokedNotice) {
   }
   // isSeeder flips true once this peer's announce arrives (handleSeederAnnounce);
   // last-known + writer core keys are pushed only to confirmed seeders.
-  perConn.set(circleId, { pubkeyHex, isSeeder: false, sendRevoked: result.sendRevoked, sendLastknownCores: result.sendLastknownCores, sendWriterCores: result.sendWriterCores })
+  perConn.set(circleId, { pubkeyHex, isSeeder: false, sendRevoked: result.sendRevoked, sendAdmitted: result.sendAdmitted, sendLastknownCores: result.sendLastknownCores, sendWriterCores: result.sendWriterCores })
 }
 
 // Push a revocation notice to any live connection to `pubkey` for this
@@ -3582,6 +3665,45 @@ function notifySeederRevoked (circleId, pubkey, revokedAt) {
   if (sent > 0) {
     mark('seeder:revoke-notice-pushed', { circleId, pubkey: pubkey.slice(0, 8), sent })
   }
+}
+
+// Push an explicit re-admission notice to any live connection to `pubkey` for
+// this circle (proposal 2026-06-11-seeder-readmit). The seed clears its revoked
+// flag on receipt; the connect-time admittedNotice on channel open covers a
+// seeder that isn't connected at re-admit time. Best-effort, mirrors
+// notifySeederRevoked.
+function notifySeederAdmitted (circleId, pubkey, updatedAt) {
+  let sent = 0
+  for (const perConn of _memberAdmissionChannels.values()) {
+    const entry = perConn.get(circleId)
+    if (entry && entry.pubkeyHex === pubkey && typeof entry.sendAdmitted === 'function' && entry.sendAdmitted(updatedAt)) sent++
+  }
+  if (sent > 0) {
+    mark('seeder:admit-notice-pushed', { circleId, pubkey: pubkey.slice(0, 8), sent })
+  }
+}
+
+// Re-attach corestore replication to a seeder's live connection(s) after a
+// re-admit (proposal 2026-06-11-seeder-readmit-resume-replication). A seeder
+// revoked from every circle had `_store.replicate(conn)` skipped at connect
+// time; re-admitting it must resume replication so blocks flow again and the
+// seeder's own download-triggered revocation-clear fires. Guarded by
+// _replicatingConns so a connection that already replicates is never
+// double-attached (the partially-revoked case).
+function resumeSeederReplication (pubkey) {
+  let resumed = 0
+  for (const conn of _activeConns) {
+    if (_connPubkey.get(conn) !== pubkey) continue
+    if (_replicatingConns.has(conn)) continue
+    try {
+      _store.replicate(conn)
+      _replicatingConns.add(conn)
+      resumed++
+    } catch (e) {
+      mark('seeder:replication-resume-failed', { pubkey: pubkey.slice(0, 8), err: e?.message ?? String(e) })
+    }
+  }
+  if (resumed > 0) mark('seeder:replication-resumed', { pubkey: pubkey.slice(0, 8), resumed })
 }
 
 function openPairChannelsForCircle (circleId, base) {
@@ -3600,7 +3722,7 @@ function openPairChannelsForCircle (circleId, base) {
     // Member-role admission channel — without this a seeder that
     // auto-enrolls (or is invited to) a circle created after the
     // connection formed could never have its announce received.
-    setupMemberAdmissionChannel(conn, circleId, base)
+    setupMemberAdmissionChannel(conn, circleId, base).catch(() => {})
     // Ephemeral live-position channel (proposal 2026-06-04 phase 1).
     setupLiveChannelFor(conn, circleId)
   }
@@ -4106,7 +4228,9 @@ async function approveSeederRow (circleId, pubkey, label) {
   if (!unsigned) throw new Error('cannot build admission row from given input')
   const signed = signValue(unsigned, _identity.secretKey)
   await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
-  return { ok: true, circleId, pubkey, reAdmit: existing !== null }
+  // updatedAt is the row's LWW clock; returned so circle:seeder:approve can
+  // stamp the re-admit notice it pushes to the seeder (2026-06-11-seeder-readmit).
+  return { ok: true, circleId, pubkey, reAdmit: existing !== null, updatedAt: unsigned.updatedAt }
 }
 
 // Member-side handler for a seeder's admission announce. A first-time
@@ -4237,6 +4361,7 @@ function onSeederSwarmConnection (conn, info) {
       label: enrollment?.label,
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
+      onAdmitted: handleSeederAdmittedNotice,
       onLastknownCores: handleSeederLastknownCores,
       onWriterCores: handleSeederWriterCores,
       mark,
@@ -4364,7 +4489,7 @@ async function onSwarmConnection (conn, info) {
   // event and we want the view to be fresh. Skipped for a revoked-
   // everywhere seeder; the admission channels below still get set up so
   // the seeder can re-announce.
-  if (replicate) _store.replicate(conn)
+  if (replicate) { _store.replicate(conn); _replicatingConns.add(conn) }
   _activeConns.add(conn)
   _connPubkey.set(conn, remotePublicKey)
   // Drop this socket fast if it goes silent (proposal 2026-06-01).
@@ -4397,10 +4522,7 @@ async function onSwarmConnection (conn, info) {
     // open so the seeder's dashboard stops listing the circle (proposal
     // 2026-05-21). Non-seeder peers have no seeder:{pubkey} row, so
     // revocationNoticeFor returns null and nothing is sent.
-    setupMemberAdmissionChannel(
-      conn, circleId, base,
-      revocationNoticeFor(circleId, seederRowByCircle.get(circleId)),
-    )
+    setupMemberAdmissionChannel(conn, circleId, base).catch(() => {})
     // Ephemeral live-position channel (proposal 2026-06-04 phase 1).
     setupLiveChannelFor(conn, circleId)
   }
@@ -4454,6 +4576,7 @@ async function onSwarmConnection (conn, info) {
   }
   conn.on('close', () => {
     _activeConns.delete(conn)
+    _replicatingConns.delete(conn)
     _memberAdmissionChannels.delete(conn)
     _liveChannels.delete(conn)
     _connPubkey.delete(conn)
@@ -4552,7 +4675,15 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     // resumes (proposal 2026-05-21 question 4). Loaded before the remount
     // loop because mountSeederCircle starts core.download() right away.
     const revokedAtBoot = await loadRevokedCircles(_localDb)
-    for (const cid of revokedAtBoot.keys()) _seederRevokedCircles.add(cid)
+    for (const [cid, row] of revokedAtBoot) {
+      _seederRevokedCircles.add(cid)
+      // Seed the LWW clock from the persisted revokedAt so a stale notice that
+      // arrives right after boot is ordered against the revoke we last applied,
+      // not treated as fresh (proposal 2026-06-11-seeder-readmit).
+      if (row && typeof row.revokedAt === 'number' && Number.isFinite(row.revokedAt)) {
+        _seederFlagTs.set(cid, row.revokedAt)
+      }
+    }
     mark('seeder:revoked-loaded', { count: _seederRevokedCircles.size })
 
     // Re-mount every persisted enrollment so a process restart picks up
