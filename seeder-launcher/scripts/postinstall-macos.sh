@@ -70,6 +70,25 @@ if [ -f "$DAEMON_SRC" ]; then
     || launchctl load "$DAEMON_DST" 2>/dev/null || true
 fi
 
+# --- Uninstaller app ---------------------------------------------------------
+# Install the clickable "Uninstall PearCircle Seeder.app" to /Applications on
+# every install (fresh + update) so it stays current. /Applications is chosen
+# over ~/Desktop because the latter is TCC-restricted for an installer/daemon
+# context; /Applications is reliable and shows in Launchpad + Spotlight.
+UNINSTALL_SRC="/usr/local/lib/pearcircle-seeder/Uninstall PearCircle Seeder.app"
+UNINSTALL_DST="/Applications/Uninstall PearCircle Seeder.app"
+if [ -d "$UNINSTALL_SRC" ]; then
+  ( set +e
+    rm -rf "$UNINSTALL_DST"
+    /usr/bin/ditto "$UNINSTALL_SRC" "$UNINSTALL_DST" 2>/dev/null \
+      || cp -R "$UNINSTALL_SRC" "$UNINSTALL_DST"
+    /usr/bin/xattr -dr com.apple.quarantine "$UNINSTALL_DST" 2>/dev/null
+    /usr/bin/touch "$UNINSTALL_DST"
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$UNINSTALL_DST" 2>/dev/null
+    /usr/bin/mdimport "$UNINSTALL_DST" 2>/dev/null
+  )
+fi
+
 # On an auto-update / re-install, the seeder is already set up and the operator
 # isn't watching — skip the browser-open + shortcut prompt entirely so the
 # update stays silent (slice 3b). The LaunchAgent reload above already brought
@@ -108,28 +127,17 @@ echo "PearCircle Seeder running. Open: $URL"
 # in their Aqua session so `open` routes to their default app.
 launchctl asuser "$USER_UID" sudo -u "$USER_NAME" open "$URL" 2>/dev/null || true
 
-# Prompt for a desktop shortcut via AppleScript. -e returns "button returned:..."
-# on success, exits non-zero on failure or "User cancelled".
-SHORTCUT_ANSWER=$(launchctl asuser "$USER_UID" sudo -u "$USER_NAME" osascript \
-  -e 'try' \
-  -e '  display dialog "Create a Desktop shortcut to open the PearCircle Seeder monitoring UI?" buttons {"Skip", "Create"} default button "Create" with title "PearCircle Seeder" with icon note' \
-  -e '  return button returned of result' \
-  -e 'on error' \
-  -e '  return "Skip"' \
-  -e 'end try' \
-  2>/dev/null || echo "Skip")
+# Dashboard shortcut. Created in /Applications, NOT ~/Desktop: ~/Desktop is
+# TCC-protected, so a later uninstall — which runs as a non-Installer root
+# process with no Full Disk Access — cannot delete a Desktop item (it fails
+# silently, no prompt). /Applications is unrestricted, so the uninstaller
+# removes it cleanly, and the app is searchable in Spotlight + Launchpad. No
+# LSUIElement, for the same searchability reason.
+APP="/Applications/PearCircle Seeder.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-if [ "$SHORTCUT_ANSWER" = "Create" ]; then
-  # Drop a real .app bundle on the Desktop. macOS shows the .app with its
-  # own AppIcon and hides the .app extension by default — looks like a
-  # PearCircle Seeder shortcut tile, not an opaque .webloc file. The
-  # launcher script reads auth.token fresh on every click, so the URL
-  # survives token rotation (which happens if the data dir is wiped).
-  APP="$USER_HOME/Desktop/PearCircle Seeder.app"
-  rm -rf "$APP"
-  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-
-  cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -142,12 +150,11 @@ if [ "$SHORTCUT_ANSWER" = "Create" ]; then
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>LSUIElement</key><true/>
 </dict>
 </plist>
 PLIST
 
-  cat > "$APP/Contents/MacOS/open-ui" <<'LAUNCH'
+cat > "$APP/Contents/MacOS/open-ui" <<'LAUNCH'
 #!/bin/bash
 # Read the current auth token and open the UI in the default browser.
 DATA="$HOME/Library/Application Support/PearCircle Seeder"
@@ -158,23 +165,22 @@ if [ -z "$TOKEN" ]; then
 fi
 exec /usr/bin/open "http://127.0.0.1:8730/?t=$TOKEN"
 LAUNCH
-  chmod +x "$APP/Contents/MacOS/open-ui"
+chmod +x "$APP/Contents/MacOS/open-ui"
 
-  if [ -f /usr/local/lib/pearcircle-seeder/AppIcon.icns ]; then
-    cp /usr/local/lib/pearcircle-seeder/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-  fi
-
-  chown -R "$USER_NAME" "$APP"
-
-  # Strip any quarantine attribute (installer-created files shouldn't have
-  # one but belt + suspenders so Gatekeeper doesn't refuse the first launch).
-  /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
-
-  # Nudge Finder + LaunchServices to pick up the new bundle + icon.
-  /usr/bin/touch "$APP"
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
-
-  echo "Created Desktop shortcut: $APP"
+if [ -f /usr/local/lib/pearcircle-seeder/AppIcon.icns ]; then
+  cp /usr/local/lib/pearcircle-seeder/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
+
+# Strip any quarantine attribute (installer-created files shouldn't have
+# one but belt + suspenders so Gatekeeper doesn't refuse the first launch).
+/usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+
+# Nudge Finder + LaunchServices + Spotlight to pick up the new bundle so it is
+# findable by name right away.
+/usr/bin/touch "$APP"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
+/usr/bin/mdimport "$APP" 2>/dev/null || true
+
+echo "Installed dashboard shortcut: $APP"
 
 exit 0

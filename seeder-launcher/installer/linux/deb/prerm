@@ -1,10 +1,24 @@
 #!/bin/bash
 # Debian prerm - stops the user service before files are removed/replaced.
-# On `remove` the service is also disabled; on `upgrade` it is only stopped
-# (postinst re-enables the new version).
+# On `remove` the service is also disabled and linger dropped; on `upgrade` it
+# is only stopped (postinst re-enables the new version).
 set -e
 
+INSTALL_ROOT=/opt/pearcircle-seeder
+
+# Resolve the install user. $SUDO_USER covers `sudo apt remove`; a GUI software
+# centre (PackageKit) sets neither, so fall back to the user recorded at install
+# time. PKEXEC_UID covers a pkexec-driven path.
 TARGET_USER="${SUDO_USER:-}"
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+  if [ -n "${PKEXEC_UID:-}" ]; then
+    TARGET_USER=$(id -un "$PKEXEC_UID" 2>/dev/null || true)
+  fi
+fi
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+  [ -r "$INSTALL_ROOT/.install-user" ] && TARGET_USER=$(cat "$INSTALL_ROOT/.install-user" 2>/dev/null || true)
+fi
+
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
   TARGET_UID=$(id -u "$TARGET_USER" 2>/dev/null || true)
   if [ -n "$TARGET_UID" ]; then
@@ -13,6 +27,8 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
       remove)
         runuser -u "$TARGET_USER" -- systemctl --user disable --now \
           pearcircle-seeder.service 2>/dev/null || true
+        # Drop the linger this package enabled at install; harmless leftover otherwise.
+        loginctl disable-linger "$TARGET_USER" 2>/dev/null || true
         ;;
       upgrade)
         runuser -u "$TARGET_USER" -- systemctl --user stop \

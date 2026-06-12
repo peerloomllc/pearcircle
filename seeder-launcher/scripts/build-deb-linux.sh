@@ -62,6 +62,11 @@ cp "$INSTALLER/open-dashboard.sh" "$INSTALL_DIR/open-dashboard.sh"
 chmod 0755 "$INSTALL_DIR/open-dashboard.sh"
 install -D -m 0644 "$INSTALLER/pearcircle-seeder-dashboard.desktop" \
   "$PKGROOT/usr/share/applications/pearcircle-seeder.desktop"
+# AppStream MetaInfo so GNOME Software / Discover list the package (and thus
+# expose a one-click Remove). A bare .desktop is no longer enough on modern
+# software centres.
+install -D -m 0644 "$INSTALLER/com.pearcircle.seeder.metainfo.xml" \
+  "$PKGROOT/usr/share/metainfo/com.pearcircle.seeder.metainfo.xml"
 ICON_SRC="$REPO/assets/images/icon.png"
 if [ -f "$ICON_SRC" ]; then
   install -D -m 0644 "$ICON_SRC" \

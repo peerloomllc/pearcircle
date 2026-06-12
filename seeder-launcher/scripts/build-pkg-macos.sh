@@ -104,6 +104,64 @@ cp installer/macos/com.pearcircle.seeder.updater.plist "$PAYLOAD_LIB/installer/"
 cp installer/macos/updater-helper.sh "$PAYLOAD_LIB/updater-helper.sh"
 chmod +x "$PAYLOAD_LIB/updater-helper.sh"
 
+# 6a2. Uninstaller: ship the teardown script + a clickable "Uninstall
+#      PearCircle Seeder.app" wrapper. postinstall copies the .app to
+#      /Applications (reliable, unlike ~/Desktop which is TCC-restricted for
+#      the installer). The wrapper prompts keep/remove-identity, then runs the
+#      script with admin privileges. The script removes everything the install
+#      lays down, including the now-orphaned root updater LaunchDaemon.
+cp installer/macos/uninstall.sh "$PAYLOAD_LIB/uninstall.sh"
+chmod +x "$PAYLOAD_LIB/uninstall.sh"
+
+UNINSTALL_APP="$PAYLOAD_LIB/Uninstall PearCircle Seeder.app"
+mkdir -p "$UNINSTALL_APP/Contents/MacOS" "$UNINSTALL_APP/Contents/Resources"
+cat > "$UNINSTALL_APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>uninstall</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIdentifier</key><string>com.pearcircle.seeder.uninstall</string>
+  <key>CFBundleName</key><string>Uninstall PearCircle Seeder</string>
+  <key>CFBundleDisplayName</key><string>Uninstall PearCircle Seeder</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+</dict>
+</plist>
+PLIST
+cat > "$UNINSTALL_APP/Contents/MacOS/uninstall" <<'LAUNCH'
+#!/bin/bash
+# Prompt keep/remove-identity, then run the teardown as root.
+SCRIPT="/usr/local/lib/pearcircle-seeder/uninstall.sh"
+if [ ! -f "$SCRIPT" ]; then
+  /usr/bin/osascript -e 'display dialog "PearCircle Seeder does not appear to be installed." with title "Uninstall PearCircle Seeder" buttons {"OK"} default button "OK" with icon caution'
+  exit 0
+fi
+CONFIRM=$(/usr/bin/osascript \
+  -e 'try' \
+  -e '  display dialog "Uninstall PearCircle Seeder?\n\nThis stops and removes the background seeder service and all its program files." buttons {"Cancel", "Uninstall"} default button "Uninstall" cancel button "Cancel" with title "Uninstall PearCircle Seeder" with icon caution' \
+  -e '  return "go"' \
+  -e 'on error' -e '  return "cancel"' -e 'end try' 2>/dev/null)
+[ "$CONFIRM" = "go" ] || exit 0
+IDENTITY=$(/usr/bin/osascript \
+  -e 'try' \
+  -e '  display dialog "Also remove the seeder identity and all circle enrollments?\n\nKeep them to reinstall later as the same seeder." buttons {"Keep", "Remove"} default button "Keep" with title "Uninstall PearCircle Seeder" with icon note' \
+  -e '  return button returned of result' \
+  -e 'on error' -e '  return "Keep"' -e 'end try' 2>/dev/null)
+FLAG="--keep"; [ "$IDENTITY" = "Remove" ] && FLAG="--purge"
+OUT=$(/usr/bin/osascript -e "do shell script \"/bin/bash '$SCRIPT' $FLAG 2>&1\" with administrator privileges" 2>&1)
+RC=$?
+if [ "$RC" = "0" ]; then
+  /usr/bin/osascript -e 'display dialog "PearCircle Seeder has been uninstalled." with title "Uninstall PearCircle Seeder" buttons {"OK"} default button "OK" with icon note' >/dev/null 2>&1
+else
+  /usr/bin/osascript -e "display dialog \"Uninstall did not complete:\n\n$OUT\" with title \"Uninstall PearCircle Seeder\" buttons {\"OK\"} default button \"OK\" with icon stop" >/dev/null 2>&1
+fi
+exit 0
+LAUNCH
+chmod +x "$UNINSTALL_APP/Contents/MacOS/uninstall"
+
 # 6b. Build the PearCircle .icns icon from the repo's 1024x1024 png. iconutil
 #     needs an .iconset directory with the standard 10 size variants.
 ICON_SRC="$ROOT/../assets/images/icon.png"
@@ -122,6 +180,8 @@ if [ -f "$ICON_SRC" ]; then
   cp "$ICON_SRC"                  "$ICONSET/icon_512x512@2x.png"
   iconutil -c icns "$ICONSET" -o "$PAYLOAD_LIB/AppIcon.icns"
   rm -rf "$ICONSET"
+  # Give the Uninstall.app the PearCircle icon too.
+  cp "$PAYLOAD_LIB/AppIcon.icns" "$PAYLOAD_LIB/Uninstall PearCircle Seeder.app/Contents/Resources/AppIcon.icns" 2>/dev/null || true
 else
   echo "warning: icon source $ICON_SRC missing; Desktop shortcut will use a generic icon"
 fi

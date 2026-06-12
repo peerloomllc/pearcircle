@@ -76,6 +76,8 @@ refresh_desktop_caches () {
   ( set +e
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications 2>/dev/null
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null
+    # Refresh the AppStream pool so the new MetaInfo shows in GNOME Software / Discover.
+    command -v appstreamcli >/dev/null 2>&1 && appstreamcli refresh --force 2>/dev/null
   )
   return 0
 }
@@ -107,6 +109,12 @@ fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 TARGET_UID=$(id -u "$TARGET_USER")
 UNIT_DIR="$TARGET_HOME/.config/systemd/user"
+
+# Record the install user so prerm/postrm can clean up the per-user service +
+# linger even when removed through a GUI software centre (GNOME Software /
+# Discover go through PackageKit, which sets no SUDO_USER). Not part of the
+# dpkg manifest, so dpkg leaves it for postrm to read, then delete on purge.
+echo "$TARGET_USER" > "$INSTALL_ROOT/.install-user" 2>/dev/null || true
 
 install -d -o "$TARGET_USER" -g "$TARGET_USER" "$UNIT_DIR"
 sed "s|__EXEC__|$INSTALL_ROOT/pearcircle-seeder --no-open|g" "$UNIT_SRC" \

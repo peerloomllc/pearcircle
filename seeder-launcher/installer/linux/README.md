@@ -97,13 +97,21 @@ enrollments under `~/.local/share/pearcircle-seeder` are preserved either way.
 ## Uninstall
 
 ```bash
-sudo apt remove pearcircle-seeder                        # .deb
-./PearCircleSeeder-x86_64.AppImage --uninstall-service   # AppImage
+sudo apt remove pearcircle-seeder                        # .deb (keeps identity)
+sudo apt purge  pearcircle-seeder                        # .deb (also wipes identity)
+./PearCircleSeeder-x86_64.AppImage --uninstall-service   # AppImage (keeps identity)
+./PearCircleSeeder-x86_64.AppImage --uninstall-service --purge   # AppImage (wipes identity)
 ```
 
-Both stop and remove the service but leave `~/.local/share/pearcircle-seeder`
-in place so a reinstall keeps the seeder identity. Delete that directory by
-hand for a full wipe.
+All paths stop the service, remove the per-user systemd unit, and drop the
+`enable-linger` the install set. `remove` / plain `--uninstall-service` leave
+`~/.local/share/pearcircle-seeder` (identity + enrollments) in place so a
+reinstall stays the same seeder; `purge` / `--purge` wipe it.
+
+The `.deb` also cleans up correctly when removed through a graphical software
+centre (GNOME Software, KDE Discover), which runs without `sudo`. After
+removing the AppImage's service, delete the `.AppImage` file to finish, and
+remove any menu entry you created with a tool like Gear Lever.
 
 ## Build from source
 

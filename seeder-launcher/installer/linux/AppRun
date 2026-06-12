@@ -70,8 +70,17 @@ uninstall_service () {
   systemctl --user disable --now pearcircle-seeder.service 2>/dev/null || true
   rm -f "$UNIT"
   systemctl --user daemon-reload 2>/dev/null || true
-  echo "PearCircle Seeder service removed. The data directory"
-  echo "$DATA_DIR is left intact."
+  # Drop the linger enabled by --install-service; harmless leftover otherwise.
+  loginctl disable-linger "$USER" 2>/dev/null || true
+  if [ "${1:-}" = "--purge" ]; then
+    rm -rf "$DATA_DIR"
+    echo "PearCircle Seeder service removed and data directory wiped."
+  else
+    echo "PearCircle Seeder service removed. The data directory"
+    echo "$DATA_DIR is left intact (pass --purge to wipe the identity too)."
+  fi
+  echo "Delete the .AppImage file to finish removing the app; if you integrated"
+  echo "it (e.g. via Gear Lever), remove the menu entry there too."
 }
 
 # Desktop launch (double-click / menu / Gear Lever): make sure the seeder is
@@ -99,7 +108,7 @@ desktop_launch () {
 
 case "${1:-}" in
   --install-service)   install_service ;;
-  --uninstall-service) uninstall_service ;;
+  --uninstall-service) uninstall_service "${2:-}" ;;
   "")
     # No args: a terminal launch runs the host in the foreground for CLI
     # use; a desktop launch (no controlling terminal) sets up the service
