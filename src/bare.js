@@ -318,15 +318,27 @@ const TRANSITION_FRESHNESS_MS = 10 * 60 * 1000
 // worklet restart re-applying historical trips) is gated separately by
 // the PEER_TRIP_FRESHNESS_MS window below so we don't fire days-old
 // notifications on cold boot.
+// Notified-trip dedup. Persisted across cold boots in the local Hyperbee
+// (`tripNotify:seen`) so a trip notified once never re-notifies, which is what
+// lets the freshness window below be generous instead of a 10-min cliff
+// (proposal 2026-06-11-peer-trip-notification-freshness). Loaded into this set
+// on init; _EMITTED_PEER_TRIP_MAX caps the in-memory set, _PERSISTED_TRIP_SEEN_MAX
+// caps the persisted FIFO list.
 const _emittedPeerTripKeys = new Set()
 const _EMITTED_PEER_TRIP_MAX = 1024
-// Only fire a peer-trip notification when the trip ended within this
-// window. Bounds the cold-boot replay problem: when the worklet starts
-// and autobase re-applies a peer's entire trip history, only genuinely
-// recent completions break through. 10 min matches the user-intent
-// framing ("they just got home"); older trips remain in trips history,
-// just don't bug anyone.
-const PEER_TRIP_FRESHNESS_MS = 10 * 60 * 1000
+const _PERSISTED_TRIP_SEEN_MAX = 512
+// Suppress notifications for trips that ended before this device first started
+// caring (set once on init, persisted as `tripNotify:baseline`), so a fresh
+// install / first upgrade doesn't replay a circle's trip history as a burst of
+// notifications. Loaded on init.
+let _tripNotifyBaseline = null
+// Backstop freshness window (was 10 min, a cliff that dropped late-replicating
+// trips even though they're real). With the persisted dedup as the primary
+// guard and the baseline suppressing first-sync history, this only bounds a
+// long-absence catch-up: a device offline for days notifies for at most the
+// last 24h of unseen trips, not weeks. Trips that end away and replicate in
+// 10-20 min later now notify instead of being silently dropped.
+const PEER_TRIP_FRESHNESS_MS = 24 * 60 * 60 * 1000
 // Don't notify on micro-trips (GPS drift across the cooldown window can
 // log a "trip" with a few meters of distance). Either bound flips the
 // notification on. Trip record itself is always written; this only
@@ -1867,6 +1879,36 @@ const handlers = {
   // FUTURE trips — no backfill on enable, no auto-tombstone on disable.
   // The shell prompts the user to delete past shared trips separately
   // if they want a clean wipe.
+  // Debug-only (peer-trip notification investigation 2026-06-11): synthesize a
+  // completed trip and run the exact real completion path (local store +
+  // replicateTripToOptedInCircles) so the peer-trip notification chain can be
+  // tested deterministically without a real drive. Triggered from the Advanced
+  // settings "Inject test trip" button. distanceMeters defaults above the 500m
+  // notification threshold; endTs is now so the receiver's freshness gate
+  // passes when both devices are connected.
+  'trip:debugComplete': async ({ distanceMeters = 1600, durationMs = 6 * 60 * 1000 } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const now = Date.now()
+    const startTs = now - durationMs
+    const trip = {
+      pubkey: ourKey,
+      startTs,
+      endTs: now,
+      polyline: [[0, 0, startTs], [0, 0, now]],
+      distanceMeters,
+      durationMs,
+      maxSpeedMps: 20,
+      v: 1,
+    }
+    await _localDb.put('trips:' + ourKey + ':' + startTs, trip)
+    send({ event: 'trip:completed', data: trip })
+    mark('trip:debug-injected', { distanceMeters, durationMs })
+    reshipTrace()
+    await replicateTripToOptedInCircles(ourKey, trip)
+    return { ok: true, trip }
+  },
+
   'trips:sharing:get': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (circleId != null && typeof circleId !== 'string') {
@@ -2007,16 +2049,90 @@ async function replicateTripToOptedInCircles (ourKey, trip) {
     v: 1,
   }, _identity.secretKey)
   const key = 'trip:' + ourKey + ':' + padTripStartTs(trip.startTs)
+  // Diagnostic (peer-trip notification investigation 2026-06-11): mark the
+  // sender-side outcome per circle so a missing peer notification can be traced
+  // to (a) trip sharing / location sharing off here, (b) the block never being
+  // pulled by a peer (instrumentTripUpload), vs (c) a receiver-side gate.
+  let replicated = 0
   for (const [circleId, base] of _circleBases) {
-    if (!base.writable) continue
+    if (!base.writable) { mark('trip:replicate-skip', { circleId: circleId.slice(0, 8), reason: 'not-writable' }); continue }
     // If location sharing is muted for this circle, trips are too:
     // sharing your route is strictly more revealing than sharing
     // presence, so the stricter gate wins.
-    if (!getCircleSharing(circleId).enabled) continue
+    const locOn = getCircleSharing(circleId).enabled
     const row = await _localDb.get('trips:sharing:' + circleId)
-    if (!shouldReplicateTrip(row)) continue
-    await safeAppend(base, { type: 'put', key, value: signedValue }, 'trip')
+    const shareOn = shouldReplicateTrip(row)
+    if (!locOn || !shareOn) { mark('trip:replicate-skip', { circleId: circleId.slice(0, 8), locOn, shareOn }); continue }
+    const ok = await safeAppend(base, { type: 'put', key, value: signedValue }, 'trip')
+    if (ok) { replicated++; instrumentTripUpload(base, circleId) }
   }
+  mark('trip:replicated', { circles: replicated, distanceMeters: trip.distanceMeters })
+  reshipTrace()
+}
+
+// One-shot watch on our local writer core: marks how long after a trip commit a
+// peer first pulls the new block (peer-trip investigation 2026-06-11). A trip
+// that commits but is never pulled (no `trip:uploaded` mark) is the iPhone-
+// killed-before-upload case the user suspects. Reaped after 30min so an offline
+// device can't leak a listener.
+function instrumentTripUpload (base, circleId) {
+  const local = base && base.local
+  if (!local || typeof local.on !== 'function') return
+  const ourIndex = (typeof local.length === 'number' ? local.length : 1) - 1
+  const t0 = Date.now()
+  let timer = null
+  const onUpload = (index) => {
+    if (typeof index === 'number' && index < ourIndex) return
+    local.off('upload', onUpload)
+    if (timer) clearTimeout(timer)
+    mark('trip:uploaded', { circleId: circleId.slice(0, 8), lagMs: Date.now() - t0 })
+    reshipTrace()
+  }
+  local.on('upload', onUpload)
+  timer = setTimeout(() => local.off('upload', onUpload), 30 * 60 * 1000)
+}
+
+// Load the persisted peer-trip notification state on init (proposal
+// 2026-06-11-peer-trip-notification-freshness): the durable already-notified set
+// and the one-time baseline. Both are local-only, never replicated. The baseline
+// is stamped now on first run so a fresh install doesn't replay trip history.
+async function loadTripNotifyState () {
+  try {
+    const seen = await _localDb.get('tripNotify:seen')
+    if (Array.isArray(seen?.value?.keys)) {
+      for (const k of seen.value.keys) _emittedPeerTripKeys.add(k)
+    }
+  } catch (e) { console.warn('[bare] load tripNotify:seen failed', e?.message) }
+  try {
+    const base = await _localDb.get('tripNotify:baseline')
+    if (typeof base?.value?.ts === 'number') {
+      _tripNotifyBaseline = base.value.ts
+    } else {
+      _tripNotifyBaseline = Date.now()
+      await _localDb.put('tripNotify:baseline', { ts: _tripNotifyBaseline })
+    }
+  } catch (e) {
+    console.warn('[bare] load tripNotify:baseline failed', e?.message)
+    if (_tripNotifyBaseline == null) _tripNotifyBaseline = Date.now()
+  }
+}
+
+// Record that we've fired a notification for this trip key: in-memory for the
+// hot path, persisted (capped FIFO) so a cold boot / autobase replay never
+// re-notifies. Called only on actual emit, so the persisted list grows at the
+// rate of real peer-trip notifications (a few per day).
+async function markTripNotified (key) {
+  if (_emittedPeerTripKeys.size >= _EMITTED_PEER_TRIP_MAX) {
+    const arr = [..._emittedPeerTripKeys]
+    _emittedPeerTripKeys.clear()
+    for (let i = arr.length >> 1; i < arr.length; i++) _emittedPeerTripKeys.add(arr[i])
+  }
+  _emittedPeerTripKeys.add(key)
+  try {
+    let keys = [..._emittedPeerTripKeys]
+    if (keys.length > _PERSISTED_TRIP_SEEN_MAX) keys = keys.slice(keys.length - _PERSISTED_TRIP_SEEN_MAX)
+    await _localDb.put('tripNotify:seen', { keys })
+  } catch (e) { console.warn('[bare] persist tripNotify:seen failed', e?.message) }
 }
 
 async function writePresenceToCircle (circleId, state, expiresAt = null) {
@@ -2950,42 +3066,47 @@ async function applyCircleNodes (nodes, view, base, circleId) {
           if (tripIsExpired(op.value, Date.now())) continue
           await view.put(op.key, op.value)
           try {
+            const v = op.value
+            const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
             if (
-              _tripNotificationsEnabled &&
-              circleId &&
-              op.value &&
-              op.value.deleted !== true &&
-              typeof op.value.pubkey === 'string' &&
-              typeof op.value.endTs === 'number' &&
-              typeof op.value.distanceMeters === 'number'
+              circleId && v && v.deleted !== true &&
+              typeof v.pubkey === 'string' &&
+              typeof v.endTs === 'number' &&
+              typeof v.distanceMeters === 'number' &&
+              v.pubkey !== ourKeyHex
             ) {
-              const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
-              const author = op.value.pubkey
-              const fresh = Date.now() - op.value.endTs <= PEER_TRIP_FRESHNESS_MS
+              const author = v.pubkey
+              const lagMs = Date.now() - v.endTs
+              // Freshness is now a generous backstop (24h); the persisted dedup
+              // and baseline are the real guards (proposal 2026-06-11).
+              const fresh = lagMs <= PEER_TRIP_FRESHNESS_MS
+              const afterBaseline = typeof _tripNotifyBaseline !== 'number' || v.endTs >= _tripNotifyBaseline
+              const notFuture = v.endTs <= Date.now() + FUTURE_TS_TOLERANCE_MS
               const meetsThreshold =
-                op.value.distanceMeters >= PEER_TRIP_MIN_DISTANCE_M ||
-                (typeof op.value.durationMs === 'number' && op.value.durationMs >= PEER_TRIP_MIN_DURATION_MS)
-              if (
-                author !== ourKeyHex &&
-                fresh &&
-                meetsThreshold &&
-                !_emittedPeerTripKeys.has(op.key)
-              ) {
-                if (_emittedPeerTripKeys.size >= _EMITTED_PEER_TRIP_MAX) {
-                  const arr = [..._emittedPeerTripKeys]
-                  _emittedPeerTripKeys.clear()
-                  for (let i = arr.length >> 1; i < arr.length; i++) _emittedPeerTripKeys.add(arr[i])
-                }
-                _emittedPeerTripKeys.add(op.key)
+                v.distanceMeters >= PEER_TRIP_MIN_DISTANCE_M ||
+                (typeof v.durationMs === 'number' && v.durationMs >= PEER_TRIP_MIN_DURATION_MS)
+              const already = _emittedPeerTripKeys.has(op.key)
+              const willEmit = _tripNotificationsEnabled && fresh && afterBaseline && notFuture && meetsThreshold && !already
+              // Diagnostic (peer-trip notification investigation 2026-06-11):
+              // record the gate decision so a non-firing notification splits
+              // cleanly into stale / pre-baseline / below-threshold / toggle-off
+              // / already-emitted. Marked only when it'll emit or is recent, so
+              // a cold-boot replay of old trips can't flood the trace.
+              if (willEmit || lagMs < 30 * 60 * 1000) {
+                mark('trip:apply', { from: author.slice(0, 8), lagMs, fresh, afterBaseline, meetsThreshold, notif: _tripNotificationsEnabled, already, distanceMeters: v.distanceMeters, willEmit })
+                reshipTrace()
+              }
+              if (willEmit) {
+                await markTripNotified(op.key)
                 const memberRow = await view.get('member:' + author)
                 send({ event: 'peerTrip:completed', data: {
                   circleId,
                   authorPubkey: author,
                   displayName: memberRow?.value?.displayName || author.slice(0, 8),
-                  distanceMeters: op.value.distanceMeters,
-                  durationMs: typeof op.value.durationMs === 'number' ? op.value.durationMs : null,
-                  startTs: typeof op.value.startTs === 'number' ? op.value.startTs : null,
-                  endTs: op.value.endTs,
+                  distanceMeters: v.distanceMeters,
+                  durationMs: typeof v.durationMs === 'number' ? v.durationMs : null,
+                  startTs: typeof v.startTs === 'number' ? v.startTs : null,
+                  endTs: v.endTs,
                 }})
               }
             }
@@ -4697,6 +4818,11 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     const row = await _localDb.get('tripNotifications')
     if (row?.value?.enabled === false) _tripNotificationsEnabled = false
   } catch {}
+
+  // Durable peer-trip notification dedup + first-run baseline (proposal
+  // 2026-06-11-peer-trip-notification-freshness). Must run before peer trips
+  // can apply, so the relaxed freshness window doesn't re-notify history.
+  await loadTripNotifyState()
 
   _activeHandlers = handlers
   _initialized = true

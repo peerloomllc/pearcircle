@@ -4766,6 +4766,16 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
         <TileCacheSection />
+        {/* Debug (peer-trip notification investigation 2026-06-11): fire a
+            synthetic completed trip through the real replication path so peers
+            should get a "completed a 1 mile trip" notification, with no drive. */}
+        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Debug</p>
+        <button
+          style={{ ...s.primaryBtn, marginTop: spacing.sm }}
+          onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
+        >
+          Inject test trip
+        </button>
       </Collapsible>
     </div>
   )
