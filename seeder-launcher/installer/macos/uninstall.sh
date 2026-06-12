@@ -80,9 +80,14 @@ rm -f "$DAEMON"
 # 3. Root updates scratch dir (verified-pkg requests + updater.log).
 rm -rf "/Library/Application Support/PearCircle Seeder"
 
-# 4. Desktop dashboard shortcut + the Uninstall app itself.
-rm -rf "$USER_HOME/Desktop/PearCircle Seeder.app"
+# 4. Dashboard shortcut + the Uninstall app itself, both in /Applications
+# (unrestricted, so root removes them cleanly). The legacy ~/Desktop shortcut
+# from older installs is best-effort only — ~/Desktop is TCC-protected, so this
+# rm works just from a Full-Disk-Access terminal; otherwise the user drags that
+# stale tile to the Trash by hand (new installs no longer put it there).
+rm -rf "/Applications/PearCircle Seeder.app"
 rm -rf "/Applications/Uninstall PearCircle Seeder.app"
+rm -rf "$USER_HOME/Desktop/PearCircle Seeder.app" 2>/dev/null || true
 
 # 5. Payload (binaries, worklet, UI, this script's origin).
 rm -rf "$PAYLOAD"
