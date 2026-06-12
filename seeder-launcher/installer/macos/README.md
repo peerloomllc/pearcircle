@@ -24,14 +24,37 @@ Download the newer `.pkg` and double-click it. The installer reloads the backgro
 
 ## Uninstall
 
+Easiest: open **Uninstall PearCircle Seeder** from `/Applications` (also in
+Launchpad / Spotlight). It asks for an administrator password, lets you keep or
+remove the seeder identity, and tears everything down.
+
+From a terminal instead:
+
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.pearcircle.seeder.plist
-rm ~/Library/LaunchAgents/com.pearcircle.seeder.plist
-sudo rm -rf /usr/local/lib/pearcircle-seeder
-rm -rf "$HOME/Library/Application Support/PearCircle Seeder"
+sudo bash /usr/local/lib/pearcircle-seeder/uninstall.sh          # keeps identity (prompts)
+sudo bash /usr/local/lib/pearcircle-seeder/uninstall.sh --purge  # also wipes identity
 ```
 
-The last line removes the seeder identity and all enrollments. Skip it to keep the identity for a later reinstall.
+Either path removes the user LaunchAgent, the program files under
+`/usr/local/lib/pearcircle-seeder`, the root auto-updater LaunchDaemon
+(`/Library/LaunchDaemons/com.pearcircle.seeder.updater.plist`) and its scratch
+dir (`/Library/Application Support/PearCircle Seeder`), the `/Applications`
+uninstaller, and any Desktop dashboard shortcut. The seeder identity and circle
+enrollments at `~/Library/Application Support/PearCircle Seeder` are kept unless
+you choose to remove them, so a reinstall stays the same seeder.
+
+If the program files are already gone, remove the leftovers by hand:
+
+```bash
+sudo launchctl bootout system/com.pearcircle.seeder.updater 2>/dev/null
+launchctl bootout gui/$(id -u)/com.pearcircle.seeder 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.pearcircle.seeder.plist
+sudo rm -f /Library/LaunchDaemons/com.pearcircle.seeder.updater.plist
+sudo rm -rf /usr/local/lib/pearcircle-seeder "/Library/Application Support/PearCircle Seeder"
+rm -rf "/Applications/Uninstall PearCircle Seeder.app" "$HOME/Desktop/PearCircle Seeder.app"
+# Identity (skip to keep for reinstall):
+rm -rf "$HOME/Library/Application Support/PearCircle Seeder"
+```
 
 ## Build from source
 

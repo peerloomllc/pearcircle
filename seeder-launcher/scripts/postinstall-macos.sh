@@ -70,6 +70,24 @@ if [ -f "$DAEMON_SRC" ]; then
     || launchctl load "$DAEMON_DST" 2>/dev/null || true
 fi
 
+# --- Uninstaller app ---------------------------------------------------------
+# Install the clickable "Uninstall PearCircle Seeder.app" to /Applications on
+# every install (fresh + update) so it stays current. /Applications is chosen
+# over ~/Desktop because the latter is TCC-restricted for an installer/daemon
+# context; /Applications is reliable and shows in Launchpad + Spotlight.
+UNINSTALL_SRC="/usr/local/lib/pearcircle-seeder/Uninstall PearCircle Seeder.app"
+UNINSTALL_DST="/Applications/Uninstall PearCircle Seeder.app"
+if [ -d "$UNINSTALL_SRC" ]; then
+  ( set +e
+    rm -rf "$UNINSTALL_DST"
+    /usr/bin/ditto "$UNINSTALL_SRC" "$UNINSTALL_DST" 2>/dev/null \
+      || cp -R "$UNINSTALL_SRC" "$UNINSTALL_DST"
+    /usr/bin/xattr -dr com.apple.quarantine "$UNINSTALL_DST" 2>/dev/null
+    /usr/bin/touch "$UNINSTALL_DST"
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$UNINSTALL_DST" 2>/dev/null
+  )
+fi
+
 # On an auto-update / re-install, the seeder is already set up and the operator
 # isn't watching — skip the browser-open + shortcut prompt entirely so the
 # update stays silent (slice 3b). The LaunchAgent reload above already brought
