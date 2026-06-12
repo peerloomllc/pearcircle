@@ -621,6 +621,10 @@ function buildHtml(jsBundle: string) {
   // can branch on it (e.g. About page hides Support development on iOS
   // until App Store approval per guideline 3.1.1).
   const platform = JSON.stringify(Platform.OS)
+  // __DEV__ is true only in debug Metro bundles, false in release. Exposed so
+  // dev-only UI (e.g. the trip-inject probe) renders on debug builds but not in
+  // the release app that ships to users.
+  const debug = JSON.stringify(__DEV__)
   return `<!DOCTYPE html>
 <html>
   <head>
@@ -630,7 +634,7 @@ function buildHtml(jsBundle: string) {
       html, body, #root { height: 100%; margin: 0; padding: 0; background: #111; }
       body { -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
     </style>
-    <script>window.__pearPlatform = ${platform};</script>
+    <script>window.__pearPlatform = ${platform}; window.__pearDebug = ${debug};</script>
   </head>
   <body>
     <div id="root"></div>

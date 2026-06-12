@@ -4725,13 +4725,15 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TripsSharingSection active={active && openSection === 'tripSharing'} />
       </Collapsible>
 
+      <Collapsible title='Trip notifications' icon={BellSimple} open={openSection === 'tripNotifications'} onToggle={() => toggleSection('tripNotifications')} maxHeight='1200px'>
+        <TripNotificationsSection />
+      </Collapsible>
+
       <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
         <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Trip notifications</p>
-        <TripNotificationsSection />
       </Collapsible>
 
       <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
@@ -4768,14 +4770,20 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TileCacheSection />
         {/* Debug (peer-trip notification investigation 2026-06-11): fire a
             synthetic completed trip through the real replication path so peers
-            should get a "completed a 1 mile trip" notification, with no drive. */}
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Debug</p>
-        <button
-          style={{ ...s.primaryBtn, marginTop: spacing.sm }}
-          onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
-        >
-          Inject test trip
-        </button>
+            should get a "completed a 1 mile trip" notification, with no drive.
+            Gated on window.__pearDebug (set from __DEV__ by the shell), so it
+            only appears on debug builds and never ships to release users. */}
+        {typeof window !== 'undefined' && window.__pearDebug && (
+          <>
+            <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Debug</p>
+            <button
+              style={{ ...s.primaryBtn, marginTop: spacing.sm }}
+              onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
+            >
+              Inject test trip
+            </button>
+          </>
+        )}
       </Collapsible>
     </div>
   )
