@@ -68,11 +68,22 @@ ssh umbrel@umbrel.local \
 
 ## Install as an Umbrel app
 
-Add a Community App Store (Umbrel - App Store - top-right - "Community App
-Stores") pointing at a git repo laid out as
-`pearcircle-seeder/{umbrel-app.yml,docker-compose.yml}`, then install from the
-store. The official route is a PR to `getumbrel/umbrel-apps` once the image is
-published to a public registry.
+The published image lives at `ghcr.io/peerloomllc/pearcircle-seeder` (public),
+and it's listed in the PeerLoom community app store:
+
+  https://github.com/peerloomllc/peerloom-umbrel-app-store
+
+In Umbrel: App Store - top-right "⋯" - "Community App Stores" - add that URL,
+then install **PearCircle Seeder** from the PeerLoom section. Umbrel pulls the
+image, assigns the port, and runs it behind `app_proxy` (dashboard gated by the
+Umbrel login). Validated on an x86_64 umbrelOS 0.5.4 box (enroll + replicate).
+
+Note: the store id is `peerloom`, so the app id is `peerloom-pearcircle-seeder`
+(Umbrel requires every app id to be prefixed with the store id). The files in
+THIS directory are the source of truth; the store repo mirrors them.
+
+The official route is a PR to `getumbrel/umbrel-apps` once a multi-arch image
+(amd64 + arm64) is published.
 
 ## Networking note
 

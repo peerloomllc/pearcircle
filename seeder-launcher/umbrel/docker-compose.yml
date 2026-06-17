@@ -2,16 +2,18 @@ version: "3.7"
 
 services:
   # Umbrel's reverse proxy: gates the UI behind the Umbrel login and forwards
-  # to the seeder container on the app network. APP_HOST is "<app-id>_app_1".
+  # to the seeder container on the app network. APP_HOST is "<app-id>_app_1",
+  # and the app id carries the PeerLoom community-store prefix (Umbrel requires
+  # every app's id to start with the store id; store id = "peerloom").
   app_proxy:
     environment:
-      APP_HOST: pearcircle-seeder_app_1
+      APP_HOST: peerloom-pearcircle-seeder_app_1
       APP_PORT: 8730
 
   app:
-    # Replace with the published multi-arch image once it's pushed. For local
-    # testing this tag must already be `docker load`ed on the Umbrel host.
-    image: ghcr.io/peerloomllc/pearcircle-seeder:0.1.0
+    # Published, public, pinned by digest (amd64). Multi-arch (arm64 for a
+    # Raspberry Pi) is a follow-up.
+    image: ghcr.io/peerloomllc/pearcircle-seeder:0.1.0@sha256:a5378a6a15ea6725b0699ee2b06a8aabe72767a79bec9cb538acf77b85a7f31d
     restart: on-failure
     stop_grace_period: 1m
     security_opt:

@@ -1,5 +1,8 @@
 manifestVersion: 1
-id: pearcircle-seeder
+# id carries the community-store prefix: Umbrel requires every app's id to
+# start with the store id (store id = "peerloom"). Published at
+# https://github.com/peerloomllc/peerloom-umbrel-app-store
+id: peerloom-pearcircle-seeder
 name: PearCircle Seeder
 tagline: Keep your PearCircle circles online 24/7
 category: networking
