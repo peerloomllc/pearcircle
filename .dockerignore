@@ -1,0 +1,25 @@
+# Build context trimming for the seeder Docker image
+# (seeder-launcher/umbrel/Dockerfile). The builder runs `npm ci` itself, so
+# node_modules is regenerated rather than copied — and everything below is
+# either regenerated, irrelevant to the seeder, or just bulky.
+**/node_modules
+.git
+.expo
+
+# Mobile build outputs / artifacts the seeder doesn't use
+android/build
+android/app/build
+android/.gradle
+android/.kotlin
+ios/build
+ios/Pods
+*.apk
+*.aab
+*.ipa
+*.sha256
+
+# Prebuilt JS bundles (the seeder rebuilds the worklet bundle from src/)
+assets/*.bundle
+
+# Launcher build outputs (re-staged in the image)
+seeder-launcher/dist

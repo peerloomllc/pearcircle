@@ -12,7 +12,18 @@ const { UpdateChecker } = require('./updateCheck')
 const { UpdateApplier } = require('./updateApply')
 
 function parseArgs (argv) {
-  const out = { dev: false, port: 8730 }
+  // Defaults bind to loopback with token auth — the desktop install model
+  // (any local process is the only reachable client). A containerized deploy
+  // (Umbrel) overrides both: it binds 0.0.0.0 so the app_proxy on the Docker
+  // network can reach it, and disables the in-app token because the proxy
+  // already gates access behind the Umbrel login. Env vars let the container
+  // set these without editing the CMD; explicit flags still win.
+  const out = {
+    dev: false,
+    port: process.env.SEEDER_PORT ? Number(process.env.SEEDER_PORT) : 8730,
+    host: process.env.SEEDER_HOST || '127.0.0.1',
+    noAuth: process.env.SEEDER_NO_AUTH === '1' || process.env.SEEDER_NO_AUTH === 'true',
+  }
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--dev') out.dev = true
@@ -21,6 +32,8 @@ function parseArgs (argv) {
     else if (a === '--ui') out.uiDir = argv[++i]
     else if (a === '--data-dir') out.dataDirOverride = argv[++i]
     else if (a === '--port') out.port = Number(argv[++i])
+    else if (a === '--host') out.host = argv[++i]
+    else if (a === '--no-auth') out.noAuth = true
     else if (a === '--no-open') out.noOpen = true
     else if (a === '--help' || a === '-h') {
       printHelp(); process.exit(0)
@@ -42,7 +55,11 @@ function printHelp () {
     '  --bundle <path>     Override the worklet entry file',
     '  --ui <dir>          Override the static UI directory',
     '  --data-dir <path>   Override the OS-default data directory',
-    '  --port <n>          Bind port (default 8730)',
+    '  --port <n>          Bind port (default 8730, env SEEDER_PORT)',
+    '  --host <addr>       Bind address (default 127.0.0.1, env SEEDER_HOST;',
+    '                      use 0.0.0.0 behind a reverse proxy / in a container)',
+    '  --no-auth           Skip the bearer-token check (env SEEDER_NO_AUTH=1);',
+    '                      only for when a front proxy already gates access',
     '  --no-open           Suppress launching the default browser',
     '',
   ].join('\n'))
@@ -166,21 +183,25 @@ async function main () {
     log,
   })
 
-  const { srv, startPolling } = createServer({ worklet, token, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker, updateApplier })
+  if (opts.noAuth) log('host', 'auth: bearer-token check DISABLED (--no-auth); relying on a front proxy')
+  const { srv, startPolling } = createServer({ worklet, token, requireAuth: !opts.noAuth, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker, updateApplier })
   srv.on('error', (err) => {
     log('host', `server error: ${err.message}`)
     if (err.code === 'EADDRINUSE') process.exit(2)
   })
 
   await new Promise((resolve, reject) => {
-    srv.listen(opts.port, '127.0.0.1', () => resolve())
+    srv.listen(opts.port, opts.host, () => resolve())
     srv.once('error', reject)
   })
   startPolling()
 
-  const url = `http://127.0.0.1:${opts.port}/?t=${token}`
+  // Loopback URL carries the token for the auto-opened browser; a non-loopback
+  // bind (container) is reached through the proxy, so just log host:port.
+  const onLoopback = opts.host === '127.0.0.1' || opts.host === 'localhost'
+  const url = onLoopback ? `http://127.0.0.1:${opts.port}/?t=${token}` : `http://${opts.host}:${opts.port}/`
   log('host', `UI at ${url}`)
-  if (!opts.noOpen && process.stdout.isTTY) tryOpenBrowser(url)
+  if (!opts.noOpen && onLoopback && process.stdout.isTTY) tryOpenBrowser(url)
 
   const shutdown = async (sig) => {
     log('host', `received ${sig}, shutting down`)
