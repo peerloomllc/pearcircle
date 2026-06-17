@@ -3564,6 +3564,17 @@ async function mountSeederCircle (enrollment) {
   // 2026-05-20). At boot _seederActiveConns is empty — harmless no-op.
   const seederPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
   for (const conn of _seederActiveConns) {
+    // Re-enroll over a persistent connection: the admission channel from before
+    // the leave is still open on both sides, so just re-send the announce on it
+    // (recreating the channel here is racy — create-failed / never-opens — and
+    // was the re-enroll resurrection bug). Only create a fresh channel when none
+    // exists for this connection (first enroll, or after a reconnect).
+    const existing = _seederAdmissionChannels.get(conn)?.get(circleId)
+    if (existing && typeof existing.sendAnnounce === 'function') {
+      existing.sendAnnounce()
+      mark('seeder:announce-channel-open', { circleId, remote: 'post-mount-reannounce' })
+      continue
+    }
     const handle = setupSeederAdmissionChannel({
       conn,
       role: 'seed',
@@ -3679,12 +3690,13 @@ function trackSeederAdmissionChannel (conn, circleId, handle) {
   if (!handle || typeof handle.sendLeft !== 'function') return
   let perConn = _seederAdmissionChannels.get(conn)
   if (!perConn) { perConn = new Map(); _seederAdmissionChannels.set(conn, perConn) }
-  // Keep the channel too so leaveSeederCircle can CLOSE it — leaving the topic
-  // doesn't drop the shared Hyperswarm connection, so without an explicit close
-  // the old admission channel lingers on the mux and a re-enroll's
-  // createChannel hits create-failed (duplicate protocol+id) → no re-announce →
-  // the seeder never reappears on members (the re-enroll resurrection bug).
-  perConn.set(circleId, { sendLeft: handle.sendLeft, channel: handle.channel })
+  // Keep sendLeft (push the leave notice) + sendAnnounce (re-announce on
+  // re-enroll over this same still-open channel — see leaveSeederCircle /
+  // mountSeederCircle). We deliberately do NOT close the channel on leave:
+  // recreating a per-circle admission channel on a persistent Hyperswarm
+  // connection is racy (create-failed, or it never reaches onopen). Keeping it
+  // open and re-sending the announce is the reliable re-enroll path.
+  perConn.set(circleId, { sendLeft: handle.sendLeft, sendAnnounce: handle.sendAnnounce, channel: handle.channel })
 }
 
 async function leaveSeederCircle (circleId) {
@@ -3695,18 +3707,16 @@ async function leaveSeederCircle (circleId) {
   // shared across circles and is NOT closed here, so the admission channel is
   // still live to carry this frame. Best-effort: members not connected right now
   // never receive it and rely on the manual Remove in Settings.
+  // Push the leave notice over each connected member's admission channel, but
+  // KEEP the channel open (do not close, do not drop the registry entry): a
+  // re-enroll re-announces over this same channel (mountSeederCircle), which is
+  // reliable, whereas closing + recreating on a persistent connection is racy
+  // (the recreate hits create-failed or never reaches onopen, so the seeder
+  // never reappears on members).
   let leftSent = 0
-  for (const [conn, perConn] of _seederAdmissionChannels) {
+  for (const perConn of _seederAdmissionChannels.values()) {
     const h = perConn.get(circleId)
-    if (h) {
-      if (h.sendLeft()) leftSent++
-      // Close the channel AFTER sending left (the left frame is queued on the
-      // stream before the close frame, so it still arrives). This frees the
-      // protocol+id on the mux so a re-enroll can re-open + re-announce.
-      try { if (h.channel) h.channel.close() } catch {}
-    }
-    perConn.delete(circleId)
-    if (perConn.size === 0) _seederAdmissionChannels.delete(conn)
+    if (h && h.sendLeft()) leftSent++
   }
   if (leftSent > 0) mark('seeder:left-notice-pushed', { circleId, sent: leftSent })
   const entry = _seederCircles.get(circleId)

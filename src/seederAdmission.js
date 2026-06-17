@@ -220,25 +220,36 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
     }
   }
 
+  // Send the announce payload (seed role). Normally fired once on channel open;
+  // also callable on demand so a re-enroll can re-announce over the SAME, still-
+  // open channel without closing/recreating it (proposal 2026-06-17-seeder-leave
+  // -propagation). Recreating on a persistent connection is racy — the
+  // protocol+id reuse either hits create-failed or never reaches onopen — so we
+  // keep the channel open across leave and just re-send this.
+  function sendAnnounce () {
+    if (role !== 'seed' || !announceMessage) return false
+    try {
+      const payload = { pubkey: seederPubkey }
+      if (typeof label === 'string' && label.length > 0) payload.label = label
+      // Seeder build version (proposal 2026-06-05-seeder-update slice 1), so
+      // members can surface "update available". Additive + optional: an old
+      // member ignores the unknown field, an old seeder simply omits it.
+      if (typeof version === 'string' && version.length > 0) payload.version = version.slice(0, 64)
+      announceMessage.send(payload)
+      trace('admission:announce-sent')
+      return true
+    } catch (e) {
+      trace('admission:announce-send-failed', { err: e?.message ?? String(e) })
+      return false
+    }
+  }
+
   const channel = mux.createChannel({
     protocol: SEEDER_ADMISSION_PROTOCOL,
     id: channelId,
     onopen () {
       trace('admission:onopen')
-      if (role === 'seed' && announceMessage) {
-        try {
-          const payload = { pubkey: seederPubkey }
-          if (typeof label === 'string' && label.length > 0) payload.label = label
-          // Seeder build version (proposal 2026-06-05-seeder-update slice 1), so
-          // members can surface "update available". Additive + optional: an old
-          // member ignores the unknown field, an old seeder simply omits it.
-          if (typeof version === 'string' && version.length > 0) payload.version = version.slice(0, 64)
-          announceMessage.send(payload)
-          trace('admission:announce-sent')
-        } catch (e) {
-          trace('admission:announce-send-failed', { err: e?.message ?? String(e) })
-        }
-      }
+      if (role === 'seed') sendAnnounce()
       // On open, push our current verdict on this seeder so its flag converges
       // even if the live revoke/admit signal was missed (e.g. re-admitted while
       // disconnected). Mutually exclusive: a seeder row is either revoked or
@@ -405,7 +416,7 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
 
   channel.open()
   trace('admission:channel-opened')
-  return { channel, sendRevoked, sendAdmitted, sendLeft, sendLastknownCores, sendWriterCores }
+  return { channel, sendRevoked, sendAdmitted, sendLeft, sendAnnounce, sendLastknownCores, sendWriterCores }
 }
 
 module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, admissionChannelId, normalizeLastknownCores, normalizeWriterCores }
