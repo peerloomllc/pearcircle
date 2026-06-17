@@ -19,9 +19,12 @@ const MIME = {
 // the result out over WS so clients have something current to render.
 const SNAPSHOT_INTERVAL_MS = 5000
 
-function createServer ({ worklet, token, uiDir, log, version = null, updateChecker = null, updateApplier = null }) {
+function createServer ({ worklet, token, uiDir, log, version = null, updateChecker = null, updateApplier = null, requireAuth = true }) {
   const routeTable = routes()
   const ctx = { worklet, version, updateChecker, updateApplier }
+  // When a front proxy gates access (Umbrel app_proxy behind the Umbrel
+  // login), the in-app bearer token is bypassed — the proxy never forwards it.
+  const authOk = (req) => !requireAuth || auth.verify(req, token)
 
   const srv = http.createServer(async (req, res) => {
     try {
@@ -45,7 +48,7 @@ function createServer ({ worklet, token, uiDir, log, version = null, updateCheck
       }
 
       if (url.pathname.startsWith('/api/')) {
-        if (!auth.verify(req, token)) return sendUnauth(res)
+        if (!authOk(req)) return sendUnauth(res)
         const route = routeTable.find((r) => r.method === req.method && r.match(url))
         if (!route) return sendStatus(res, 404, 'not found')
         const result = await route.handler(req, ctx, url)
@@ -64,7 +67,7 @@ function createServer ({ worklet, token, uiDir, log, version = null, updateCheck
   srv.on('upgrade', (req, sock, head) => {
     const url = new URL(req.url, 'http://localhost')
     if (url.pathname !== '/ws') return sock.destroy()
-    if (!auth.verify(req, token)) {
+    if (!authOk(req)) {
       sock.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
       return sock.destroy()
     }
