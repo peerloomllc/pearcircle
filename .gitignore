@@ -30,6 +30,9 @@ scripts/frame-android-screenshots.sh
 scripts/assets/
 scripts/.env
 .env
+# Local Windows build tooling (machine/VM-specific)
+seeder-launcher/scripts/build-windows.sh
+seeder-launcher/scripts/windows-remote-build.ps1
 
 # Store-listing assets and the Zapstore publish manifest live locally.
 # Screenshots, framed bezel composites, store-listing copy, icon and

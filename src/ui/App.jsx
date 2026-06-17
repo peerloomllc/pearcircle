@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
@@ -298,6 +298,16 @@ export function App () {
   // free local state. Stored as an array because two circles could
   // theoretically be deleted in quick succession.
   const [deletedNotices, setDeletedNotices] = useState([])
+  // Member-side migration nudge (proposal 2026-06-17 slice 3/4). The owner of a
+  // recreated circle posts an owner-signed `supersede:` record into the OLD
+  // circle carrying the new invite; we surface it as a "your group moved"
+  // prompt with one-tap join + leave-old. dismissedNudgesRef holds new-circle
+  // ids the user tapped "Later" on, so they don't re-pop within the session
+  // (they reappear on next launch — persistent until the user joins or leaves,
+  // per the proposal's open-question resolution).
+  const [migrationNudge, setMigrationNudge] = useState(null)
+  const [migrationBusy, setMigrationBusy] = useState(false)
+  const dismissedNudgesRef = useRef(new Set())
   // iOS Always-location flow state. permissionStatus tracks the latest
   // status published by the shell ('always' | 'whenInUse' | 'denied' |
   // 'restricted' | 'notDetermined' | 'unknown'); the home banner reads
@@ -575,6 +585,71 @@ export function App () {
     return () => { document.removeEventListener('click', onAnyClick, true) }
   }, [refresh])
 
+  // Poll for migration nudges: any circle we're a non-owner member of that
+  // carries a supersede record pointing at a circle we have NOT joined yet.
+  // Light poll (every 8s while no nudge is showing) — supersede records are
+  // rare and low-volume, and the worklet read is cheap.
+  useEffect(() => {
+    const ourKey = identity?.publicKey
+    if (!ourKey) return
+    let cancelled = false
+    const scan = async () => {
+      if (migrationNudge) return // one at a time; don't churn while one is up
+      try {
+        const snap = await pear.call('circles:getAll')
+        if (cancelled) return
+        const circles = (snap?.circles ?? []).filter(c => !c.error && !c.circle?.deleted)
+        const joinedIds = new Set(circles.map(c => c.circleId))
+        for (const c of circles) {
+          // The owner of the old circle authored the record and already holds
+          // the new circle — no nudge for them.
+          if (c.circle?.ownerKey === ourKey) continue
+          for (const sp of (c.supersedes ?? [])) {
+            if (!sp?.newCircleId || !sp?.invite) continue
+            if (joinedIds.has(sp.newCircleId)) continue
+            if (dismissedNudgesRef.current.has(sp.newCircleId)) continue
+            setMigrationNudge({
+              oldCircleId: c.circleId,
+              oldName: c.circle?.name || 'your circle',
+              newCircleId: sp.newCircleId,
+              name: sp.name || c.circle?.name || 'the circle',
+              invite: sp.invite,
+            })
+            return
+          }
+        }
+      } catch {}
+    }
+    scan()
+    const id = setInterval(scan, 8000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [identity, migrationNudge])
+
+  // Join the new circle then leave the old one (one-tap migration). On any
+  // failure we surface nothing destructive: the leave only runs after a
+  // successful join, so a member never loses the old circle without the new.
+  const acceptMigration = useCallback(async () => {
+    if (!migrationNudge) return
+    setMigrationBusy(true)
+    try {
+      await pear.call('circle:join', { invite: migrationNudge.invite })
+      try { await pear.call('circle:leave', { circleId: migrationNudge.oldCircleId }) } catch {}
+      setMigrationNudge(null)
+      refresh()
+    } catch (e) {
+      // Leave the nudge up so the user can retry; surface via a deleted-style
+      // notice would be noisy, so we just keep the modal and stop the spinner.
+      console.warn('[ui] migration join failed', e?.message ?? e)
+    } finally {
+      setMigrationBusy(false)
+    }
+  }, [migrationNudge, refresh])
+
+  const dismissMigration = useCallback(() => {
+    if (migrationNudge) dismissedNudgesRef.current.add(migrationNudge.newCircleId)
+    setMigrationNudge(null)
+  }, [migrationNudge])
+
   // Dismiss the head notice: tell the worklet to free local state, then
   // pop it from the queue.
   const dismissDeletedNotice = useCallback(async (circleId) => {
@@ -705,6 +780,14 @@ export function App () {
           circleName={deletedNotices[0].circleName}
           kind={deletedNotices[0].kind}
           onDismiss={() => dismissDeletedNotice(deletedNotices[0].circleId)}
+        />
+      )}
+      {migrationNudge && (
+        <MigrationNudgeModal
+          nudge={migrationNudge}
+          busy={migrationBusy}
+          onJoin={acceptMigration}
+          onLater={dismissMigration}
         />
       )}
       {primingVisible && (
@@ -1230,6 +1313,58 @@ function CircleDeletedNotice ({ circleName, kind = 'deleted', onDismiss }) {
             fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
           }}>
           OK
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Member-side migration nudge (proposal 2026-06-17). Shown when the owner of a
+// circle we're in has recreated it on a fresh Autobase: one tap joins the new
+// circle and leaves the old, so the member never silently faces two same-named
+// circles. "Later" defers within the session.
+function MigrationNudgeModal ({ nudge, busy = false, onJoin, onLater }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 300,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(0,0,0,0.6)', padding: spacing.lg,
+    }}>
+      <div style={{
+        background: colors.surface.elevated, borderRadius: radius.lg,
+        padding: spacing.lg, maxWidth: 400, width: '100%',
+        border: `1px solid ${colors.border}`,
+      }}>
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
+          Your group moved
+        </div>
+        <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
+          The owner recreated <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{nudge.name}</strong> on a fresh start. Join the new circle to keep sharing — your old copy is left behind automatically.
+        </div>
+        <button
+          data-haptic='light'
+          onClick={onJoin}
+          disabled={busy}
+          style={{
+            width: '100%', padding: '12px', borderRadius: radius.md,
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', cursor: busy ? 'default' : 'pointer',
+            fontFamily: typography.fontFamily, fontWeight: 500, fontSize: 14,
+            opacity: busy ? 0.7 : 1, marginBottom: spacing.sm,
+          }}>
+          {busy ? 'Joining...' : 'Join the new circle'}
+        </button>
+        <button
+          onClick={onLater}
+          disabled={busy}
+          style={{
+            width: '100%', padding: '12px', borderRadius: radius.md,
+            background: 'transparent', color: colors.text.secondary,
+            border: `1px solid ${colors.border}`, cursor: busy ? 'default' : 'pointer',
+            fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+            opacity: busy ? 0.5 : 1,
+          }}>
+          Later
         </button>
       </div>
     </div>
@@ -4264,6 +4399,18 @@ function CirclesSection ({ active = true, onChanged }) {
   const [editingId, setEditingId] = useState(null)
   const [editName, setEditName] = useState('')
   const [savingRename, setSavingRename] = useState(false)
+  // Recreate (proposal 2026-06-17 slice 4): which circle the troubleshooting
+  // explainer is open for, an in-flight flag, and the freshly-minted invite to
+  // surface once recreate succeeds. File export/import share the same section.
+  const [recreatingFor, setRecreatingFor] = useState(null)   // source circle object
+  const [recreateBusy, setRecreateBusy] = useState(false)
+  const [recreateResult, setRecreateResult] = useState(null) // { name, invite, sourceName }
+  // File export/import (proposal 2026-06-17 slice 4). exportingFor opens the
+  // coordinate-privacy confirm; busy flags gate double-taps.
+  const [exportingFor, setExportingFor] = useState(null)     // circle object
+  const [exportBusy, setExportBusy] = useState(false)
+  const [importBusy, setImportBusy] = useState(false)
+  const [notice, setNotice] = useState(null)                 // transient success line
 
   const refresh = useCallback(async () => {
     try {
@@ -4279,6 +4426,10 @@ function CirclesSection ({ active = true, onChanged }) {
           name: c.circle?.name || CIRCLE_NAME_PENDING,
           isOwner: c.circle?.ownerKey === ourKey,
           memberCount: (c.members ?? []).length,
+          // Local recreate links + created date (proposal 2026-06-17 slice 3/4).
+          createdAt: typeof c.createdAt === 'number' ? c.createdAt : null,
+          recreatedFrom: typeof c.recreatedFrom === 'string' ? c.recreatedFrom : null,
+          recreatedTo: typeof c.recreatedTo === 'string' ? c.recreatedTo : null,
         }))
       setList(next)
     } catch (e) {
@@ -4346,14 +4497,118 @@ function CirclesSection ({ active = true, onChanged }) {
     }
   }
 
+  // Recreate this circle on a fresh empty Autobase (proposal 2026-06-17). The
+  // worklet keeps the name + Places + toggles, mints a new invite, posts the
+  // owner-signed migration nudge to the old circle, and links the two locally.
+  const performRecreate = async (c) => {
+    setRecreateBusy(true)
+    setError(null)
+    try {
+      const r = await pear.call('circle:recreate', { circleId: c.circleId })
+      if (!r?.invite) throw new Error('Recreate did not return an invite')
+      setRecreatingFor(null)
+      setRecreateResult({ name: r.name || c.name, invite: r.invite, sourceName: c.name })
+      onChanged?.()
+      refresh()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setRecreateBusy(false)
+    }
+  }
+
+  // Export this circle's curated config (name + Places + toggles) to a JSON
+  // file via the OS share sheet. The confirm modal carries the coordinate-
+  // privacy note before we hand any Place coordinates to a share target.
+  const performExport = async (c) => {
+    setExportBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const exportObj = await pear.call('circle:export', { circleId: c.circleId })
+      const filename = (c.name || 'circle').replace(/\s+/g, '-').toLowerCase() + '.pearcircle.json'
+      const r = await pear.call('shell:exportFile', {
+        filename,
+        contents: JSON.stringify(exportObj, null, 2),
+        title: 'Export ' + (c.name || 'circle'),
+      })
+      if (r && r.ok === false && r.error) throw new Error(r.error)
+      setExportingFor(null)
+      // r.canceled (no folder picked) leaves no note; a real save confirms it.
+      if (r?.ok) setNotice(r.savedToFolder ? `Saved ${filename} to your chosen folder.` : `Exported ${filename}.`)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setExportBusy(false)
+    }
+  }
+
+  // Import a circle config from a file: pick it, parse, hand the payload to the
+  // worklet (which validates + mints a brand-new circle), then surface the new
+  // invite via the same success modal recreate uses.
+  const performImport = async () => {
+    setImportBusy(true)
+    setError(null)
+    try {
+      const picked = await pear.call('shell:importFile')
+      if (!picked?.ok) {
+        if (picked?.canceled) return
+        throw new Error(picked?.error || 'Could not read the file')
+      }
+      let payload
+      try { payload = JSON.parse(picked.contents) }
+      catch { throw new Error('That file is not valid JSON') }
+      const r = await pear.call('circle:import', { payload })
+      if (!r?.invite) throw new Error('Import did not return an invite')
+      setRecreateResult({ name: r.name, invite: r.invite, imported: true })
+      onChanged?.()
+      refresh()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setImportBusy(false)
+    }
+  }
+
   if (loading) return null
+  // "Import from file" footer button, shown whether or not the user has any
+  // circles (importing always mints a brand-new one).
+  const importButton = (
+    <button
+      onClick={performImport}
+      disabled={importBusy}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
+        marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
+        background: 'transparent', color: colors.text.secondary,
+        border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
+        fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+        opacity: importBusy ? 0.6 : 1,
+      }}>
+      <DownloadSimple size={16} weight="regular" />
+      {importBusy ? 'Importing...' : 'Import circle from file'}
+    </button>
+  )
+
   if (list.length === 0) {
     return (
-      <p style={s.muted}>
-        You're not in any circles yet. Create or join one from the circle menu on the map.
-      </p>
+      <>
+        <p style={s.muted}>
+          You're not in any circles yet. Create or join one from the circle menu on the map.
+        </p>
+        {importButton}
+        {error && <p style={s.error}>{error}</p>}
+        {recreateResult && (
+          <RecreatedInviteModal result={recreateResult} onClose={() => setRecreateResult(null)} />
+        )}
+      </>
     )
   }
+
+  // Which circles are still present locally — used so a recreate badge only
+  // shows while both halves of the pair exist (the owner deletes the old one
+  // once members migrate, which retires the "Being replaced" badge).
+  const presentIds = new Set(list.map(x => x.circleId))
 
   return (
     <>
@@ -4364,6 +4619,10 @@ function CirclesSection ({ active = true, onChanged }) {
         {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
           const isPending = pending === c.circleId
           const isEditing = editingId === c.circleId
+          // "Being replaced": this circle was recreated into another that still
+          // exists. "New": this circle came from a recreate of one still present.
+          const beingReplaced = !!(c.recreatedTo && presentIds.has(c.recreatedTo))
+          const isReplacement = !!(c.recreatedFrom && presentIds.has(c.recreatedFrom))
           if (isEditing) {
             // Edit mode: input replaces name + count column; Save / Cancel
             // replace the action button. Disabled while saving so a
@@ -4427,9 +4686,13 @@ function CirclesSection ({ active = true, onChanged }) {
               borderBottom: `1px solid ${colors.divider}`,
             }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name || CIRCLE_NAME_PENDING}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, minWidth: 0 }}>
+                  <span style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name || CIRCLE_NAME_PENDING}</span>
+                  {beingReplaced && <RecreateBadge label="Being replaced" tone="muted" />}
+                  {isReplacement && <RecreateBadge label="New" tone="primary" />}
+                </div>
                 <div style={{ ...typography.caption, color: colors.text.secondary }}>
-                  {c.isOwner ? 'You own this · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
+                  {c.createdAt ? `Created ${formatCreatedDate(c.createdAt)} · ` : ''}{c.isOwner ? 'You own this · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
                 </div>
               </div>
               {c.isOwner && (
@@ -4440,6 +4703,26 @@ function CirclesSection ({ active = true, onChanged }) {
                   aria-label="Rename"
                   style={iconBtnStyle({ disabled: isPending })}>
                   <PencilSimple size={18} weight="regular" />
+                </button>
+              )}
+              {c.isOwner && (
+                <button
+                  onClick={() => { setError(null); setRecreatingFor(c) }}
+                  disabled={isPending}
+                  title="Recreate circle"
+                  aria-label="Recreate circle"
+                  style={iconBtnStyle({ disabled: isPending })}>
+                  <ArrowsClockwise size={18} weight="regular" />
+                </button>
+              )}
+              {c.isOwner && (
+                <button
+                  onClick={() => { setError(null); setExportingFor(c) }}
+                  disabled={isPending}
+                  title="Export circle to file"
+                  aria-label="Export circle to file"
+                  style={iconBtnStyle({ disabled: isPending })}>
+                  <ExportIcon size={18} weight="regular" />
                 </button>
               )}
               <button
@@ -4456,22 +4739,140 @@ function CirclesSection ({ active = true, onChanged }) {
           )
         })}
       </ul>
+      {importButton}
       {error && <p style={s.error}>{error}</p>}
-      {confirmingFor && (
+      {notice && <p style={{ ...typography.caption, color: colors.success, marginTop: spacing.sm }}>{notice}</p>}
+      {exportingFor && (
         <ConfirmSheet
-          title={confirmingFor.isOwner ? 'Delete circle?' : 'Leave circle?'}
-          message={confirmingFor.isOwner
-            ? <>Delete <strong>{confirmingFor.name}</strong>? This removes the circle for everyone in it. This cannot be undone.</>
-            : <>Leave <strong>{confirmingFor.name}</strong>? You will stop sharing with this circle. You can rejoin later if someone shares the invite again.</>}
-          confirmLabel={confirmingFor.isOwner ? 'Delete' : 'Leave'}
-          destructive
-          busy={pending === confirmingFor.circleId}
-          onConfirm={() => performAction(confirmingFor)}
-          onClose={() => { if (pending !== confirmingFor.circleId) setConfirmingFor(null) }}
+          title="Export circle to file"
+          message={<>
+            Save <strong>{exportingFor.name}</strong>'s name, Places and sharing toggles to a file you can re-import later. No keys, members or history are included. You'll pick where it goes (like Downloads) the first time.
+            <span style={{ display: 'block', marginTop: spacing.sm, color: colors.error }}>
+              This file contains your Place coordinates (like home and work). Only save it somewhere you trust.
+            </span>
+          </>}
+          confirmLabel="Export"
+          destructive={false}
+          busy={exportBusy}
+          onConfirm={() => performExport(exportingFor)}
+          onClose={() => { if (!exportBusy) setExportingFor(null) }}
+        />
+      )}
+      {confirmingFor && (() => {
+        // Delete-confirmation guard (proposal 2026-06-17): if the owner is
+        // about to delete the NEWER half of a recreated pair (the replacement,
+        // whose partner old circle still exists), call that out loudly — the
+        // two share a name and deleting the new one undoes the recreate.
+        const deletingNewer = confirmingFor.isOwner &&
+          !!(confirmingFor.recreatedFrom && presentIds.has(confirmingFor.recreatedFrom))
+        const created = confirmingFor.createdAt ? `created ${formatCreatedDate(confirmingFor.createdAt)}` : null
+        const detail = [created, `${confirmingFor.memberCount} ${confirmingFor.memberCount === 1 ? 'member' : 'members'}`]
+          .filter(Boolean).join(' · ')
+        return (
+          <ConfirmSheet
+            title={confirmingFor.isOwner ? 'Delete circle?' : 'Leave circle?'}
+            message={confirmingFor.isOwner
+              ? <>
+                  Delete <strong>{confirmingFor.name}</strong>{detail ? <> ({detail})</> : null}? This removes the circle for everyone in it. This cannot be undone.
+                  {deletingNewer && (
+                    <span style={{ display: 'block', marginTop: spacing.sm, color: colors.error }}>
+                      Heads up: this is the <strong>new</strong> circle you just recreated. Members are migrating to it. You probably meant to delete the older one being replaced.
+                    </span>
+                  )}
+                </>
+              : <>Leave <strong>{confirmingFor.name}</strong>? You will stop sharing with this circle. You can rejoin later if someone shares the invite again.</>}
+            confirmLabel={confirmingFor.isOwner ? 'Delete' : 'Leave'}
+            destructive
+            busy={pending === confirmingFor.circleId}
+            onConfirm={() => performAction(confirmingFor)}
+            onClose={() => { if (pending !== confirmingFor.circleId) setConfirmingFor(null) }}
+          />
+        )
+      })()}
+      {recreatingFor && (
+        <ConfirmSheet
+          title="Recreate Circle"
+          message={<>
+            Stuck, slow, or cluttered? Recreating rebuilds <strong>{recreatingFor.name}</strong> from scratch while keeping its name and Places. Members rejoin with a fresh invite, and history starts clean.
+            <span style={{ display: 'block', marginTop: spacing.sm, color: colors.text.secondary }}>
+              The old circle stays put until you delete it, so you can let everyone move over first.
+            </span>
+          </>}
+          confirmLabel="Recreate"
+          destructive={false}
+          busy={recreateBusy}
+          onConfirm={() => performRecreate(recreatingFor)}
+          onClose={() => { if (!recreateBusy) setRecreatingFor(null) }}
+        />
+      )}
+      {recreateResult && (
+        <RecreatedInviteModal
+          result={recreateResult}
+          onClose={() => setRecreateResult(null)}
         />
       )}
     </>
   )
+}
+
+// Small pill badge that disambiguates the two same-named circles of a
+// recreated pair in the Settings list (proposal 2026-06-17 slice 4).
+function RecreateBadge ({ label, tone = 'muted' }) {
+  const isPrimary = tone === 'primary'
+  return (
+    <span style={{
+      flexShrink: 0,
+      fontSize: 10, fontWeight: 500, lineHeight: 1,
+      textTransform: 'uppercase', letterSpacing: 0.4,
+      padding: '3px 6px', borderRadius: radius.full,
+      color: isPrimary ? colors.text.onPrimary : colors.text.secondary,
+      background: isPrimary ? colors.primary : colors.surface.input,
+      border: `1px solid ${isPrimary ? colors.primary : colors.border}`,
+    }}>
+      {label}
+    </span>
+  )
+}
+
+// Post-recreate success modal: surfaces the new circle's invite so the owner
+// can share it with the members who need to rejoin (proposal 2026-06-17).
+function RecreatedInviteModal ({ result, onClose }) {
+  return (
+    <BottomSheet onClose={onClose} zIndex={250}>
+      <h2 style={{ margin: `${spacing.sm}px 0 ${spacing.xs}px`, fontSize: 18, fontWeight: 400, color: colors.text.primary, textAlign: 'center' }}>
+        {result.imported ? 'Circle imported' : 'Circle recreated'}
+      </h2>
+      <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.md }}>
+        {result.imported
+          ? <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> was created from your file with the same Places. Share this invite so people can join.</>
+          : <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. Share this invite so members rejoin — anyone on the latest app also gets a one-tap "your group moved" nudge. The old circle stays until you delete it.</>}
+      </div>
+      <QrImage text={result.invite} />
+      <textarea style={s.inviteBox} readOnly value={result.invite} onFocus={(e) => e.target.select()} />
+      <ShareButton text={result.invite} title={'Join ' + (result.name || 'my PearCircle')} />
+      <button
+        onClick={onClose}
+        style={{
+          width: '100%', marginTop: spacing.sm, padding: '12px', borderRadius: radius.md,
+          background: 'transparent', color: colors.text.secondary,
+          border: `1px solid ${colors.border}`, cursor: 'pointer',
+          fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+        }}>
+        Done
+      </button>
+    </BottomSheet>
+  )
+}
+
+// "Created Jun 17" / "Created Jun 17, 2025" — drops the year only for the
+// current calendar year to keep the row caption short.
+function formatCreatedDate (ts) {
+  if (typeof ts !== 'number') return ''
+  const d = new Date(ts)
+  const opts = d.getFullYear() === new Date().getFullYear()
+    ? { month: 'short', day: 'numeric' }
+    : { month: 'short', day: 'numeric', year: 'numeric' }
+  return d.toLocaleDateString([], opts)
 }
 
 // Icon button styling shared by the Settings rows. 36x36 square,
@@ -6789,6 +7190,7 @@ function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive =
       <h2 style={{
         margin: `${spacing.sm}px 0 ${spacing.xs}px`,
         fontSize: 18, fontWeight: 400, color: colors.text.primary,
+        textAlign: 'center',
       }}>
         {title}
       </h2>

@@ -5,6 +5,8 @@ import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
 import { Asset } from 'expo-asset'
 import * as FileSystem from 'expo-file-system/legacy'
+import * as Sharing from 'expo-sharing'
+import * as DocumentPicker from 'expo-document-picker'
 import * as Linking from 'expo-linking'
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Notifications from 'expo-notifications'
@@ -62,6 +64,9 @@ const TOUR_PENDING_KEY = 'pc:tourPending'
 // About page's donate section).
 const DONATE_FIRST_LAUNCH_KEY = 'pc:donateReminder:firstLaunch'
 const DONATE_SHOWN_KEY = 'pc:donateReminder:shown'
+// Android SAF directory the user picked for circle-config exports (e.g.
+// Downloads). Persisted so exports after the first grant need no prompt.
+const EXPORT_DIR_KEY = 'pc:export:dirUri'
 const _mutes = new Set<string>()
 let _ourPubkey: string | null = null
 // Cached locally so the peerTrip:completed hot path doesn't round-trip
@@ -85,6 +90,14 @@ function formatTripDistance(meters: number, unit: 'km' | 'miles'): string {
 }
 
 const muteKey = (circleId: string, placeId: string) => circleId + ':' + placeId
+
+// Strip anything that isn't safe in a filename (path separators, control
+// chars) so a circle name can't escape the cache dir or break the share.
+// Used by shell:exportFile. Falls back to '' so the caller can default.
+function sanitizeFilename(name: unknown): string {
+  if (typeof name !== 'string') return ''
+  return name.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '').slice(0, 80)
+}
 
 async function loadMutes() {
   try {
@@ -923,6 +936,80 @@ export default function Index() {
           title: msg.args?.title ?? '',
         })
         respond(msg.id, { ok: result.action !== Share.dismissedAction })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:exportFile') {
+      // Save the circle-config JSON to a real, user-visible file. Proposal
+      // 2026-06-17 slice 4.
+      //   Android: write straight into a folder the user picked once (e.g.
+      //   Downloads) via the Storage Access Framework. The granted folder URI
+      //   is persisted, so after the first grant every export lands there with
+      //   no further prompt. Scoped-storage compliant — apps can't blind-write
+      //   to Downloads without this one-time grant.
+      //   iOS: there is no Downloads folder; route through the share sheet so
+      //   the user can "Save to Files".
+      try {
+        const filename = sanitizeFilename(msg.args?.filename) || 'pearcircle-export.json'
+        const baseName = filename.replace(/\.json$/i, '')
+        const contents = typeof msg.args?.contents === 'string' ? msg.args.contents : ''
+        if (Platform.OS === 'android') {
+          const SAF = (FileSystem as any).StorageAccessFramework
+          const writeInto = async (dirUri: string) => {
+            const fileUri = await SAF.createFileAsync(dirUri, baseName, 'application/json')
+            await FileSystem.writeAsStringAsync(fileUri, contents, { encoding: FileSystem.EncodingType.UTF8 })
+          }
+          let dirUri = await AsyncStorage.getItem(EXPORT_DIR_KEY)
+          if (dirUri) {
+            // Reuse the saved grant. If it's stale (folder removed / access
+            // revoked) the write throws; fall through to a fresh prompt.
+            try { await writeInto(dirUri); respond(msg.id, { ok: true, savedToFolder: true }); return }
+            catch { dirUri = null; await AsyncStorage.removeItem(EXPORT_DIR_KEY) }
+          }
+          const perm = await SAF.requestDirectoryPermissionsAsync()
+          if (!perm.granted) { respond(msg.id, { ok: false, canceled: true }); return }
+          await AsyncStorage.setItem(EXPORT_DIR_KEY, perm.directoryUri)
+          await writeInto(perm.directoryUri)
+          respond(msg.id, { ok: true, savedToFolder: true })
+          return
+        }
+        const uri = (FileSystem.cacheDirectory ?? FileSystem.documentDirectory!) + filename
+        await FileSystem.writeAsStringAsync(uri, contents, { encoding: FileSystem.EncodingType.UTF8 })
+        if (!(await Sharing.isAvailableAsync())) {
+          respond(msg.id, { ok: false, error: 'sharing not available' })
+          return
+        }
+        await Sharing.shareAsync(uri, {
+          mimeType: 'application/json',
+          dialogTitle: msg.args?.title ?? 'Export circle',
+          UTI: 'public.json',
+        })
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:importFile') {
+      // Open the OS document picker, read the chosen JSON file, and hand its
+      // text back to the WebView, which validates + imports it. Proposal
+      // 2026-06-17 slice 4.
+      try {
+        const res = await DocumentPicker.getDocumentAsync({
+          type: ['application/json', 'text/plain', '*/*'],
+          copyToCacheDirectory: true,
+          multiple: false,
+        })
+        if (res.canceled || !res.assets?.[0]?.uri) {
+          respond(msg.id, { ok: false, canceled: true })
+          return
+        }
+        const contents = await FileSystem.readAsStringAsync(res.assets[0].uri, {
+          encoding: FileSystem.EncodingType.UTF8,
+        })
+        respond(msg.id, { ok: true, contents })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
       }
