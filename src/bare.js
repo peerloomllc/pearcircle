@@ -49,6 +49,7 @@ const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
 const { createStoreFlusher } = require('./lib/storeFlush')
+const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -785,6 +786,47 @@ const handlers = {
     admitFollowedSeedersToCircle(circleId, base).catch(() => {})
 
     return { circleId, circleKey, bootstrap, encryptionKey, name, ownerPublicKey, createdAt, invite }
+  },
+
+  // Export a circle's curated config (name + Places + per-circle toggles) as a
+  // versioned, keyless JSON envelope (proposal 2026-06-17). Read-only.
+  'circle:export': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    return buildExport(await readCircleConfigForExport(circleId))
+  },
+
+  // Create a brand-new circle from a previously-exported config envelope.
+  // Always mints a fresh circle (the envelope carries no keys/ids); returns the
+  // new circle's invite for the owner to share.
+  'circle:import': async ({ payload } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const result = validateImport(payload)
+    if (!result.ok) throw new Error('invalid import: ' + result.error)
+    const created = await createCircleFromConfig(result.value)
+    return { circleId: created.circleId, name: created.name, invite: created.invite }
+  },
+
+  // In-app one-shot: recreate THIS circle on a fresh empty Autobase, keeping its
+  // name + Places + toggles, and link the two locally so Settings can tell them
+  // apart and guard the delete screen. Owner-only. Leaves the source untouched.
+  'circle:recreate': async ({ circleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const sourceRec = await _localDb.get('circles:joined:' + circleId)
+    if (!sourceRec) throw new Error('unknown circle: ' + circleId)
+    if (sourceRec.value.role !== 'owner') throw new Error('only the circle owner can recreate it')
+
+    const created = await createCircleFromConfig(await readCircleConfigForExport(circleId))
+    const recreatedAt = Date.now()
+    // Local-only links: distinguish the two same-named circles in Settings and
+    // back the delete-confirmation guard (proposal 2026-06-17). No wire effect.
+    const newRec = await _localDb.get('circles:joined:' + created.circleId)
+    if (newRec) {
+      await _localDb.put('circles:joined:' + created.circleId, { ...newRec.value, recreatedFrom: circleId, recreatedAt })
+    }
+    await _localDb.put('circles:joined:' + circleId, { ...sourceRec.value, recreatedTo: created.circleId, recreatedAt })
+    return { circleId: created.circleId, name: created.name, invite: created.invite, sourceCircleId: circleId }
   },
 
   'circle:join': async ({ invite } = {}) => {
@@ -4629,6 +4671,46 @@ async function onSwarmConnection (conn, info) {
 // ~zero. This is the canonical lever -- Corestore.suspend() flushes via the
 // same `storage.db.flush()` call. Belt to the lastSeen-ephemeral fix's braces:
 // this bounds the damage from any high-frequency write path, present or future.
+// --- Circle config export / recreate (proposal 2026-06-17) ------------------
+// Read a circle's curated config (name + Places + per-circle toggles) for
+// export or recreate. Reads the on-disk view directly (no base.update(), same
+// cold-boot rationale as snapshotCircle / place:list).
+async function readCircleConfigForExport (circleId) {
+  const base = _circleBases.get(circleId)
+  if (!base) throw new Error('unknown circle: ' + circleId)
+  const local = await _localDb.get('circles:joined:' + circleId)
+  const name = local?.value?.name
+  if (typeof name !== 'string') throw new Error('circle has no local name')
+  const places = []
+  for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+    if (value && !isDeleted(value)) {
+      places.push({ name: value.name, lat: value.lat, lon: value.lon, radiusMeters: value.radiusMeters })
+    }
+  }
+  const tripRow = await _localDb.get('trips:sharing:' + circleId)
+  return {
+    name,
+    places,
+    settings: {
+      sharingDefault: getCircleSharing(circleId).enabled === true,
+      tripSharing: tripRow?.value?.enabled === true,
+    },
+  }
+}
+
+// Create a brand-new circle from a validated config, reusing the live
+// circle:create + place:create + toggle handlers so the result is
+// indistinguishable from a hand-made circle. Returns the create result.
+async function createCircleFromConfig ({ name, places, settings }) {
+  const created = await handlers['circle:create']({ name })
+  for (const p of places) {
+    await handlers['place:create']({ circleId: created.circleId, name: p.name, lat: p.lat, lon: p.lon, radiusMeters: p.radiusMeters })
+  }
+  await handlers['sharing:set']({ circleId: created.circleId, enabled: settings.sharingDefault === true })
+  await handlers['trips:sharing:set']({ circleId: created.circleId, enabled: settings.tripSharing === true })
+  return created
+}
+
 const STORE_FLUSH_INTERVAL_MS = 5 * 60 * 1000
 let _storeFlushTimer = null
 
