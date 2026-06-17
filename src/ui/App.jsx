@@ -1537,6 +1537,7 @@ function SeedersSection ({ active = true }) {
   const [bundleInfo, setBundleInfo] = useState(null)
   const [minting, setMinting] = useState(false)
   const [confirmingRevoke, setConfirmingRevoke] = useState(null)
+  const [confirmingRemove, setConfirmingRemove] = useState(null)
   const [pending, setPending] = useState(null)
   // Latest published seeder release tag, fetched once from GitHub so we can flag
   // out-of-date seeders (proposal 2026-06-05-seeder-update slice 2). The phone
@@ -1628,6 +1629,27 @@ function SeedersSection ({ active = true }) {
         await pear.call('circle:seeder:approve', { circleId: circle.circleId, pubkey: seeder.pubkey })
       }
       await refresh()
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setPending(null)
+    }
+  }
+
+  // Forget a seeder device entirely (proposal 2026-06-17-seeder-leave
+  // -propagation): writes a `left` tombstone for every circle it's in (live or
+  // revoked) so it disappears from this list. The reliable fallback for a seeder
+  // that left while no member was connected, so the in-band notice was missed.
+  // If the same seeder ever reconnects + re-announces, it auto-re-admits fresh.
+  const removeEverywhere = async (seeder) => {
+    setPending(seeder.pubkey)
+    setError(null)
+    try {
+      for (const circle of seeder.circles) {
+        try { await pear.call('circle:seeder:remove', { circleId: circle.circleId, pubkey: seeder.pubkey }) } catch {}
+      }
+      await refresh()
+      setConfirmingRemove(null)
     } catch (e) {
       setError(String(e?.message ?? e))
     } finally {
@@ -1809,6 +1831,20 @@ function SeedersSection ({ active = true }) {
                     onChange={() => toggleFollow(seeder)}
                   />
                 </div>
+                {/* Forget this seeder entirely. Distinct from Revoke (which
+                    keeps it listed for re-admit): Remove clears it from the
+                    list. Use it for a seeder that left on its own. */}
+                <button
+                  onClick={() => setConfirmingRemove(seeder)}
+                  disabled={isPending}
+                  style={{
+                    marginTop: spacing.sm, padding: 0,
+                    background: 'transparent', border: 'none',
+                    color: colors.text.muted, cursor: isPending ? 'not-allowed' : 'pointer',
+                    fontFamily: typography.fontFamily, fontSize: 12, textDecoration: 'underline',
+                  }}>
+                  Remove from list
+                </button>
               </li>
             )
           })}
@@ -1828,6 +1864,21 @@ function SeedersSection ({ active = true }) {
           busy={pending === confirmingRevoke.pubkey}
           onConfirm={() => revokeEverywhere(confirmingRevoke)}
           onClose={() => { if (pending !== confirmingRevoke.pubkey) setConfirmingRevoke(null) }}
+        />
+      )}
+      {confirmingRemove && (
+        <ConfirmSheet
+          title='Remove seeder?'
+          message={<>
+            Remove <strong>{confirmingRemove.label || ('Seeder ' + confirmingRemove.pubkey.slice(0, 8))}</strong> from
+            this list entirely? Use this when the seeder has stopped running or you took it off your circles.
+            If it ever reconnects and announces again, it'll come back automatically.
+          </>}
+          confirmLabel='Remove'
+          destructive
+          busy={pending === confirmingRemove.pubkey}
+          onConfirm={() => removeEverywhere(confirmingRemove)}
+          onClose={() => { if (pending !== confirmingRemove.pubkey) setConfirmingRemove(null) }}
         />
       )}
     </div>

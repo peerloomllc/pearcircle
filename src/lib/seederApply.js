@@ -17,6 +17,12 @@
 //     revoked?:    boolean
 //     revokedAt?:  number
 //     revokedBy?:  hex64
+//     left?:       boolean — seeder-operator-initiated leave (proposal
+//                            2026-06-17-seeder-leave-propagation); when true the
+//                            member-facing lists hide the row entirely (vs
+//                            `revoked`, which lingers for re-admit)
+//     leftAt?:     number
+//     leftBy?:     hex64
 //     v:           1
 //     sig:         hex128 — signature over canonical(rest) by `writer`
 //   }
@@ -62,6 +68,14 @@ function shouldAcceptSeederRow ({
     if (typeof incoming.revokedAt !== 'number' || !Number.isFinite(incoming.revokedAt)) return false
     if (incoming.revokedAt > now + futureToleranceMs) return false
     if (!isHex64(incoming.revokedBy)) return false
+  }
+  // `left` tombstone (proposal 2026-06-17-seeder-leave-propagation). Same shape
+  // discipline as revoked: a leave must carry a timestamp + the member who
+  // recorded it. The member-facing list filters these out entirely.
+  if (incoming.left === true) {
+    if (typeof incoming.leftAt !== 'number' || !Number.isFinite(incoming.leftAt)) return false
+    if (incoming.leftAt > now + futureToleranceMs) return false
+    if (!isHex64(incoming.leftBy)) return false
   }
   if (typeof verifySig !== 'function' || !verifySig(incoming)) return false
   if (!writerMember) return false
@@ -142,4 +156,36 @@ function buildSeederAdmission ({ seederPubkey, adminPubkeyHex, label, existing, 
   return out
 }
 
-module.exports = { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission }
+// Build the unsigned value for a `left` tombstone — the seeder operator left
+// this circle (in-band notice or manual member-side Remove). Proposal
+// 2026-06-17-seeder-leave-propagation. Like buildSeederRevoke, preserves
+// addedBy / addedAt / label so a later re-enroll keeps its first-admit history,
+// but marks the row `left` (hidden from the member list) rather than `revoked`
+// (which lingers for re-admit). `byPubkeyHex` is the member recording the leave
+// (the receiver of the in-band notice, or the user pressing Remove). Caller
+// signs before appending. Returns null on malformed input.
+function buildSeederGone ({ existing, byPubkeyHex, now }) {
+  if (!existing || typeof existing !== 'object') return null
+  if (typeof existing.pubkey !== 'string') return null
+  if (typeof existing.addedBy !== 'string') return null
+  if (typeof existing.addedAt !== 'number') return null
+  if (typeof byPubkeyHex !== 'string' || !HEX_64.test(byPubkeyHex)) return null
+  if (typeof now !== 'number' || !Number.isFinite(now)) return null
+  const out = {
+    pubkey: existing.pubkey,
+    writer: byPubkeyHex,
+    addedBy: existing.addedBy,
+    addedAt: existing.addedAt,
+    updatedAt: now,
+    left: true,
+    leftAt: now,
+    leftBy: byPubkeyHex,
+    v: 1,
+  }
+  if (typeof existing.label === 'string' && existing.label.length > 0) {
+    out.label = existing.label
+  }
+  return out
+}
+
+module.exports = { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone }

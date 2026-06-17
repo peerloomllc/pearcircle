@@ -37,7 +37,7 @@ const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
 const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLastKnown')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
-const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone } = require('./lib/seederApply')
 const { shouldAcceptSupersede } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
@@ -255,6 +255,11 @@ const _replicatingConns = new Set()
 // topic join emits no fresh `connection` event. Member-mode equivalent
 // is _activeConns. Proposal amendment 2026-05-20 (blind-seeder auto-follow).
 const _seederActiveConns = new Set()
+// Seed-mode: per-connection admission-channel send handles, so leaveSeederCircle
+// can push the in-band `left` notice to currently-connected members before
+// tearing the circle down (proposal 2026-06-17-seeder-leave-propagation).
+// conn → Map<circleId, { sendLeft }>. Cleaned on connection close.
+const _seederAdmissionChannels = new Map()
 // Open member-side seeder-sync channels. One per live connection; each
 // entry is { resend }. The channel sends the seed bundle only when the
 // remote is a followed seeder (checked at send time), so a channel to a
@@ -1246,7 +1251,9 @@ const handlers = {
       gt: 'seeder:',
       lt: 'seeder:~',
     })) {
-      if (!value || value.revoked === true) continue
+      // `left` rows are seeders that left/were removed — hidden entirely
+      // (proposal 2026-06-17-seeder-leave-propagation), unlike `revoked`.
+      if (!value || value.revoked === true || value.left === true) continue
       seeders.push({
         pubkey: value.pubkey,
         addedBy: value.addedBy,
@@ -1300,6 +1307,11 @@ const handlers = {
           lt: 'seeder:~',
         })) {
           if (!value || typeof value.pubkey !== 'string') continue
+          // A seeder that left / was removed is hidden entirely (proposal
+          // 2026-06-17-seeder-leave-propagation). If this is its only circle,
+          // the seeder won't appear at all; if it's still live elsewhere, just
+          // this circle is dropped from its list.
+          if (value.left === true) continue
           let entry = byPubkey.get(value.pubkey)
           if (!entry) {
             entry = { pubkey: value.pubkey, label: null, followed: false, circles: [] }
@@ -1370,6 +1382,27 @@ const handlers = {
     // right away, so its dashboard updates without waiting for a reconnect
     // (proposal 2026-05-21 amendment). Best-effort.
     notifySeederRevoked(circleId, pubkey, unsigned.revokedAt)
+    return { ok: true, circleId, pubkey }
+  },
+
+  // Remove a seeder from this circle's list entirely (proposal 2026-06-17
+  // -seeder-leave-propagation). Writes a `left` tombstone — distinct from
+  // revoke, which lingers for re-admit. The manual counterpart to the seeder's
+  // in-band "left" notice: use it to clear a seeder that's gone (e.g. it left
+  // while no member was connected, so the in-band signal was never delivered).
+  // A later re-announce from the same seeder auto-re-admits it (left is not a
+  // durable trust decision; see handleSeederAnnounce).
+  'circle:seeder:remove': async ({ circleId, pubkey } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string' || pubkey.length !== 64) {
+      throw new Error('pubkey must be a 64-char hex string')
+    }
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const wrote = await writeSeederGone(circleId, base, pubkey)
+    if (!wrote) throw new Error('no removable seeder with that pubkey in this circle')
     return { ok: true, circleId, pubkey }
   },
 
@@ -3531,7 +3564,7 @@ async function mountSeederCircle (enrollment) {
   // 2026-05-20). At boot _seederActiveConns is empty — harmless no-op.
   const seederPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
   for (const conn of _seederActiveConns) {
-    setupSeederAdmissionChannel({
+    const handle = setupSeederAdmissionChannel({
       conn,
       role: 'seed',
       circleId,
@@ -3544,6 +3577,7 @@ async function mountSeederCircle (enrollment) {
       onWriterCores: handleSeederWriterCores,
       mark,
     })
+    trackSeederAdmissionChannel(conn, circleId, handle)
     mark('seeder:announce-channel-open', { circleId, remote: 'post-mount' })
   }
   return _seederCircles.get(circleId)
@@ -3638,8 +3672,32 @@ async function runOneSeederRetentionSweep () {
   })
 }
 
+// Register a seed-role admission channel's send handles so leaveSeederCircle can
+// later push the in-band `left` notice over it (proposal 2026-06-17-seeder-leave
+// -propagation). No-op for older handles lacking sendLeft.
+function trackSeederAdmissionChannel (conn, circleId, handle) {
+  if (!handle || typeof handle.sendLeft !== 'function') return
+  let perConn = _seederAdmissionChannels.get(conn)
+  if (!perConn) { perConn = new Map(); _seederAdmissionChannels.set(conn, perConn) }
+  perConn.set(circleId, { sendLeft: handle.sendLeft })
+}
+
 async function leaveSeederCircle (circleId) {
   _seederRevokedCircles.delete(circleId)
+  // Tell currently-connected members we're leaving BEFORE tearing down, so each
+  // writes a `left` tombstone and the seeder vanishes from their Seeders list
+  // (proposal 2026-06-17-seeder-leave-propagation). The Hyperswarm connection is
+  // shared across circles and is NOT closed here, so the admission channel is
+  // still live to carry this frame. Best-effort: members not connected right now
+  // never receive it and rely on the manual Remove in Settings.
+  let leftSent = 0
+  for (const [conn, perConn] of _seederAdmissionChannels) {
+    const h = perConn.get(circleId)
+    if (h && h.sendLeft()) leftSent++
+    perConn.delete(circleId)
+    if (perConn.size === 0) _seederAdmissionChannels.delete(conn)
+  }
+  if (leftSent > 0) mark('seeder:left-notice-pushed', { circleId, sent: leftSent })
   const entry = _seederCircles.get(circleId)
   if (!entry) return
   try {
@@ -3815,6 +3873,9 @@ async function setupMemberAdmissionChannel (conn, circleId, base) {
     // mislabeled circleId can't cross-pair (2026-06-11-circleid-channel-binding).
     bootstrap: b4a.toString(base.key, 'hex'),
     onAnnounce: (msg) => handleSeederAnnounce(circleId, base, msg, conn),
+    // The seeder operator left this circle (proposal 2026-06-17-seeder-leave
+    // -propagation): write the `left` tombstone so it vanishes from our list.
+    onLeft: () => handleSeederLeaveNotice(circleId, base, conn),
     revokedNotice,
     admittedNotice,
     mark,
@@ -4438,14 +4499,17 @@ async function handleSeederAnnounce (circleId, base, { pubkey, label, version },
   }
   const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
   const existing = existingNode?.value ?? null
-  // Already admitted (non-revoked): nothing to admit, but this announce
-  // confirms the peer is a live seeder, so hand it our last-known core keys.
-  if (existing && existing.revoked !== true) {
+  // Already admitted (live, i.e. neither revoked nor left): nothing to admit,
+  // but this announce confirms the peer is a live seeder, so hand it our
+  // last-known core keys.
+  if (existing && existing.revoked !== true && existing.left !== true) {
     mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
     markConnSeederAndPush(circleId, conn)
     return
   }
   // Already revoked: keep the revocation, re-send the notice, do not admit.
+  // Revoke is a member trust decision (durable); re-admission is an explicit
+  // Settings action, never a side effect of the seeder reconnecting.
   if (existing && existing.revoked === true) {
     mark('admission:announce-from-revoked', { circleId, seeder: pubkey.slice(0, 8) })
     const entry = conn ? _memberAdmissionChannels.get(conn)?.get(circleId) : null
@@ -4454,7 +4518,16 @@ async function handleSeederAnnounce (circleId, base, { pubkey, label, version },
     }
     return
   }
-  // No row yet — first admission. Frictionless auto-admit.
+  // No row yet — first admission — OR a `left` tombstone whose seeder is now
+  // announcing again. Unlike `revoked`, `left` is not a member trust decision
+  // (the seeder voluntarily left, or a member tidied a dead entry), so an
+  // announce means it's back: auto-(re)admit resurrects it. buildSeederAdmission
+  // preserves the original addedBy/addedAt and drops the `left` field, and LWW
+  // (fresh updatedAt > leftAt) lets the admit out-date the tombstone.
+  // Frictionless auto-admit (proposal 2026-06-17-seeder-leave-propagation).
+  if (existing && existing.left === true) {
+    mark('admission:announce-from-left', { circleId, seeder: pubkey.slice(0, 8) })
+  }
   if (!base.writable) {
     mark('admission:not-writable', { circleId, seeder: pubkey.slice(0, 8) })
     return
@@ -4479,6 +4552,43 @@ function markConnSeederAndPush (circleId, conn) {
   // Also hand the seeder every writer core key so it mirrors all members, not
   // just the founder's bootstrap (slice 3d).
   try { pushWriterCoresToSeeder(circleId, conn) } catch {}
+}
+
+// Member-side handler for a seeder's in-band "left" notice (proposal
+// 2026-06-17-seeder-leave-propagation). The seeder operator left this circle,
+// so write a `left` tombstone for its row — that hides it from the Seeders
+// list entirely (vs `revoked`, which lingers for re-admit). The seeder pubkey
+// is the connection's remote identity key; circleId is the trusted channel id.
+async function handleSeederLeaveNotice (circleId, base, conn) {
+  const pubkey = conn ? _connPubkey.get(conn) : null
+  if (typeof pubkey !== 'string' || pubkey.length !== 64) return
+  try {
+    if (await writeSeederGone(circleId, base, pubkey)) {
+      mark('seeder:left-noticed', { circleId, seeder: pubkey.slice(0, 8) })
+      send({ event: 'seeder:left', data: { circleId, pubkey } })
+    }
+  } catch (e) {
+    mark('seeder:left-notice-failed', { circleId, err: e?.message ?? String(e) })
+  }
+}
+
+// Append a member-signed `left` tombstone for a seeder row. Shared by the
+// in-band leave notice and the manual circle:seeder:remove IPC. Returns false
+// (no-op) when there is no row, it is already left, or we can't write. A row
+// that was `revoked` can still be turned into `left` (a revoked seeder the
+// user also wants gone from the list) — buildSeederGone drops the revoked
+// fields and the fresh updatedAt wins by LWW.
+async function writeSeederGone (circleId, base, pubkey) {
+  if (!base || !base.writable) return false
+  const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
+  const existing = existingNode?.value ?? null
+  if (!existing || existing.left === true) return false
+  const byPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
+  const unsigned = buildSeederGone({ existing, byPubkeyHex, now: Date.now() })
+  if (!unsigned) return false
+  const signed = signValue(unsigned, _identity.secretKey)
+  await base.append({ type: 'put', key: 'seeder:' + pubkey, value: signed })
+  return true
 }
 
 // Write seeder:{pubkey} admission rows for every followed seeder into a
@@ -4513,7 +4623,10 @@ function onSeederSwarmConnection (conn, info) {
   // Track for post-mount admission-channel opening (auto-follow enrolls
   // circles after a connection already exists).
   _seederActiveConns.add(conn)
-  conn.once('close', () => _seederActiveConns.delete(conn))
+  conn.once('close', () => {
+    _seederActiveConns.delete(conn)
+    _seederAdmissionChannels.delete(conn)
+  })
   const remotePublicKey = info?.publicKey ? b4a.toString(info.publicKey, 'hex') : null
   const seederPubkeyHex = b4a.toString(_identity.publicKey, 'hex')
   // Figure out which enrolled circles this connection belongs to. info.topics
@@ -4532,7 +4645,7 @@ function onSeederSwarmConnection (conn, info) {
   }
   for (const circleId of candidateCircleIds) {
     const enrollment = _seederCircles.get(circleId)
-    setupSeederAdmissionChannel({
+    const handle = setupSeederAdmissionChannel({
       conn,
       role: 'seed',
       circleId,
@@ -4546,6 +4659,7 @@ function onSeederSwarmConnection (conn, info) {
       onWriterCores: handleSeederWriterCores,
       mark,
     })
+    trackSeederAdmissionChannel(conn, circleId, handle)
     if (remotePublicKey) {
       mark('seeder:announce-channel-open', { circleId, remote: remotePublicKey.slice(0, 8) })
     }
