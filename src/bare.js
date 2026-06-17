@@ -48,6 +48,7 @@ const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = re
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
+const { createStoreFlusher } = require('./lib/storeFlush')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
@@ -562,6 +563,11 @@ function runLocationModeDriver () {
 const handlers = {
   'ping': async () => ({ ok: true, ts: Date.now() }),
 
+  // Force a RocksDB memtable flush (truncates the WAL). Exposed for the
+  // verify gate / recovery tooling; the worklet also flushes on a timer and
+  // on background. See flushStore for the why (device 4fc221b3 WAL wedge).
+  'store:flush': async ({ reason } = {}) => ({ flushed: await flushStore(reason || 'manual') }),
+
   // RN AppState foreground/background, forwarded from app/index.tsx.
   // Foreground pins the adaptive location mode to "tracking" (proposal
   // 2026-05-21) so an opened map shows fresh positions including the
@@ -578,6 +584,11 @@ const handlers = {
     // while backgrounded is shed before the user looks at the map (proposal
     // 2026-06-01).
     if (_appForeground) probeConnections('foreground')
+    // Backgrounding is the most likely moment just before the OS kills or the
+    // user swipes the app away, so flush the WAL now to keep the next cold
+    // start's replay small (store maintenance). Fire-and-forget: never block
+    // the IPC response on disk I/O, and flushStore swallows its own errors.
+    if (!_appForeground) flushStore('background')
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
   },
@@ -4598,6 +4609,40 @@ async function onSwarmConnection (conn, info) {
   })
 }
 
+// --- Store maintenance: bound the RocksDB write-ahead log ------------------
+// The corestore backend (rocksdb-native) only flushes its in-memory memtable
+// to an on-disk SST when the write buffer fills (the 64 MB default) or on a
+// clean close. A location-sharing app appends lastSeen on every fix, so on a
+// device that's actively moving the WAL grows fast -- meanwhile the app is far
+// more often OS-killed or swiped away than closed cleanly, so the 64 MB
+// auto-flush is usually the FIRST flush a busy device ever attempts. Replaying
+// a 60 MB+ WAL on the next cold start (plus rebuilding the Autobase view on top
+// of it) blows memory and trips Android's 5 s ANR watchdog before the
+// post-recovery flush can finish, wedging the app in a crash loop where Circles
+// never load (root cause, device 4fc221b3 -- a 62 MB WAL of 202k entries, ~80%
+// lastSeen overwrites/deletes).
+//
+// Fix: flush the memtable to SST on a fixed cadence and whenever the app
+// backgrounds. Each flush truncates the WAL, so cold-start replay stays cheap
+// and no single flush is ever large enough to lose the ANR race. Flushing an
+// empty memtable is a RocksDB no-op (creates no stray SST), so the idle cost is
+// ~zero. This is the canonical lever -- Corestore.suspend() flushes via the
+// same `storage.db.flush()` call. Belt to the lastSeen-ephemeral fix's braces:
+// this bounds the damage from any high-frequency write path, present or future.
+const STORE_FLUSH_INTERVAL_MS = 5 * 60 * 1000
+let _storeFlushTimer = null
+
+const flushStore = createStoreFlusher({
+  getStore: () => _store,
+  mark,
+  warn: (...args) => console.warn(...args),
+})
+
+function startStoreFlushTimer () {
+  if (_storeFlushTimer) return
+  _storeFlushTimer = setInterval(() => { flushStore('interval') }, STORE_FLUSH_INTERVAL_MS)
+}
+
 async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   if (typeof version === 'string' && version.length > 0) _seederVersion = version.slice(0, 64)
   if (_initialized) {
@@ -4626,6 +4671,10 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   }
 
   mark('init:store-ready')
+
+  // Start bounding the WAL as soon as the store is open, before the heavy
+  // Autobase mount. Runs in both member and seed modes (both share _store).
+  startStoreFlushTimer()
 
   const localCore = _store.get({ name: 'local' })
   await localCore.ready()
