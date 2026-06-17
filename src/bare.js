@@ -3679,7 +3679,12 @@ function trackSeederAdmissionChannel (conn, circleId, handle) {
   if (!handle || typeof handle.sendLeft !== 'function') return
   let perConn = _seederAdmissionChannels.get(conn)
   if (!perConn) { perConn = new Map(); _seederAdmissionChannels.set(conn, perConn) }
-  perConn.set(circleId, { sendLeft: handle.sendLeft })
+  // Keep the channel too so leaveSeederCircle can CLOSE it — leaving the topic
+  // doesn't drop the shared Hyperswarm connection, so without an explicit close
+  // the old admission channel lingers on the mux and a re-enroll's
+  // createChannel hits create-failed (duplicate protocol+id) → no re-announce →
+  // the seeder never reappears on members (the re-enroll resurrection bug).
+  perConn.set(circleId, { sendLeft: handle.sendLeft, channel: handle.channel })
 }
 
 async function leaveSeederCircle (circleId) {
@@ -3693,7 +3698,13 @@ async function leaveSeederCircle (circleId) {
   let leftSent = 0
   for (const [conn, perConn] of _seederAdmissionChannels) {
     const h = perConn.get(circleId)
-    if (h && h.sendLeft()) leftSent++
+    if (h) {
+      if (h.sendLeft()) leftSent++
+      // Close the channel AFTER sending left (the left frame is queued on the
+      // stream before the close frame, so it still arrives). This frees the
+      // protocol+id on the mux so a re-enroll can re-open + re-announce.
+      try { if (h.channel) h.channel.close() } catch {}
+    }
     perConn.delete(circleId)
     if (perConn.size === 0) _seederAdmissionChannels.delete(conn)
   }
