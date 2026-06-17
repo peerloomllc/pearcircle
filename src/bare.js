@@ -38,6 +38,7 @@ const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLast
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('./lib/seederApply')
+const { shouldAcceptSupersede } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
@@ -826,7 +827,57 @@ const handlers = {
       await _localDb.put('circles:joined:' + created.circleId, { ...newRec.value, recreatedFrom: circleId, recreatedAt })
     }
     await _localDb.put('circles:joined:' + circleId, { ...sourceRec.value, recreatedTo: created.circleId, recreatedAt })
+
+    // Post the in-band migration nudge into the OLD circle so upgraded members
+    // get a one-tap "your group moved" prompt carrying the new invite (proposal
+    // 2026-06-17 slice 3). Best-effort: a supersede failure (e.g. source not yet
+    // writable) must not fail the recreate, which already succeeded.
+    try {
+      await handlers['circle:supersede']({ oldCircleId: circleId, newCircleId: created.circleId })
+    } catch (e) { console.warn('[bare] circle:supersede during recreate failed', e?.message) }
+
     return { circleId: created.circleId, name: created.name, invite: created.invite, sourceCircleId: circleId }
+  },
+
+  // Post (or re-post) the owner-signed migration nudge into the OLD circle's
+  // Autobase: a `supersede:{newCircleId}` record carrying the new circle's
+  // invite, readable only by the old circle's current members (the view is
+  // encrypted with the old encryptionKey, so the blind seeder can't read it).
+  // applyCircleNodes accepts it only when its signature verifies against the
+  // circle's ownerKey, so no other writer can forge a "we moved" notice. A
+  // no-op for a non-owner of the old circle. Proposal 2026-06-17 slice 3.
+  'circle:supersede': async ({ oldCircleId, newCircleId } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof oldCircleId !== 'string') throw new Error('oldCircleId must be a string')
+    if (typeof newCircleId !== 'string') throw new Error('newCircleId must be a string')
+    const base = _circleBases.get(oldCircleId)
+    if (!base) throw new Error('unknown circle: ' + oldCircleId)
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const circleRow = await base.view.get('circle')
+    // Non-owner of the old circle: nothing to post (only the owner's signature
+    // is accepted on the wire). Return a benign no-op rather than throwing.
+    if (circleRow?.value?.ownerKey !== ourKeyHex) return { ok: false, reason: 'not_owner' }
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+
+    // Build the new circle's invite from its persisted joined record (same
+    // fields circle:invite uses). The owner must already hold the new circle.
+    const newRec = await _localDb.get('circles:joined:' + newCircleId)
+    if (!newRec?.value) throw new Error('unknown new circle: ' + newCircleId)
+    const { circleKey, bootstrap, encryptionKey, name } = newRec.value
+    const invite = buildInvite({ circleId: newCircleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey: ourKeyHex })
+
+    // ownerKey is the signer field (verifyValueWithSigner against 'ownerKey'),
+    // and the apply branch cross-checks it equals the circle row's ownerKey.
+    const value = signValue({
+      newCircleId,
+      name,
+      invite,
+      ownerKey: ourKeyHex,
+      postedAt: Date.now(),
+      v: 1,
+    }, _identity.secretKey)
+    await base.append({ type: 'put', key: 'supersede:' + newCircleId, value })
+    return { ok: true }
   },
 
   'circle:join': async ({ invite } = {}) => {
@@ -949,7 +1000,21 @@ const handlers = {
     for (const [circleId, base] of _circleBases) {
       try {
         const snap = await safeSnapshot(circleId, base)
-        out.push({ circleId, ...snap })
+        // Attach the local-only recreate links + createdAt so the Settings UI
+        // can date each row, show member counts, badge a recreated pair
+        // ("Being replaced" / "New") and guard the delete confirmation
+        // (proposal 2026-06-17 slice 3). These live in the joined record, not
+        // the replicated view, so they're read here rather than in the snapshot.
+        const localRec = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+        const lv = localRec?.value || {}
+        out.push({
+          circleId,
+          ...snap,
+          createdAt: typeof lv.createdAt === 'number' ? lv.createdAt : (typeof lv.joinedAt === 'number' ? lv.joinedAt : null),
+          recreatedFrom: lv.recreatedFrom || null,
+          recreatedTo: lv.recreatedTo || null,
+          recreatedAt: typeof lv.recreatedAt === 'number' ? lv.recreatedAt : null,
+        })
         // A repairing circle is "done enough" once its rebuilt base is
         // writable again (re-admitted as a writer == functional). Historical
         // catch-up continues as normal replication after this.
@@ -1604,9 +1669,30 @@ const handlers = {
   },
 
   'circles:peers': async () => {
+    // Connected-peer truth is derived live from the current connections, not
+    // the connection-time topic snapshot in _circlePeers. Hyperswarm reuses one
+    // connection per peer pair, so a circle joined AFTER a connection formed
+    // (e.g. every device migrating to a recreated circle over the links it
+    // already held for the old one) never fires a fresh 'connection' event and
+    // never lands in _circlePeers — the peer then reads as "not connected" until
+    // an app restart re-forms every link with the new topic. Intersecting the
+    // set of pubkeys we hold a live socket to with each circle's membership
+    // reflects reality regardless of when the socket formed. The event-tracked
+    // _circlePeers set is merged in as a floor so nothing regresses; a degraded
+    // circle (view reads stall) falls back to it alone.
+    const connectedRemotes = new Set(_connPubkey.values())
     const out = {}
-    for (const [circleId, peers] of _circlePeers) {
-      out[circleId] = Array.from(peers)
+    for (const [circleId, base] of _circleBases) {
+      const acc = new Set(_circlePeers.get(circleId) ?? [])
+      if (connectedRemotes.size && !_degradedCircles.has(circleId)) {
+        try {
+          for await (const { value } of base.view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+            const pk = value?.pubkey
+            if (typeof pk === 'string' && connectedRemotes.has(pk)) acc.add(pk)
+          }
+        } catch (e) { console.warn('[bare] circles:peers member reconcile failed', e?.message) }
+      }
+      out[circleId] = Array.from(acc)
     }
     return { peers: out }
   },
@@ -2405,7 +2491,7 @@ async function safeSnapshot (circleId, base) {
     if (cached) return { ...cached, needsRepair: true }
     // No prior snapshot to serve: return the full empty shape (not a bare
     // object) so the UI's renderers never hit an undefined members/places.
-    return { circle: null, members: [], lastSeen: {}, presence: {}, places: [], transitions: [], writable: false, writers: null, needsRepair: true, stale: true }
+    return { circle: null, members: [], lastSeen: {}, presence: {}, places: [], transitions: [], supersedes: [], writable: false, writers: null, needsRepair: true, stale: true }
   }
   _lastGoodSnapshot.set(circleId, value)
   return value
@@ -2601,6 +2687,22 @@ async function snapshotCircle (circleId, base) {
   })) {
     if (value) transitions.push(value)
   }
+  // Owner-signed migration nudges (proposal 2026-06-17 slice 3). Each record
+  // carries the new circle's invite; the member-side UI shows a "your group
+  // moved" prompt for any circle the local device does NOT already hold (it
+  // filters by newCircleId against circles:list). Newest first.
+  const supersedes = []
+  for await (const { value } of view.createReadStream({ gt: 'supersede:', lt: 'supersede:~' })) {
+    if (value && typeof value.newCircleId === 'string' && typeof value.invite === 'string') {
+      supersedes.push({
+        newCircleId: value.newCircleId,
+        name: value.name,
+        invite: value.invite,
+        postedAt: typeof value.postedAt === 'number' ? value.postedAt : 0,
+      })
+    }
+  }
+  supersedes.sort((a, b) => b.postedAt - a.postedAt)
   // Overlay last-known core tips then ephemeral live positions (proposal
   // 2026-06-04 phase 1, precedence live > core > view). mergeLiveLastSeen is
   // freshest-ts-wins, so composing it twice (view←core, then ←live) yields the
@@ -2619,6 +2721,7 @@ async function snapshotCircle (circleId, base) {
     presence,
     places,
     transitions,
+    supersedes,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
     // True once an append to this circle timed out (wedged local Autobase);
@@ -3217,6 +3320,30 @@ async function applyCircleNodes (nodes, view, base, circleId) {
           now: Date.now(),
           futureToleranceMs: FUTURE_TS_TOLERANCE_MS,
           verifySig: (val) => verifyValueWithSigner(val, 'writer'),
+        })
+        if (accept) await view.put(op.key, incoming)
+        continue
+      }
+      // `supersede:{newCircleId}` (proposal 2026-06-17 slice 3): the owner's
+      // migration nudge, carrying the new circle's invite. Accepted only when
+      // the signature verifies against the circle's ownerKey (no other writer
+      // can forge a "we moved" notice), the embedded ownerKey matches the
+      // circle row's ownerKey, and the key segment matches the signed
+      // newCircleId. LWW on postedAt so a re-post out-dates the prior record.
+      // Old-build members ignore the unknown prefix and migrate manually.
+      if (op.key.startsWith('supersede:')) {
+        const incoming = op.value
+        const keyNew = op.key.slice('supersede:'.length)
+        const ownerKey = (await view.get('circle'))?.value?.ownerKey
+        const existing = (await view.get(op.key))?.value
+        const accept = shouldAcceptSupersede({
+          keyNew,
+          incoming,
+          ownerKey,
+          existing,
+          now: Date.now(),
+          futureToleranceMs: FUTURE_TS_TOLERANCE_MS,
+          verifySig: (val) => verifyValueWithSigner(val, 'ownerKey'),
         })
         if (accept) await view.put(op.key, incoming)
         continue
