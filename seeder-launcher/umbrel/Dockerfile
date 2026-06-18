@@ -28,11 +28,18 @@ RUN npm ci --no-audit --no-fund \
  && npm --prefix seeder-launcher ci --no-audit --no-fund
 # Stage the flat payload (host-bundled.js, bare, worklet/, ui/) for the TARGET
 # arch. TARGETARCH (amd64 | arm64) is provided by the build platform; map it to
-# the bare-runtime triple.
+# the bare-runtime triple. SEEDER_VERSION (passed by release.sh / the image
+# build script) is the release tag — build-host-sea.sh stamps it into the
+# bundle via esbuild so the running seeder reports its real version (the
+# dashboard's "update available" check + seeder:status). Empty in a bare
+# `podman build` → build-host-sea falls back to seeder-launcher/package.json.
+# It can't read git here: .dockerignore excludes .git, so without this arg the
+# container would always report package.json's stale version.
 ARG TARGETARCH
+ARG SEEDER_VERSION=
 RUN BARE_HOST="$([ "$TARGETARCH" = arm64 ] && echo linux-arm64 || echo linux-x64)"; \
-    echo "staging payload for TARGETARCH=$TARGETARCH BARE_HOST=$BARE_HOST"; \
-    BARE_HOST="$BARE_HOST" OUT_DIR=/payload \
+    echo "staging payload for TARGETARCH=$TARGETARCH BARE_HOST=$BARE_HOST SEEDER_VERSION=${SEEDER_VERSION:-<package.json>}"; \
+    SEEDER_VERSION="$SEEDER_VERSION" BARE_HOST="$BARE_HOST" OUT_DIR=/payload \
       bash seeder-launcher/scripts/stage-payload-linux.sh \
  && rm -f /payload/node /payload/pearcircle-seeder
 # ^ drop the payload's bundled Node + wrapper: the runtime image already has
