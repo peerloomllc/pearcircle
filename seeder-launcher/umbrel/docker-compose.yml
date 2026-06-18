@@ -13,7 +13,7 @@ services:
   app:
     # Published, public, pinned by digest (amd64). Multi-arch (arm64 for a
     # Raspberry Pi) is a follow-up.
-    image: ghcr.io/peerloomllc/pearcircle-seeder:0.1.5@sha256:a197ad34047236b8959a1ae12e9801432c43296cdddf1367ba709162f5c3119f
+    image: ghcr.io/peerloomllc/pearcircle-seeder:0.1.6@sha256:32adf2f01f591d469c6c490c034a7425c58cdff6c7bb6f108f4f3bbab4b85059
     restart: on-failure
     stop_grace_period: 1m
     security_opt:
