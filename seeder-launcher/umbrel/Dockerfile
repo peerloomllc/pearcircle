@@ -4,32 +4,41 @@
 # node_modules + native addon prebuilds), so build with:
 #   docker build -f seeder-launcher/umbrel/Dockerfile -t pearcircle/seeder:<ver> .
 #
-# Two stages: a heavy builder that runs the existing stage-payload-linux.sh
-# (UI build, esbuilt host, bare runtime, bare-pack worklet bundle + prebuilds)
-# into a flat /payload, and a slim runtime that just runs it. Builder and
-# runtime share the same Debian release so the staged `bare` binary and the
-# native addon prebuilds match the runtime glibc.
+# Multi-arch (amd64 + arm64 for a Raspberry Pi). Cross-build pattern: the heavy
+# builder runs on the NATIVE build platform (so npm/bare-pack/esbuild never run
+# under emulation — slow + flaky), and only the thin runtime stage targets the
+# requested arch. The payload is arch-portable to stage: stage-payload-linux.sh
+# fetches the target's `bare` runtime via `npm pack` and copies the target's
+# native prebuilds (prebuildify ships every arch), so an amd64 builder produces
+# a complete arm64 payload — exactly how the .deb/.AppImage arm64 builds work.
+# Build both arches + a manifest with:
+#   podman build --platform=linux/amd64,linux/arm64 --manifest <tag> \
+#     -f seeder-launcher/umbrel/Dockerfile .
+# (arm64 needs qemu-user-static on the build host for the runtime apt step.)
 
-# ---- builder ---------------------------------------------------------------
-FROM node:20-bookworm AS builder
+# ---- builder (always native via $BUILDPLATFORM) ----------------------------
+FROM --platform=$BUILDPLATFORM node:20-bookworm AS builder
 WORKDIR /src
 # Full repo (see .dockerignore for what's excluded — notably node_modules,
-# which we regenerate so the prebuilds match this Linux/x64 builder).
+# which we regenerate so the prebuilds match).
 COPY . .
 # Worklet deps + bare-pack + native prebuilds for the worklet bundle, then the
 # launcher's own build deps (esbuild, preact, ws).
 RUN npm ci --no-audit --no-fund \
  && npm --prefix seeder-launcher ci --no-audit --no-fund
-# Stage the flat payload (host-bundled.js, bare, worklet/, ui/, node) exactly
-# as the .deb/.AppImage builds do. BARE_HOST tracks the build arch.
-ARG BARE_HOST=linux-x64
-RUN BARE_HOST=${BARE_HOST} OUT_DIR=/payload \
+# Stage the flat payload (host-bundled.js, bare, worklet/, ui/) for the TARGET
+# arch. TARGETARCH (amd64 | arm64) is provided by the build platform; map it to
+# the bare-runtime triple.
+ARG TARGETARCH
+RUN BARE_HOST="$([ "$TARGETARCH" = arm64 ] && echo linux-arm64 || echo linux-x64)"; \
+    echo "staging payload for TARGETARCH=$TARGETARCH BARE_HOST=$BARE_HOST"; \
+    BARE_HOST="$BARE_HOST" OUT_DIR=/payload \
       bash seeder-launcher/scripts/stage-payload-linux.sh \
  && rm -f /payload/node /payload/pearcircle-seeder
 # ^ drop the payload's bundled Node + wrapper: the runtime image already has
 #   node, and we invoke host-bundled.js directly.
 
-# ---- runtime ---------------------------------------------------------------
+# ---- runtime (targets the requested arch) ----------------------------------
 FROM node:20-bookworm-slim
 # Runtime libs the slim image lacks but the worklet's native addons need:
 #   libatomic1 - rocksdb-native links libatomic.so.1

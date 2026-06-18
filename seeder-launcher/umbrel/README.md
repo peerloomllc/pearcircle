@@ -33,18 +33,26 @@ From the **repo root** (the worklet bundle needs the repo's node_modules):
 docker build -f seeder-launcher/umbrel/Dockerfile -t ghcr.io/peerloomllc/pearcircle-seeder:0.1.0 .
 ```
 
-For a multi-arch image (amd64 + the arm64 a Raspberry Pi uses):
+For a multi-arch image (amd64 + the arm64 a Raspberry Pi uses), build both into
+one manifest and push it:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg BARE_HOST=linux-arm64 \
-  -f seeder-launcher/umbrel/Dockerfile \
-  -t ghcr.io/peerloomllc/pearcircle-seeder:0.1.0 --push .
+podman build --platform=linux/amd64,linux/arm64 \
+  --manifest ghcr.io/peerloomllc/pearcircle-seeder:<ver> \
+  -f seeder-launcher/umbrel/Dockerfile .
+podman manifest push --all \
+  ghcr.io/peerloomllc/pearcircle-seeder:<ver> \
+  docker://ghcr.io/peerloomllc/pearcircle-seeder:<ver>
 ```
 
-(`BARE_HOST` selects the `bare` runtime + native prebuilds; it must match the
-target platform. A real multi-arch push uses one builder per platform with the
-matching `BARE_HOST`.)
+The Dockerfile cross-builds: the builder stage is pinned to `$BUILDPLATFORM`
+(so npm / bare-pack / esbuild always run natively — never under emulation), and
+the per-arch payload is selected from `TARGETARCH` (no `--build-arg` needed).
+Only the thin runtime stage runs in the target arch, so building the arm64
+image on an amd64 host needs `qemu-user-static` registered (binfmt) for the
+runtime's small `apt-get` step — e.g. `sudo dnf install qemu-user-static` on
+Fedora. Pinning the store's `docker-compose.yml` to the manifest-list digest
+(`@sha256:…`) lets Umbrel pull the right arch automatically.
 
 ## Test on an Umbrel without publishing
 
