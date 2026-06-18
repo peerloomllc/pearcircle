@@ -6,7 +6,7 @@ id: peerloom-pearcircle-seeder
 name: PearCircle Seeder
 tagline: Keep your PearCircle circles online 24/7
 category: networking
-version: "0.1.3"
+version: "0.1.5"
 port: 8730
 description: >-
   Run a blind seeder for your PearCircle circles on your Umbrel so their
