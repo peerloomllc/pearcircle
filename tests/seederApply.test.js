@@ -2,7 +2,7 @@
 // Proposal 2026-05-19-blind-seeder-peers slice 3a.
 
 const b4a = require('b4a')
-const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission } = require('../src/lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone } = require('../src/lib/seederApply')
 const { signValue, verifyValueWithSigner } = require('../src/lib/sign')
 const { generateKeypair } = require('../src/identity')
 
@@ -74,6 +74,110 @@ describe('shouldAcceptSeederRow — positive cases', () => {
     const existing = { ...f.row({ revoked: true, revokedAt: f.baseTs + 500, revokedBy: f.writerHex, updatedAt: f.baseTs + 500 }) }
     const readmit = f.row({ updatedAt: f.baseTs + 1000 })
     expect(f.decide({ incoming: readmit, existing })).toBe(true)
+  })
+})
+
+// Proposal 2026-06-17-seeder-leave-propagation: the `left` tombstone.
+describe('shouldAcceptSeederRow — left tombstone', () => {
+  const leftRow = (f, overrides = {}) => f.row({
+    left: true,
+    leftAt: f.baseTs + 1000,
+    leftBy: f.writerHex,
+    updatedAt: f.baseTs + 1000,
+    ...overrides,
+  })
+
+  test('accepts a well-formed left row by a current member', () => {
+    const f = makeFixture()
+    const existing = { ...f.row(), updatedAt: f.baseTs }
+    expect(f.decide({ incoming: leftRow(f), existing })).toBe(true)
+  })
+
+  test('rejects a left row missing leftAt', () => {
+    const f = makeFixture()
+    const bad = f.row({ left: true, leftBy: f.writerHex, updatedAt: f.baseTs + 1000 })
+    expect(f.decide({ incoming: bad })).toBe(false)
+  })
+
+  test('rejects a left row missing/short leftBy', () => {
+    const f = makeFixture()
+    const bad = f.row({ left: true, leftAt: f.baseTs + 1000, leftBy: 'short', updatedAt: f.baseTs + 1000 })
+    expect(f.decide({ incoming: bad })).toBe(false)
+  })
+
+  test('rejects a future-dated leftAt', () => {
+    const f = makeFixture()
+    const future = f.baseTs + FUTURE_TS_TOLERANCE_MS + 10_000
+    const bad = leftRow(f, { leftAt: future, updatedAt: future })
+    expect(f.decide({ incoming: bad, now: f.baseTs + 1 })).toBe(false)
+  })
+
+  test('rejects a tampered left row (signature no longer verifies)', () => {
+    const f = makeFixture()
+    const signed = leftRow(f)
+    expect(f.decide({ incoming: { ...signed, leftBy: f.seederHex } })).toBe(false)
+  })
+
+  test('LWW: a fresh re-admit (greater updatedAt) beats a left tombstone', () => {
+    const f = makeFixture()
+    const existing = { ...leftRow(f) } // updatedAt = baseTs+1000
+    const readmit = f.row({ updatedAt: f.baseTs + 2000 })
+    expect(f.decide({ incoming: readmit, existing })).toBe(true)
+  })
+
+  test('LWW: a left tombstone not newer than the existing row is rejected', () => {
+    const f = makeFixture()
+    const existing = { ...f.row({ updatedAt: f.baseTs + 1000 }) }
+    const stale = leftRow(f, { leftAt: f.baseTs + 1000, updatedAt: f.baseTs + 1000 })
+    expect(f.decide({ incoming: stale, existing })).toBe(false)
+  })
+})
+
+describe('buildSeederGone', () => {
+  const writer = generateKeypair()
+  const seeder = generateKeypair()
+  const writerHex = b4a.toString(writer.publicKey, 'hex')
+  const seederHex = b4a.toString(seeder.publicKey, 'hex')
+  const now = 1714867300000
+  const existing = { pubkey: seederHex, addedBy: writerHex, addedAt: now - 5000, updatedAt: now - 5000, label: 'Home Pi' }
+
+  test('builds a left row preserving addedBy/addedAt/label', () => {
+    const out = buildSeederGone({ existing, byPubkeyHex: writerHex, now })
+    expect(out).toMatchObject({
+      pubkey: seederHex,
+      writer: writerHex,
+      addedBy: existing.addedBy,
+      addedAt: existing.addedAt,
+      updatedAt: now,
+      left: true,
+      leftAt: now,
+      leftBy: writerHex,
+      label: 'Home Pi',
+      v: 1,
+    })
+  })
+
+  test('returns null on malformed input', () => {
+    expect(buildSeederGone({ existing: null, byPubkeyHex: writerHex, now })).toBeNull()
+    expect(buildSeederGone({ existing, byPubkeyHex: 'short', now })).toBeNull()
+    expect(buildSeederGone({ existing, byPubkeyHex: writerHex, now: 'x' })).toBeNull()
+  })
+
+  test('signed output round-trips through shouldAcceptSeederRow', () => {
+    const unsigned = buildSeederGone({ existing, byPubkeyHex: writerHex, now })
+    const signed = signValue(unsigned, writer.secretKey)
+    expect(verifyValueWithSigner(signed, 'writer')).toBe(true)
+    const accept = shouldAcceptSeederRow({
+      keyPubkey: seederHex,
+      incoming: signed,
+      writerMember: { pubkey: writerHex },
+      writerRemoved: null,
+      existing: { ...existing },
+      now: now + 100,
+      futureToleranceMs: FUTURE_TS_TOLERANCE_MS,
+      verifySig: (val) => verifyValueWithSigner(val, 'writer'),
+    })
+    expect(accept).toBe(true)
   })
 })
 

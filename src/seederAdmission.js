@@ -3,11 +3,12 @@
 // and the existing pair channel; protomux multiplexes them by protocol name.
 //
 // Wire: protocol 'pearcircle/seeder-admission/2', id = blake2b(bootstrap).
-// Five messages, added in the same order on both sides so protomux indexes
+// Six messages, added in the same order on both sides so protomux indexes
 // line up: [0] announce (seed -> member), [1] revoked (member -> seed),
 // [2] lastknownCores (member -> seed), [3] writerCores (member -> seed),
-// [4] admitted (member -> seed). Messages are additive: an older peer that
-// lacks [4] simply ignores that index, so no protocol-version bump is needed.
+// [4] admitted (member -> seed), [5] left (seed -> member). Messages are
+// additive: an older peer that lacks [4]/[5] simply ignores that index, so no
+// protocol-version bump is needed.
 //
 // Roles:
 //   'seed'   — opened by a seed-mode worklet that has enrolled in this circle.
@@ -96,7 +97,7 @@ function normalizeWriterCores (msg) {
   return out
 }
 
-function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederPubkey, label, version, onAnnounce, onRevoked, onAdmitted, revokedNotice, admittedNotice, onLastknownCores, onWriterCores, mark }) {
+function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederPubkey, label, version, onAnnounce, onRevoked, onAdmitted, onLeft, revokedNotice, admittedNotice, onLastknownCores, onWriterCores, mark }) {
   if (role !== 'seed' && role !== 'member') {
     throw new Error('role must be "seed" or "member"')
   }
@@ -116,6 +117,7 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
   let lastknownMessage = null
   let writerMessage = null
   let admittedMessage = null
+  let leftMessage = null
 
   // Send a { cores: [{pubkey, coreKey}] } list on this channel (member role
   // only). Used for the on-open push and for re-pushes when the circle's known
@@ -200,25 +202,54 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
     }
   }
 
+  // Send a { type:'left' } notice on this channel (seed role only). Proposal
+  // 2026-06-17-seeder-leave-propagation: when the seeder operator leaves a
+  // circle, it pushes this to currently-connected members BEFORE tearing down,
+  // and each member writes a `left` tombstone so the seeder vanishes from their
+  // Seeders list. Best-effort + content-blind (only the trusted channel id /
+  // circleId, no key material). Mirrors the announce direction (seed -> member).
+  function sendLeft () {
+    if (role !== 'seed' || !leftMessage) return false
+    try {
+      leftMessage.send({ type: 'left', circleId })
+      trace('admission:left-sent')
+      return true
+    } catch (e) {
+      trace('admission:left-send-failed', { err: e?.message ?? String(e) })
+      return false
+    }
+  }
+
+  // Send the announce payload (seed role). Normally fired once on channel open;
+  // also callable on demand so a re-enroll can re-announce over the SAME, still-
+  // open channel without closing/recreating it (proposal 2026-06-17-seeder-leave
+  // -propagation). Recreating on a persistent connection is racy — the
+  // protocol+id reuse either hits create-failed or never reaches onopen — so we
+  // keep the channel open across leave and just re-send this.
+  function sendAnnounce () {
+    if (role !== 'seed' || !announceMessage) return false
+    try {
+      const payload = { pubkey: seederPubkey }
+      if (typeof label === 'string' && label.length > 0) payload.label = label
+      // Seeder build version (proposal 2026-06-05-seeder-update slice 1), so
+      // members can surface "update available". Additive + optional: an old
+      // member ignores the unknown field, an old seeder simply omits it.
+      if (typeof version === 'string' && version.length > 0) payload.version = version.slice(0, 64)
+      announceMessage.send(payload)
+      trace('admission:announce-sent')
+      return true
+    } catch (e) {
+      trace('admission:announce-send-failed', { err: e?.message ?? String(e) })
+      return false
+    }
+  }
+
   const channel = mux.createChannel({
     protocol: SEEDER_ADMISSION_PROTOCOL,
     id: channelId,
     onopen () {
       trace('admission:onopen')
-      if (role === 'seed' && announceMessage) {
-        try {
-          const payload = { pubkey: seederPubkey }
-          if (typeof label === 'string' && label.length > 0) payload.label = label
-          // Seeder build version (proposal 2026-06-05-seeder-update slice 1), so
-          // members can surface "update available". Additive + optional: an old
-          // member ignores the unknown field, an old seeder simply omits it.
-          if (typeof version === 'string' && version.length > 0) payload.version = version.slice(0, 64)
-          announceMessage.send(payload)
-          trace('admission:announce-sent')
-        } catch (e) {
-          trace('admission:announce-send-failed', { err: e?.message ?? String(e) })
-        }
-      }
+      if (role === 'seed') sendAnnounce()
       // On open, push our current verdict on this seeder so its flag converges
       // even if the live revoke/admit signal was missed (e.g. re-admitted while
       // disconnected). Mutually exclusive: a seeder row is either revoked or
@@ -360,9 +391,32 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
     },
   })
 
+  // [5] left — seed -> member (proposal 2026-06-17-seeder-leave-propagation).
+  // The seeder operator left this circle; the member writes a `left` tombstone
+  // for this seeder's row so it disappears from the Seeders list. Additive
+  // after admitted so protomux indices line up with older peers (an old member
+  // without this message ignores index 5; an old seeder never sends it).
+  // circleId is the trusted channel id, never the body's.
+  leftMessage = channel.addMessage({
+    encoding: c.json,
+    onmessage: async (msg) => {
+      if (role !== 'member') return
+      if (!msg || typeof msg !== 'object' || msg.type !== 'left') {
+        trace('admission:left-rejected', { reason: 'bad-shape' })
+        return
+      }
+      trace('admission:left-received')
+      try {
+        if (typeof onLeft === 'function') await onLeft({ circleId })
+      } catch (e) {
+        trace('admission:onleft-failed', { err: e?.message ?? String(e) })
+      }
+    },
+  })
+
   channel.open()
   trace('admission:channel-opened')
-  return { channel, sendRevoked, sendAdmitted, sendLastknownCores, sendWriterCores }
+  return { channel, sendRevoked, sendAdmitted, sendLeft, sendAnnounce, sendLastknownCores, sendWriterCores }
 }
 
 module.exports = { SEEDER_ADMISSION_PROTOCOL, setupSeederAdmissionChannel, admissionChannelId, normalizeLastknownCores, normalizeWriterCores }
