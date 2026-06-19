@@ -521,4 +521,41 @@ describe('enrollSeedInvite (direct call)', () => {
     await expect(enrollSeedInvite({ invite: 'https://evil.example/foo', localDb: db }))
       .rejects.toThrow(/seed invite/)
   })
+
+  // Franken-enrollment guard (bugfix 2026-06-19): a blind seeder can't verify a
+  // circleId against the encrypted founder row, but it can refuse a second
+  // circleId that reuses an already-enrolled bootstrap — which is always a
+  // circleId-glued-onto-another-circle's-bootstrap franken. Reproduces the live
+  // "duplicate name, different id" defect (New2's id bound to SeederTest's
+  // bootstrap on the Mac mini seeder).
+  const inviteWith = ({ circleId, bootstrap }) => buildSeedInvite({
+    circleId, name: 'C', circleKey: 'a'.repeat(64), bootstrap, inviterPublicKey: 'b'.repeat(64),
+  })
+
+  test('refuses a new circleId that reuses an already-enrolled bootstrap (franken)', async () => {
+    const db = makeFakeLocalDb()
+    await enrollSeedInvite({ invite: inviteWith({ circleId: 'A'.repeat(43), bootstrap: 'c'.repeat(64) }), localDb: db })
+    await expect(
+      enrollSeedInvite({ invite: inviteWith({ circleId: 'B'.repeat(43), bootstrap: 'c'.repeat(64) }), localDb: db })
+    ).rejects.toThrow(/franken/)
+    // The franken must NOT have been persisted.
+    expect(db._data.has('seeder:enrolled:' + 'B'.repeat(43))).toBe(false)
+  })
+
+  test('allows distinct circles with distinct bootstraps', async () => {
+    const db = makeFakeLocalDb()
+    const a = await enrollSeedInvite({ invite: inviteWith({ circleId: 'A'.repeat(43), bootstrap: 'c'.repeat(64) }), localDb: db })
+    const b = await enrollSeedInvite({ invite: inviteWith({ circleId: 'B'.repeat(43), bootstrap: 'd'.repeat(64) }), localDb: db })
+    expect(a.alreadyEnrolled).toBe(false)
+    expect(b.alreadyEnrolled).toBe(false)
+    expect(db._data.has('seeder:enrolled:' + 'B'.repeat(43))).toBe(true)
+  })
+
+  test('re-enroll of the same circleId+bootstrap stays idempotent (not flagged franken)', async () => {
+    const db = makeFakeLocalDb()
+    const invite = inviteWith({ circleId: 'A'.repeat(43), bootstrap: 'c'.repeat(64) })
+    await enrollSeedInvite({ invite, localDb: db })
+    const second = await enrollSeedInvite({ invite, localDb: db })
+    expect(second.alreadyEnrolled).toBe(true)
+  })
 })
