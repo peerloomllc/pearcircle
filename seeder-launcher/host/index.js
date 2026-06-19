@@ -23,6 +23,7 @@ function parseArgs (argv) {
     port: process.env.SEEDER_PORT ? Number(process.env.SEEDER_PORT) : 8730,
     host: process.env.SEEDER_HOST || '127.0.0.1',
     noAuth: process.env.SEEDER_NO_AUTH === '1' || process.env.SEEDER_NO_AUTH === 'true',
+    noUpdateCheck: process.env.SEEDER_NO_UPDATE_CHECK === '1' || process.env.SEEDER_NO_UPDATE_CHECK === 'true',
   }
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i]
@@ -34,6 +35,7 @@ function parseArgs (argv) {
     else if (a === '--port') out.port = Number(argv[++i])
     else if (a === '--host') out.host = argv[++i]
     else if (a === '--no-auth') out.noAuth = true
+    else if (a === '--no-update-check') out.noUpdateCheck = true
     else if (a === '--no-open') out.noOpen = true
     else if (a === '--help' || a === '-h') {
       printHelp(); process.exit(0)
@@ -60,6 +62,9 @@ function printHelp () {
     '                      use 0.0.0.0 behind a reverse proxy / in a container)',
     '  --no-auth           Skip the bearer-token check (env SEEDER_NO_AUTH=1);',
     '                      only for when a front proxy already gates access',
+    '  --no-update-check   Disable the in-app update checker/banner (env',
+    '                      SEEDER_NO_UPDATE_CHECK=1; auto-on in a container).',
+    '                      For image/store-managed deploys (Umbrel)',
     '  --no-open           Suppress launching the default browser',
     '',
   ].join('\n'))
@@ -146,42 +151,55 @@ async function main () {
   log('host', 'worklet ready')
 
   // Background GitHub-Releases update check (proposal 2026-06-05-seeder-update
-  // slice 2). Fail-open; surfaced via /api/update + the WS snapshot.
-  const updateChecker = new UpdateChecker({ currentVersion: SEEDER_VERSION, log }).start()
+  // slice 2). Skipped in container / Umbrel deploys: there the image lifecycle is
+  // owned by the Umbrel Store / Community Store (you update by re-pulling the
+  // image), so an in-app "Update now" banner is misleading and can't self-apply
+  // anyway (no installer / privileged helper inside the container). Disabled via
+  // SEEDER_NO_UPDATE_CHECK / --no-update-check, or auto-detected from /.dockerenv.
+  // When disabled both stay null: the WS snapshot omits `update` (no banner) and
+  // /api/update reports it disabled — the server already handles the null case.
+  const updatesDisabled = opts.noUpdateCheck || fs.existsSync('/.dockerenv')
+  let updateChecker = null
+  let updateApplier = null
+  if (updatesDisabled) {
+    log('host', `update check disabled (${opts.noUpdateCheck ? 'SEEDER_NO_UPDATE_CHECK' : 'container'}); updates managed by the image/store`)
+  } else {
+    updateChecker = new UpdateChecker({ currentVersion: SEEDER_VERSION, log }).start()
 
-  // One-click apply (slice 3a). Self-apply on Linux AppImage when launched as
-  // one (process.env.APPIMAGE is the running image path to swap) + Windows;
-  // macOS .pkg / Linux .deb land on `needs-helper` (download fallback) until the
-  // privileged helper ships (slice 3b). The actual child commands are spawned by
-  // `exec`; a failure leaves the running service untouched.
-  const { spawn: spawnChild } = require('node:child_process')
-  const exec = (argv) => new Promise((resolve, reject) => {
-    const p = spawnChild(argv[0], argv.slice(1), { stdio: 'ignore' })
-    p.on('error', reject)
-    p.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${argv[0]} exited ${code}`)))
-  })
-  // macOS privileged-helper drop dir (slice 3b): the host (unprivileged
-  // LaunchAgent) drops a verified-pkg request here and the root
-  // com.pearcircle.seeder.updater LaunchDaemon installs it. Absent when the
-  // helper isn't installed (old build) -> apply falls back to a download.
-  const macRequestDir = process.platform === 'darwin'
-    ? '/Library/Application Support/PearCircle Seeder/updates/requests'
-    : null
-  // Linux .deb privileged updater (slice 3c): the .deb postinst drops this
-  // root-owned helper and a passwordless polkit rule for the seeder user. Absent
-  // on an AppImage install or an old .deb -> apply falls back to a download.
-  const debHelperPath = process.platform === 'linux'
-    ? '/opt/pearcircle-seeder/updater-helper.sh'
-    : null
-  const updateApplier = new UpdateApplier({
-    getUpdate: () => updateChecker.get(),
-    target: process.env.APPIMAGE || null,
-    requestDir: macRequestDir,
-    helperPath: debHelperPath,
-    user: process.platform === 'linux' ? os.userInfo().username : null,
-    exec,
-    log,
-  })
+    // One-click apply (slice 3a). Self-apply on Linux AppImage when launched as
+    // one (process.env.APPIMAGE is the running image path to swap) + Windows;
+    // macOS .pkg / Linux .deb land on `needs-helper` (download fallback) until the
+    // privileged helper ships (slice 3b). The actual child commands are spawned by
+    // `exec`; a failure leaves the running service untouched.
+    const { spawn: spawnChild } = require('node:child_process')
+    const exec = (argv) => new Promise((resolve, reject) => {
+      const p = spawnChild(argv[0], argv.slice(1), { stdio: 'ignore' })
+      p.on('error', reject)
+      p.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${argv[0]} exited ${code}`)))
+    })
+    // macOS privileged-helper drop dir (slice 3b): the host (unprivileged
+    // LaunchAgent) drops a verified-pkg request here and the root
+    // com.pearcircle.seeder.updater LaunchDaemon installs it. Absent when the
+    // helper isn't installed (old build) -> apply falls back to a download.
+    const macRequestDir = process.platform === 'darwin'
+      ? '/Library/Application Support/PearCircle Seeder/updates/requests'
+      : null
+    // Linux .deb privileged updater (slice 3c): the .deb postinst drops this
+    // root-owned helper and a passwordless polkit rule for the seeder user. Absent
+    // on an AppImage install or an old .deb -> apply falls back to a download.
+    const debHelperPath = process.platform === 'linux'
+      ? '/opt/pearcircle-seeder/updater-helper.sh'
+      : null
+    updateApplier = new UpdateApplier({
+      getUpdate: () => updateChecker.get(),
+      target: process.env.APPIMAGE || null,
+      requestDir: macRequestDir,
+      helperPath: debHelperPath,
+      user: process.platform === 'linux' ? os.userInfo().username : null,
+      exec,
+      log,
+    })
+  }
 
   if (opts.noAuth) log('host', 'auth: bearer-token check DISABLED (--no-auth); relying on a front proxy')
   const { srv, startPolling } = createServer({ worklet, token, requireAuth: !opts.noAuth, uiDir: paths.uiDir, log, version: SEEDER_VERSION, updateChecker, updateApplier })

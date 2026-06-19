@@ -13,7 +13,7 @@ services:
   app:
     # Published, public, pinned by digest (amd64). Multi-arch (arm64 for a
     # Raspberry Pi) is a follow-up.
-    image: ghcr.io/peerloomllc/pearcircle-seeder:0.1.7@sha256:7b2ac94ec51428e5ebb324aa28ad65ac27f8195bf06b46ac568b6520cab14a51
+    image: ghcr.io/peerloomllc/pearcircle-seeder:1.0.16@sha256:f032f3b8555cd6fb804c55f5bacc7b26c3a1057f323c0c217c5b8278844d85c6
     restart: on-failure
     stop_grace_period: 1m
     security_opt:
@@ -22,6 +22,11 @@ services:
       SEEDER_HOST: 0.0.0.0
       SEEDER_PORT: "8730"
       SEEDER_NO_AUTH: "1"
+      # Updates are managed by the Umbrel Store / Community Store (re-pull the
+      # image), so the in-app update checker/banner is disabled here. The host
+      # also auto-detects the container via /.dockerenv; this is explicit + self-
+      # documenting.
+      SEEDER_NO_UPDATE_CHECK: "1"
     volumes:
       # Seeder identity, per-circle enrollments, retention state, logs.
       - ${APP_DATA_DIR}/data:/data
