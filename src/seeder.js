@@ -107,6 +107,27 @@ async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
       alreadyEnrolled: true,
     }
   }
+  // Franken-enrollment guard (bugfix 2026-06-19). A blind seeder holds no
+  // encryption key, so it cannot read the founder-written circle.id to verify
+  // that the invite's circleId actually belongs to this circle — the member-side
+  // inviteCircleIdMismatch check is impossible here. But every real circle has a
+  // unique bootstrap (the Autobase root key), so a seed invite whose bootstrap is
+  // ALREADY enrolled under a DIFFERENT circleId is always malformed: one circle's
+  // id glued onto another's bootstrap. Enrolling it would mirror the same circle
+  // twice under two ids (the "duplicate name, different id" symptom) and shadow
+  // the real circle whose id was borrowed. Refuse it. Only reachable for a NEW
+  // circleId — a legit re-enroll of the same circle returned above; a recreate
+  // mints a fresh bootstrap so it never collides.
+  if (typeof localDb.createReadStream === 'function') {
+    for await (const { value } of localDb.createReadStream({ gt: 'seeder:enrolled:', lt: 'seeder:enrolled:~' })) {
+      if (value && value.bootstrap === bootstrap && value.circleId !== circleId) {
+        throw new Error(
+          'franken seed invite: bootstrap already enrolled under circle ' +
+          value.circleId + ' — refusing to bind it to a different circleId (' + circleId + ')'
+        )
+      }
+    }
+  }
   const row = {
     circleId,
     name,

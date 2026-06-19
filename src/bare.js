@@ -1244,9 +1244,19 @@ const handlers = {
     const record = await _localDb.get('circles:joined:' + circleId)
     if (!record?.value) throw new Error('not a member of that circle')
     const { name, circleKey, bootstrap } = record.value
+    // Defense-in-depth (bugfix 2026-06-19): refuse to mint a seed invite from a
+    // franken local record whose circleId disagrees with the founder-written
+    // circle.id in our own view — it would enroll a phantom on the blind seeder.
+    const base = _circleBases.get(circleId)
+    let viewRow = null
+    if (base) { try { viewRow = await base.view.get('circle') } catch (e) { /* view not ready */ } }
+    if (inviteCircleIdMismatch(circleId, viewRow?.value)) {
+      throw new Error('refusing to mint a seed invite: local record does not match this circle')
+    }
+    const liveName = resolveCircleName(name, viewRow)
     const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
-    const invite = buildSeedInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
-    return { invite, name }
+    const invite = buildSeedInvite({ circleId, name: liveName, circleKey, bootstrap, inviterPublicKey })
+    return { invite, name: liveName }
   },
 
   // List the current (non-revoked) seeders for a circle the local device
@@ -4444,15 +4454,24 @@ async function collectSeedInvites () {
     if (!value || !value.circleId) continue
     if (!value.encryptionKey) { skipped++; continue }
     const { circleId, name, circleKey, bootstrap } = value
+    let viewRow = null
+    const base = _circleBases.get(circleId)
+    if (base) { try { viewRow = await base.view.get('circle') } catch (e) { /* view not ready */ } }
+    // Defense-in-depth (bugfix 2026-06-19): never emit a seed invite whose
+    // circleId disagrees with the founder-written circle.id in our own
+    // (decryptable) view. Such a record is a franken (one circle's id glued onto
+    // another's bootstrap) and would enroll a phantom duplicate on the blind
+    // seeder, which cannot self-validate the binding. Skip it. Only fires on a
+    // positive mismatch — an un-replicated view (id undefined) is not blocked.
+    if (inviteCircleIdMismatch(circleId, viewRow?.value)) {
+      console.warn('[bare] skip seed invite: circleId mismatch', circleId.slice(0, 8))
+      continue
+    }
     // Prefer the live view name (what the app shows + what tracks renames) over
     // the circles:joined cache, which freezes at join-time on non-renamer
     // devices and otherwise leaks a stale / duplicated name into the seed
     // invite. Falls back to the cache when the view hasn't replicated yet.
-    let inviteName = name
-    try {
-      const base = _circleBases.get(circleId)
-      if (base) inviteName = resolveCircleName(name, await base.view.get('circle'))
-    } catch (e) { /* keep the cached name */ }
+    const inviteName = resolveCircleName(name, viewRow)
     const invite = buildSeedInvite({ circleId, name: inviteName, circleKey, bootstrap, inviterPublicKey })
     entries.push({ circleId, name: inviteName, invite })
   }
