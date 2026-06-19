@@ -49,6 +49,7 @@ const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = re
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
+const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher } = require('./lib/storeFlush')
 const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
@@ -1012,6 +1013,18 @@ const handlers = {
         // the replicated view, so they're read here rather than in the snapshot.
         const localRec = await _localDb.get('circles:joined:' + circleId).catch(() => null)
         const lv = localRec?.value || {}
+        // Self-heal the local name cache: the app shows snap.circle.name (live
+        // view), but circles:joined.name only updates at create/join + on the
+        // renamer's own device, so a member who joined before a rename keeps a
+        // stale name that seed invites then leak. Mirror the live name back when
+        // it has moved past the cache. Only writes on an actual change, so the
+        // ~3s poll isn't chatty; skips when the view hasn't replicated (snap.circle
+        // null / empty name) so a cold-boot blank can't clobber a good cache.
+        const healedName = resolveCircleName(lv.name, snap?.circle)
+        if (localRec && healedName && healedName !== lv.name) {
+          lv.name = healedName
+          await _localDb.put('circles:joined:' + circleId, { ...localRec.value, name: healedName }).catch(() => {})
+        }
         out.push({
           circleId,
           ...snap,
@@ -4431,8 +4444,17 @@ async function collectSeedInvites () {
     if (!value || !value.circleId) continue
     if (!value.encryptionKey) { skipped++; continue }
     const { circleId, name, circleKey, bootstrap } = value
-    const invite = buildSeedInvite({ circleId, name, circleKey, bootstrap, inviterPublicKey })
-    entries.push({ circleId, name, invite })
+    // Prefer the live view name (what the app shows + what tracks renames) over
+    // the circles:joined cache, which freezes at join-time on non-renamer
+    // devices and otherwise leaks a stale / duplicated name into the seed
+    // invite. Falls back to the cache when the view hasn't replicated yet.
+    let inviteName = name
+    try {
+      const base = _circleBases.get(circleId)
+      if (base) inviteName = resolveCircleName(name, await base.view.get('circle'))
+    } catch (e) { /* keep the cached name */ }
+    const invite = buildSeedInvite({ circleId, name: inviteName, circleKey, bootstrap, inviterPublicKey })
+    entries.push({ circleId, name: inviteName, invite })
   }
   return { entries, skipped }
 }
