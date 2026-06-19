@@ -30,9 +30,21 @@ scripts/frame-android-screenshots.sh
 scripts/assets/
 scripts/.env
 .env
-# Local Windows build tooling (machine/VM-specific)
+# Local seeder build/release tooling (machine/VM-specific: default to personal
+# build hosts, or operator-local payload assembly). Kept on disk, untracked.
+# Note: a fresh clone won't have these, so it can't build the seeder installers
+# until they're copied in — same tradeoff as scripts/release.sh.
 seeder-launcher/scripts/build-windows.sh
 seeder-launcher/scripts/windows-remote-build.ps1
+seeder-launcher/scripts/build-macos-remote.sh
+seeder-launcher/scripts/build-pkg-macos.sh
+seeder-launcher/scripts/postinstall-macos.sh
+seeder-launcher/scripts/build-host-sea.sh
+seeder-launcher/scripts/build-linux.sh
+seeder-launcher/scripts/build-deb-linux.sh
+seeder-launcher/scripts/build-appimage-linux.sh
+seeder-launcher/scripts/stage-payload-linux.sh
+seeder-launcher/scripts/build-umbrel-image.sh
 
 # Store-listing assets and the Zapstore publish manifest live locally.
 # Screenshots, framed bezel composites, store-listing copy, icon and
