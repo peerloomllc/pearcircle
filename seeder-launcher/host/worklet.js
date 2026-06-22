@@ -128,6 +128,16 @@ class Worklet extends EventEmitter {
       try { p.kill('SIGTERM') } catch {}
     })
   }
+
+  // Restart the worklet subprocess in place (launcher "Restart seeder").
+  // The host process + HTTP server stay up; only the bare worklet is torn
+  // down and respawned, which re-runs init -> remount circles -> boot
+  // retention sweeps. Resolves once the new worklet has re-initialized.
+  async restart () {
+    await this.stop()
+    this._ready = false
+    return this.start()
+  }
 }
 
 module.exports = { Worklet }

@@ -175,6 +175,21 @@ describe('runSeederRetentionSweep', () => {
     expect(cleared.sort()).toEqual([['c1', 1], ['c1', 2], ['c2', 1]])
   })
 
+  test('accumulates clearedBytes from clearBlock return values', async () => {
+    const db = makeFakeLocalDb()
+    await recordBlockReceived(db, 'c1', 1, 0)
+    await recordBlockReceived(db, 'c1', 2, 0)
+    const result = await runSeederRetentionSweep({
+      localDb: db,
+      enrolledCircles: ['c1'],
+      getRetentionMs: async () => 100,
+      clearBlock: async () => 200, // est. bytes per cleared block
+      now: 1000,
+    })
+    expect(result.cleared).toBe(2)
+    expect(result.clearedBytes).toBe(400)
+  })
+
   test('counts errors when clearBlock throws but keeps going', async () => {
     const db = makeFakeLocalDb()
     await recordBlockReceived(db, 'c1', 1, 0)
@@ -287,6 +302,21 @@ describe('runSeederWriterRetentionSweep', () => {
     expect(cleared.sort()).toEqual([['c1', 'coreA', 1], ['c1', 'coreB', 1]])
     // retention read once per circle (2 circles), not once per core (3 cores)
     expect(retentionCalls).toBe(2)
+  })
+
+  test('accumulates clearedBytes from clearBlock return values', async () => {
+    const db = makeFakeLocalDb()
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 1, 0)
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 2, 0)
+    const result = await runSeederWriterRetentionSweep({
+      localDb: db,
+      writerCores: [{ circleId: 'c1', coreKey: 'coreA' }],
+      getRetentionMs: async () => 100,
+      clearBlock: async () => 150,
+      now: 1000,
+    })
+    expect(result.cleared).toBe(2)
+    expect(result.clearedBytes).toBe(300)
   })
 
   test('counts errors when clearBlock throws but keeps going', async () => {

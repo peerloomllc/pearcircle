@@ -40,6 +40,8 @@ export const api = {
   retentionSet: (circleId, pruneOlderThan) => jsonFetch(`/api/retention/${encodeURIComponent(circleId)}`, {
     method: 'PUT', body: JSON.stringify({ pruneOlderThan }),
   }),
+  sweepNow: () => jsonFetch('/api/sweep', { method: 'POST' }),
+  restart: () => jsonFetch('/api/restart', { method: 'POST' }),
   update: () => jsonFetch('/api/update'),
   applyUpdate: () => jsonFetch('/api/update/apply', { method: 'POST' }),
 }

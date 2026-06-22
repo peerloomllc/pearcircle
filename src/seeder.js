@@ -34,6 +34,7 @@ const SEED_METHODS = Object.freeze([
   'seeder:leave',
   'seeder:retention:get',
   'seeder:retention:set',
+  'seeder:retention:sweep',
 ])
 
 /**
@@ -168,7 +169,7 @@ async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
  *   Called by seeder:leave before the persistence rows are deleted so the host can
  *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
@@ -270,6 +271,17 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version
         })
       }
       return { ok: true }
+    },
+
+    // Run both retention sweeps now (launcher "Run sweep now"). Applies a
+    // just-changed retention policy immediately instead of waiting for the
+    // 24h interval / a restart. Returns the per-sweep cleared counts.
+    'seeder:retention:sweep': async () => {
+      if (typeof runRetentionSweeps !== 'function') {
+        throw new Error('retention sweep unavailable')
+      }
+      const r = await runRetentionSweeps()
+      return { ok: true, ...r }
     },
   }
 }
