@@ -25,6 +25,13 @@ function generateCircleId () {
   return toBase64url(randomBytes32())
 }
 
+// One-time rendezvous key for a seeder-pairing session (proposal 2026-06-22):
+// 32 random bytes as base64url (43 chars), same format as a circleId so it
+// round-trips through buildSeederPairLink / seederPairTopic.
+function generateRendezvousKey () {
+  return toBase64url(randomBytes32())
+}
+
 function generateCircleKey () {
   return b4a.toString(randomBytes32(), 'hex')
 }
@@ -46,4 +53,4 @@ function generatePlaceId () {
   return b4a.toString(buf, 'hex')
 }
 
-module.exports = { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId }
+module.exports = { generateCircleId, generateRendezvousKey, generateCircleKey, generateEncryptionKey, generatePlaceId }

@@ -1,5 +1,14 @@
-const { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('../src/circle')
+const { generateCircleId, generateRendezvousKey, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('../src/circle')
 const { buildInvite, parseInvite } = require('../src/invite')
+
+describe('generateRendezvousKey', () => {
+  test('returns a 43-char base64url string (32 bytes), distinct each call', () => {
+    const a = generateRendezvousKey()
+    const b = generateRendezvousKey()
+    expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(a).not.toBe(b)
+  })
+})
 
 describe('generateCircleId', () => {
   test('returns a 43-char string', () => {
