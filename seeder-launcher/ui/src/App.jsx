@@ -55,6 +55,52 @@ export function App () {
       <Status status={status} />
       <Enroll onEnrolled={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <Circles circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
+      <Maintenance setError={setError} />
+    </div>
+  )
+}
+
+// On-demand maintenance controls. Retention sweeps already run at startup and
+// every 24h; these apply a just-changed retention policy immediately (or claw
+// back disk now) without waiting or restarting from a shell.
+function Maintenance ({ setError }) {
+  const [sweeping, setSweeping] = useState(false)
+  const [restarting, setRestarting] = useState(false)
+  const [msg, setMsg] = useState(null)
+
+  const sweep = async () => {
+    setMsg(null); setError(null); setSweeping(true)
+    try {
+      const r = await api.sweepNow()
+      const w = r?.writer?.cleared ?? 0
+      const b = r?.bootstrap?.cleared ?? 0
+      const total = w + b
+      setMsg(`Swept — cleared ${total} block${total === 1 ? '' : 's'} (${w} writer-core, ${b} bootstrap).`)
+    } catch (e) { setError(e.message) }
+    finally { setSweeping(false) }
+  }
+
+  const restart = async () => {
+    if (!confirm('Restart the seeder? It will briefly disconnect, re-sync, and run a retention sweep on boot.')) return
+    setMsg(null); setError(null); setRestarting(true)
+    try {
+      await api.restart()
+      setMsg('Seeder restarted.')
+    } catch (e) { setError(e.message) }
+    finally { setRestarting(false) }
+  }
+
+  return (
+    <div class="panel">
+      <h2>Maintenance</h2>
+      <div class="empty" style={{ marginBottom: 12 }}>
+        Retention sweeps run automatically at startup and every 24h. Use these to apply a changed retention policy right away.
+      </div>
+      <div class="row" style={{ gap: 10 }}>
+        <button onClick={sweep} disabled={sweeping || restarting}>{sweeping ? 'Sweeping…' : 'Run sweep now'}</button>
+        <button class="ghost" onClick={restart} disabled={sweeping || restarting}>{restarting ? 'Restarting…' : 'Restart seeder'}</button>
+      </div>
+      {msg && <div style={{ marginTop: 10, color: 'var(--good)', fontSize: 13 }}>{msg}</div>}
     </div>
   )
 }

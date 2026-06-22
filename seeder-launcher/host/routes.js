@@ -122,6 +122,21 @@ function routes () {
         return ctx.worklet.call('seeder:retention:set', { circleId, pruneOlderThan })
       },
     },
+    {
+      // Run both retention sweeps now, across every enrolled circle. Applies
+      // a just-changed retention policy immediately instead of waiting for
+      // the 24h interval or a restart.
+      method: 'POST',
+      match: (url) => url.pathname === '/api/sweep',
+      handler: async (req, ctx) => ctx.worklet.call('seeder:retention:sweep'),
+    },
+    {
+      // Restart the worklet subprocess (host + HTTP server stay up). Re-runs
+      // init -> remount -> boot sweeps. Resolves once it's back up.
+      method: 'POST',
+      match: (url) => url.pathname === '/api/restart',
+      handler: async (req, ctx) => { await ctx.worklet.restart(); return { ok: true } },
+    },
   ]
 }
 

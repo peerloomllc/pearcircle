@@ -5222,6 +5222,14 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
         }
         return total
       },
+      // On-demand retention sweep (launcher "Run sweep now"). Runs both the
+      // bootstrap-core and per-member writer-core sweeps so a just-changed
+      // retention policy applies immediately, without waiting for the 24h
+      // interval or a restart.
+      runRetentionSweeps: async () => ({
+        bootstrap: await runOneSeederRetentionSweep(),
+        writer: await runOneSeederWriterRetentionSweep(),
+      }),
     })
 
     // Mirror persisted seeder:revoked:* rows into the in-memory set so the

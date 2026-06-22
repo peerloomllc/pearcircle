@@ -48,6 +48,7 @@ describe('SEED_METHODS', () => {
       'seeder:leave',
       'seeder:retention:get',
       'seeder:retention:set',
+      'seeder:retention:sweep',
     ])
   })
 
@@ -456,6 +457,29 @@ describe('createSeederHandlers', () => {
       const handlers = makeHandlers(makeFakeLocalDb())
       await expect(handlers['seeder:retention:get']({})).rejects.toThrow(/circleId/)
       await expect(handlers['seeder:retention:set']({ pruneOlderThan: 1000 })).rejects.toThrow(/circleId/)
+    })
+  })
+
+  describe('seeder:retention:sweep', () => {
+    test('runs the injected sweeps and returns their counts', async () => {
+      let ran = 0
+      const handlers = createSeederHandlers({
+        localDb: makeFakeLocalDb(),
+        identity: { publicKey: b4a.from('a'.repeat(64), 'hex'), secretKey: b4a.from('b'.repeat(128), 'hex') },
+        bootTs: 1000,
+        runRetentionSweeps: async () => {
+          ran++
+          return { bootstrap: { circles: 1, cleared: 3, errors: 0 }, writer: { cores: 1, cleared: 7, errors: 0 } }
+        },
+      })
+      const r = await handlers['seeder:retention:sweep']()
+      expect(ran).toBe(1)
+      expect(r).toEqual({ ok: true, bootstrap: { circles: 1, cleared: 3, errors: 0 }, writer: { cores: 1, cleared: 7, errors: 0 } })
+    })
+
+    test('throws when no sweep runner is wired (e.g. a unit-test context)', async () => {
+      const handlers = makeHandlers(makeFakeLocalDb())
+      await expect(handlers['seeder:retention:sweep']()).rejects.toThrow(/unavailable/)
     })
   })
 
