@@ -22,4 +22,28 @@ function topicForCircleKey (circleKeyHex) {
   return out
 }
 
-module.exports = { topicForCircleKey, TOPIC_BYTES }
+// Domain-separation prefix so a seeder-pair rendezvous topic can never collide
+// with a circle topic even if the random rendezvous key happens to equal some
+// circleKey (circle topics are blake2b(circleKey) with no prefix).
+const SEEDER_PAIR_CONTEXT = 'pearcircle/seeder-pair'
+
+/**
+ * Derive the one-time Hyperswarm rendezvous topic for a seeder-pairing session
+ * from its 32-byte rendezvous key (43-char base64url, as carried in the QR).
+ * topic = blake2b(SEEDER_PAIR_CONTEXT || rvBytes). Seeder QR pairing proposal
+ * 2026-06-22.
+ * @param {string} rvB64 43-char base64url string (32 bytes)
+ * @returns {Buffer} 32-byte blake2b digest
+ */
+function seederPairTopic (rvB64) {
+  if (typeof rvB64 !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(rvB64)) {
+    throw new Error('rendezvous key must be a 43-char base64url string (32 bytes)')
+  }
+  const rv = b4a.from(rvB64 + '=', 'base64') // 43 base64url chars -> 32 bytes
+  const seed = b4a.concat([b4a.from(SEEDER_PAIR_CONTEXT), rv])
+  const out = b4a.allocUnsafe(TOPIC_BYTES)
+  sodium.crypto_generichash(out, seed)
+  return out
+}
+
+module.exports = { topicForCircleKey, seederPairTopic, SEEDER_PAIR_CONTEXT, TOPIC_BYTES }

@@ -1,4 +1,4 @@
-const { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, NAME_MAX } = require('../src/invite')
+const { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, buildSeederPairLink, parseSeederPairLink, NAME_MAX } = require('../src/invite')
 
 const VALID = {
   circleId: 'A'.repeat(43),
@@ -471,5 +471,48 @@ describe('trailing-slash tolerance', () => {
   test('the canonical no-slash form still parses', () => {
     expect(parseInvite(buildInvite(VALID)).ok).toBe(true)
     expect(parseSeedInvite(buildSeedInvite(VALID)).ok).toBe(true)
+  })
+})
+
+// Seeder-pairing link (QR shown by the seeder, scanned by the phone). Seeder QR
+// pairing proposal 2026-06-22, slice 1.
+describe('seeder-pair link', () => {
+  const RV = 'A'.repeat(43)        // 43-char base64url (32 bytes)
+  const SEEDER = 'b'.repeat(64)    // 64-char hex (32 bytes)
+
+  test('round-trips buildSeederPairLink -> parseSeederPairLink', () => {
+    const url = buildSeederPairLink({ rv: RV, seeder: SEEDER })
+    expect(url).toBe(`pear://pearcircle/seeder-pair?rv=${RV}&seeder=${SEEDER}&v=1`)
+    const r = parseSeederPairLink(url)
+    expect(r.ok).toBe(true)
+    expect(r.rv).toBe(RV)
+    expect(r.seeder).toBe(SEEDER)
+  })
+
+  test('builder rejects malformed rv / seeder', () => {
+    expect(() => buildSeederPairLink({ rv: 'short', seeder: SEEDER })).toThrow(/rv/)
+    expect(() => buildSeederPairLink({ rv: RV, seeder: 'z'.repeat(64) })).toThrow(/seeder/)
+    expect(() => buildSeederPairLink({ rv: RV, seeder: 'b'.repeat(63) })).toThrow(/seeder/)
+  })
+
+  test('parser rejects missing / malformed fields', () => {
+    expect(parseSeederPairLink('pear://pearcircle/seeder-pair?seeder=' + SEEDER).ok).toBe(false)
+    expect(parseSeederPairLink('pear://pearcircle/seeder-pair?rv=' + RV).ok).toBe(false)
+    expect(parseSeederPairLink(`pear://pearcircle/seeder-pair?rv=nope&seeder=${SEEDER}`).ok).toBe(false)
+    expect(parseSeederPairLink(null).ok).toBe(false)
+  })
+
+  test('rejects circle-shaped links (join / seed) so an invite cannot be mistaken for a pairing handle', () => {
+    expect(parseSeederPairLink(buildInvite(VALID)).ok).toBe(false)
+    expect(parseSeederPairLink(buildSeedInvite(VALID)).ok).toBe(false)
+  })
+
+  test('and parseSeedInvite rejects a pairing link (no cross-acceptance)', () => {
+    expect(parseSeedInvite(buildSeederPairLink({ rv: RV, seeder: SEEDER })).ok).toBe(false)
+  })
+
+  test('tolerates a trailing slash before the query', () => {
+    const slashed = `pear://pearcircle/seeder-pair/?rv=${RV}&seeder=${SEEDER}&v=1`
+    expect(parseSeederPairLink(slashed).ok).toBe(true)
   })
 })
