@@ -58,18 +58,79 @@ async function removeBlockTracking (localDb, circleId, seq) {
 // `now - pruneOlderThan`. Empty list when pruneOlderThan is null /
 // undefined / non-positive — that's the "no pruning configured" signal
 // from the seeder:retention:set IPC.
-async function pickStaleBlocks (localDb, circleId, now, pruneOlderThan) {
-  if (typeof circleId !== 'string' || circleId.length === 0) return []
+// Shared: list block seqs in `range` whose receivedAt is strictly older
+// than the cutoff. Empty when pruneOlderThan is null / undefined /
+// non-positive — the "no pruning configured" signal.
+async function pickStaleInRange (localDb, range, now, pruneOlderThan) {
   if (typeof now !== 'number' || !Number.isFinite(now)) return []
   if (typeof pruneOlderThan !== 'number' || !Number.isFinite(pruneOlderThan) || pruneOlderThan <= 0) return []
   const cutoff = now - pruneOlderThan
   const stale = []
-  for await (const { value } of localDb.createReadStream(rangeForCircle(circleId))) {
+  for await (const { value } of localDb.createReadStream(range)) {
     if (!value || typeof value.seq !== 'number') continue
     if (typeof value.receivedAt !== 'number') continue
     if (value.receivedAt < cutoff) stale.push(value.seq)
   }
   return stale
+}
+
+// Bootstrap (founder) core: list stale block seqs for a circle.
+async function pickStaleBlocks (localDb, circleId, now, pruneOlderThan) {
+  if (typeof circleId !== 'string' || circleId.length === 0) return []
+  return pickStaleInRange(localDb, rangeForCircle(circleId), now, pruneOlderThan)
+}
+
+// --- Per-member writer-core retention (storage audit 2026-06-22) ---
+// The bootstrap core above is the founder's writer core; the SAME
+// time-based pruneOlderThan policy (launcher UI) is extended to every
+// OTHER member's writer core so it actually bounds them too — previously
+// the sweep only touched the bootstrap, so writer cores grew forever
+// regardless of the configured retention. Each writer core has its own
+// independent seq space, so the tracking key carries the coreKey:
+//   seeder:wBlockTime:{circleId}:{coreKey}:{paddedSeq}
+// Track-forward only (like the bootstrap core, which also never
+// backfilled): blocks already on disk before this shipped carry no row
+// and are reclaimed by a fresh seeder reinstall.
+
+function writerBlockTimeKey (circleId, coreKey, seq) {
+  return 'seeder:wBlockTime:' + circleId + ':' + coreKey + ':' + padSeq(seq)
+}
+
+function rangeForWriterCore (circleId, coreKey) {
+  return {
+    gt: 'seeder:wBlockTime:' + circleId + ':' + coreKey + ':',
+    lt: 'seeder:wBlockTime:' + circleId + ':' + coreKey + ':~',
+  }
+}
+
+function rangeForWriterCircle (circleId) {
+  return {
+    gt: 'seeder:wBlockTime:' + circleId + ':',
+    lt: 'seeder:wBlockTime:' + circleId + ':~',
+  }
+}
+
+async function recordWriterBlockReceived (localDb, circleId, coreKey, seq, receivedAt) {
+  if (typeof circleId !== 'string' || circleId.length === 0) return false
+  if (typeof coreKey !== 'string' || coreKey.length === 0) return false
+  if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 0) return false
+  if (typeof receivedAt !== 'number' || !Number.isFinite(receivedAt)) return false
+  await localDb.put(writerBlockTimeKey(circleId, coreKey, seq), { seq, receivedAt })
+  return true
+}
+
+async function removeWriterBlockTracking (localDb, circleId, coreKey, seq) {
+  if (typeof circleId !== 'string' || circleId.length === 0) return false
+  if (typeof coreKey !== 'string' || coreKey.length === 0) return false
+  if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 0) return false
+  await localDb.del(writerBlockTimeKey(circleId, coreKey, seq)).catch(() => {})
+  return true
+}
+
+async function pickStaleWriterBlocks (localDb, circleId, coreKey, now, pruneOlderThan) {
+  if (typeof circleId !== 'string' || circleId.length === 0) return []
+  if (typeof coreKey !== 'string' || coreKey.length === 0) return []
+  return pickStaleInRange(localDb, rangeForWriterCore(circleId, coreKey), now, pruneOlderThan)
 }
 
 // One-shot orchestrator. Pure-ish: caller passes in clearBlock(seq)
@@ -102,10 +163,53 @@ async function runSeederRetentionSweep ({ localDb, enrolledCircles, getRetention
   return result
 }
 
+// Writer-core orchestrator. `writerCores` is a flat list of
+// { circleId, coreKey }; retention is read once per circle (cached) and
+// applied to each of that circle's writer cores. clearBlock(circleId,
+// coreKey, seq) performs core.clear(seq, seq+1) + removeWriterBlockTracking
+// on the specific writer core.
+async function runSeederWriterRetentionSweep ({ localDb, writerCores, getRetentionMs, clearBlock, now }) {
+  const result = { cores: 0, cleared: 0, errors: 0 }
+  const retentionByCircle = new Map()
+  for (const { circleId, coreKey } of writerCores) {
+    let pruneOlderThan
+    if (retentionByCircle.has(circleId)) {
+      pruneOlderThan = retentionByCircle.get(circleId)
+    } else {
+      try {
+        pruneOlderThan = await getRetentionMs(circleId)
+      } catch {
+        pruneOlderThan = null
+        result.errors++
+      }
+      retentionByCircle.set(circleId, pruneOlderThan)
+    }
+    if (typeof pruneOlderThan !== 'number' || pruneOlderThan <= 0) continue
+    const stale = await pickStaleWriterBlocks(localDb, circleId, coreKey, now, pruneOlderThan)
+    if (stale.length === 0) continue
+    result.cores++
+    for (const seq of stale) {
+      try {
+        await clearBlock(circleId, coreKey, seq)
+        result.cleared++
+      } catch {
+        result.errors++
+      }
+    }
+  }
+  return result
+}
+
 module.exports = {
   blockTimeKey,
   recordBlockReceived,
   removeBlockTracking,
   pickStaleBlocks,
   runSeederRetentionSweep,
+  writerBlockTimeKey,
+  rangeForWriterCircle,
+  recordWriterBlockReceived,
+  removeWriterBlockTracking,
+  pickStaleWriterBlocks,
+  runSeederWriterRetentionSweep,
 }
