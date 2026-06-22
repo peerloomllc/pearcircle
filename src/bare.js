@@ -3720,6 +3720,17 @@ async function handleSeederAdmittedNotice ({ circleId, updatedAt }) {
 // seeder:retention:{circleId} sidecar for every currently-mounted circle;
 // pure helper picks the stale block seqs; we call core.clear + drop the
 // per-block tracker row. Proposal 2026-05-19-blind-seeder-peers slice 5.
+// Estimate a core's per-block byte size for the sweep's reclaimed-bytes
+// diagnostic. byteLength is the authority total and doesn't drop on clear(),
+// and exact per-block sizes aren't cheaply available on a blind core, so the
+// average is the honest cheap proxy (seeder blocks are uniform lastSeen/
+// transition ops). Physical disk is reclaimed by the next RocksDB compaction.
+function avgBlockBytes (core) {
+  const len = core?.length || 0
+  const bytes = core?.byteLength || 0
+  return len > 0 && bytes > 0 ? Math.round(bytes / len) : 0
+}
+
 async function runOneSeederRetentionSweep () {
   return runSeederRetentionSweep({
     localDb: _localDb,
@@ -3731,12 +3742,14 @@ async function runOneSeederRetentionSweep () {
     },
     clearBlock: async (circleId, seq) => {
       const entry = _seederCircles.get(circleId)
-      if (!entry?.core) return
+      if (!entry?.core) return 0
+      const bytes = avgBlockBytes(entry.core)
       try {
         await entry.core.clear(seq, seq + 1)
       } finally {
         await removeBlockTracking(_localDb, circleId, seq).catch(() => {})
       }
+      return bytes
     },
     now: Date.now(),
   })
@@ -3764,12 +3777,14 @@ async function runOneSeederWriterRetentionSweep () {
     clearBlock: async (circleId, coreKey, seq) => {
       const entry = _seederCircles.get(circleId)
       const core = entry?.writerCores?.get(coreKey)
-      if (!core) return
+      if (!core) return 0
+      const bytes = avgBlockBytes(core)
       try {
         await core.clear(seq, seq + 1)
       } finally {
         await removeWriterBlockTracking(_localDb, circleId, coreKey, seq).catch(() => {})
       }
+      return bytes
     },
     now: Date.now(),
   })

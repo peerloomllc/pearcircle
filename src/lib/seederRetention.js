@@ -138,7 +138,11 @@ async function pickStaleWriterBlocks (localDb, circleId, coreKey, now, pruneOlde
 // real corestore + localDb. Returns counts so the boot mark can record
 // how much was pruned.
 async function runSeederRetentionSweep ({ localDb, enrolledCircles, getRetentionMs, clearBlock, now }) {
-  const result = { circles: 0, cleared: 0, errors: 0 }
+  // clearedBytes is an estimate: clearBlock returns the core's average block
+  // size per cleared seq (exact per-block sizes aren't cheaply available on a
+  // blind core, and the blocks a seeder holds are uniform). Physical disk is
+  // reclaimed by the next RocksDB compaction, not by clear() itself.
+  const result = { circles: 0, cleared: 0, clearedBytes: 0, errors: 0 }
   for (const circleId of enrolledCircles) {
     let pruneOlderThan = null
     try {
@@ -153,8 +157,9 @@ async function runSeederRetentionSweep ({ localDb, enrolledCircles, getRetention
     result.circles++
     for (const seq of stale) {
       try {
-        await clearBlock(circleId, seq)
+        const bytes = await clearBlock(circleId, seq)
         result.cleared++
+        if (typeof bytes === 'number' && bytes > 0) result.clearedBytes += bytes
       } catch {
         result.errors++
       }
@@ -169,7 +174,9 @@ async function runSeederRetentionSweep ({ localDb, enrolledCircles, getRetention
 // coreKey, seq) performs core.clear(seq, seq+1) + removeWriterBlockTracking
 // on the specific writer core.
 async function runSeederWriterRetentionSweep ({ localDb, writerCores, getRetentionMs, clearBlock, now }) {
-  const result = { cores: 0, cleared: 0, errors: 0 }
+  // clearedBytes is an estimate (avg block size per cleared seq) — see the note
+  // on runSeederRetentionSweep.
+  const result = { cores: 0, cleared: 0, clearedBytes: 0, errors: 0 }
   const retentionByCircle = new Map()
   for (const { circleId, coreKey } of writerCores) {
     let pruneOlderThan
@@ -190,8 +197,9 @@ async function runSeederWriterRetentionSweep ({ localDb, writerCores, getRetenti
     result.cores++
     for (const seq of stale) {
       try {
-        await clearBlock(circleId, coreKey, seq)
+        const bytes = await clearBlock(circleId, coreKey, seq)
         result.cleared++
+        if (typeof bytes === 'number' && bytes > 0) result.clearedBytes += bytes
       } catch {
         result.errors++
       }

@@ -75,7 +75,10 @@ function Maintenance ({ setError }) {
       const w = r?.writer?.cleared ?? 0
       const b = r?.bootstrap?.cleared ?? 0
       const total = w + b
-      setMsg(`Swept — cleared ${total} block${total === 1 ? '' : 's'} (${w} writer-core, ${b} bootstrap).`)
+      const bytes = (r?.writer?.clearedBytes ?? 0) + (r?.bootstrap?.clearedBytes ?? 0)
+      setMsg(total === 0
+        ? 'Swept — nothing past the retention window to reclaim.'
+        : `Swept — cleared ${total} block${total === 1 ? '' : 's'} (${w} writer-core, ${b} bootstrap), ~${formatBytes(bytes)} freed. Disk space is reclaimed on the next compaction.`)
     } catch (e) { setError(e.message) }
     finally { setSweeping(false) }
   }
