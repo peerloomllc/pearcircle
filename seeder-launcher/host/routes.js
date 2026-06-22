@@ -66,7 +66,15 @@ function routes () {
         // covering every encrypted circle at once. Split + enroll each;
         // the worklet's seeder:enroll stays single-invite. A plain
         // single-invite paste is just a one-line bundle.
+        //
+        // The bundle is newline-joined at the source, but a share sheet /
+        // messaging app in transit often URL-encodes the separators to %0A
+        // (or %0D%0A). Without decoding them first the whole blob stays one
+        // "line" and parseSeedInvite mangles it into a franken enrollment
+        // (circle A's id + circle B's bootstrap). Normalize both forms.
         const lines = String(body.invite)
+          .replace(/%0[dD]/g, '\r')
+          .replace(/%0[aA]/g, '\n')
           .split(/\r?\n/)
           .map((l) => l.trim())
           .filter((l) => l.length > 0)
