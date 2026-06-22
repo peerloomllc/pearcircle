@@ -1895,6 +1895,11 @@ function JoinView ({ onClose, onJoined, initialInvite }) {
   }, [initialInvite])
   const [joining, setJoining] = useState(false)
   const [error, setError] = useState(null)
+  // Set when the worklet reports we re-joined a circle we're already in
+  // (idempotent join, alreadyJoined: true). We still let the user open it,
+  // but with a clear "already a member" notice instead of a silent
+  // fake-success that looks identical to a fresh join.
+  const [already, setAlready] = useState(null) // { circleId, name } | null
 
   const onScan = async () => {
     setError(null)
@@ -1914,7 +1919,11 @@ function JoinView ({ onClose, onJoined, initialInvite }) {
       const r = await pear.call('circle:join', { invite: invite.trim() })
       setJoining(false)
       if (r?.circleId) {
-        onJoined(r.circleId)
+        if (r.alreadyJoined) {
+          setAlready({ circleId: r.circleId, name: typeof r.name === 'string' && r.name ? r.name : null })
+        } else {
+          onJoined(r.circleId)
+        }
       } else if (r?.error) {
         // Surface the worklet's real reason. The most common non-parse failure
         // is a circleId/circle mismatch (a malformed or stale invite).
@@ -1928,6 +1937,25 @@ function JoinView ({ onClose, onJoined, initialInvite }) {
       setJoining(false)
       setError(String(e?.message ?? e))
     }
+  }
+
+  if (already) {
+    return (
+      <div style={s.screen}>
+        <BackBar onBack={onClose} title='Join Circle' />
+        <div style={s.section}>
+          <p style={{ fontSize: typography.subheading.fontSize, fontWeight: typography.subheading.fontWeight, marginTop: 0, marginBottom: spacing.sm }}>
+            You're already a member
+          </p>
+          <p style={{ fontSize: typography.body.fontSize, color: colors.text.secondary, margin: 0 }}>
+            {already.name ? `You've already joined "${already.name}".` : "You've already joined this circle."}
+          </p>
+        </div>
+        <button style={s.primaryBtn} onClick={() => onJoined(already.circleId)}>
+          {already.name ? `Open ${already.name}` : 'Open circle'}
+        </button>
+      </div>
+    )
   }
 
   return (
