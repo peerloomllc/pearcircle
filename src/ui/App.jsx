@@ -1544,6 +1544,10 @@ function SeedersSection ({ active = true }) {
   // does the compare; the seeder wire stays unchanged (it only reports its own
   // version). Best-effort: a fetch failure just means no "update available" hint.
   const [latestVersion, setLatestVersion] = useState(null)
+  // QR pairing (proposal 2026-06-22): scan the seeder's "Pair a phone" QR and
+  // push our circles to it over P2P, no copy-paste.
+  const [pairing, setPairing] = useState(false)
+  const [pairResult, setPairResult] = useState(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -1556,6 +1560,28 @@ function SeedersSection ({ active = true }) {
       setLoading(false)
     }
   }, [])
+
+  const scanSeeder = useCallback(async () => {
+    setError(null); setPairResult(null)
+    let text
+    try {
+      text = await pear.call('shell:scanQr')
+    } catch (e) { setError('Scan failed: ' + (e?.message ?? e)); return }
+    if (typeof text !== 'string' || text.trim().length === 0) return // cancelled
+    setPairing(true)
+    try {
+      const r = await pear.call('seeder:pair:scan', { link: text.trim() })
+      if (r?.ok) { setPairResult(r); refresh() }
+      else setError(r?.error || 'Pairing failed')
+    } catch (e) {
+      const m = String(e?.message ?? e)
+      setError(/invalid pairing link/i.test(m)
+        ? 'That QR is not a seeder pairing code.'
+        : (/timed out/i.test(m)
+          ? "Could not reach the seeder. Make sure its dashboard is showing the QR, then try again."
+          : m))
+    } finally { setPairing(false) }
+  }, [refresh])
 
   useEffect(() => {
     if (!active) return
@@ -1695,8 +1721,43 @@ function SeedersSection ({ active = true }) {
         Install the free PearCircle Seeder app (macOS, Windows or Linux) on that
         computer, then set up a device below to link it to your circles.
       </p>
-      <button onClick={mintBundle} disabled={minting} style={s.primaryBtn}>
-        {minting ? 'Building invites...' : 'Set up a seeder device'}
+      {pairResult ? (
+        <div style={{ ...s.section, textAlign: 'center' }}>
+          <p style={{ margin: 0, color: colors.text.primary, fontSize: typography.body.fontSize }}>
+            Paired! Now seeding {pairResult.enrolled} {pairResult.enrolled === 1 ? 'circle' : 'circles'}
+            {Array.isArray(pairResult.names) && pairResult.names.length > 0 ? ` (${pairResult.names.join(', ')})` : ''}.
+          </p>
+          <button
+            onClick={() => setPairResult(null)}
+            style={{
+              width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
+              background: 'transparent', color: colors.text.primary,
+              border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
+              cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
+            }}>
+            Done
+          </button>
+        </div>
+      ) : (
+        <>
+          <button onClick={scanSeeder} disabled={pairing} style={s.primaryBtn}>
+            {pairing ? 'Pairing...' : 'Scan seeder QR'}
+          </button>
+          <p style={{ ...s.muted, textAlign: 'center', marginTop: spacing.sm, marginBottom: 0 }}>
+            On the seeder's dashboard, tap "Pair a phone" and scan the code.
+          </p>
+        </>
+      )}
+      <button
+        onClick={mintBundle}
+        disabled={minting}
+        style={{
+          width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
+          background: 'transparent', color: colors.text.primary,
+          border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
+          cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
+        }}>
+        {minting ? 'Building invites...' : 'Or set up by pasting an invite'}
       </button>
       <button
         onClick={() => openURL('https://github.com/peerloomllc/pearcircle/releases')}

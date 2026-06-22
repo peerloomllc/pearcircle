@@ -137,6 +137,19 @@ function routes () {
       match: (url) => url.pathname === '/api/restart',
       handler: async (req, ctx) => { await ctx.worklet.restart(); return { ok: true } },
     },
+    {
+      // Open a QR-pairing session: mint a rendezvous + return the pear:// link
+      // the dashboard renders as a QR. Seeder QR pairing proposal 2026-06-22.
+      method: 'POST',
+      match: (url) => url.pathname === '/api/pair/open',
+      handler: async (req, ctx) => ctx.worklet.call('seeder:pair:open'),
+    },
+    {
+      // Close the pairing session (panel closed / done).
+      method: 'POST',
+      match: (url) => url.pathname === '/api/pair/close',
+      handler: async (req, ctx) => ctx.worklet.call('seeder:pair:close'),
+    },
   ]
 }
 
