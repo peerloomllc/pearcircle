@@ -23,7 +23,10 @@ export function App () {
       onMessage: (msg) => {
         setWsConnected(true)
         if (msg.type === 'snapshot') {
-          if (msg.status && !msg.status.error) setStatus(msg.status)
+          // A healthy snapshot means the worklet is up — clear any stale
+          // error (e.g. the transient "worklet exited" from a Restart, which
+          // would otherwise linger after it comes back).
+          if (msg.status && !msg.status.error) { setStatus(msg.status); setError(null) }
           if (msg.circles && !msg.circles.error) setCircles(msg.circles.circles ?? [])
           if (msg.launcherVersion) setVersion(msg.launcherVersion)
           if (msg.update) setUpdate(msg.update)
@@ -52,9 +55,8 @@ export function App () {
         <UpdateBanner update={update} applyState={applyState} setApplyState={setApplyState} />
       )}
 
-      <Status status={status} />
+      <Status status={status} circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <Enroll onEnrolled={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
-      <Circles circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <Maintenance setError={setError} />
     </div>
   )
@@ -96,14 +98,14 @@ function Maintenance ({ setError }) {
   return (
     <div class="panel">
       <h2>Maintenance</h2>
-      <div class="empty" style={{ marginBottom: 12 }}>
+      <div class="empty" style={{ marginBottom: 12, textAlign: 'center' }}>
         Retention sweeps run automatically at startup and every 24h. Use these to apply a changed retention policy right away.
       </div>
-      <div class="row" style={{ gap: 10 }}>
+      <div class="row" style={{ gap: 10, justifyContent: 'center' }}>
         <button onClick={sweep} disabled={sweeping || restarting}>{sweeping ? 'Sweeping…' : 'Run sweep now'}</button>
         <button class="ghost" onClick={restart} disabled={sweeping || restarting}>{restarting ? 'Restarting…' : 'Restart seeder'}</button>
       </div>
-      {msg && <div style={{ marginTop: 10, color: 'var(--good)', fontSize: 13 }}>{msg}</div>}
+      {msg && <div style={{ marginTop: 10, color: 'var(--good)', fontSize: 13, textAlign: 'center' }}>{msg}</div>}
     </div>
   )
 }
@@ -146,7 +148,10 @@ function UpdateBanner ({ update, applyState, setApplyState }) {
   )
 }
 
-function Status ({ status }) {
+// Status + the enrolled-circles list folded into one Overview panel: the
+// seeder's identity/uptime/bytes and what it's actually seeding belong
+// together. Per-circle retention/leave controls live on each Circle row.
+function Status ({ status, circles, onChanged, setError }) {
   return (
     <div class="panel">
       <h2>Status</h2>
@@ -158,6 +163,11 @@ function Status ({ status }) {
           <div class="row"><div class="label">Replicated</div><div>{formatBytes(status.totalBytesReplicated || 0)}</div></div>
         </div>
       )}
+      <div class="section-head">Seeding {circles.length} circle{circles.length === 1 ? '' : 's'}</div>
+      {circles.length === 0 && <div class="empty">no circles yet — paste a seed invite below to start</div>}
+      {circles.map((c) => (
+        <Circle key={c.circleId} circle={c} onChanged={onChanged} setError={setError} />
+      ))}
     </div>
   )
 }
@@ -210,18 +220,6 @@ function Enroll ({ onEnrolled, setError }) {
           </div>
         )}
       </form>
-    </div>
-  )
-}
-
-function Circles ({ circles, onChanged, setError }) {
-  return (
-    <div class="panel">
-      <h2>Enrolled circles ({circles.length})</h2>
-      {circles.length === 0 && <div class="empty">no circles yet — paste a seed invite above to start</div>}
-      {circles.map((c) => (
-        <Circle key={c.circleId} circle={c} onChanged={onChanged} setError={setError} />
-      ))}
     </div>
   )
 }
