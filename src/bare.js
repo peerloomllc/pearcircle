@@ -58,6 +58,7 @@ const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, tripIsExpired } = require('./lib/tripRetention')
+const { TRANSITION_RETENTION_MS, transitionIsExpired } = require('./lib/transitionRetention')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -2251,6 +2252,34 @@ async function pruneOldTrips () {
   return { localDeleted, viewDeleted }
 }
 
+// Worklet-side transition retention sweep (storage audit 2026-06-22).
+// Drops transition records older than TRANSITION_RETENTION_MS from each
+// per-circle autobase transition:{ts}:{pubkey}:{placeId} view. Unlike
+// trips there is no local Hyperbee copy — transitions live only in the
+// per-circle autobase view. View deletes are local-only and don't
+// replicate, so each peer prunes its own copy; the apply-branch filter
+// keeps the bound across reboots. Returns a count for logging.
+async function pruneOldTransitions () {
+  if (!_initialized) return { viewDeleted: 0 }
+  const now = Date.now()
+  let viewDeleted = 0
+  for (const [, base] of _circleBases) {
+    try {
+      const toDelete = []
+      for await (const { key, value } of base.view.createReadStream({
+        gt: 'transition:',
+        lt: 'transition:~',
+      })) {
+        if (transitionIsExpired(value, now)) toDelete.push(key)
+      }
+      for (const k of toDelete) {
+        try { await base.view.del(k); viewDeleted++ } catch {}
+      }
+    } catch (e) { console.warn('[bare] pruneOldTransitions view scan failed', e?.message) }
+  }
+  return { viewDeleted }
+}
+
 // Replicate a freshly-completed trip to every per-circle autobase
 // whose sharing toggle is on. Per proposal 2026-05-10 the toggle is
 // strict opt-in (absent row = off) and only applies to FUTURE trips
@@ -3239,6 +3268,13 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         const keyPlaceId = tail.slice(secondColon + 1)
         if (keyPubkey !== incoming.pubkey) continue
         if (keyPlaceId !== incoming.placeId) continue
+        // Retention gate: don't store transitions older than the 90-day
+        // window. A late-syncing peer's stale transition log would
+        // otherwise blow back the bound that pruneOldTransitions() just
+        // freed. transitionIsExpired tolerates malformed ts (keeps them).
+        // Expired transitions are always well past TRANSITION_FRESHNESS_MS
+        // so no notification would have fired anyway.
+        if (transitionIsExpired(incoming, Date.now())) continue
         await view.put(op.key, incoming)
         // Emit transition:applied so the RN shell can fire an OS notification.
         // Skip the emit when we've already fired for this exact op key in
@@ -5405,6 +5441,14 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   setInterval(() => {
     pruneOldTrips().then((r) => mark('trip:prune:interval', r))
       .catch((e) => console.warn('[bare] pruneOldTrips interval failed', e?.message))
+  }, TRIP_PRUNE_INTERVAL_MS)
+  // Transition retention sweep, same boot + 6h-cadence shape as trips
+  // (storage audit 2026-06-22). Equally cheap and never blocks boot.
+  pruneOldTransitions().then((r) => mark('transition:prune:boot', r))
+    .catch((e) => console.warn('[bare] pruneOldTransitions boot failed', e?.message))
+  setInterval(() => {
+    pruneOldTransitions().then((r) => mark('transition:prune:interval', r))
+      .catch((e) => console.warn('[bare] pruneOldTransitions interval failed', e?.message))
   }, TRIP_PRUNE_INTERVAL_MS)
   // Reconcile iOS CLCircularRegion state once init completes. Even
   // when zero places exist, this clears any stale OS-side regions
