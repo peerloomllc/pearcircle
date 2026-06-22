@@ -50,7 +50,7 @@ const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
 const { resolveCircleName } = require('./lib/circleName')
-const { createStoreFlusher } = require('./lib/storeFlush')
+const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
 const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -5028,6 +5028,31 @@ function startStoreFlushTimer () {
   _storeFlushTimer = setInterval(() => { flushStore('interval') }, STORE_FLUSH_INTERVAL_MS)
 }
 
+// Full-keyspace RocksDB compaction to reclaim dead SST left by overwritten
+// lastSeen and the trip / transition / seeder retention deletes (storage
+// audit 2026-06-22). Far heavier than a flush, so: one compaction per
+// session delayed off the cold-start path, then a slow daily cadence. Never
+// per-write. Shared by member + seed mode (seed mode accrues the most dead
+// SST via retention clears).
+const STORE_COMPACT_INTERVAL_MS = 24 * 60 * 60 * 1000
+const STORE_COMPACT_BOOT_DELAY_MS = 90 * 1000
+let _storeCompactTimer = null
+
+const compactStore = createStoreCompactor({
+  getStore: () => _store,
+  mark,
+  warn: (...args) => console.warn(...args),
+})
+
+function startStoreCompactTimer () {
+  if (_storeCompactTimer) return
+  // Delayed boot compaction runs after the fire-and-forget retention sweeps
+  // at init:done, so it reclaims their fresh deletes without competing with
+  // worklet startup.
+  setTimeout(() => { compactStore('boot') }, STORE_COMPACT_BOOT_DELAY_MS)
+  _storeCompactTimer = setInterval(() => { compactStore('interval') }, STORE_COMPACT_INTERVAL_MS)
+}
+
 async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   if (typeof version === 'string' && version.length > 0) _seederVersion = version.slice(0, 64)
   if (_initialized) {
@@ -5060,6 +5085,8 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // Start bounding the WAL as soon as the store is open, before the heavy
   // Autobase mount. Runs in both member and seed modes (both share _store).
   startStoreFlushTimer()
+  // Schedule the periodic dead-SST reclaim (delayed boot pass + daily).
+  startStoreCompactTimer()
 
   const localCore = _store.get({ name: 'local' })
   await localCore.ready()

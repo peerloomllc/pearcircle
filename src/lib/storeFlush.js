@@ -35,4 +35,42 @@ function createStoreFlusher ({ getStore, mark, warn } = {}) {
   }
 }
 
-module.exports = { createStoreFlusher }
+// Reclaim dead on-disk SST by forcing a full-keyspace RocksDB compaction.
+// Flushing (above) rolls the memtable to SST and truncates the WAL, but it
+// never reclaims space from keys that were overwritten or deleted -- the
+// superseded SST blocks linger until RocksDB happens to run a background
+// compaction, which it may defer indefinitely on a mostly-idle app. After a
+// big delete pass (the trip / transition retention sweeps) or a long run of
+// lastSeen overwrites, that dead SST is the bulk of the on-disk footprint
+// (storage audit 2026-06-22). compactRange(null, null) compacts the whole
+// keyspace, dropping tombstoned + superseded blocks for real.
+//
+// Heavier than a flush (it rewrites SST files), so callers schedule it off the
+// cold-start path and on a slow cadence, never per-write. We flush first so any
+// just-deleted keys are on disk as SST and actually get compacted away. Same
+// coalesce / read-only / error-swallow contract as the flusher.
+function createStoreCompactor ({ getStore, mark, warn } = {}) {
+  let compacting = false
+
+  return async function compactStore (reason) {
+    const store = typeof getStore === 'function' ? getStore() : null
+    const db = store && store.storage && store.storage.db
+    // No store yet, or a read-only (seed-replica) store: nothing to compact.
+    if (!db || store.storage.readOnly) return false
+    if (compacting) return false
+    compacting = true
+    try {
+      try { await db.flush() } catch {}
+      await db.compactRange()
+      if (typeof mark === 'function') mark('store:compact', { reason })
+      return true
+    } catch (e) {
+      if (typeof warn === 'function') warn('[bare] store compact failed', reason, e && e.message)
+      return false
+    } finally {
+      compacting = false
+    }
+  }
+}
+
+module.exports = { createStoreFlusher, createStoreCompactor }
