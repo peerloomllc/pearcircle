@@ -9,6 +9,12 @@ const {
   removeBlockTracking,
   pickStaleBlocks,
   runSeederRetentionSweep,
+  writerBlockTimeKey,
+  rangeForWriterCircle,
+  recordWriterBlockReceived,
+  removeWriterBlockTracking,
+  pickStaleWriterBlocks,
+  runSeederWriterRetentionSweep,
 } = require('../src/lib/seederRetention')
 
 function makeFakeLocalDb () {
@@ -206,5 +212,112 @@ describe('runSeederRetentionSweep', () => {
     })
     expect(result.errors).toBe(1)
     expect(cleared).toEqual([['c2', 1]])
+  })
+})
+
+// --- Per-member writer-core retention (storage audit 2026-06-22) ---
+
+describe('writerBlockTimeKey', () => {
+  test('carries the coreKey and pads the seq', () => {
+    expect(writerBlockTimeKey('cid', 'deadbeef', 7)).toBe('seeder:wBlockTime:cid:deadbeef:0000000000007')
+  })
+
+  test('different cores get disjoint key spaces under the same circle', () => {
+    const a = writerBlockTimeKey('cid', 'coreA', 5)
+    const b = writerBlockTimeKey('cid', 'coreB', 5)
+    expect(a).not.toBe(b)
+  })
+})
+
+describe('recordWriterBlockReceived / removeWriterBlockTracking', () => {
+  test('writes and deletes the coreKey-scoped row', async () => {
+    const db = makeFakeLocalDb()
+    expect(await recordWriterBlockReceived(db, 'cid', 'coreA', 5, 12345)).toBe(true)
+    expect(db._data.get('seeder:wBlockTime:cid:coreA:0000000000005')).toEqual({ seq: 5, receivedAt: 12345 })
+    await removeWriterBlockTracking(db, 'cid', 'coreA', 5)
+    expect(db._data.size).toBe(0)
+  })
+
+  test('rejects malformed coreKey', async () => {
+    const db = makeFakeLocalDb()
+    expect(await recordWriterBlockReceived(db, 'cid', '', 5, 1)).toBe(false)
+    expect(await recordWriterBlockReceived(db, 'cid', null, 5, 1)).toBe(false)
+  })
+})
+
+describe('pickStaleWriterBlocks', () => {
+  test('isolates seq spaces per core — one core does not bleed into another', async () => {
+    const db = makeFakeLocalDb()
+    await recordWriterBlockReceived(db, 'cid', 'coreA', 1, 0)   // stale
+    await recordWriterBlockReceived(db, 'cid', 'coreA', 2, 950) // fresh
+    await recordWriterBlockReceived(db, 'cid', 'coreB', 1, 0)   // stale, different core
+    // now=1000, prune=100, cutoff=900
+    expect(await pickStaleWriterBlocks(db, 'cid', 'coreA', 1000, 100)).toEqual([1])
+    expect(await pickStaleWriterBlocks(db, 'cid', 'coreB', 1000, 100)).toEqual([1])
+  })
+
+  test('returns empty when pruneOlderThan is null', async () => {
+    const db = makeFakeLocalDb()
+    await recordWriterBlockReceived(db, 'cid', 'coreA', 1, 0)
+    expect(await pickStaleWriterBlocks(db, 'cid', 'coreA', 1000, null)).toEqual([])
+  })
+})
+
+describe('runSeederWriterRetentionSweep', () => {
+  test('clears stale blocks per core and caches retention per circle', async () => {
+    const db = makeFakeLocalDb()
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 1, 0)   // stale
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 2, 950) // fresh
+    await recordWriterBlockReceived(db, 'c1', 'coreB', 1, 50)  // stale
+    await recordWriterBlockReceived(db, 'c2', 'coreC', 1, 0)   // no retention
+    const cleared = []
+    let retentionCalls = 0
+    const result = await runSeederWriterRetentionSweep({
+      localDb: db,
+      writerCores: [
+        { circleId: 'c1', coreKey: 'coreA' },
+        { circleId: 'c1', coreKey: 'coreB' },
+        { circleId: 'c2', coreKey: 'coreC' },
+      ],
+      getRetentionMs: async (cid) => { retentionCalls++; return cid === 'c1' ? 100 : null },
+      clearBlock: async (cid, coreKey, seq) => cleared.push([cid, coreKey, seq]),
+      now: 1000,
+    })
+    expect(result.cleared).toBe(2)
+    expect(cleared.sort()).toEqual([['c1', 'coreA', 1], ['c1', 'coreB', 1]])
+    // retention read once per circle (2 circles), not once per core (3 cores)
+    expect(retentionCalls).toBe(2)
+  })
+
+  test('counts errors when clearBlock throws but keeps going', async () => {
+    const db = makeFakeLocalDb()
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 1, 0)
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 2, 0)
+    const cleared = []
+    const result = await runSeederWriterRetentionSweep({
+      localDb: db,
+      writerCores: [{ circleId: 'c1', coreKey: 'coreA' }],
+      getRetentionMs: async () => 100,
+      clearBlock: async (cid, coreKey, seq) => {
+        if (seq === 1) throw new Error('hypercore unavailable')
+        cleared.push([cid, coreKey, seq])
+      },
+      now: 1000,
+    })
+    expect(result.errors).toBe(1)
+    expect(result.cleared).toBe(1)
+  })
+})
+
+describe('rangeForWriterCircle', () => {
+  test('bounds a prefix scan over all of a circle’s writer tracking rows', async () => {
+    const db = makeFakeLocalDb()
+    await recordWriterBlockReceived(db, 'c1', 'coreA', 1, 0)
+    await recordWriterBlockReceived(db, 'c1', 'coreB', 1, 0)
+    await recordWriterBlockReceived(db, 'c2', 'coreC', 1, 0)
+    const keys = []
+    for await (const { key } of db.createReadStream(rangeForWriterCircle('c1'))) keys.push(key)
+    expect(keys.length).toBe(2)
+    expect(keys.every((k) => k.startsWith('seeder:wBlockTime:c1:'))).toBe(true)
   })
 })

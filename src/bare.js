@@ -42,7 +42,7 @@ const { shouldAcceptSupersede } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
-const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep } = require('./lib/seederRetention')
+const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
@@ -3742,6 +3742,39 @@ async function runOneSeederRetentionSweep () {
   })
 }
 
+// One pass of the per-member writer-core retention sweep (storage audit
+// 2026-06-22). Same time-based pruneOlderThan policy as the bootstrap
+// sweep above, applied to every mounted circle's writer cores so the
+// launcher retention knob actually bounds them. Clears on the specific
+// writer core (independent seq space), not entry.core.
+async function runOneSeederWriterRetentionSweep () {
+  const writerCores = []
+  for (const [circleId, entry] of _seederCircles) {
+    if (!entry?.writerCores) continue
+    for (const coreKey of entry.writerCores.keys()) writerCores.push({ circleId, coreKey })
+  }
+  return runSeederWriterRetentionSweep({
+    localDb: _localDb,
+    writerCores,
+    getRetentionMs: async (circleId) => {
+      const row = await _localDb.get('seeder:retention:' + circleId)
+      const v = row?.value?.pruneOlderThan
+      return typeof v === 'number' ? v : null
+    },
+    clearBlock: async (circleId, coreKey, seq) => {
+      const entry = _seederCircles.get(circleId)
+      const core = entry?.writerCores?.get(coreKey)
+      if (!core) return
+      try {
+        await core.clear(seq, seq + 1)
+      } finally {
+        await removeWriterBlockTracking(_localDb, circleId, coreKey, seq).catch(() => {})
+      }
+    },
+    now: Date.now(),
+  })
+}
+
 // Register a seed-role admission channel's send handles so leaveSeederCircle can
 // later push the in-band `left` notice over it (proposal 2026-06-17-seeder-leave
 // -propagation). No-op for older handles lacking sendLeft.
@@ -3801,12 +3834,22 @@ async function leaveSeederCircle (circleId) {
   }
   // Close + forget this circle's writer cores and their persisted keys (slice 3d).
   if (entry.writerCores) {
-    for (const c of entry.writerCores.values()) { try { await c.close() } catch {} }
+    for (const [coreKey, c] of entry.writerCores) {
+      const fn = entry.writerOnDownload?.get(coreKey)
+      if (fn) { try { c.off('download', fn) } catch {} }
+      try { await c.close() } catch {}
+    }
     entry.writerCores.clear()
   }
+  if (entry.writerOnDownload) entry.writerOnDownload.clear()
   for await (const { key } of _localDb.createReadStream({
     gt: 'seeder:writerCore:' + circleId + ':', lt: 'seeder:writerCore:' + circleId + ':~',
   })) {
+    await _localDb.del(key).catch(() => {})
+  }
+  // Drop per-block writer retention tracking rows for this circle (storage
+  // audit 2026-06-22) so they don't orphan after a leave.
+  for await (const { key } of _localDb.createReadStream(rangeForWriterCircle(circleId))) {
     await _localDb.del(key).catch(() => {})
   }
   _seederCircles.delete(circleId)
@@ -3901,6 +3944,20 @@ async function openSeederWriterCore (entry, circleId, pubkey, coreKey) {
   const core = openPeerCore(_store, coreKey, null)
   await core.ready()
   entry.writerCores.set(coreKey, core)
+  // Track per-block receive time so the writer-core retention sweep can
+  // drop blocks older than the circle's pruneOlderThan (storage audit
+  // 2026-06-22). Mirrors the bootstrap core's onDownload in
+  // mountSeederCircle; track-forward only (already-downloaded blocks
+  // don't re-emit 'download'). receivedAt is when THIS seeder stored the
+  // block, the only thing measurable without the encryption key.
+  const onDownload = (index) => {
+    recordWriterBlockReceived(_localDb, circleId, coreKey, index, Date.now()).catch((e) => {
+      console.warn('[bare] seeder writer block-track failed', circleId, coreKey.slice(0, 8), index, e?.message)
+    })
+  }
+  core.on('download', onDownload)
+  if (!entry.writerOnDownload) entry.writerOnDownload = new Map()
+  entry.writerOnDownload.set(coreKey, onDownload)
   core.download({ start: 0, end: -1, linear: false })
   mark('seeder:writer-opened', { circleId, pubkey: (pubkey || '').slice(0, 8), coreKey: coreKey.slice(0, 8), length: core.length })
 }
@@ -5219,9 +5276,13 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     const SEEDER_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000
     runOneSeederRetentionSweep().then((r) => mark('seeder:retention:boot', r))
       .catch((e) => console.warn('[bare] seeder retention boot failed', e?.message))
+    runOneSeederWriterRetentionSweep().then((r) => mark('seeder:writer-retention:boot', r))
+      .catch((e) => console.warn('[bare] seeder writer retention boot failed', e?.message))
     setInterval(() => {
       runOneSeederRetentionSweep().then((r) => mark('seeder:retention:interval', r))
         .catch((e) => console.warn('[bare] seeder retention interval failed', e?.message))
+      runOneSeederWriterRetentionSweep().then((r) => mark('seeder:writer-retention:interval', r))
+        .catch((e) => console.warn('[bare] seeder writer retention interval failed', e?.message))
     }, SEEDER_RETENTION_INTERVAL_MS)
 
     _initialized = true
