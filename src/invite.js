@@ -196,6 +196,19 @@ function parseSeedInvite (url) {
   if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
   url = stripPathTrailingSlash(url)
 
+  // Multi-invite-bundle guard. The all-circles seed bundle is several
+  // /circle/seed URLs newline-joined (and the newlines may arrive URL-encoded
+  // as %0A); callers must split it and parse each line. If a whole bundle is
+  // parsed as one string, parseQuery's last-key-wins merges fields ACROSS
+  // invites (circle A's id glued to circle B's bootstrap) into a single record
+  // that passes every per-field check — a silent franken enrollment. A real
+  // circle name can't contain "/seed?" (encodeURIComponent escapes / and ?),
+  // so more than one marker is always a bundle (whether \n- or %0A-joined,
+  // both carry two markers). Reject loudly rather than mangle.
+  if ((url.match(/\/seed\?/g) || []).length > 1) {
+    return { ok: false, error: 'looks like a multi-circle seed bundle — split on newlines and parse each invite' }
+  }
+
   let scheme, qs
   if (url.startsWith(HTTPS_SEED_HOST_PATH + '?')) {
     scheme = 'https'

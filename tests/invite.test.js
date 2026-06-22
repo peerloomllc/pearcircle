@@ -409,6 +409,44 @@ describe('seed invite bundle', () => {
       expect(line).not.toContain('enc=')
     }
   })
+
+  // Franken-enrollment guard (bug 2026-06-22). If a whole bundle reaches
+  // parseSeedInvite UNSPLIT, parseQuery's last-key-wins merges fields across
+  // invites (circle A's id + circle B's bootstrap/name) into one record that
+  // passes every per-field check — a silent franken enrollment.
+  test('parseSeedInvite rejects a whole newline-joined bundle instead of mangling it', () => {
+    const r = parseSeedInvite(buildBundle())
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/bundle/i)
+  })
+
+  test('parseSeedInvite rejects a bundle whose newlines were URL-encoded to %0A in transit', () => {
+    const r = parseSeedInvite(buildBundle().replace(/\n/g, '%0A'))
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/bundle/i)
+  })
+
+  test('the exact two-circle franken (A.id + B.bootstrap) is refused, not enrolled', () => {
+    const a = buildSeedInvite({ ...VALID, circleId: 'A'.repeat(43), bootstrap: 'a'.repeat(64), name: 'New2' })
+    const b = buildSeedInvite({ ...VALID, circleId: 'B'.repeat(43), bootstrap: 'b'.repeat(64), name: 'SeederTest' })
+    // Pre-fix this returned { circleId: A, bootstrap: b, name: SeederTest }.
+    expect(parseSeedInvite(a + '%0A' + b).ok).toBe(false)
+    expect(parseSeedInvite(a + '\n' + b).ok).toBe(false)
+  })
+
+  test('decoding %0A then splitting recovers every invite (mirrors launcher /api/enroll)', () => {
+    const transitMangled = buildBundle().replace(/\n/g, '%0A')
+    const lines = transitMangled
+      .replace(/%0[dD]/g, '\r')
+      .replace(/%0[aA]/g, '\n')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+    expect(lines).toHaveLength(3)
+    const parsed = lines.map((l) => parseSeedInvite(l))
+    expect(parsed.every((p) => p.ok)).toBe(true)
+    expect(parsed.map((p) => p.circleId)).toEqual(circleIds)
+  })
 })
 
 // Proposal 2026-06-11 follow-up: app share links and some share sheets emit a
