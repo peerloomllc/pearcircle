@@ -152,10 +152,29 @@ const _topicToCircle = new Map()  // topicHex → circleId
 const _circleBases = new Map()    // circleId → Autobase instance
 // Ephemeral live position (proposal 2026-06-04-lastseen-ephemeral, phase 1).
 // _liveLastSeen: circleId → Map<pubkeyHex, signed value> of the freshest fix
-// received over the live protomux channel (never persisted). _liveChannels:
-// conn → Map<circleId, send(value)> for broadcasting our fix to that peer.
+// received over the live protomux channel (never persisted). _liveByCircle:
+// circleId → Map<conn, send(value)>, indexed by circle so broadcasting our fix
+// touches only the peers on that circle (O(peers), not O(all connections) per
+// fix — storage/sync audit 2026-06-22).
 const _liveLastSeen = new Map()
-const _liveChannels = new Map()
+const _liveByCircle = new Map()
+
+// Live-channel index helpers (keep the circle→conn→send map consistent).
+function liveChannelAdd (circleId, conn, sendFn) {
+  let byConn = _liveByCircle.get(circleId)
+  if (!byConn) { byConn = new Map(); _liveByCircle.set(circleId, byConn) }
+  byConn.set(conn, sendFn)
+}
+function liveChannelHas (circleId, conn) {
+  const byConn = _liveByCircle.get(circleId)
+  return !!(byConn && byConn.has(conn))
+}
+function liveChannelDropConn (conn) {
+  for (const byConn of _liveByCircle.values()) byConn.delete(conn)
+}
+function liveChannelDropCircle (circleId) {
+  _liveByCircle.delete(circleId)
+}
 // Per-member last-known cores (proposal 2026-06-04-lastseen-ephemeral, slice 2a).
 // The bounded, persisted offline fallback that will replace the Autobase
 // lastSeen oplog write. _lastKnownSelfCores: circleId → our own single-writer
@@ -2277,6 +2296,8 @@ async function pruneOldTrips () {
       for (const k of toDelete) {
         try { await base.view.del(k); viewDeleted++ } catch {}
       }
+      // No invalidateCircleView: `trip:` keys aren't part of the cached
+      // snapshot view (only `transition:` is); trips reach the UI via trips:list.
     } catch (e) { console.warn('[bare] pruneOldTrips view scan failed', e?.message) }
   }
   return { localDeleted, viewDeleted }
@@ -2293,7 +2314,7 @@ async function pruneOldTransitions () {
   if (!_initialized) return { viewDeleted: 0 }
   const now = Date.now()
   let viewDeleted = 0
-  for (const [, base] of _circleBases) {
+  for (const [circleId, base] of _circleBases) {
     try {
       const toDelete = []
       for await (const { key, value } of base.view.createReadStream({
@@ -2305,6 +2326,9 @@ async function pruneOldTransitions () {
       for (const k of toDelete) {
         try { await base.view.del(k); viewDeleted++ } catch {}
       }
+      // Transitions are in the cached snapshot view; drop it so the next poll
+      // reflects the prune (storage/sync audit 2026-06-22).
+      if (toDelete.length) invalidateCircleView(circleId)
     } catch (e) { console.warn('[bare] pruneOldTransitions view scan failed', e?.message) }
   }
   return { viewDeleted }
@@ -2728,19 +2752,36 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
   }
 }
 
-async function snapshotCircle (circleId, base) {
-  // No base.update() here. On a cold boot Autobase's update() blocks
-  // until Hyperswarm peer discovery flushes -- 40+ seconds when a
-  // circle's members are offline (confirmed on-device 2026-05-22 via the
-  // snapshot:slow trace). circles:getAll polls this every ~3s, so a
-  // blocking update froze the whole circle list and map. The view core
-  // is already on disk and Autobase auto-applies replicated data into
-  // it, so reading it directly returns last-known state instantly and
-  // the re-poll converges as the swarm warms up. The in-flight update()
-  // also serialized base.append() behind it on the same base, delaying
-  // the device's own location writes -- dropping it frees that too.
-  // circle:join / circle:create keep their own explicit update() where
-  // a synchronous wait is genuinely required.
+// Cache of the expensive view-derived part of a snapshot: the range scans over
+// circle/left/removed/member/lastSeen/presence/place/transition/supersede keys.
+// circles:getAll polls snapshotCircle every ~3s, and the view only changes when
+// the autobase apply pass (or a prune sweep) mutates it -- so we rebuild this
+// part only when the view is dirty and re-overlay the cheap live/runtime state
+// on every read. Keyed by circleId; the stored base ref guards a repair/rebuild
+// swap (storage/sync audit 2026-06-22). Entries are dropped by
+// invalidateCircleView from applyCircleNodes + pruneOldTrips/Transitions.
+const _viewSnapshotCache = new Map() // circleId → { base, gen, view: {...} }
+// Monotonic per-circle mutation counter. The worklet is single-threaded but
+// readCircleView awaits between range scans, so an apply / prune can interleave
+// mid-scan. Bumping the gen on every invalidation lets readCircleView refuse to
+// cache a result that was built across a concurrent mutation -- otherwise a
+// write that lands mid-scan and is the last write for a while could be served
+// stale indefinitely (storage/sync audit 2026-06-22).
+const _viewGen = new Map() // circleId → number
+
+function invalidateCircleView (circleId) {
+  _viewGen.set(circleId, (_viewGen.get(circleId) || 0) + 1)
+  _viewSnapshotCache.delete(circleId)
+}
+
+// Read (and cache) the view-derived part of a circle snapshot. Pure reads off
+// base.view -- no base.update() (see snapshotCircle's cold-boot rationale). The
+// returned object is treated as immutable; snapshotCircle composes the live
+// overlay into a fresh object rather than mutating these.
+async function readCircleView (circleId, base) {
+  const genAtStart = _viewGen.get(circleId) || 0
+  const cached = _viewSnapshotCache.get(circleId)
+  if (cached && cached.base === base && cached.gen === genAtStart) return cached.view
   const view = base.view
   const circleRow = await view.get('circle')
   // Pull `left:` rows up front so the member / lastSeen / presence
@@ -2818,25 +2859,57 @@ async function snapshotCircle (circleId, base) {
     }
   }
   supersedes.sort((a, b) => b.postedAt - a.postedAt)
+  const result = {
+    circle: circleRow ? circleRow.value : null,
+    members,
+    lastSeen,
+    presence,
+    places,
+    transitions,
+    supersedes,
+  }
+  // Only cache when no mutation raced our scans; if the gen moved, return this
+  // result for the current call but leave the cache empty so the next poll
+  // rebuilds from the post-mutation view.
+  if ((_viewGen.get(circleId) || 0) === genAtStart) {
+    _viewSnapshotCache.set(circleId, { base, gen: genAtStart, view: result })
+  }
+  return result
+}
+
+async function snapshotCircle (circleId, base) {
+  // No base.update() here. On a cold boot Autobase's update() blocks
+  // until Hyperswarm peer discovery flushes -- 40+ seconds when a
+  // circle's members are offline (confirmed on-device 2026-05-22 via the
+  // snapshot:slow trace). circles:getAll polls this every ~3s, so a
+  // blocking update froze the whole circle list and map. The view core
+  // is already on disk and Autobase auto-applies replicated data into
+  // it, so reading it directly returns last-known state instantly and
+  // the re-poll converges as the swarm warms up. The in-flight update()
+  // also serialized base.append() behind it on the same base, delaying
+  // the device's own location writes -- dropping it frees that too.
+  // circle:join / circle:create keep their own explicit update() where
+  // a synchronous wait is genuinely required.
+  const v = await readCircleView(circleId, base)
   // Overlay last-known core tips then ephemeral live positions (proposal
   // 2026-06-04 phase 1, precedence live > core > view). mergeLiveLastSeen is
   // freshest-ts-wins, so composing it twice (view←core, then ←live) yields the
   // freshest of the three. Restricted to visible members so a stale entry for a
   // left/removed member (already filtered out of `members`) can't reappear.
-  const allowedMemberKeys = new Set(members.map((m) => m.value?.pubkey).filter(Boolean))
+  const allowedMemberKeys = new Set(v.members.map((m) => m.value?.pubkey).filter(Boolean))
   // Kick a background refresh of peers' last-known cores; the result lands in
   // the cache for a later poll (slice 2a). Non-blocking — never awaited here.
   refreshPeerLastKnown(circleId).catch(() => {})
-  const withCore = mergeLiveLastSeen(lastSeen, _lastKnownCache.get(circleId), allowedMemberKeys)
+  const withCore = mergeLiveLastSeen(v.lastSeen, _lastKnownCache.get(circleId), allowedMemberKeys)
   const mergedLastSeen = mergeLiveLastSeen(withCore, _liveLastSeen.get(circleId), allowedMemberKeys)
   return {
-    circle: circleRow ? circleRow.value : null,
-    members,
+    circle: v.circle,
+    members: v.members,
     lastSeen: mergedLastSeen,
-    presence,
-    places,
-    transitions,
-    supersedes,
+    presence: v.presence,
+    places: v.places,
+    transitions: v.transitions,
+    supersedes: v.supersedes,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
     // True once an append to this circle timed out (wedged local Autobase);
@@ -2936,7 +3009,8 @@ async function tearDownCircleLocally (circleId) {
   for (const perConn of _memberAdmissionChannels.values()) perConn.delete(circleId)
   // Drop ephemeral live state for the circle (proposal 2026-06-04 phase 1).
   _liveLastSeen.delete(circleId)
-  for (const perConn of _liveChannels.values()) perConn.delete(circleId)
+  liveChannelDropCircle(circleId)
+  invalidateCircleView(circleId)
   // Close + drop per-member last-known cores for the circle (slice 2a).
   const selfCore = _lastKnownSelfCores.get(circleId)
   if (selfCore) {
@@ -3488,6 +3562,13 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       }, 0)
     }
   }
+  // This apply pass may have mutated the view; drop the cached snapshot view so
+  // the next circles:getAll poll rebuilds it (storage/sync audit 2026-06-22).
+  // circleId is passed by every apply wrapper; fall back to a base match so a
+  // future caller that omits it can't leave the cache silently stale.
+  let cid = circleId
+  if (!cid) for (const [c, b] of _circleBases) { if (b === base) { cid = c; break } }
+  invalidateCircleView(cid)
 }
 
 async function autoAppendMemberRow (circleId) {
@@ -4166,9 +4247,7 @@ function setupLiveChannelFor (conn, circleId) {
   })
   if (!handle) return
   trackCircleChannel(circleId, handle.channel)
-  let perConn = _liveChannels.get(conn)
-  if (!perConn) { perConn = new Map(); _liveChannels.set(conn, perConn) }
-  perConn.set(circleId, handle.send)
+  liveChannelAdd(circleId, conn, handle.send)
 }
 
 // Lazy live-channel creation when a peer opens the live protocol for a circle
@@ -4180,8 +4259,7 @@ function registerLiveNotify (conn) {
     let circleIdStr
     try { circleIdStr = b4a.toString(id) } catch { return }
     if (!_circleBases.has(circleIdStr)) return
-    const perConn = _liveChannels.get(conn)
-    if (perConn && perConn.has(circleIdStr)) return // already open
+    if (liveChannelHas(circleIdStr, conn)) return // already open
     setupLiveChannelFor(conn, circleIdStr)
   })
 }
@@ -4220,9 +4298,11 @@ async function handleLivePosition (circleId, value) {
 // Broadcast a signed fix to every connected peer's live channel for a circle.
 function broadcastLive (circleId, value) {
   let sent = 0
-  for (const perConn of _liveChannels.values()) {
-    const sendFn = perConn.get(circleId)
-    if (sendFn && sendFn(value)) sent++
+  const byConn = _liveByCircle.get(circleId)
+  if (byConn) {
+    for (const sendFn of byConn.values()) {
+      if (sendFn(value)) sent++
+    }
   }
   // One-shot observability: the first time we actually push a live fix to at
   // least one peer for a circle (proposal 2026-06-04 phase 1). Bounded to once
@@ -5185,7 +5265,7 @@ async function onSwarmConnection (conn, info) {
     _activeConns.delete(conn)
     _replicatingConns.delete(conn)
     _memberAdmissionChannels.delete(conn)
-    _liveChannels.delete(conn)
+    liveChannelDropConn(conn)
     _connPubkey.delete(conn)
     for (const circleId of matchedCircleIds) {
       const peers = _circlePeers.get(circleId)
@@ -5611,18 +5691,29 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // promptly regardless of HomeMapView's polling cadence.
   setInterval(() => {
     for (const [circleId, base] of _circleBases) {
+      // Local + idempotent: must run regardless of peer connectivity so a
+      // fresh-joined or just-became-writable circle publishes our rows even
+      // before a peer shows up. Each self-guards / skips fast when already done.
       autoAppendMemberRow(circleId).catch(() => {})
       autoAppendSelfLastSeen(circleId).catch(() => {})
-      // Publish our last-known core key once (idempotent) and pull peers'
-      // announced cores into the cache (proposal 2026-06-04 slice 2a).
+      // Publish our last-known core key once (idempotent, proposal 2026-06-04 2a).
       announceLastKnownCore(circleId).catch(() => {})
-      refreshPeerLastKnown(circleId).catch(() => {})
-      // Push any newly-known last-known core keys to connected seeders (2b).
-      repushLastknownCoresToSeeders(circleId).catch(() => {})
-      // Push any newly-added writer core keys to connected seeders (slice 3d).
-      try { repushWriterCoresToSeeders(circleId) } catch {}
-      // Recompute the phase-2 lastSeen-write cutover (slice 3).
+      // Recompute the phase-2 lastSeen-write cutover (slice 3). Cheap two-range
+      // view read; its inputs only move via apply or our own announce above.
       updateLastSeenCutover(circleId, base).catch(() => {})
+      // Peer-dependent convergence work: a view scan + opening peer cores +
+      // background tip fetches, and pushes to connected seeders. All no-ops
+      // without a live peer, so skip the whole block for circles with none
+      // (storage/sync audit 2026-06-22). Re-runs as soon as a peer connects
+      // (_circlePeers populated in onSwarmConnection); the read-path also kicks
+      // refreshPeerLastKnown on every snapshot while the UI is open.
+      if (_circlePeers.get(circleId)?.size > 0) {
+        refreshPeerLastKnown(circleId).catch(() => {})
+        // Push any newly-known last-known core keys to connected seeders (2b).
+        repushLastknownCoresToSeeders(circleId).catch(() => {})
+        // Push any newly-added writer core keys to connected seeders (slice 3d).
+        try { repushWriterCoresToSeeders(circleId) } catch {}
+      }
     }
   }, 5000)
 
