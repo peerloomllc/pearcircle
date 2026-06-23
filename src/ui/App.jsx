@@ -176,6 +176,36 @@ const pear = {
   on: (...args) => window.pear.on(...args),
 }
 
+// Bounded IPC call (UX audit item b). pear.call awaits the worklet's reply with
+// no ceiling, so a wedged worklet pins the caller -- and any button spinner --
+// forever. Race against a 10s timeout; on a timeout retry once (a transient
+// stall / GC pause), then throw a labelled IPC_TIMEOUT the caller surfaces and
+// recovers from (finally re-enables the control). A *real* worklet error (the
+// reply rejected) is surfaced immediately without retrying.
+//
+// retries defaults to 1 (safe for idempotent reads / deterministic rebuilds).
+// Pass retries:0 for non-idempotent writes like circle:create where a retry
+// after a slow-but-successful first attempt would duplicate the side effect.
+async function callWithTimeout (method, args, { timeoutMs = 10_000, retries = 1 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let timer
+    try {
+      return await Promise.race([
+        pear.call(method, args),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('__ipc_timeout__')), timeoutMs) }),
+      ])
+    } catch (e) {
+      if (e?.message !== '__ipc_timeout__') throw e // real worklet error: don't retry
+      // timed out: fall through to retry if attempts remain
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  const err = new Error(method + ' timed out')
+  err.code = 'IPC_TIMEOUT'
+  throw err
+}
+
 // Tactile feedback helper. Fire-and-forget: a missed haptic is never a
 // reason to block the visible action that triggered it. Kinds match the
 // shell's `shell:haptic` IPC handler:
@@ -1450,13 +1480,22 @@ function CreateView ({ onClose, onCreated }) {
     if (!name.trim()) return
     setCreating(true)
     setError(null)
-    const r = await pear.call('circle:create', { name: name.trim() })
-    setCreating(false)
-    if (r?.invite) {
-      setResult(r)
-      onCreated(r.circleId)
-    } else {
-      setError('Could not create circle')
+    try {
+      // retries:0 -- circle:create is non-idempotent; a retry after a slow but
+      // successful first attempt would create a duplicate circle (item b).
+      const r = await callWithTimeout('circle:create', { name: name.trim() }, { retries: 0 })
+      if (r?.invite) {
+        setResult(r)
+        onCreated(r.circleId)
+      } else {
+        setError('Could not create circle')
+      }
+    } catch (e) {
+      setError(e?.code === 'IPC_TIMEOUT'
+        ? 'Creating the circle is taking too long. Please try again.'
+        : 'Could not create circle')
+    } finally {
+      setCreating(false)
     }
   }
 
@@ -1516,9 +1555,9 @@ function InviteShareView ({ circleId, circleName, onClose }) {
   useEffect(() => {
     if (!circleId) return
     let cancelled = false
-    pear.call('circle:invite', { circleId })
+    callWithTimeout('circle:invite', { circleId })
       .then((r) => { if (!cancelled) setInvite(r?.invite ?? null) })
-      .catch((e) => { if (!cancelled) setError(String(e?.message ?? e)) })
+      .catch((e) => { if (!cancelled) setError(e?.code === 'IPC_TIMEOUT' ? 'Loading the invite is taking too long. Please reopen this sheet.' : String(e?.message ?? e)) })
     return () => { cancelled = true }
   }, [circleId])
   return (
@@ -1656,7 +1695,7 @@ function SeedersSection ({ active = true }) {
     setMinting(true)
     setError(null)
     try {
-      const r = await pear.call('circle:invite:seed:all')
+      const r = await callWithTimeout('circle:invite:seed:all')
       if (!r?.bundle) {
         setBundle(null)
         setError('No encrypted circles yet. Seed invites need a circle created with encryption.')
@@ -1665,7 +1704,7 @@ function SeedersSection ({ active = true }) {
         setBundleInfo({ count: r.invites?.length ?? 0, skipped: r.skipped ?? 0 })
       }
     } catch (e) {
-      setError(String(e?.message ?? e))
+      setError(e?.code === 'IPC_TIMEOUT' ? 'Minting the seed invite is taking too long. Please try again.' : String(e?.message ?? e))
     } finally {
       setMinting(false)
     }
@@ -7055,13 +7094,13 @@ function TripsView ({ active, ownerPubkey, myPubkey, ownerName, distanceUnit, ti
   const refresh = useCallback(async () => {
     if (!targetPubkey) return
     try {
-      const r = await pear.call('trips:listFor', { pubkey: targetPubkey })
+      const r = await callWithTimeout('trips:listFor', { pubkey: targetPubkey })
       const list = Array.isArray(r?.trips) ? r.trips : []
       list.sort((a, b) => (b.startTs ?? 0) - (a.startTs ?? 0))
       setTrips(list)
       setError(null)
     } catch (e) {
-      setError(e?.message || 'Failed to load trips')
+      setError(e?.code === 'IPC_TIMEOUT' ? 'Loading trips is taking too long. Please try again.' : (e?.message || 'Failed to load trips'))
       setTrips([])
     }
   }, [targetPubkey])
