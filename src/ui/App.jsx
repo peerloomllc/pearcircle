@@ -1092,6 +1092,13 @@ function BatteryOptBanner ({ onOpenSettings, onDismiss }) {
 // from nagging de-Googled users who are mobile / near a window and fine.
 const NETWORK_BANNER_STALE_MS = 60 * 60 * 1000
 
+// Freshness window for the map pin's tri-state dot (UX audit item d). A
+// connected peer whose last fix is newer than this shows green ("live"),
+// older shows amber ("stale but online"). 2 min is more forgiving than the
+// row label's 60s LIVE_THRESHOLD_MS since periodic location updates can space
+// out, and we don't want a moving peer's dot flickering amber between fixes.
+const PIN_FRESH_MS = 2 * 60 * 1000
+
 // Android-only banner for de-Googled ROMs (notably GrapheneOS) where the OS
 // network-location provider is off, so a stationary indoor phone can't get a
 // fix and its shared position freezes. Surfaced only when the user's own
@@ -4225,14 +4232,22 @@ function renderBubble (root, member, selected, last, connected) {
   // keeps the pin readable on bright tiles.
   const avatarBorder = selected ? 'none' : `${ring}px solid ${ringColor}`
 
-  // Connection-status dot at the top-left of the avatar. Green when the
-  // peer is currently connected via Hyperswarm, grey when not. Suppressed
-  // for self (connected === null) since the affordance is "are they
-  // online" and you're always online to yourself. Top-left because the
-  // motion glyph lives at top-right and the battery hangs below. Plain
-  // DOM (no SVG) per the renderBubble saga.
+  // Tri-state connection/freshness dot at the top-left of the avatar (UX
+  // audit item d). Suppressed for self (connected === null) since the
+  // affordance is "are they online" and you're always online to yourself.
+  // When connected we also reflect position freshness so green can't imply
+  // "current" for a stale fix: green = connected AND fix < PIN_FRESH_MS old,
+  // amber = connected but the fix is older / unconfirmed-stale (reuses
+  // liveStatus -- the same 3-way as the member row's Live / Reconnecting
+  // label), grey = not connected. Top-left because the motion glyph lives at
+  // top-right and the battery hangs below. Plain DOM (no SVG) per the
+  // renderBubble saga.
+  let dotColor = '#666'
+  if (connected) {
+    dotColor = liveStatus(last?.ts, last?.stale, Date.now(), PIN_FRESH_MS) === 'live' ? '#7ec77a' : '#e0b76a'
+  }
   const onlineHtml = connected === null ? '' : (
-    `<div style="position:absolute;z-index:3;top:-1px;left:-1px;width:14px;height:14px;border-radius:50%;background:${connected ? '#7ec77a' : '#666'};border:2px solid #0d0d0d;box-sizing:border-box;pointer-events:none;"></div>`
+    `<div style="position:absolute;z-index:3;top:-1px;left:-1px;width:14px;height:14px;border-radius:50%;background:${dotColor};border:2px solid #0d0d0d;box-sizing:border-box;pointer-events:none;"></div>`
   )
 
   content.innerHTML =
