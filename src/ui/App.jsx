@@ -2412,6 +2412,27 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const repairingCircles = circles.filter((c) => c.repairing || c.repairStaged)
   const repairStagedPending = repairingCircles.some((c) => c.repairStaged)
   const needRepairCircles = circles.filter((c) => c.needsRepair && !c.repairing && !c.repairStaged)
+
+  // Single top-of-map banner slot (UX audit item a). Exactly one banner renders
+  // at top:0, chosen by priority so they can never stack (previously each
+  // rendered independently with ad-hoc pairwise guards, so e.g. a repair nudge
+  // could pile on a battery banner). Order: permission > battery > network >
+  // repairing > repair > sync. Everything is suppressed during the tour.
+  const permissionBannerEligible = permissionStatus !== 'always' && permissionStatus !== 'unknown' && permissionStatus !== 'notDetermined' && !bannerDismissed
+  const batteryBannerEligible = battery.supported === true && !battery.exempt && !batteryBannerDismissed
+  const networkBannerEligible = networkLocationOff && !networkBannerDismissed && (!selfSeen || (Date.now() - (selfSeen.ts ?? 0)) > NETWORK_BANNER_STALE_MS)
+  const repairingBannerEligible = repairingCircles.length > 0
+  const repairBannerEligible = !repairBannerDismissed && needRepairCircles.length > 0
+  const syncBannerEligible = syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed
+  const topBanner = tourActive ? null
+    : permissionBannerEligible ? 'permission'
+    : batteryBannerEligible ? 'battery'
+    : networkBannerEligible ? 'network'
+    : repairingBannerEligible ? 'repairing'
+    : repairBannerEligible ? 'repair'
+    : syncBannerEligible ? 'sync'
+    : null
+
   // Where to write per-place / per-circle actions. With "All" selected
   // and multiple circles we don't have a single target for membership-
   // post / read-only-warning lines. Place creation handles the
@@ -2680,7 +2701,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           Settings" lands on a page where there's nothing to change. The
           PermissionPrime modal handles notDetermined; the banner picks
           up once status moves to whenInUse / denied / restricted. */}
-      {permissionStatus !== 'always' && permissionStatus !== 'unknown' && permissionStatus !== 'notDetermined' && !bannerDismissed && !tourActive && (
+      {/* iOS Always-location nudge. Apple's openSettingsURLString deep-link
+          is the one supported recovery path once the system dialog has been
+          answered. Suppressed for notDetermined (the PermissionPrime modal
+          handles that) since iOS omits the Location row pre-prompt. */}
+      {topBanner === 'permission' && (
         <PermissionBanner
           status={permissionStatus}
           onOpenSettings={() => { pear.call('shell:openSettings').catch(() => {}) }}
@@ -2688,12 +2713,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         />
       )}
 
-      {/* Android Doze nudge banner. Mutually exclusive with the iOS
-          permission banner in practice (battery.supported is false on
-          iOS, permissionStatus is 'always' on Android), so they don't
-          stack. Suppressed during the tour for the same reason as the
-          iOS banner. */}
-      {battery.supported === true && !battery.exempt && !batteryBannerDismissed && !tourActive && (
+      {/* Android Doze nudge banner. */}
+      {topBanner === 'battery' && (
         <BatteryOptBanner
           onOpenSettings={onOpenBatteryAdvanced}
           onDismiss={onBatteryBannerDismiss}
@@ -2703,12 +2724,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       {/* GrapheneOS / de-Googled network-location nudge. Gated on STALENESS,
           not just "network off": a de-Googled user who is mobile or near a
           window is fine, so we only surface it when their own location has
-          actually gone stale (or never arrived). Mutually exclusive with the
-          battery banner so two Android nudges don't stack. Dismissible
-          per-session. */}
-      {networkLocationOff && !networkBannerDismissed && !tourActive &&
-        !(battery.supported === true && !battery.exempt && !batteryBannerDismissed) &&
-        (!selfSeen || (Date.now() - (selfSeen.ts ?? 0)) > NETWORK_BANNER_STALE_MS) && (
+          actually gone stale (or never arrived). */}
+      {topBanner === 'network' && (
         <NetworkLocationBanner
           onOpenSettings={() => { pear.call('shell:location:openSettings').catch(() => {}) }}
           onDismiss={onNetworkBannerDismiss}
@@ -2718,28 +2735,26 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       {/* Circle-repair surfaces. A repair in flight (Repairing…) takes
           priority over the needs-repair nudge. The nudge is the discoverable
           entry point; tapping Repair opens the confirm-with-explainer. */}
-      {!tourActive && repairingCircles.length > 0 ? (
+      {topBanner === 'repairing' && (
         <RepairingBanner
           count={repairingCircles.length}
           circleName={repairingCircles[0]?.circle?.name}
           needsRestart={repairStagedPending}
         />
-      ) : (!tourActive && !repairBannerDismissed && needRepairCircles.length > 0 && (
+      )}
+      {topBanner === 'repair' && (
         <RepairBanner
           count={needRepairCircles.length}
           circleName={needRepairCircles[0]?.circle?.name}
           onRepair={() => setRepairConfirmOpen(true)}
           onDismiss={() => setRepairBannerDismissed(true)}
         />
-      ))}
+      )}
 
-      {/* Worklet-wedged sync notice (UX audit item f). Suppressed while a
-          repair/repairing banner is up -- that's the more specific, actionable
-          surface for a stuck circle -- and during the tour. Full banner
-          mutual-exclusion is item (a). */}
-      {syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed && !tourActive &&
-        !(repairingCircles.length > 0) &&
-        !(!repairBannerDismissed && needRepairCircles.length > 0) && (
+      {/* Worklet-wedged sync notice (UX audit item f). Lowest banner priority
+          (item a): the setup nudges + the more specific repair surface win the
+          single slot first. */}
+      {topBanner === 'sync' && (
         <SyncInterruptedBanner onDismiss={() => setSyncBannerDismissed(true)} />
       )}
       {repairConfirmOpen && needRepairCircles.length > 0 && (
