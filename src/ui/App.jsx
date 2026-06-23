@@ -1099,6 +1099,11 @@ const NETWORK_BANNER_STALE_MS = 60 * 60 * 1000
 // out, and we don't want a moving peer's dot flickering amber between fixes.
 const PIN_FRESH_MS = 2 * 60 * 1000
 
+// Consecutive 3s-refresh failures before the "Sync interrupted" banner shows
+// (~15s of a continuously-throwing worklet). High enough that a one-off hiccup
+// or a brief reconnection blip stays silent (console.warn only).
+const SYNC_FAIL_BANNER_THRESHOLD = 5
+
 // Android-only banner for de-Googled ROMs (notably GrapheneOS) where the OS
 // network-location provider is off, so a stationary indoor phone can't get a
 // fix and its shared position freezes. Surfaced only when the user's own
@@ -1143,6 +1148,40 @@ function NetworkLocationBanner ({ onOpenSettings, onDismiss }) {
         >
           Open Location settings
         </button>
+      </div>
+    </div>
+  )
+}
+
+// Top-of-map notice when the home refresh has failed repeatedly (worklet
+// wedged / IPC stalled), so the map is showing last-good data that may be
+// silently frozen (UX audit item f). No action button -- there's nothing the
+// user can tap to fix a wedged worklet -- just an honest "data may be stale"
+// signal. Dismissible per session; re-arms automatically once a poll succeeds.
+function SyncInterruptedBanner ({ onDismiss }) {
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+    }}>
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+          right: spacing.sm,
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
+        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>Sync interrupted</div>
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+          Can't reach the background service, so locations may be out of date. Reopen the app if this persists.
+        </div>
       </div>
     </div>
   )
@@ -2093,6 +2132,13 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // re-surfaces next launch since the worklet persists the degraded flag).
   const [repairConfirmOpen, setRepairConfirmOpen] = useState(false)
   const [repairBannerDismissed, setRepairBannerDismissed] = useState(false)
+  // Consecutive failures of the 3s home refresh. A wedged worklet makes every
+  // circles:getAll throw; the catch used to swallow it silently, so the UI
+  // froze on last-good data with no hint (UX audit item f). Count failures and,
+  // after SYNC_FAIL_BANNER_THRESHOLD in a row (~15s at the 3s cadence), surface
+  // a dismissible "Sync interrupted" banner. Reset to 0 on the first success.
+  const [syncFailCount, setSyncFailCount] = useState(0)
+  const [syncBannerDismissed, setSyncBannerDismissed] = useState(false)
   // peerCount used to be a separate piece of state, summed across every
   // circle's peersByCircle entry — which double-counted a peer in N
   // circles and never narrowed to the active filter. It's now derived
@@ -2149,7 +2195,14 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       setCircles((all?.circles ?? []).filter((c) => !c.error && !c.circle?.deleted))
       setSelfSeen(all?.selfLastSeen ?? null)
       setPeersByCircle(peersResp?.peers ?? {})
-    } catch {}
+      // Healthy poll: clear any failure streak + re-arm the banner so a future
+      // wedge can surface again after a recovery (UX audit item f).
+      setSyncFailCount(0)
+      setSyncBannerDismissed(false)
+    } catch (e) {
+      console.warn('[ui] home refresh failed (worklet may be wedged):', e?.message ?? e)
+      setSyncFailCount((c) => c + 1)
+    }
   }, [])
 
   useEffect(() => {
@@ -2679,6 +2732,16 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           onDismiss={() => setRepairBannerDismissed(true)}
         />
       ))}
+
+      {/* Worklet-wedged sync notice (UX audit item f). Suppressed while a
+          repair/repairing banner is up -- that's the more specific, actionable
+          surface for a stuck circle -- and during the tour. Full banner
+          mutual-exclusion is item (a). */}
+      {syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed && !tourActive &&
+        !(repairingCircles.length > 0) &&
+        !(!repairBannerDismissed && needRepairCircles.length > 0) && (
+        <SyncInterruptedBanner onDismiss={() => setSyncBannerDismissed(true)} />
+      )}
       {repairConfirmOpen && needRepairCircles.length > 0 && (
         <RepairConfirmModal
           circles={needRepairCircles}
@@ -7609,7 +7672,10 @@ function ShareButton ({ text, title = 'Join my PearCircle' }) {
 // to whole minutes / hours / days.
 function ageLabel (ts) {
   if (typeof ts !== 'number') return ''
-  const ms = Date.now() - ts
+  // Clamp: a peer with a fast clock (or a future-stamped ts) would otherwise
+  // make Date.now() - ts negative and fall through to nonsense "Xd ago" math
+  // (UX audit item g). Treat any future ts as "just now".
+  const ms = Math.max(0, Date.now() - ts)
   if (ms < 60_000) return 'just now'
   if (ms < 3_600_000) return Math.floor(ms / 60_000) + 'm ago'
   if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + 'h ago'
