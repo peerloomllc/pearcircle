@@ -2598,6 +2598,16 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           onLongPress={onMapLongPress}
           onClusterSpreadChange={setClusterSpread}
         />
+        {/* Waiting-for-location cue. When nothing is on the map yet (no self
+            fix and no visible peers, so data.lastSeen is empty) the camera
+            sits at the country-level US default; dim it and label the empty
+            state instead of showing a bare map. pointer-events:none keeps it
+            purely visual. Clears the instant any pin appears. */}
+        {Object.keys(data.lastSeen || {}).length === 0 && (
+          <div style={s.mapWaiting}>
+            <span style={s.mapWaitingText}>Getting your location…</span>
+          </div>
+        )}
       </div>
 
       {/* iOS Always-location nudge banner. Shows when permission is
@@ -3690,8 +3700,15 @@ const CircleMap = React.forwardRef(function CircleMap (
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: initialStyleRef.current,
-      center: [0, 0],
-      zoom: 1.5,
+      // Default to a country-level view of the contiguous US rather than
+      // [0,0] (Null Island, ocean off Africa) for the brief window before a
+      // self/member fix lands. The auto-fit / flyTo below takes over the
+      // moment there's anything to show; this only persists in the genuine
+      // "no location yet" empty state, paired with the waiting overlay.
+      // zoom 2 shows ~70° of longitude on a phone, so both coasts (~-124..-67)
+      // are visible with margin; 3+ was too tight (only a few central states).
+      center: [-98.58, 39.83],
+      zoom: 2,
       attributionControl: false,
     })
     mapRef.current = map
@@ -7699,6 +7716,11 @@ const s = {
   // confined under the floating chrome (pill z20, focus bar z6, gear z5)
   // instead of leaking into the root context and painting over it.
   mapFill: { position: 'absolute', inset: 0, zIndex: 0 },
+  // Waiting-for-location scrim: dark overlay + light text so it reads against
+  // any tile theme (same rationale as mapAttribution). Above the leader
+  // overlay (z1), still inside mapFill so the floating chrome stays on top.
+  mapWaiting: { position: 'absolute', inset: 0, zIndex: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.45)', pointerEvents: 'none' },
+  mapWaitingText: { color: '#fff', fontSize: 15, fontWeight: 500, letterSpacing: 0.2, textShadow: '0 1px 2px rgba(0,0,0,0.4)' },
   mapTopBar: {
     position: 'absolute', top: 0, left: 0, right: 0, zIndex: 5,
     display: 'flex', alignItems: 'center', gap: 8,
