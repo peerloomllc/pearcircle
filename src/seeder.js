@@ -35,6 +35,8 @@ const SEED_METHODS = Object.freeze([
   'seeder:retention:get',
   'seeder:retention:set',
   'seeder:retention:sweep',
+  'seeder:pair:open',
+  'seeder:pair:close',
 ])
 
 /**
@@ -169,7 +171,7 @@ async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
  *   Called by seeder:leave before the persistence rows are deleted so the host can
  *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps, openPairSession, closePairSession }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
@@ -282,6 +284,19 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version
       }
       const r = await runRetentionSweeps()
       return { ok: true, ...r }
+    },
+
+    // Open a QR-pairing session (proposal 2026-06-22): mint a one-time
+    // rendezvous + join its topic, returning the QR link for the dashboard.
+    'seeder:pair:open': async () => {
+      if (typeof openPairSession !== 'function') throw new Error('pairing unavailable')
+      return openPairSession()
+    },
+
+    // Close the pairing session (panel closed). Idempotent.
+    'seeder:pair:close': async () => {
+      if (typeof closePairSession === 'function') closePairSession('closed')
+      return { ok: true }
     },
   }
 }

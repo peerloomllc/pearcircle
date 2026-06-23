@@ -14,10 +14,11 @@
     "node": ">=20"
   },
   "dependencies": {
+    "qrcode": "^1.5.4",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "preact": "^10.24.0",
-    "esbuild": "^0.24.0"
+    "esbuild": "^0.24.0",
+    "preact": "^10.24.0"
   }
 }

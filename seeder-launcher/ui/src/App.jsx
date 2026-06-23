@@ -1,5 +1,6 @@
 import { h } from 'preact'
 import { useEffect, useState, useCallback } from 'preact/hooks'
+import QRCode from 'qrcode'
 import { api, openWs, formatBytes, formatUptime } from './api.js'
 
 const RETENTION_OPTIONS = [
@@ -17,11 +18,16 @@ export function App () {
   const [version, setVersion] = useState(null)
   const [update, setUpdate] = useState(null)
   const [applyState, setApplyState] = useState(null)
+  const [pairResult, setPairResult] = useState(null)
 
   useEffect(() => {
     const ws = openWs({
       onMessage: (msg) => {
         setWsConnected(true)
+        if (msg.type === 'event' && msg.name === 'seeder:pair:result') {
+          setPairResult(msg.data || { enrolled: 0, names: [] })
+          return
+        }
         if (msg.type === 'snapshot') {
           // A healthy snapshot means the worklet is up — clear any stale
           // error (e.g. the transient "worklet exited" from a Restart, which
@@ -56,8 +62,93 @@ export function App () {
       )}
 
       <Status status={status} circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
-      <Enroll onEnrolled={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
+      <AddCircles pairResult={pairResult} clearPairResult={() => setPairResult(null)} onAdded={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <Maintenance setError={setError} />
+    </div>
+  )
+}
+
+// QR pairing: show a QR a phone scans to push its circles to this seeder, no
+// copy-paste (proposal 2026-06-22). The phone-side push + enroll completes over
+// P2P; the worklet emits seeder:pair:result, which arrives as pairResult.
+function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
+  const [link, setLink] = useState(null)
+  const [qr, setQr] = useState(null)
+  const [remaining, setRemaining] = useState(0)
+  const [busy, setBusy] = useState(false)
+
+  const close = async () => {
+    setLink(null); setQr(null); setRemaining(0)
+    try { await api.pairClose() } catch {}
+  }
+
+  const open = async () => {
+    setBusy(true); setError(null); clearPairResult()
+    try {
+      const r = await api.pairOpen()
+      if (r?.error) { setError(r.error); return }
+      setLink(r.link)
+      setRemaining(Math.round((r.ttlMs || 300000) / 1000))
+    } catch (e) { setError(e.message) }
+    finally { setBusy(false) }
+  }
+
+  // Render the link as a QR data URL whenever it changes.
+  useEffect(() => {
+    if (!link) { setQr(null); return }
+    let cancelled = false
+    QRCode.toDataURL(link, { width: 240, margin: 1, errorCorrectionLevel: 'M' })
+      .then((url) => { if (!cancelled) setQr(url) })
+      .catch(() => { if (!cancelled) setQr(null) })
+    return () => { cancelled = true }
+  }, [link])
+
+  // Countdown; auto-close when the TTL runs out (the worklet enforces the real one).
+  useEffect(() => {
+    if (!link) return
+    if (remaining <= 0) { close(); return }
+    const t = setTimeout(() => setRemaining(remaining - 1), 1000)
+    return () => clearTimeout(t)
+  }, [link, remaining])
+
+  // A successful pairing arrived: stop showing the QR and refresh the circle list.
+  useEffect(() => {
+    if (!pairResult) return
+    setLink(null); setQr(null); setRemaining(0)
+    api.pairClose().catch(() => {})
+    if (typeof onPaired === 'function') onPaired()
+  }, [pairResult])
+
+  return (
+    <div>
+      {pairResult ? (
+        <div style={{ textAlign: 'center', color: 'var(--good)', padding: '8px 0' }}>
+          Paired — now seeding {pairResult.enrolled} circle{pairResult.enrolled === 1 ? '' : 's'}
+          {Array.isArray(pairResult.names) && pairResult.names.length > 0 ? ` (${pairResult.names.join(', ')})` : ''}.
+          <div class="row" style={{ justifyContent: 'center', marginTop: 12 }}>
+            <button class="ghost" onClick={clearPairResult}>Done</button>
+          </div>
+        </div>
+      ) : !link ? (
+        <div>
+          <div class="empty" style={{ textAlign: 'center', marginBottom: 12 }}>
+            Link this seeder to a phone's circles by QR — no copy-paste. Tap below, then in the PearCircle app open Seeders → Scan seeder QR.
+          </div>
+          <div class="row" style={{ justifyContent: 'center' }}>
+            <button onClick={open} disabled={busy}>{busy ? 'Starting…' : 'Pair a phone'}</button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ textAlign: 'center' }}>
+          {qr
+            ? <img src={qr} alt="pairing QR code" style={{ width: 240, height: 240, background: '#fff', borderRadius: 8, padding: 8 }} />
+            : <div class="empty">generating…</div>}
+          <div class="empty" style={{ marginTop: 10 }}>Scan with the PearCircle app. Expires in {remaining}s.</div>
+          <div class="row" style={{ justifyContent: 'center', marginTop: 12 }}>
+            <button class="ghost" onClick={close}>Cancel</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -203,23 +294,42 @@ function Enroll ({ onEnrolled, setError }) {
   }, [invite])
 
   return (
-    <div class="panel">
-      <h2>Enroll circles</h2>
-      <form onSubmit={submit}>
-        <textarea
-          placeholder="Paste a seed invite, or a bundle (one per line) from a PearCircle member's Settings → Seeders"
-          value={invite}
-          onInput={(e) => setInvite(e.currentTarget.value)}
-        />
-        <div class="row" style={{ marginTop: 12, justifyContent: 'center' }}>
-          <button type="submit" disabled={busy || !invite.trim()}>{busy ? 'enrolling…' : 'Enroll'}</button>
+    <form onSubmit={submit} style={{ marginTop: 12 }}>
+      <textarea
+        placeholder="Paste a seed invite, or a bundle (one per line) from a PearCircle member's Settings → Seeders"
+        value={invite}
+        onInput={(e) => setInvite(e.currentTarget.value)}
+      />
+      <div class="row" style={{ marginTop: 12, justifyContent: 'center' }}>
+        <button type="submit" disabled={busy || !invite.trim()}>{busy ? 'enrolling…' : 'Enroll'}</button>
+      </div>
+      {msg && (
+        <div style={{ marginTop: 10, textAlign: 'center', color: 'var(--good)', fontSize: 13 }}>
+          {msg}
         </div>
-        {msg && (
-          <div style={{ marginTop: 10, textAlign: 'center', color: 'var(--good)', fontSize: 13 }}>
-            {msg}
-          </div>
-        )}
-      </form>
+      )}
+    </form>
+  )
+}
+
+// "Add circles" combines the two ways to link circles to this seeder: QR
+// pairing (primary) and pasting an invite (tucked behind an expander). Both are
+// the same function - adding circles - so they live in one section.
+function AddCircles ({ pairResult, clearPairResult, onAdded, setError }) {
+  const [pasteOpen, setPasteOpen] = useState(false)
+  return (
+    <div class="panel">
+      <h2>Add circles</h2>
+      <PairPhone pairResult={pairResult} clearPairResult={clearPairResult} onPaired={onAdded} setError={setError} />
+      <button
+        onClick={() => setPasteOpen((v) => !v)}
+        style={{
+          width: '100%', marginTop: 14, padding: '4px 0', background: 'transparent',
+          border: 0, color: 'var(--muted)', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit',
+        }}>
+        {pasteOpen ? '▾ Or paste an invite instead' : '▸ Or paste an invite instead'}
+      </button>
+      {pasteOpen && <Enroll onEnrolled={onAdded} setError={setError} />}
     </div>
   )
 }

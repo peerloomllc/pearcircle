@@ -49,6 +49,8 @@ describe('SEED_METHODS', () => {
       'seeder:retention:get',
       'seeder:retention:set',
       'seeder:retention:sweep',
+      'seeder:pair:open',
+      'seeder:pair:close',
     ])
   })
 

@@ -42,6 +42,8 @@ export const api = {
   }),
   sweepNow: () => jsonFetch('/api/sweep', { method: 'POST' }),
   restart: () => jsonFetch('/api/restart', { method: 'POST' }),
+  pairOpen: () => jsonFetch('/api/pair/open', { method: 'POST' }),
+  pairClose: () => jsonFetch('/api/pair/close', { method: 'POST' }),
   update: () => jsonFetch('/api/update'),
   applyUpdate: () => jsonFetch('/api/update/apply', { method: 'POST' }),
 }

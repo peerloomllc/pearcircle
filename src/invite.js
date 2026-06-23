@@ -20,6 +20,10 @@ const PEAR_HOST_PATH = 'pear://pearcircle/join'
 // permission flag (consumed only by seed-mode worklets).
 const HTTPS_SEED_HOST_PATH = 'https://peerloomllc.com/circle/seed'
 const PEAR_SEED_HOST_PATH = 'pear://pearcircle/seed'
+// Seeder-pairing rendezvous link (QR shown by the seeder dashboard). Carries a
+// one-time rendezvous key + the seeder pubkey, NOT a circle invite. v1 ships the
+// pear:// scheme only. Seeder QR pairing proposal 2026-06-22.
+const PEAR_PAIR_HOST_PATH = 'pear://pearcircle/seeder-pair'
 
 const HEX_64 = /^[0-9a-f]{64}$/i
 const BASE64URL_43 = /^[A-Za-z0-9_-]{43}$/
@@ -85,7 +89,7 @@ function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, 
 // which the app's own share links and some browsers/share sheets emit. The
 // deep-link path normalizes it; pasted links hit parse directly, so do it here. Pure.
 function stripPathTrailingSlash (url) {
-  for (const base of [HTTPS_HOST_PATH, PEAR_HOST_PATH, HTTPS_SEED_HOST_PATH, PEAR_SEED_HOST_PATH]) {
+  for (const base of [HTTPS_HOST_PATH, PEAR_HOST_PATH, HTTPS_SEED_HOST_PATH, PEAR_SEED_HOST_PATH, PEAR_PAIR_HOST_PATH]) {
     if (url.startsWith(base + '/?')) return base + '?' + url.slice((base + '/?').length)
   }
   return url
@@ -246,6 +250,48 @@ function parseSeedInvite (url) {
   return { ok: true, scheme, circleId, name, circleKey, bootstrap, inviterPublicKey }
 }
 
+/**
+ * Build the seeder-pairing rendezvous link (rendered as a QR by the seeder
+ * dashboard). NOT a circle invite: it carries a one-time rendezvous key and the
+ * seeder's pubkey only. Seeder QR pairing proposal 2026-06-22.
+ * @param {string} args.rv 43-char base64url rendezvous key (32 bytes)
+ * @param {string} args.seeder 64-char hex seeder pubkey (32 bytes)
+ */
+function buildSeederPairLink ({ rv, seeder }) {
+  if (typeof rv !== 'string' || !BASE64URL_43.test(rv)) {
+    throw new Error('rv must be a 43-char base64url string (32 bytes)')
+  }
+  if (typeof seeder !== 'string' || !HEX_64.test(seeder)) {
+    throw new Error('seeder must be a 64-char hex string (32 bytes)')
+  }
+  return `${PEAR_PAIR_HOST_PATH}?rv=${rv}&seeder=${seeder}&v=1`
+}
+
+/**
+ * Parse a seeder-pairing link. Returns { ok, rv, seeder } or { ok:false, error }.
+ * Rejects circle-shaped (/join, /seed) links so a member invite can never be
+ * mistaken for a pairing handle.
+ * @param {string} url
+ * @returns {{ ok: boolean, rv?: string, seeder?: string, error?: string }}
+ */
+function parseSeederPairLink (url) {
+  if (typeof url !== 'string') return { ok: false, error: 'url must be a string' }
+  url = stripPathTrailingSlash(url)
+  if (!url.startsWith(PEAR_PAIR_HOST_PATH + '?')) {
+    return { ok: false, error: 'not a PearCircle seeder-pair link' }
+  }
+  const params = parseQuery(url.slice(PEAR_PAIR_HOST_PATH.length + 1))
+  const rv = params.rv
+  const seeder = params.seeder
+  if (typeof rv !== 'string' || !BASE64URL_43.test(rv)) {
+    return { ok: false, error: 'invalid or missing rendezvous key' }
+  }
+  if (typeof seeder !== 'string' || !HEX_64.test(seeder)) {
+    return { ok: false, error: 'invalid or missing seeder pubkey' }
+  }
+  return { ok: true, rv, seeder }
+}
+
 function parseQuery (qs) {
   const params = {}
   if (!qs) return params
@@ -273,4 +319,4 @@ function inviteCircleIdMismatch (inviteCircleId, circleRowValue) {
   return typeof canonical === 'string' && canonical !== inviteCircleId
 }
 
-module.exports = { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, inviteCircleIdMismatch, NAME_MAX }
+module.exports = { buildInvite, parseInvite, buildSeedInvite, parseSeedInvite, buildSeederPairLink, parseSeederPairLink, inviteCircleIdMismatch, NAME_MAX }

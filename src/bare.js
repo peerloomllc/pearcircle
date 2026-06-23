@@ -27,11 +27,12 @@ const Hyperswarm = require('hyperswarm')
 const Autobase = require('autobase')
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
-const { generateCircleId, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
-const { buildInvite, parseInvite, buildSeedInvite, inviteCircleIdMismatch } = require('./invite')
+const { generateCircleId, generateRendezvousKey, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
+const { buildInvite, parseInvite, buildSeedInvite, buildSeederPairLink, parseSeederPairLink, inviteCircleIdMismatch } = require('./invite')
 const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers, enrollSeedInvite } = require('./seeder')
-const { topicForCircleKey } = require('./swarm')
+const { topicForCircleKey, seederPairTopic } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
+const { setupSeederPairChannel } = require('./seederPair')
 const { setupLiveChannel, LIVE_PROTOCOL } = require('./liveLocation')
 const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
 const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLastKnown')
@@ -1376,6 +1377,35 @@ const handlers = {
       await _localDb.del('seederfollow:' + pubkey).catch(() => {})
     }
     return { ok: true, pubkey, enabled: !!enabled }
+  },
+
+  // Pair with a seeder by scanning its QR (proposal 2026-06-22). Parse the
+  // pairing link, join its one-time rendezvous topic, and push our seed bundle
+  // to the connection whose authenticated remote pubkey matches the QR's seeder
+  // (the security anchor). Resolves when the seeder acks the enroll, or after a
+  // timeout. Also marks the seeder followed so future circles auto-push.
+  'seeder:pair:scan': async ({ link } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (!SEEDER_PAIR_ENABLED) throw new Error('seeder pairing is disabled')
+    const parsed = parseSeederPairLink(link)
+    if (!parsed.ok) throw new Error('invalid pairing link: ' + (parsed.error ?? 'unknown'))
+    if (_pairScan) throw new Error('a pairing is already in progress')
+    const { rv, seeder } = parsed
+    const topic = seederPairTopic(rv)
+    const topicHex = b4a.toString(topic, 'hex')
+    try { _swarm.join(topic, { server: true, client: true }) } catch (e) {
+      throw new Error('rendezvous join failed: ' + (e?.message ?? String(e)))
+    }
+    return await new Promise((resolve) => {
+      const timer = setTimeout(() => finishPairScan({ ok: false, error: 'timed out waiting for the seeder' }), SEEDER_PAIR_SCAN_TIMEOUT_MS)
+      if (typeof timer.unref === 'function') timer.unref()
+      _pairScan = { rv, topic, topicHex, seederKeyHex: seeder, timer, resolve }
+      mark('seeder:pair:scan-started', { seeder: seeder.slice(0, 8) })
+      // Cover the rare case where we're already connected to the seeder.
+      for (const conn of _activeConns) {
+        if (_connPubkey.get(conn) === seeder) maybeSetupPairScanChannel(conn, seeder)
+      }
+    })
   },
 
   // Revoke an admitted seeder. Proposal 2026-05-19-blind-seeder-peers
@@ -4786,6 +4816,111 @@ async function admitFollowedSeedersToCircle (circleId, base) {
 // slice 3d. Pipes corestore replication (so encrypted blocks flow) and opens
 // the admission Protomux channel for each enrolled circle whose topic is
 // reachable through this connection.
+// --- Seeder QR pairing (proposal 2026-06-22-seeder-qr-pairing) ---------------
+// Seeder shows a QR = a one-time rendezvous topic + its pubkey; the phone scans
+// it, joins the rendezvous, and pushes its seed bundle over a one-time
+// pearcircle/seeder-pair/1 channel. No copy-paste; works headless/remote.
+const SEEDER_PAIR_ENABLED = true                 // kill-switch (proposal §Rollback)
+const SEEDER_PAIR_TTL_MS = 5 * 60 * 1000         // seed-side rendezvous lifetime (decision 2)
+const SEEDER_PAIR_SCAN_TIMEOUT_MS = 60 * 1000    // phone-side give-up window
+let _pairSession = null   // seed mode: { rv, topic, topicHex, ttlTimer }
+let _pairScan = null      // member mode: { rv, topic, topicHex, seederKeyHex, timer, resolve }
+
+// Seed side: open the receive channel for an active pairing session on a conn.
+function setupSeederPairChannelFor (conn) {
+  if (!_pairSession) return
+  setupSeederPairChannel({
+    conn,
+    role: 'seed',
+    rv: _pairSession.rv,
+    onBundle: async ({ invites }) => {
+      const names = []
+      let enrolled = 0
+      for (const invite of invites) {
+        try {
+          const r = await enrollSeedInvite({ invite, localDb: _localDb, mountCircle: mountSeederCircle })
+          if (r?.circleId) { enrolled++; if (!r.alreadyEnrolled) names.push(r.name || r.circleId.slice(0, 8)) }
+        } catch (e) { mark('seeder:pair:enroll-failed', { err: e?.message ?? String(e) }) }
+      }
+      mark('seeder:pair:enrolled', { enrolled })
+      try { send({ event: 'seeder:pair:result', data: { enrolled, names } }) } catch {}
+      if (enrolled > 0) closeSeederPairSession('paired') // one-shot: pairing done
+      return { enrolled, names }
+    },
+    mark,
+  })
+}
+
+// Seed side: mint a fresh rendezvous + join its topic; return the QR link.
+// Idempotent - re-opening returns the same live session's link.
+async function openSeederPairSession () {
+  if (!SEEDER_PAIR_ENABLED) return { error: 'pairing disabled' }
+  const seederHex = b4a.toString(_identity.publicKey, 'hex')
+  if (_pairSession) {
+    return { link: buildSeederPairLink({ rv: _pairSession.rv, seeder: seederHex }), ttlMs: SEEDER_PAIR_TTL_MS, reused: true }
+  }
+  const rv = generateRendezvousKey()
+  const topic = seederPairTopic(rv)
+  const topicHex = b4a.toString(topic, 'hex')
+  try { _swarm.join(topic, { server: true, client: true }) } catch (e) {
+    return { error: 'join failed: ' + (e?.message ?? String(e)) }
+  }
+  const ttlTimer = setTimeout(() => closeSeederPairSession('ttl'), SEEDER_PAIR_TTL_MS)
+  if (typeof ttlTimer.unref === 'function') ttlTimer.unref()
+  _pairSession = { rv, topic, topicHex, ttlTimer }
+  for (const conn of _seederActiveConns) setupSeederPairChannelFor(conn)
+  mark('seeder:pair:open', { ttlMs: SEEDER_PAIR_TTL_MS })
+  return { link: buildSeederPairLink({ rv, seeder: seederHex }), ttlMs: SEEDER_PAIR_TTL_MS }
+}
+
+function closeSeederPairSession (reason) {
+  if (!_pairSession) return
+  const s = _pairSession; _pairSession = null
+  try { clearTimeout(s.ttlTimer) } catch {}
+  try { _swarm.leave(s.topic) } catch {}
+  mark('seeder:pair:closed', { reason })
+}
+
+// Member side: finish a scan (success or timeout), leave the rendezvous, resolve.
+function finishPairScan (result) {
+  if (!_pairScan) return
+  const s = _pairScan; _pairScan = null
+  try { clearTimeout(s.timer) } catch {}
+  try { _swarm.leave(s.topic) } catch {}
+  mark('seeder:pair:scan-finished', { ok: !!result.ok })
+  try { s.resolve(result) } catch {}
+}
+
+// Member side: on a rendezvous connection, push the bundle ONLY if the
+// authenticated remote pubkey equals the scanned seeder pubkey (the security
+// anchor - circle secrets never go to an impostor who merely knows the topic).
+function maybeSetupPairScanChannel (conn, remotePubkeyHex) {
+  const session = _pairScan
+  if (!session) return
+  if (remotePubkeyHex !== session.seederKeyHex) {
+    mark('seeder:pair:wrong-peer', { got: (remotePubkeyHex || '?').slice(0, 8), want: session.seederKeyHex.slice(0, 8) })
+    return
+  }
+  setupSeederPairChannel({
+    conn,
+    role: 'member',
+    rv: session.rv,
+    getBundle: async () => {
+      const { entries } = await collectSeedInvites()
+      return entries.map((e) => e.invite)
+    },
+    onAck: async ({ enrolled, names }) => {
+      // Follow the seeder so all FUTURE circles auto-push over the normal
+      // circle-topic sync channels (no re-pairing). Same row shape as
+      // circle:seeder:follow:set.
+      try { await _localDb.put('seederfollow:' + session.seederKeyHex, { pubkey: session.seederKeyHex, since: Date.now() }) } catch {}
+      mark('seeder:pair:acked', { enrolled })
+      finishPairScan({ ok: true, enrolled, names, seeder: session.seederKeyHex })
+    },
+    mark,
+  })
+}
+
 function onSeederSwarmConnection (conn, info) {
   try { _store.replicate(conn) } catch (e) {
     console.warn('[bare] seeder replicate failed', e?.message)
@@ -4859,6 +4994,10 @@ function onSeederSwarmConnection (conn, info) {
     },
     mark,
   })
+
+  // One-time pairing receive channel, only while a pairing session is open
+  // (the seeder is on the rendezvous topic only then). Proposal 2026-06-22.
+  if (_pairSession) setupSeederPairChannelFor(conn)
 }
 
 // --- Stale-connection shedding (proposal 2026-06-01) ------------------------
@@ -5011,6 +5150,10 @@ async function onSwarmConnection (conn, info) {
     _memberSyncChannels.add(entry)
     conn.once('close', () => _memberSyncChannels.delete(entry))
   }
+
+  // Seeder-pairing: if a scan is in progress and this connection's authenticated
+  // remote is the scanned seeder, push the bundle. Proposal 2026-06-22.
+  if (_pairScan) maybeSetupPairScanChannel(conn, remotePublicKey)
 
   // Peer tracking: prefer info.topics, fall back to all circles we both
   // could be on. The fallback over-counts when the remote isn't actually
@@ -5245,6 +5388,10 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
         bootstrap: await runOneSeederRetentionSweep(),
         writer: await runOneSeederWriterRetentionSweep(),
       }),
+      // Seeder QR pairing (proposal 2026-06-22): open mints a rendezvous +
+      // returns the QR link; close tears the session down.
+      openPairSession: openSeederPairSession,
+      closePairSession: closeSeederPairSession,
     })
 
     // Mirror persisted seeder:revoked:* rows into the in-memory set so the
