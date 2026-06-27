@@ -90,8 +90,14 @@ Note: the store id is `peerloom`, so the app id is `peerloom-pearcircle-seeder`
 (Umbrel requires every app id to be prefixed with the store id). The files in
 THIS directory are the source of truth; the store repo mirrors them.
 
-The official route is a PR to `getumbrel/umbrel-apps` once a multi-arch image
-(amd64 + arm64) is published.
+The seeder is also in the **official Umbrel App Store** (`getumbrel/umbrel-apps`,
+app id `pearcircle-seeder`, no store prefix) as of 2026-06-26 (merged PR #5761).
+Each release must bump that store too — umbrelOS keys "update available" off each
+store's own `version:` field. `seeder-launcher/scripts/build-umbrel-image.sh`
+automates it: set `OFFICIAL_STORE_DIR` to a clone of the `peerloomllc/umbrel-apps`
+fork and it cuts a fresh per-release branch off upstream, bumps the manifest +
+image digest, and (with `OFFICIAL_STORE_PR=1`) opens/refreshes the getumbrel PR
+via `gh`. `release.sh` exposes this as `UMBREL_OFFICIAL_DIR` / `UMBREL_OFFICIAL_PR`.
 
 ## Networking note
 
