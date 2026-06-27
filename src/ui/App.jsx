@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
@@ -3155,6 +3155,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                 const isPaused = effectivePresenceMuted(pres) && pubkey !== myPubkey
                 const t = latestTransition?.[pubkey]
                 const tPlaceName = t ? placesById?.[t.placeId]?.name : null
+                const curPlaceName = !isPaused && !t ? currentPlaceFor(seen, data.places)?.name ?? null : null
                 return (
                   <MemberRow
                     key={m.key}
@@ -3163,6 +3164,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                     isPaused={isPaused}
                     transition={t}
                     transitionPlaceName={tPlaceName}
+                    currentPlaceName={curPlaceName}
                     connected={connectedPubkeys.has(pubkey)}
                     isSelf={pubkey === myPubkey}
                     onFocus={focusMember}
@@ -3291,6 +3293,59 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   )
 }
 
+// Predefined Places: quick-add presets for the add-Place form, plus name-based
+// icon inference so a place (and the "at X" member-row indicator) gets a
+// recognizable glyph. UI-only — no Place-record field, so a place renamed to
+// something unrecognized just falls back to the generic pin. First match wins.
+const PLACE_PRESETS = [
+  { label: 'Home', Icon: House },
+  { label: 'Work', Icon: Briefcase },
+  { label: 'School', Icon: GraduationCap },
+  { label: 'Gym', Icon: Barbell },
+  { label: 'Store', Icon: Storefront },
+  { label: 'Park', Icon: Tree },
+  { label: 'Friends', Icon: UsersThree },
+  { label: 'Doctor', Icon: FirstAid },
+]
+const PLACE_ICON_RULES = [
+  { re: /\b(home|house|casa|apartment|apt|condo)\b/, Icon: House },
+  { re: /\b(work|office|job|hq)\b/, Icon: Briefcase },
+  { re: /\b(school|college|university|campus|class|daycare|preschool)\b/, Icon: GraduationCap },
+  { re: /\b(gym|fitness|workout|crossfit|yoga)\b/, Icon: Barbell },
+  { re: /\b(store|shop|mall|market|grocery|groceries|errand|errands)\b/, Icon: Storefront },
+  { re: /\b(park|playground|trail|garden)\b/, Icon: Tree },
+  { re: /\b(doctor|dentist|clinic|hospital|medical|pharmacy|vet)\b/, Icon: FirstAid },
+  { re: /\b(restaurant|cafe|coffee|diner|bar|pub|eatery)\b/, Icon: ForkKnife },
+  { re: /\b(airport)\b/, Icon: AirplaneTilt },
+  { re: /\b(friend|friends)\b/, Icon: UsersThree },
+]
+function placeIconFor (name) {
+  const n = (name || '').toLowerCase()
+  for (const r of PLACE_ICON_RULES) if (r.re.test(n)) return r.Icon
+  return null
+}
+// Inline place glyph for a place name; generic pin fallback so both recognized
+// and unrecognized places read as "a place". Sized/colored for the row text.
+function PlaceIcon ({ name, size = 13 }) {
+  const Icon = placeIconFor(name) || MapPin
+  return <Icon size={size} weight='fill' style={{ color: colors.text.secondary, flexShrink: 0 }} />
+}
+// The place (across visible circles) whose geofence currently contains a
+// member's last position; smallest-radius match wins. Pure client-side
+// point-in-circle over data the UI already has — no transition/replication
+// dependency, so it works even when transitions lag.
+function currentPlaceFor (seen, places) {
+  if (!seen || seen.lat == null || seen.lon == null || !Array.isArray(places)) return null
+  let best = null
+  for (const p of places) {
+    if (p?.lat == null || p?.lon == null || !(p?.radiusMeters > 0)) continue
+    if (haversineMeters(seen.lat, seen.lon, p.lat, p.lon) <= p.radiusMeters) {
+      if (!best || p.radiusMeters < best.radiusMeters) best = p
+    }
+  }
+  return best
+}
+
 function EditPlaceForm ({ initial, onCancel, onSaved }) {
   const [name, setName] = useState(initial?.name ?? '')
   const [radius, setRadius] = useState(initial?.radiusMeters != null ? String(initial.radiusMeters) : '')
@@ -3416,6 +3471,27 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
         </>
       )}
       <label style={s.label}>Name</label>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, marginBottom: 8 }}>
+        {PLACE_PRESETS.map(({ label, Icon }) => {
+          const active = name.trim().toLowerCase() === label.toLowerCase()
+          return (
+            <button
+              key={label}
+              onClick={() => setName(label)}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+                padding: '6px 4px', borderRadius: radius.sm, cursor: 'pointer',
+                fontFamily: typography.fontFamily, fontSize: 13, whiteSpace: 'nowrap', minWidth: 0,
+                background: active ? colors.surface.elevated : 'transparent',
+                color: active ? colors.primary : colors.text.secondary,
+                border: `1px solid ${active ? colors.primary : colors.border}`,
+              }}
+            >
+              <Icon size={14} style={{ flexShrink: 0 }} /> {label}
+            </button>
+          )
+        })}
+      </div>
       <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
       <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
@@ -7606,7 +7682,7 @@ function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive =
 // Single member row in the bottom sheet's roster. Pulled out as its
 // own component so the useReverseGeocode hook has a stable call site
 // per row (otherwise hook ordering would shift with the members list).
-function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, connected, isSelf, onFocus }) {
+function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, currentPlaceName, connected, isSelf, onFocus }) {
   const pubkey = member.value?.pubkey ?? ''
   const displayName = member.value?.displayName ?? short(pubkey)
   // Every row opens the member-detail sheet on tap, even one with no
@@ -7623,7 +7699,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, c
     pubkey,
     seen?.lat,
     seen?.lon,
-    !!seen && !transition && !isPaused,
+    !!seen && !transition && !isPaused && !currentPlaceName,
   )
   return (
     <li
@@ -7644,10 +7720,18 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, c
           {isPaused ? (
             <div style={s.lastSeenMuted}>Sharing paused</div>
           ) : transition ? (
-            <div style={s.status}>
-              {transition.kind === 'enter' ? 'arrived at ' : 'left '}
-              {transitionPlaceName ?? '(unknown place)'}
-              {' · '}{ageLabel(transition.ts)}
+            <div style={{ ...s.status, display: 'flex', alignItems: 'center', gap: 4 }}>
+              <PlaceIcon name={transitionPlaceName} />
+              <span>
+                {transition.kind === 'enter' ? 'arrived at ' : 'left '}
+                {transitionPlaceName ?? '(unknown place)'}
+                {' · '}{ageLabel(transition.ts)}
+              </span>
+            </div>
+          ) : currentPlaceName ? (
+            <div style={{ ...s.lastSeen, display: 'flex', alignItems: 'center', gap: 4 }}>
+              <PlaceIcon name={currentPlaceName} />
+              <span>at {currentPlaceName}</span>
             </div>
           ) : seen ? (
             <div style={s.lastSeen}>
