@@ -18,6 +18,11 @@
 #   IMAGE       image repo (default ghcr.io/peerloomllc/pearcircle-seeder)
 #   PLATFORMS   build platforms (default linux/amd64,linux/arm64)
 #   PUSH        1 = build + push (default); 0 = build only
+#   GHCR_TOKEN  classic PAT with write:packages, used to log in to the registry
+#               before pushing (skipped if already logged in). Put it in
+#               scripts/.env; release.sh sources + exports that. Without it (and
+#               without an existing `podman login`), the push fails fast.
+#   GHCR_USER   registry login user (default peerloomllc)
 #   STORE_DIR   optional path to a local clone of the community app store repo
 #               (peerloom-umbrel-app-store); if set, its app manifest is bumped
 #               too (commit + push it yourself to publish).
@@ -58,6 +63,40 @@ if command -v podman >/dev/null 2>&1; then ENGINE=podman
 elif command -v docker >/dev/null 2>&1; then ENGINE=docker
 else echo "build-umbrel-image: need podman or docker" >&2; exit 1
 fi
+
+# Authenticate to the registry BEFORE the (multi-arch, multi-minute) build so a
+# missing credential fails fast instead of 403-ing at the very end. podman's
+# login lives in $XDG_RUNTIME_DIR (a tmpfs wiped on reboot/logout), so don't
+# assume an earlier manual `podman login` survived. Resolution order:
+#   1. already logged in (manual `podman login`, or a prior run) -> reuse it
+#   2. GHCR_TOKEN set (a classic PAT with write:packages, from scripts/.env)
+#      -> log in as GHCR_USER (default: the org)
+#   3. otherwise -> fail fast with guidance
+# Only runs when actually pushing (PUSH=1).
+GHCR_USER="${GHCR_USER:-peerloomllc}"
+ensure_registry_login () {
+  local host="${IMAGE%%/*}"   # ghcr.io
+  # podman can probe an existing session; docker can't, so on docker we only
+  # act when a token is given and otherwise trust an existing login.
+  if [ "$ENGINE" = podman ] && podman login --get-login "$host" >/dev/null 2>&1; then
+    echo "==> $host: using existing login ($(podman login --get-login "$host" 2>/dev/null))"
+    return 0
+  fi
+  if [ -n "${GHCR_TOKEN:-}" ]; then
+    printf '%s' "$GHCR_TOKEN" | "$ENGINE" login "$host" -u "$GHCR_USER" --password-stdin >/dev/null \
+      && echo "==> $host: logged in as $GHCR_USER (GHCR_TOKEN)"
+    return 0
+  fi
+  if [ "$ENGINE" = docker ]; then
+    echo "==> $host: assuming an existing docker login (set GHCR_TOKEN to auto-login)"
+    return 0
+  fi
+  echo "build-umbrel-image: not logged in to $host and GHCR_TOKEN is unset." >&2
+  echo "  Add GHCR_TOKEN=<PAT with write:packages> to scripts/.env (it is sourced + exported)," >&2
+  echo "  or run once: podman login $host -u $GHCR_USER" >&2
+  exit 1
+}
+[ "$PUSH" = 1 ] && ensure_registry_login
 
 echo "==> building $TAG  platforms=$PLATFORMS  SEEDER_VERSION=$VERSION  engine=$ENGINE  push=$PUSH"
 
