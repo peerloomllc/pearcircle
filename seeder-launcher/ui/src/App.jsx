@@ -64,6 +64,96 @@ export function App () {
       <Status status={status} circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <AddCircles pairResult={pairResult} clearPairResult={() => setPairResult(null)} onAdded={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
       <Maintenance setError={setError} />
+      <Support />
+    </div>
+  )
+}
+
+// Donation / support. Two no-account rails the dashboard renders entirely
+// client-side (no tracking, no phone-home, no host network call): a Lightning
+// address for sats and Buy Me a Coffee for USD/card. The QR is built from the
+// constants below, so blanking either string drops that rail. The dashboard is
+// often viewed on a laptop while paying from a phone, hence a QR for both.
+const DONATE = {
+  lnAddress: 'peerloomllc@strike.me',
+  bmcUrl: 'https://buymeacoffee.com/peerloomllc?new=1',
+}
+
+// Copy that also works on the seeder's plain-http origin (Umbrel proxy): the
+// async Clipboard API needs a secure context, so fall back to execCommand.
+async function copyText (text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {}
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus(); ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch { return false }
+}
+
+function Support () {
+  const [tab, setTab] = useState('ln') // 'ln' | 'bmc'
+  const [qr, setQr] = useState(null)
+  const [copied, setCopied] = useState(false)
+
+  // Lightning Address QR = the bare address (what wallet scanners expect);
+  // Buy Me a Coffee QR = the page URL.
+  const qrPayload = tab === 'ln' ? DONATE.lnAddress : DONATE.bmcUrl
+  const copyValue = tab === 'ln' ? DONATE.lnAddress : DONATE.bmcUrl
+
+  useEffect(() => {
+    let cancelled = false
+    setQr(null)
+    QRCode.toDataURL(qrPayload, { width: 200, margin: 1, errorCorrectionLevel: 'M' })
+      .then((url) => { if (!cancelled) setQr(url) })
+      .catch(() => { if (!cancelled) setQr(null) })
+    return () => { cancelled = true }
+  }, [qrPayload])
+
+  const onCopy = async () => {
+    if (await copyText(copyValue)) { setCopied(true); setTimeout(() => setCopied(false), 1500) }
+  }
+
+  return (
+    <div class="panel">
+      <h2>Support PearCircle</h2>
+      <div class="empty" style={{ marginBottom: 14 }}>
+        No accounts, no servers, no subscriptions. If running this seeder is useful, a tip helps keep PearCircle free — entirely optional.
+      </div>
+      <div class="row" style={{ gap: 10, justifyContent: 'center', marginBottom: 14 }}>
+        <button class={tab === 'ln' ? '' : 'ghost'} style={{ flex: 1, maxWidth: 180 }} onClick={() => setTab('ln')}>⚡ BTC ⚡</button>
+        <button class={tab === 'bmc' ? '' : 'ghost'} style={{ flex: 1, maxWidth: 180 }} onClick={() => setTab('bmc')}>💲 USD 💲</button>
+      </div>
+      <div style={{ textAlign: 'center' }}>
+        {qr
+          ? <img src={qr} alt={tab === 'ln' ? 'Lightning donation QR code' : 'Buy Me a Coffee QR code'}
+                 style={{ width: 200, height: 200, background: '#fff', borderRadius: 8, padding: 8 }} />
+          : <div class="empty">generating…</div>}
+        <div class="empty" style={{ marginTop: 10 }}>
+          {tab === 'ln'
+            ? 'Scan with any bitcoin lightning wallet to donate sats (pick your own amount), or copy the address.'
+            : 'Scan to open Buy Me a Coffee on your phone, or open it here to donate by card.'}
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <div class="mono" style={{ color: 'var(--muted)', wordBreak: 'break-all' }}>{copyValue}</div>
+          <div class="row" style={{ gap: 10, justifyContent: 'center', marginTop: 10 }}>
+            <button class="ghost" onClick={onCopy}>{copied ? 'Copied' : 'Copy'}</button>
+            {tab === 'bmc' && (
+              <button onClick={() => window.open(DONATE.bmcUrl, '_blank', 'noopener,noreferrer')}>Open</button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
