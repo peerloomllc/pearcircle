@@ -5419,6 +5419,10 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TripNotificationsSection />
       </Collapsible>
 
+      <Collapsible title='Sync reminder' icon={ArrowsClockwise} open={openSection === 'syncReminder'} onToggle={() => toggleSection('syncReminder')} maxHeight='1200px'>
+        <SyncReminderSection />
+      </Collapsible>
+
       <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
@@ -5904,6 +5908,78 @@ function TripNotificationsSection () {
         {btn('On', true)}
         {btn('Off', false)}
       </div>
+    </>
+  )
+}
+
+// A daily local reminder to open the app. PearCircle has no servers, so a
+// circle's history only catches up while members' apps are open; if nobody
+// opens it (and no always-on seeder is enrolled), everyone's view drifts
+// stale. The reminder only fires after ~a day of not opening the app (the
+// shell re-arms it on every foreground), so a daily user never sees it.
+// Reads/writes the shell preference via shell:syncReminder:get/set.
+function SyncReminderSection () {
+  const [enabled, setEnabled] = useState(true)
+  const [time, setTime] = useState('08:00')
+  useEffect(() => {
+    pear.call('shell:syncReminder:get').then((r) => {
+      if (r && typeof r.enabled === 'boolean') setEnabled(r.enabled)
+      if (r && typeof r.time === 'string') setTime(r.time)
+    }).catch(() => {})
+  }, [])
+  const toggle = useCallback(async (value) => {
+    if (value === enabled) return
+    setEnabled(value)   // optimistic; revert on failure
+    try { await pear.call('shell:syncReminder:set', { enabled: value }) }
+    catch { setEnabled(!value) }
+  }, [enabled])
+  const changeTime = useCallback(async (value) => {
+    if (!/^\d{2}:\d{2}$/.test(value)) return
+    const prev = time
+    setTime(value)
+    try { await pear.call('shell:syncReminder:set', { time: value }) }
+    catch { setTime(prev) }
+  }, [time])
+  const btn = (label, value) => (
+    <button
+      onClick={() => toggle(value)}
+      style={{
+        flex: 1, padding: '10px', borderRadius: radius.sm,
+        background: enabled === value ? colors.primary : 'transparent',
+        color: enabled === value ? colors.text.onPrimary : colors.text.primary,
+        border: `1px solid ${enabled === value ? colors.primary : colors.border}`,
+        cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+      }}
+    >
+      {label}
+    </button>
+  )
+  return (
+    <>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
+        PearCircle has no servers — your circles sync directly between members' phones, only while the app is running. A once-a-day reminder nudges you to open PearCircle so your latest location goes out and you catch up on everyone else. It stays quiet on any day you've already opened the app.
+      </p>
+      <div style={{ display: 'flex', gap: spacing.sm }}>
+        {btn('On', true)}
+        {btn('Off', false)}
+      </div>
+      {enabled && (
+        <div style={{ marginTop: spacing.lg }}>
+          <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Reminder time</p>
+          <input
+            type='time'
+            value={time}
+            onChange={(e) => changeTime(e.currentTarget.value)}
+            style={{
+              width: '100%', padding: '10px', borderRadius: radius.sm,
+              background: colors.surface.input, color: colors.text.primary,
+              border: `1px solid ${colors.border}`,
+              fontFamily: typography.fontFamily, fontSize: 14,
+            }}
+          />
+        </div>
+      )}
     </>
   )
 }
