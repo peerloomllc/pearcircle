@@ -64,6 +64,29 @@ const TOUR_PENDING_KEY = 'pc:tourPending'
 // About page's donate section).
 const DONATE_FIRST_LAUNCH_KEY = 'pc:donateReminder:firstLaunch'
 const DONATE_SHOWN_KEY = 'pc:donateReminder:shown'
+// Daily "open the app to sync" reminder. PearCircle has no servers: a circle's
+// history only converges while members' apps run the worklet (Activity-bound;
+// no reliable background autostart), so a circle with no always-on seeder goes
+// stale when everyone backgrounds/kills the app. A local notification nudges the
+// user to reopen. Reschedule-on-open semantics (see refreshSyncReminder): every
+// foreground cancels + re-arms a single one-shot, so it only ever fires after
+// ~a day of NO opens -- not a fixed daily ping. Default ON; the WebView toggles
+// it via shell:syncReminder:get/set. Stored as the string 'false' when disabled;
+// absent/anything else = enabled (default-on).
+const SYNC_REMINDER_KEY = 'pc:syncReminder:enabled'
+const SYNC_REMINDER_TIME_KEY = 'pc:syncReminder:time'  // 'HH:MM' local; user-set, default 08:00
+const SYNC_REMINDER_DEFAULT_TIME = '08:00'             // 8am: a morning nudge before the day gets going
+const SYNC_REMINDER_ID = 'sync-reminder'               // stable id so re-arm is cancel+reschedule
+// Floor on how soon after an open the reminder may fire. A naive "next HH:MM"
+// can land just a few hours after an open; this keeps it to "~a day of no opens"
+// by skipping to the next HH:MM that's at least this far out.
+const SYNC_REMINDER_MIN_GAP_MS = 20 * 60 * 60 * 1000
+// Shared copy for both the scheduled reminder and the test fire. Time-neutral
+// since the user picks the time.
+const SYNC_REMINDER_CONTENT = {
+  title: 'Open PearCircle to sync',
+  body: "Your circles sync peer-to-peer while the app is open. Open PearCircle a moment to share a fresh location and catch up on everyone.",
+}
 // Android SAF directory the user picked for circle-config exports (e.g.
 // Downloads). Persisted so exports after the first grant need no prompt.
 const EXPORT_DIR_KEY = 'pc:export:dirUri'
@@ -162,10 +185,81 @@ async function ensureNotifications() {
       description: 'Notifications when members join or leave a circle',
       lightColor: '#0E413A',
     })
+    // The daily "open to sync" reminder. Its own channel so users can mute it
+    // from system settings independently of the geofence/trip/membership ones.
+    await Notifications.setNotificationChannelAsync('reminders', {
+      name: 'Sync reminders',
+      importance: Notifications.AndroidImportance.DEFAULT,
+      description: 'A daily nudge to open PearCircle so your circles stay in sync',
+      lightColor: '#0E413A',
+    })
   }
   const settings = await Notifications.getPermissionsAsync()
   if (settings.status !== 'granted') {
     await Notifications.requestPermissionsAsync()
+  }
+}
+
+// Default-on: only an explicit 'false' disables it (absent key = enabled).
+async function isSyncReminderEnabled(): Promise<boolean> {
+  try { return (await AsyncStorage.getItem(SYNC_REMINDER_KEY)) !== 'false' }
+  catch { return true }
+}
+
+// Parse a stored/incoming 'HH:MM' (24h). Returns null on anything malformed so
+// callers can fall back to the default rather than schedule at a bogus time.
+function parseHHMM(s: unknown): { hour: number, minute: number } | null {
+  if (typeof s !== 'string') return null
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s.trim())
+  if (!m) return null
+  const hour = Number(m[1]), minute = Number(m[2])
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+  return { hour, minute }
+}
+
+async function getSyncReminderTime(): Promise<{ hour: number, minute: number }> {
+  try {
+    return parseHHMM(await AsyncStorage.getItem(SYNC_REMINDER_TIME_KEY))
+      ?? parseHHMM(SYNC_REMINDER_DEFAULT_TIME)!
+  } catch { return { hour: 8, minute: 0 } }
+}
+
+// The next local HH:MM that's at least SYNC_REMINDER_MIN_GAP_MS away. Walks
+// forward a day at a time (handles DST via local Date math). Because we re-arm
+// on every foreground (refreshSyncReminder), the effect is "the next HH:MM after
+// ~a day you didn't open the app".
+function nextSyncReminderDate(hour: number, minute: number): Date {
+  const now = Date.now()
+  const d = new Date()
+  d.setHours(hour, minute, 0, 0)
+  while (d.getTime() - now < SYNC_REMINDER_MIN_GAP_MS) {
+    d.setDate(d.getDate() + 1)
+  }
+  return d
+}
+
+// Cancel any pending reminder and, if enabled, re-arm a single one-shot. Called
+// on boot (after channels exist) and on every app foreground, so a user who
+// opens daily never sees it; one quiet nudge lands only after ~a day away.
+// Best-effort: notification permission may be denied (no-op then).
+async function refreshSyncReminder(): Promise<void> {
+  try {
+    await Notifications.cancelScheduledNotificationAsync(SYNC_REMINDER_ID)
+  } catch {}
+  if (!(await isSyncReminderEnabled())) return
+  const { hour, minute } = await getSyncReminderTime()
+  try {
+    await Notifications.scheduleNotificationAsync({
+      identifier: SYNC_REMINDER_ID,
+      content: SYNC_REMINDER_CONTENT,
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: nextSyncReminderDate(hour, minute),
+        channelId: 'reminders',
+      },
+    })
+  } catch (e: any) {
+    console.warn('sync reminder schedule failed', e?.message ?? String(e))
   }
 }
 
@@ -617,9 +711,13 @@ export const ensureBackendStarted = makeStartLock(async () => {
   registerNativeActionHandlers()
   // Notification channels + permission. Stash the promise so onBackendReady
   // can await it before Android startUpdates. Non-fatal.
-  _notifSetupReady = ensureNotifications().catch((e) => {
-    console.warn('notif setup failed', e?.message ?? String(e))
-  })
+  _notifSetupReady = ensureNotifications()
+    // Arm the daily sync reminder once channels + permission exist. The
+    // AppState 'active' handler re-arms it on every foreground thereafter.
+    .then(() => { refreshSyncReminder().catch(() => {}) })
+    .catch((e) => {
+      console.warn('notif setup failed', e?.message ?? String(e))
+    })
   // Local caches read by the notification formatters: muted places and the
   // distance-unit preference. Safe before the worklet is ready.
   loadMutes().catch(() => {})
@@ -729,6 +827,9 @@ export default function Index() {
       // that change outside the app (e.g. the battery-optimization
       // toggle reflects after the user dismisses the system dialog).
       emitEvent('app:state', { state: s })
+      // Re-arm the "open to sync" reminder: opening the app pushes the next
+      // nudge out ~a day, so a daily user never sees it (reschedule-on-open).
+      if (s === 'active') refreshSyncReminder().catch(() => {})
       // iOS: re-query authorization status whenever we come back to
       // foreground. The user may have gone to Settings via the home
       // banner, flipped the toggle, and bounced back -- in which case
@@ -1117,6 +1218,36 @@ export default function Index() {
       }
       try {
         await AsyncStorage.setItem(THEME_KEY, theme)
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:syncReminder:get') {
+      const { hour, minute } = await getSyncReminderTime()
+      const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+      respond(msg.id, { enabled: await isSyncReminderEnabled(), time })
+      return
+    }
+    if (msg.method === 'shell:syncReminder:set') {
+      // Both fields optional; set whichever the UI sends (toggle vs time picker).
+      const { enabled, time } = msg.args ?? {}
+      if (enabled !== undefined && typeof enabled !== 'boolean') {
+        respond(msg.id, { ok: false, error: 'enabled must be a boolean' })
+        return
+      }
+      if (time !== undefined && !parseHHMM(time)) {
+        respond(msg.id, { ok: false, error: "time must be 'HH:MM' (24h)" })
+        return
+      }
+      try {
+        if (typeof enabled === 'boolean') {
+          await AsyncStorage.setItem(SYNC_REMINDER_KEY, enabled ? 'true' : 'false')
+        }
+        if (parseHHMM(time)) await AsyncStorage.setItem(SYNC_REMINDER_TIME_KEY, time)
+        // Apply immediately: enabling/time-change re-arms, disabling cancels.
+        await refreshSyncReminder()
         respond(msg.id, { ok: true })
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
