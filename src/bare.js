@@ -54,7 +54,7 @@ const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
 const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
-const { shouldSwallowFault } = require('./lib/conflictSeatbelt')
+const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
@@ -2633,7 +2633,45 @@ function installFaultHandlers () {
   _faultHandlersInstalled = true
   Bare.on('uncaughtException', (err) => onWorkletFault(err, 'uncaughtException'))
   Bare.on('unhandledRejection', (err) => onWorkletFault(err, 'unhandledRejection'))
+  // Source-agnostic conflict arming: hypercore logs '[hypercore] conflict
+  // detected in <discoveryKey>' for ANY forked core, including a remote
+  // member's writer core that base.local/base.view listeners never see. Tap
+  // that line to stamp _lastConflictAt (so the seatbelt swallows the 'Closed'
+  // fallout regardless of whose core forked) and flag the circle best-effort.
+  // Always passes through to the original console.log; never throws.
+  const _origConsoleLog = console.log.bind(console)
+  console.log = function (...consoleArgs) {
+    try {
+      const disc = parseConflictLog(consoleArgs[0])
+      if (disc) onConflictLog(disc)
+    } catch (e) { /* never let logging break */ }
+    return _origConsoleLog(...consoleArgs)
+  }
   mark('faulthandlers:installed')
+}
+
+// Arm the seatbelt from hypercore's conflict log line (remote- or local-core
+// fork). Attribution is best-effort: a remote writer core's discoveryKey won't
+// match a known circle, in which case the affected base's next append times out
+// and the existing flagDegraded path flags it. The stamp itself is what keeps
+// the worklet alive.
+function onConflictLog (discHex) {
+  _lastConflictAt = Date.now()
+  const circleId = circleIdForDiscoveryKey(discHex)
+  mark('conflict:log-detected', { disc: discHex.slice(0, 16), circle: circleId ? circleId.slice(0, 8) : null })
+  if (circleId) flagDegraded(circleId, 'conflict')
+}
+
+// Map a discoveryKey hex to a mounted circle by comparing against each base's
+// local/view core discoveryKeys (the cores we open ourselves). Remote writer
+// cores aren't covered — see onConflictLog.
+function circleIdForDiscoveryKey (discHex) {
+  for (const [cid, base] of _circleBases) {
+    for (const core of [base.local, base.view]) {
+      try { if (core && core.discoveryKey && b4a.toString(core.discoveryKey, 'hex') === discHex) return cid } catch (e) {}
+    }
+  }
+  return null
 }
 
 // Attach 'conflict' listeners to a mounted circle's writer + view Hypercore

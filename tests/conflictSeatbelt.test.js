@@ -1,4 +1,24 @@
-const { shouldSwallowFault, isConflictFallout, CONFLICT_GRACE_MS } = require('../src/lib/conflictSeatbelt')
+const { shouldSwallowFault, isConflictFallout, parseConflictLog, CONFLICT_GRACE_MS } = require('../src/lib/conflictSeatbelt')
+
+describe('parseConflictLog', () => {
+  test('extracts the discoveryKey from the real hypercore log line', () => {
+    const line = '[hypercore] conflict detected in 2a97627776e4c1d3991fd4e80526fc10423a0867fd9b34c679774d518216db96 (writable=true,quorum=1)'
+    expect(parseConflictLog(line)).toBe('2a97627776e4c1d3991fd4e80526fc10423a0867fd9b34c679774d518216db96')
+  })
+
+  test('returns null for unrelated log lines', () => {
+    expect(parseConflictLog('[hypercore] something else')).toBeNull()
+    expect(parseConflictLog('conflict detected in abc')).toBeNull() // missing prefix
+    expect(parseConflictLog('')).toBeNull()
+  })
+
+  test('handles non-string args (console.log can be called with anything)', () => {
+    expect(parseConflictLog(undefined)).toBeNull()
+    expect(parseConflictLog(null)).toBeNull()
+    expect(parseConflictLog({})).toBeNull()
+    expect(parseConflictLog(42)).toBeNull()
+  })
+})
 
 describe('isConflictFallout', () => {
   test('matches the escaping "Closed" rejection (the observed crash)', () => {

@@ -37,4 +37,19 @@ function shouldSwallowFault (err, lastConflictAt, now, graceMs = CONFLICT_GRACE_
   return isConflictFallout(err)
 }
 
-module.exports = { shouldSwallowFault, isConflictFallout, CONFLICT_GRACE_MS }
+// Hypercore logs this line from checkConflict on EVERY fork conflict, for any
+// core (local writer OR a remote member's writer core), e.g.:
+//   [hypercore] conflict detected in <discoveryKeyHex> (writable=true,quorum=1)
+// Intercepting it is how we arm the seatbelt source-agnostically: per-core
+// listeners only cover our own base.local/base.view, so a remote member's fork
+// would otherwise set no _lastConflictAt and still crash everyone. Returns the
+// discoveryKey hex (for best-effort attribution) or null if the line isn't one.
+const CONFLICT_LOG_RE = /^\[hypercore\] conflict detected in ([0-9a-f]+)/
+
+function parseConflictLog (arg) {
+  if (typeof arg !== 'string') return null
+  const m = CONFLICT_LOG_RE.exec(arg)
+  return m ? m[1] : null
+}
+
+module.exports = { shouldSwallowFault, isConflictFallout, parseConflictLog, CONFLICT_GRACE_MS }
