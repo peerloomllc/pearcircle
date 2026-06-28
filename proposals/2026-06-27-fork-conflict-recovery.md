@@ -89,7 +89,7 @@ Revert the single commit. The `'conflict'` listener, the scoped `unhandledReject
 1. **Repair trigger: auto-flag, manual tap.** A detected fork flags the circle `needsRepair`; the user taps Repair to rebuild. Matches the append-hang UX and avoids rebuild loops. (Already how the implemented routing behaves.)
 2. **Idempotency: pin to seeder + refuse the bad offer.** The rebuilt gen+1 base must sync the writer core from the seeder first and explicitly reject a conflicting offer until it holds the original branch. Not just the soft preference hint. *Remaining work* — needs the hypercore offer/refuse surface.
 3. **Circle-wide: local repair only for v1.** Heal the crashing device; do NOT add a poisoned-core broadcast yet. The forked core staying in the writer set is an accepted residual risk for v1 (revisit if a second member conflicts independently).
-4. **Remote-member forks: make the seatbelt fork-source-agnostic.** Today listeners only cover `base.local`/`base.view`, so a *remote* member's fork sets no `_lastConflictAt` and would still crash everyone. Set the conflict flag from hypercore's own conflict signal (e.g. intercept its `[hypercore] conflict detected` log to stamp `_lastConflictAt` + attribute by discoveryKey) so the seatbelt swallows ANY fork's fallout. *Remaining work.*
+4. **Remote-member forks: make the seatbelt fork-source-agnostic.** Today listeners only cover `base.local`/`base.view`, so a *remote* member's fork sets no `_lastConflictAt` and would still crash everyone. Set the conflict flag from hypercore's own conflict signal (e.g. intercept its `[hypercore] conflict detected` log to stamp `_lastConflictAt` + attribute by discoveryKey) so the seatbelt swallows ANY fork's fallout. **IMPLEMENTED** (commit bd74b40, `onConflictLog`/`parseConflictLog`).
 5. **Prevention: build now, in this branch, both guards.** Raises the effort to T3 (see Tier). Both the writer-core rewind guard and durability ordering are in scope (moved up from the sibling section below).
 
 ## Prevention (now in scope, T3)
@@ -100,6 +100,42 @@ The fork can only exist if a signed log went backwards then forward with new con
 - **Durability ordering.** Never let a block reach peers before it is durably flushed locally. Continues `bugfix/store-wal-flush-maintenance` and removes the upstream cause (WAL loss) of the rewind.
 
 Open design points for review: where the boot-time "is the network ahead of my own core?" check hooks in without adding cold-start latency; and how to enforce flush-before-replicate without throttling normal append throughput.
+
+## Implementation design (T3 batch: items 2-4)
+
+Decision 4 (source-agnostic seatbelt) is already implemented: a `console.log` tap on hypercore's `[hypercore] conflict detected in <discoveryKey>` line stamps `_lastConflictAt` for any forked core and best-effort-flags the circle (`onConflictLog` / `parseConflictLog`). The three below remain.
+
+### Item 2 — Pin the rebuilt base to the seeder + refuse the bad offer (decision 2)
+
+Surfaces: `circle:repair` already remounts under `rebuildGen+1` with empty local cores that re-sync from the network; `_replicatingConns` tracks live replicating connections; the per-core `'conflict'` listener is already attached to `base.local`/`base.view`.
+
+Approach:
+1. **Seeder-first re-sync.** During the repair window, attach the seeder connection's replication to the rebuilt namespace before (or ahead of) member peers, so the rebuilt `base.local` for our own writer core fills from the seeder's original branch first.
+2. **Refuse the conflicting offer.** Hypercore has no clean public "reject this fork, keep mine" call — its built-in reaction is `_onconflict` → `closeAllSessions` (the crash we now catch). So "refuse" means: once the rebuilt base holds the seeder-sourced branch, if a member later offers the conflicting branch, **shed that peer's replication for this circle** (disconnect/teardown the offending connection) so the divergent blocks are never ingested. We already shed stale connections (proposal 2026-06-01); reuse that.
+
+Open review points: can we scope a shed to the offending peer+core specifically, or only the whole connection? If only the whole connection, a member who legitimately needs other circles served gets dropped — acceptable? Confirm the seeder reliably has the original branch (it usually does, but Non-goals: it is not an authority — if the seeder itself only has the forked branch, this degrades to "conflict recurs, circle stays needsRepair", which is safe, not corrupting).
+
+### Item 3 — Writer-core rewind guard (decision 5a)
+
+Surfaces: `base.local.length` (our writer core's local length), `base.local.peers[].remoteLength` (length each connected peer advertises for *that* core — already per-core, so correctly scoped), `base.local.download(range)`, `base.update()`.
+
+Algorithm, per circle, gating the first post-boot append to our own writer core:
+1. After the circle's swarm connects and `base.update()` settles, compute `networkLen = max(peer.remoteLength)` over `base.local.peers`.
+2. If `networkLen > base.local.length`, our writer core was truncated. Add the circle to a new `_rewoundCircles` gate (sibling of `_degradedCircles`) that blocks appends to `base.local`, and `download` our own core up to `networkLen`.
+3. When `base.local.length >= networkLen` (caught up with no divergence), clear the gate and resume appends.
+4. If the local core had *already* re-appended divergent blocks before this ran, the download conflicts → caught by the seatbelt → `circle:repair`. So the guard's value is entirely in running **before** the first post-boot append; the append gate is the load-bearing piece.
+
+Open review points: **cold-start latency** — we must not block the first `lastSeen` append forever waiting for a peer. Bound the gate: wait only until the first peer advertising our core connects, with a timeout (seeder usually connects fast); if it times out with no peer, assume we're authoritative and proceed. **Append queueing** — native location appends fired during the gate window must queue, not drop. **Scope** — only gate our OWN writer core (`base.local`), never remote writer cores.
+
+### Item 4 — Durability ordering (decision 5b)
+
+Surfaces: `store.storage.db.flush()` (existing coalesced flusher, `lib/storeFlush`), the writer-append path (`safeAppend`), and replication (advertises blocks on append, no clean pre-broadcast hook).
+
+Goal: a block must be durably flushed before peers can rely on it, so a WAL-loss crash can't leave us behind the network on our own core (the upstream cause of the rewind).
+
+Approach (pragmatic v1): **flush shortly after a writer append**, coalesced/debounced (~1-2s) on the writer-append path, shrinking the durability gap from "until the 64 MB write buffer fills" to a couple of seconds. A clean pre-broadcast replication gate has no hook in hypercore, so we accept a small window rather than re-architecting replication.
+
+Open review points: **throughput** — flush-per-append is too heavy; reuse the existing coalescing flusher with a short debounce keyed off writer appends. **Do not reintroduce the giant-flush wedge** — the original `bad_alloc` crash was the 64 MB first flush itself (`project_wal_badalloc_wedge`); frequent small flushes are the fix and the existing cadence flusher already aims for this, so durability ordering should layer on it, not bypass it. **Interaction with the rewind guard** — together they shrink the residual fork window to near zero: durability ordering makes truncation rare, the rewind guard catches it when it still happens.
 
 ## Relationship to other work
 
