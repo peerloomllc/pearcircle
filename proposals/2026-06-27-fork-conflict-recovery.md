@@ -1,10 +1,10 @@
 # Fork-conflict recovery — catch hypercore conflicts and re-sync from the seeder instead of crash-looping
 
-**Status**: Draft 2026-06-27. Not yet reviewed. Grounded in an on-device crash log from Benjamin's Pixel 7 (`PearCircle_log_275784395528.txt`, 17 identical aborts 2026-06-24 → 2026-06-27).
+**Status**: Draft 2026-06-27. **Decisions recorded 2026-06-28** (owner answered all five open questions, see Decisions). Recovery + seatbelt half implemented and on-device-validated as no-regression (TCL + Pixel 9, debug); prevention half now in scope and not yet built. Not yet reviewed. Grounded in an on-device crash log from Benjamin's Pixel 7 (`PearCircle_log_275784395528.txt`, 17 identical aborts 2026-06-24 → 2026-06-27).
 
-**Goal**: Stop a single forked hypercore from hard-crashing the worklet in a loop, and recover the affected circle by rebuilding its local cores and re-syncing the canonical history (the seeder being the most reliable holder of it). Reuse the existing `circle:repair` machinery rather than inventing a new recovery path.
+**Goal**: Stop a single forked hypercore from hard-crashing the worklet in a loop, recover the affected circle by rebuilding its local cores and re-syncing the canonical history (the seeder being the most reliable holder of it), AND prevent the fork from recurring by keeping writer cores from ever rewinding. Reuse the existing `circle:repair` machinery for recovery rather than inventing a new path.
 
-**Tier**: T2. No new wire message and no new replicated record kind — recovery reuses the existing `circle:repair` rebuild (local) and the pair-channel `addWriter` re-admission (existing protocol). The new surface is local: a conflict detector, a route into `flagDegraded` → `circle:repair`, and a seeder-preferred re-sync hint. The data-integrity blast radius is circle-wide, so this is proposal-gated; the *prevention* half (writer-core rewind guard) is a sibling and is T3 (touches the replication durability invariant) — out of scope here, tracked separately.
+**Tier**: **T3** (raised from T2 on 2026-06-28). Recovery alone reuses existing local flows, but the owner chose to bundle the prevention guards (writer-core rewind guard + durability ordering), which change the replication durability invariant — a wire/protocol-adjacent guarantee. Per Constitution §3 this wants a review record before the prevention implementation lands. The recovery + seatbelt code is already written; prevention is design-first.
 
 ## Background
 
@@ -57,10 +57,11 @@ In scope:
 - **Auto-vs-prompt policy.** Decide whether a detected fork auto-triggers `circle:repair` or only flags `needsRepair` and lets the user tap "Repair" (today's manual model). Default in this draft: **auto-flag, manual repair**, to avoid surprising data churn and to keep parity with the append-hang UX. (Open question 1.)
 - **Observability.** `conflict:detected {circleId, discoveryKey, writable, quorum}`, `conflict:routed-to-repair`, `conflict:seatbelt-caught` (backstop fired), `circle:repair:seeder-preferred`.
 
-Out of scope (siblings, tracked separately):
+Now IN scope (per Decision 5): prevention — the writer-core rewind guard and durability ordering. See the Prevention section.
 
-- **Prevention (the real fix).** A writer-core **rewind guard**: on boot, before the worklet writes, detect whether the network holds a *longer* copy of this device's own core and adopt it rather than appending at a rewound tip; plus durability ordering so a block never reaches peers before it is durably flushed locally (continues `bugfix/store-wal-flush-maintenance`). This is what stops forks from happening at all and is T3. Recovery without prevention just heals the same wound repeatedly.
-- **Circle-wide fork eviction.** If the forked core stays in the autobase writer set, other members replicating it among themselves can still conflict (Open question 3). A full fix may need to evict/replace the poisoned writer core across the circle, which is a larger protocol question.
+Out of scope:
+
+- **Circle-wide fork eviction** (per Decision 3). If the forked core stays in the autobase writer set, other members replicating it among themselves can still conflict. A full fix may need to evict/replace the poisoned writer core across the circle, a larger protocol question deferred past v1.
 - Making the seeder an authoritative conflict arbiter. Explicitly rejected — see Non-goals.
 
 ## Non-goals
@@ -83,12 +84,22 @@ No wire change, no persisted-schema change, no new replicated record. The detect
 
 Revert the single commit. The `'conflict'` listener, the scoped `unhandledRejection` backstop, the routing, and the seeder-preference hint all go away; behavior returns to today's (fatal). No peer-visible or persisted state changes.
 
-## Open questions
+## Decisions (2026-06-28)
 
-1. **Auto-repair or manual?** Auto-triggering `circle:repair` on a detected fork is less for the user to do, but a fork that recurs (e.g. seeder also holds the bad branch) would auto-rebuild on a loop. Draft default is auto-flag + manual repair. Decision needed.
-2. **What if the rebuilt base re-downloads the forked branch?** Both branches are validly signed; hypercore cannot tell "canonical" from "forked" by signature alone, only that they conflict. The rebuilt gen+1 base pulls the writer core fresh from the network — if a peer offers the forked branch before the seeder offers the original, the conflict can recur. The seeder-preference hint mitigates this but does not guarantee it. Do we need to pin the rebuilt base to the seeder's copy until it has the full original branch, and explicitly refuse the conflicting offer?
-3. **Circle-wide scope.** `circle:repair` heals *this device*. The forked gen-0 writer core is still referenced by the circle's writer set, so two other members could conflict on it independently. Does recovery need to propagate a "this writer core is poisoned, replace it" signal across the circle, and is that a wire change (escalating to T3)?
-4. **Detection hook.** Confirm the cleanest attach point for the `'conflict'` event across the cores Autobase opens on demand (per-core listener via a corestore `core-open`-style hook vs relying on the scoped `unhandledRejection` backstop as primary). Implementation detail, but it decides how much we depend on the catch-all.
+1. **Repair trigger: auto-flag, manual tap.** A detected fork flags the circle `needsRepair`; the user taps Repair to rebuild. Matches the append-hang UX and avoids rebuild loops. (Already how the implemented routing behaves.)
+2. **Idempotency: pin to seeder + refuse the bad offer.** The rebuilt gen+1 base must sync the writer core from the seeder first and explicitly reject a conflicting offer until it holds the original branch. Not just the soft preference hint. *Remaining work* — needs the hypercore offer/refuse surface.
+3. **Circle-wide: local repair only for v1.** Heal the crashing device; do NOT add a poisoned-core broadcast yet. The forked core staying in the writer set is an accepted residual risk for v1 (revisit if a second member conflicts independently).
+4. **Remote-member forks: make the seatbelt fork-source-agnostic.** Today listeners only cover `base.local`/`base.view`, so a *remote* member's fork sets no `_lastConflictAt` and would still crash everyone. Set the conflict flag from hypercore's own conflict signal (e.g. intercept its `[hypercore] conflict detected` log to stamp `_lastConflictAt` + attribute by discoveryKey) so the seatbelt swallows ANY fork's fallout. *Remaining work.*
+5. **Prevention: build now, in this branch, both guards.** Raises the effort to T3 (see Tier). Both the writer-core rewind guard and durability ordering are in scope (moved up from the sibling section below).
+
+## Prevention (now in scope, T3)
+
+The fork can only exist if a signed log went backwards then forward with new content. Kill the rewind and forks become structurally impossible.
+
+- **Writer-core rewind guard.** On boot, before the worklet appends anything, check whether the network (seeder/peers) holds a *longer* copy of this device's own writer core. If so, the local core was truncated — adopt/re-sync the network copy first and never append at the rewound tip. Catches truncation from any cause (WAL loss, reclaim, restore).
+- **Durability ordering.** Never let a block reach peers before it is durably flushed locally. Continues `bugfix/store-wal-flush-maintenance` and removes the upstream cause (WAL loss) of the rewind.
+
+Open design points for review: where the boot-time "is the network ahead of my own core?" check hooks in without adding cold-start latency; and how to enforce flush-before-replicate without throttling normal append throughput.
 
 ## Relationship to other work
 
