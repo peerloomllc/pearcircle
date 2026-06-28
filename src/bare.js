@@ -26,7 +26,6 @@ const Hyperbee = require('hyperbee')
 const Hyperswarm = require('hyperswarm')
 const Autobase = require('autobase')
 const b4a = require('b4a')
-const abort = require('bare-abort')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateRendezvousKey, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite, buildSeedInvite, buildSeederPairLink, parseSeederPairLink, inviteCircleIdMismatch } = require('./invite')
@@ -774,6 +773,7 @@ const handlers = {
       encryptionKey: encryptionKeyBuf,
     })
     await base.ready()
+    attachConflictListeners(base, circleId)
     _circleBases.set(circleId, base)
     const bootstrap = b4a.toString(base.local.key, 'hex')
 
@@ -939,6 +939,7 @@ const handlers = {
     if (encryptionKey) baseOpts.encryptionKey = b4a.from(encryptionKey, 'hex')
     const base = new Autobase(ns, b4a.from(bootstrap, 'hex'), baseOpts)
     await base.ready()
+    attachConflictListeners(base, circleId)
 
     // Stale-invite check (proposal amendment 2026-05-07 §1). Join the
     // swarm topic briefly so we can pull the latest `circle:` row; if the
@@ -2586,11 +2587,11 @@ function circleIdForConflictCore (core) {
 // for the 'Closed' rejection that the teardown leaks) and flag the circle for
 // repair, which the user heals via circle:repair (fresh writer + seeder
 // re-sync). Recovery is routing, not crashing.
-function onCoreConflict (core, length, fork) {
+function onCoreConflict (core, length, fork, knownCircleId) {
   _lastConflictAt = Date.now()
   let disc = null
   try { disc = core && core.discoveryKey ? b4a.toString(core.discoveryKey, 'hex') : null } catch (e) {}
-  const circleId = circleIdForConflictCore(core)
+  const circleId = knownCircleId || circleIdForConflictCore(core)
   let writable = false
   try { writable = !!(core && core.writable) } catch (e) {}
   mark('conflict:detected', { circle: circleId ? circleId.slice(0, 8) : null, disc: disc ? disc.slice(0, 16) : null, writable, length, fork })
@@ -2615,25 +2616,41 @@ function onWorkletFault (err, kind) {
     console.warn('[bare] swallowed post-conflict ' + kind + ': ' + ((err && err.message) || err))
     return // circle already flagged needsRepair; keep the rest of the app alive
   }
-  // Not conflict fallout: preserve today's fail-fast behavior, including the
-  // stack trace the crash report depends on, then abort exactly as Bare would.
+  // Not conflict fallout: preserve today's fail-fast behavior. Log the stack
+  // the crash report depends on, then terminate via the Bare runtime global
+  // (Bare.exit) — NOT a native abort addon, which isn't linked into the APK.
   console.error('[bare] fatal ' + kind + ': ' + ((err && err.stack) || (err && err.message) || err))
-  abort()
+  Bare.exit(1)
 }
 
-// Install once (guarded against init-retry double-registration). The store
-// watcher attaches a 'conflict' listener to every core opened in any
-// namespace; watch only fires for cores set AFTER it registers, so this runs
-// right after the store is ready and before any circle/seeder core is opened.
+// Install once (guarded against init-retry double-registration). Just the
+// global seatbelt; per-core 'conflict' listeners are attached per circle at
+// mount time (attachConflictListeners), since corestore's core tracker hands
+// back an internal Core without an .on() — only the Autobase's Hypercore
+// sessions (base.local / base.view) expose the event.
 function installFaultHandlers () {
   if (_faultHandlersInstalled) return
   _faultHandlersInstalled = true
   Bare.on('uncaughtException', (err) => onWorkletFault(err, 'uncaughtException'))
   Bare.on('unhandledRejection', (err) => onWorkletFault(err, 'unhandledRejection'))
-  _store.watch((core) => {
-    core.on('conflict', (length, fork) => onCoreConflict(core, length, fork))
-  })
   mark('faulthandlers:installed')
+}
+
+// Attach 'conflict' listeners to a mounted circle's writer + view Hypercore
+// sessions. Fully defensive: a fork must never let listener wiring break the
+// mount. The observed fork (Benjamin's Pixel 7) is on the local writer core
+// (writable=true), so base.local is the load-bearing one; base.view is added
+// in case the linearized view core conflicts. attachConflictListeners is safe
+// to call repeatedly (hypercore dedups identical listeners by monitor index).
+function attachConflictListeners (base, circleId) {
+  if (!base) return
+  for (const core of [base.local, base.view]) {
+    try {
+      if (core && typeof core.on === 'function') {
+        core.on('conflict', (length, fork) => onCoreConflict(core, length, fork, circleId))
+      }
+    } catch (e) { mark('conflict:listener-attach-failed', { circle: circleId ? circleId.slice(0, 8) : null, err: e && e.message }) }
+  }
 }
 
 // Mark a circle's local Autobase as wedged (append or read timed out). Idempotent.
@@ -3730,6 +3747,7 @@ async function buildCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, re
   if (encryptionKeyHex) baseOpts.encryptionKey = b4a.from(encryptionKeyHex, 'hex')
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
+  attachConflictListeners(base, circleId)
   return base
 }
 
