@@ -26,6 +26,7 @@ const Hyperbee = require('hyperbee')
 const Hyperswarm = require('hyperswarm')
 const Autobase = require('autobase')
 const b4a = require('b4a')
+const abort = require('bare-abort')
 const { generateKeypair } = require('./identity')
 const { generateCircleId, generateRendezvousKey, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite, buildSeedInvite, buildSeederPairLink, parseSeederPairLink, inviteCircleIdMismatch } = require('./invite')
@@ -54,6 +55,7 @@ const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
 const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
+const { shouldSwallowFault } = require('./lib/conflictSeatbelt')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
@@ -205,6 +207,8 @@ let _forceAutobaseLastSeen = false
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
+let _lastConflictAt = 0 // ts of the most recent hypercore 'conflict' event; gates the post-conflict seatbelt so it only swallows a fork's fallout, not unrelated bugs (proposal 2026-06-27-fork-conflict-recovery)
+let _faultHandlersInstalled = false // guards installFaultHandlers against re-running on init retry (lock-contention reattempts)
 const _leavingCircles = new Set() // circleIds with a voluntary circle:leave in flight. Set before we append our left: tombstone, cleared on local teardown. Suppresses autoAppendMemberRow so the membership sweep doesn't mistake our just-written self-leave for a stale tombstone and resurrect our member row with a fresh joinedAt -- which would un-leave us on every peer (and fire a spurious member:joined).
 const _lastGoodSnapshot = new Map() // circleId → last successful snapshotCircle result, served when a bounded snapshot times out so the UI stays populated (proposal 2026-06-03c)
 const _lastAppendedPos = new Map() // circleId → { lat, lon } last written to lastSeen (movement-gate state, proposal 2026-05-29)
@@ -2555,6 +2559,81 @@ async function loadPersistedSharing () {
 function circleIdForBase (base) {
   for (const [cid, b] of _circleBases) if (b === base) return cid
   return null
+}
+
+// Best-effort attribution of a conflicting Hypercore to a mounted circle.
+// The observed fork (Benjamin's Pixel 7, 2026-06-24) is on the local writer
+// core (writable=true), so a base.local.key match covers the real case;
+// bootstrap/view matches are added defensively. An unattributable conflict
+// (e.g. a remote writer core opened on demand) still gets the seatbelt — the
+// affected base's sessions close, so its next append times out and the
+// existing flagDegraded path catches it (proposal 2026-06-27-fork-conflict-recovery).
+function circleIdForConflictCore (core) {
+  let keyHex = null
+  try { keyHex = core && core.key ? b4a.toString(core.key, 'hex') : null } catch (e) { /* core not ready */ }
+  if (!keyHex) return null
+  for (const [cid, base] of _circleBases) {
+    try { if (base.local && base.local.key && b4a.toString(base.local.key, 'hex') === keyHex) return cid } catch (e) {}
+    try { if (base.bootstrap && b4a.toString(base.bootstrap, 'hex') === keyHex) return cid } catch (e) {}
+    try { if (base.view && base.view.key && b4a.toString(base.view.key, 'hex') === keyHex) return cid } catch (e) {}
+  }
+  return null
+}
+
+// Fires on a hypercore fork conflict (two validly-signed but divergent blocks
+// at the same index). Hypercore emits this from _onconflict BEFORE it tears
+// down the core's sessions, so we stamp _lastConflictAt (arming the seatbelt
+// for the 'Closed' rejection that the teardown leaks) and flag the circle for
+// repair, which the user heals via circle:repair (fresh writer + seeder
+// re-sync). Recovery is routing, not crashing.
+function onCoreConflict (core, length, fork) {
+  _lastConflictAt = Date.now()
+  let disc = null
+  try { disc = core && core.discoveryKey ? b4a.toString(core.discoveryKey, 'hex') : null } catch (e) {}
+  const circleId = circleIdForConflictCore(core)
+  let writable = false
+  try { writable = !!(core && core.writable) } catch (e) {}
+  mark('conflict:detected', { circle: circleId ? circleId.slice(0, 8) : null, disc: disc ? disc.slice(0, 16) : null, writable, length, fork })
+  if (circleId) {
+    flagDegraded(circleId, 'conflict')
+    mark('conflict:routed-to-repair', { circle: circleId.slice(0, 8) })
+  } else {
+    mark('conflict:unattributed', { disc: disc ? disc.slice(0, 16) : null })
+  }
+}
+
+// Last line of defense. Hypercore's conflict teardown rejects in-flight
+// sessions with Error('Closed'), and that rejection escapes through the
+// replicator's Promise.all as an unhandled rejection. With no handler Bare
+// aborts the whole worklet (every circle, not just the broken one) — the
+// 17x crash loop on Benjamin's Pixel 7. shouldSwallowFault (lib/conflictSeatbelt)
+// swallows ONLY a conflict's fallout; we preserve fail-fast abort for everything
+// else, so the diagnostic stack the logcat report relies on is never lost.
+function onWorkletFault (err, kind) {
+  if (shouldSwallowFault(err, _lastConflictAt, Date.now())) {
+    mark('conflict:seatbelt-caught', { kind, msg: ((err && err.message) || String(err)).slice(0, 80) })
+    console.warn('[bare] swallowed post-conflict ' + kind + ': ' + ((err && err.message) || err))
+    return // circle already flagged needsRepair; keep the rest of the app alive
+  }
+  // Not conflict fallout: preserve today's fail-fast behavior, including the
+  // stack trace the crash report depends on, then abort exactly as Bare would.
+  console.error('[bare] fatal ' + kind + ': ' + ((err && err.stack) || (err && err.message) || err))
+  abort()
+}
+
+// Install once (guarded against init-retry double-registration). The store
+// watcher attaches a 'conflict' listener to every core opened in any
+// namespace; watch only fires for cores set AFTER it registers, so this runs
+// right after the store is ready and before any circle/seeder core is opened.
+function installFaultHandlers () {
+  if (_faultHandlersInstalled) return
+  _faultHandlersInstalled = true
+  Bare.on('uncaughtException', (err) => onWorkletFault(err, 'uncaughtException'))
+  Bare.on('unhandledRejection', (err) => onWorkletFault(err, 'unhandledRejection'))
+  _store.watch((core) => {
+    core.on('conflict', (length, fork) => onCoreConflict(core, length, fork))
+  })
+  mark('faulthandlers:installed')
 }
 
 // Mark a circle's local Autobase as wedged (append or read timed out). Idempotent.
@@ -5412,6 +5491,11 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   }
 
   mark('init:store-ready')
+
+  // Install fault handlers before any circle/seeder core opens: the global
+  // conflict seatbelt + the per-core 'conflict' watcher (proposal
+  // 2026-06-27-fork-conflict-recovery). Covers both member and seed modes.
+  installFaultHandlers()
 
   // Start bounding the WAL as soon as the store is open, before the heavy
   // Autobase mount. Runs in both member and seed modes (both share _store).
