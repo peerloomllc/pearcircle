@@ -1,6 +1,6 @@
 # Fork-conflict recovery review
 
-**Status: recovery half APPROVED + merged 2026-06-28 (Tim, in-session). Prevention batch (items 2-4) PENDING REVIEW.** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
+**Status: recovery half APPROVED + merged 2026-06-28 (#132). Prevention items 3+4 IMPLEMENTED on `feature/fork-prevention` (PENDING REVIEW); item 2 DEFERRED (no clean API).** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
 
 ## What is built and validated (recovery + seatbelt half)
 
@@ -16,7 +16,7 @@
 ## Decisions to confirm (recorded 2026-06-28, please sign off)
 
 1. Repair trigger: auto-flag + manual tap. ✅ proposed, implemented.
-2. Idempotency: pin rebuilt base to seeder + refuse (shed) the conflicting peer. ⏳ design only.
+2. Idempotency: pin rebuilt base to seeder + refuse (shed) the conflicting peer. ⛔ DEFERRED 2026-06-28 — no clean hypercore API to identify/shed the offending peer or to prioritise the seeder as a download source (see proposal feasibility finding). Safe to defer: items 3+4 prevent the fork, recovery handles recurrence gracefully (bounded by manual Repair). Follow-up needs an upstream hypercore affordance.
 3. Circle-wide eviction: deferred, local repair only for v1. ✅ proposed.
 4. Remote forks: source-agnostic seatbelt. ✅ implemented (commit bd74b40).
 5. Prevention now, both guards (rewind guard + durability ordering) → T3. ⏳ design only.
