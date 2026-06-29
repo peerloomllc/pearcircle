@@ -2753,6 +2753,7 @@ async function safeAppend (base, op, label) {
   if (writerRewindBlocked(base, cid)) return false
   const { ok, timedOut } = await raceAppend(base.append(op), APPEND_TIMEOUT_MS)
   if (timedOut) flagDegraded(cid, 'append:' + (label || ''))
+  else if (ok) scheduleDurabilityFlush() // item 4: bound the WAL-loss window after a writer append
   return ok
 }
 
@@ -5525,6 +5526,27 @@ const flushStore = createStoreFlusher({
 function startStoreFlushTimer () {
   if (_storeFlushTimer) return
   _storeFlushTimer = setInterval(() => { flushStore('interval') }, STORE_FLUSH_INTERVAL_MS)
+}
+
+// Durability ordering (proposal 2026-06-27 item 4 / decision 5b). The interval
+// flush above leaves up to 5 min (or until the 64 MB write buffer fills) where
+// a just-appended writer block lives only in the WAL — if a crash loses the WAL
+// (the bad_alloc boot wedge), that block is gone locally but peers may already
+// hold it, leaving us behind the network on our own core: the truncation that
+// the rewind guard then has to clean up. Shrink that window: schedule a
+// coalesced flush ~1.5s after a writer append. Coalesced (not debounced/reset)
+// so a burst of appends still flushes within ~1.5s of the FIRST one, bounding
+// the durability gap regardless of append rate. Reuses the small-frequent
+// flusher, so it never grows into the giant first-flush that wedged boot.
+const DURABILITY_FLUSH_MS = 1500
+let _durabilityFlushTimer = null
+function scheduleDurabilityFlush () {
+  if (_durabilityFlushTimer) return
+  _durabilityFlushTimer = setTimeout(() => {
+    _durabilityFlushTimer = null
+    flushStore('writer-append').catch(() => {})
+  }, DURABILITY_FLUSH_MS)
+  if (_durabilityFlushTimer && _durabilityFlushTimer.unref) _durabilityFlushTimer.unref()
 }
 
 // Full-keyspace RocksDB compaction to reclaim dead SST left by overwritten
