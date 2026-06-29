@@ -5311,19 +5311,23 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   // expanded Collapsible, or null when all are collapsed.
   const [openSection, setOpenSection] = useState(null)
   const toggleSection = (id) => setOpenSection((s) => (s === id ? null : id))
+  // Shared sub-section label inside the consolidated Collapsibles (Trips,
+  // Staying in sync, Display & map). Set marginTop per use (0 for the first
+  // label in a section, spacing.lg/xl to separate later ones).
+  const subLabel = { ...typography.caption, color: colors.text.secondary, marginBottom: spacing.sm, fontWeight: 400 }
   // Battery banner / onboarding deep-link signal: when the sheet opens
-  // with initialExpand='battery', auto-expand Advanced and scroll the
-  // section into view so the user lands on the toggle instead of the
-  // top of Settings. Ref keeps it one-shot per sheet open.
-  const advancedRef = useRef(null)
+  // with initialExpand='battery', auto-expand "Staying in sync" (where the
+  // battery toggle now lives) and scroll it into view so the user lands on
+  // the toggle instead of the top of Settings. One-shot per sheet open.
+  const stayingSyncRef = useRef(null)
   const handledInitialExpandRef = useRef(null)
   useEffect(() => {
     if (!active) { handledInitialExpandRef.current = null; return }
     if (initialExpand === 'battery' && handledInitialExpandRef.current !== initialExpand) {
       handledInitialExpandRef.current = initialExpand
-      setOpenSection('advanced')
+      setOpenSection('stayingSync')
       requestAnimationFrame(() => {
-        try { advancedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
+        try { stayingSyncRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
       })
     }
   }, [active, initialExpand])
@@ -5522,36 +5526,25 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <LocationSharingSection active={active && openSection === 'locationSharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
       </Collapsible>
 
-      <Collapsible title='Trip sharing' icon={MapTrifold} open={openSection === 'tripSharing'} onToggle={() => toggleSection('tripSharing')} maxHeight='1200px'>
-        <TripsSharingSection active={active && openSection === 'tripSharing'} />
-      </Collapsible>
-
-      <Collapsible title='Trip notifications' icon={BellSimple} open={openSection === 'tripNotifications'} onToggle={() => toggleSection('tripNotifications')} maxHeight='1200px'>
+      {/* Trips: sharing + notifications for trips together. */}
+      <Collapsible title='Trips' icon={MapTrifold} open={openSection === 'trips'} onToggle={() => toggleSection('trips')} maxHeight='1800px'>
+        <p style={{ ...subLabel, marginTop: 0 }}>Trip sharing</p>
+        <TripsSharingSection active={active && openSection === 'trips'} />
+        <p style={{ ...subLabel, marginTop: spacing.xl }}>Trip notifications</p>
         <TripNotificationsSection />
       </Collapsible>
 
-      <Collapsible title='Sync reminder' icon={ArrowsClockwise} open={openSection === 'syncReminder'} onToggle={() => toggleSection('syncReminder')} maxHeight='1200px'>
+      {/* Staying in sync: everything that keeps the no-server P2P backend
+          running -- the daily open reminder, boot autostart (Android), and
+          the battery exemption. The 'battery' deep-link lands here. */}
+      <div ref={stayingSyncRef} />
+      <Collapsible title='Staying in sync' icon={ArrowsClockwise} open={openSection === 'stayingSync'} onToggle={() => toggleSection('stayingSync')} maxHeight='2600px'>
+        <p style={{ ...subLabel, marginTop: 0 }}>Daily reminder</p>
         <SyncReminderSection />
-      </Collapsible>
-
-      {/* Renders its own Collapsible, or nothing on iOS (no boot-resume path). */}
-      <AutostartSection open={openSection === 'autostart'} onToggle={() => toggleSection('autostart')} />
-
-      <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
-        <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
-        <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
-      </Collapsible>
-
-      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
-        <SeedersSection active={active && openSection === 'seeders'} />
-      </Collapsible>
-
-      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={openSection === 'advanced'} onToggle={() => toggleSection('advanced')} maxHeight='1200px'>
+        <AutostartStatus />
         {battery.supported && (
-          <div style={{ marginBottom: spacing.lg }}>
-            <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Battery optimization</p>
+          <div style={{ marginTop: spacing.lg }}>
+            <p style={{ ...subLabel, marginTop: 0 }}>Battery optimization</p>
             {battery.exempt ? (
               <p style={s.muted}>
                 Battery optimization is off for PearCircle. Location sharing
@@ -5573,26 +5566,36 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
             {batteryError && <p style={s.error}>{batteryError}</p>}
           </div>
         )}
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Map tiles</p>
+      </Collapsible>
+
+      <Collapsible title='Display & map' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')} maxHeight='1600px'>
+        <p style={{ ...subLabel, marginTop: 0 }}>Theme</p>
+        <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
+        <p style={{ ...subLabel, marginTop: spacing.lg }}>Distance unit</p>
+        <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
+        <p style={{ ...subLabel, marginTop: spacing.lg }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
         <TileCacheSection />
-        {/* Debug (peer-trip notification investigation 2026-06-11): fire a
-            synthetic completed trip through the real replication path so peers
-            should get a "completed a 1 mile trip" notification, with no drive.
-            Gated on window.__pearDebug (set from __DEV__ by the shell), so it
-            only appears on debug builds and never ships to release users. */}
-        {typeof window !== 'undefined' && window.__pearDebug && (
-          <>
-            <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Debug</p>
-            <button
-              style={{ ...s.primaryBtn, marginTop: spacing.sm }}
-              onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
-            >
-              Inject test trip
-            </button>
-          </>
-        )}
       </Collapsible>
+
+      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
+        <SeedersSection active={active && openSection === 'seeders'} />
+      </Collapsible>
+
+      {/* Advanced is debug-only now (battery moved to Staying in sync, map
+          tiles to Display & map), so it only appears on debug builds. Gated
+          on window.__pearDebug (set from __DEV__ by the shell). */}
+      {typeof window !== 'undefined' && window.__pearDebug && (
+        <Collapsible title='Advanced' icon={Wrench} open={openSection === 'advanced'} onToggle={() => toggleSection('advanced')} maxHeight='1200px'>
+          <p style={{ ...subLabel, marginTop: 0 }}>Debug</p>
+          <button
+            style={{ ...s.primaryBtn, marginTop: spacing.sm }}
+            onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
+          >
+            Inject test trip
+          </button>
+        </Collapsible>
+      )}
     </div>
   )
 }
@@ -6111,15 +6114,18 @@ function SyncReminderSection () {
   )
 }
 
-// "Autostart after restart" diagnostic (Android only). PearCircle resumes
-// background sharing after a reboot or in-place update via the native
-// BootReceiver, but only when the gate is armed (sharing on in some circle)
-// AND a location grant is held -- and only if the app was opened at least once
-// since the update and never force-stopped (an OS "stopped state" rule we can't
-// read from inside the app). This surfaces the readable parts so a user or the
-// owner can see why a phone isn't auto-resuming without pulling logcat. Returns
-// null on iOS (no boot-resume path), so the whole section is hidden there.
-function AutostartSection ({ open, onToggle }) {
+// "Autostart after restart" status (Android only), a sub-block of the
+// "Staying in sync" Settings section. PearCircle resumes background sharing
+// after a reboot or in-place update via the native BootReceiver, but only when
+// the gate is armed (sharing on in some circle) AND a location grant is held --
+// and only if the app was opened at least once since the update and never
+// force-stopped (an OS "stopped state" rule we can't read from inside the app).
+// This surfaces the readable parts so a user or the owner can see why a phone
+// isn't auto-resuming without pulling logcat. Battery exemption is shown by the
+// sibling block in the same section, so it's intentionally not repeated here
+// (and it gates staying-alive, not arming). Returns null on iOS (no boot-resume
+// path), hiding the whole sub-block there.
+function AutostartStatus () {
   const [status, setStatus] = useState(null)
   const mountedRef = useRef(true)
   useEffect(() => {
@@ -6128,16 +6134,16 @@ function AutostartSection ({ open, onToggle }) {
       .then((r) => { if (mountedRef.current) setStatus(r || { supported: false }) })
       .catch(() => { if (mountedRef.current) setStatus({ supported: false }) })
     refresh()
-    // Re-read on foreground so returning from system Settings (permission or
-    // battery change) refreshes the readout without a manual action.
+    // Re-read on foreground so returning from system Settings (permission
+    // change) refreshes the readout without a manual action.
     pear.on('app:state', ({ state }) => { if (state === 'active') refresh() })
     return () => { mountedRef.current = false }
   }, [])
   // Stay hidden until we know it's supported: on iOS this resolves to
-  // supported:false and the section never appears (no header flash).
+  // supported:false and the sub-block never appears (no flash).
   if (!status || status.supported === false) return null
 
-  const { gateEnabled, locationGranted, locationStatus, batteryExempt } = status
+  const { gateEnabled, locationGranted, locationStatus } = status
   const armed = gateEnabled && locationGranted
   const headline = armed
     ? 'Armed. PearCircle will reopen itself after a phone restart.'
@@ -6157,7 +6163,8 @@ function AutostartSection ({ open, onToggle }) {
   )
 
   return (
-    <Collapsible title='Autostart after restart' icon={ArrowsClockwise} open={open} onToggle={onToggle} maxHeight='1200px'>
+    <div style={{ marginTop: spacing.lg }}>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Autostart after restart</p>
       <div style={{
         display: 'flex', alignItems: 'center', gap: spacing.sm,
         padding: spacing.md, borderRadius: radius.sm, marginBottom: spacing.md,
@@ -6181,15 +6188,11 @@ function AutostartSection ({ open, onToggle }) {
               ? 'set it to "Allow all the time" for reliable background sharing'
               : 'not granted'
       )}
-      {factorRow(
-        batteryExempt, !batteryExempt, 'Battery optimization',
-        batteryExempt ? 'not restricting the app' : 'exempt the app so it keeps running after it resumes'
-      )}
 
       <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: 0, fontWeight: 400 }}>
         One thing Android hides from the app: after you update PearCircle you have to open it once, and never "Force stop" it, or the system blocks it from starting on its own until you reopen it.
       </p>
-    </Collapsible>
+    </div>
   )
 }
 
