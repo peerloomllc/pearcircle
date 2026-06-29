@@ -1,6 +1,6 @@
 # Fork-conflict recovery review
 
-**Status: PENDING REVIEW** (stub opened 2026-06-28). Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is already written and on-device no-regression-validated.
+**Status: recovery half APPROVED + merged 2026-06-28 (Tim, in-session). Prevention batch (items 2-4) PENDING REVIEW.** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
 
 ## What is built and validated (recovery + seatbelt half)
 
