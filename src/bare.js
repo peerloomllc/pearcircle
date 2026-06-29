@@ -55,6 +55,7 @@ const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
 const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
+const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
@@ -207,6 +208,7 @@ const _degradedCircles = new Set() // circleIds whose base append/read timed out
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
 const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
 let _lastConflictAt = 0 // ts of the most recent hypercore 'conflict' event; gates the post-conflict seatbelt so it only swallows a fork's fallout, not unrelated bugs (proposal 2026-06-27-fork-conflict-recovery)
+const _rewoundCircles = new Set() // circleIds whose local writer core is behind the network (truncated); appends are blocked while the original tail downloads, then self-clears (proposal 2026-06-27 item 3)
 let _faultHandlersInstalled = false // guards installFaultHandlers against re-running on init retry (lock-contention reattempts)
 const _leavingCircles = new Set() // circleIds with a voluntary circle:leave in flight. Set before we append our left: tombstone, cleared on local teardown. Suppresses autoAppendMemberRow so the membership sweep doesn't mistake our just-written self-leave for a stale tombstone and resurrect our member row with a fresh joinedAt -- which would un-leave us on every peer (and fire a spurious member:joined).
 const _lastGoodSnapshot = new Map() // circleId → last successful snapshotCircle result, served when a bounded snapshot times out so the UI stays populated (proposal 2026-06-03c)
@@ -2746,9 +2748,41 @@ function clearRepairing (circleId) {
 async function safeAppend (base, op, label) {
   const cid = circleIdForBase(base)
   if (cid && _degradedCircles.has(cid)) return false
+  // Rewind guard (proposal 2026-06-27 item 3): never append past a truncated
+  // writer tip while the network still holds the original blocks, or we fork.
+  if (writerRewindBlocked(base, cid)) return false
   const { ok, timedOut } = await raceAppend(base.append(op), APPEND_TIMEOUT_MS)
   if (timedOut) flagDegraded(cid, 'append:' + (label || ''))
+  else if (ok) scheduleDurabilityFlush() // item 4: bound the WAL-loss window after a writer append
   return ok
+}
+
+// Synchronous, never-throws check on the writer-append hot path. Returns true
+// (block the append) when our own writer core (base.local) is shorter than the
+// longest copy a connected peer advertises for it — which can only mean we were
+// truncated, since nobody else signs our core. In that case we kick off a
+// background download of the original tail and skip the append; lastSeen is
+// last-writer-wins so the next location fix re-appends once we've caught up, and
+// member/transition writes retry on their own sweeps. If no peer is connected
+// (networkLength 0) we are authoritative and the append proceeds. Self-clears.
+function writerRewindBlocked (base, cid) {
+  try {
+    const local = base && base.local
+    if (!local || !local.peers || local.peers.length === 0) return false
+    let networkLen = 0
+    for (const p of local.peers) { const rl = (p && p.remoteLength) || 0; if (rl > networkLen) networkLen = rl }
+    const status = writerRewindStatus({ localLength: local.length, networkLength: networkLen })
+    if (!status.behind) {
+      if (cid && _rewoundCircles.has(cid)) { _rewoundCircles.delete(cid); mark('writer:rewind-cleared', { circle: cid.slice(0, 8), len: local.length }) }
+      return false
+    }
+    if (cid && !_rewoundCircles.has(cid)) {
+      _rewoundCircles.add(cid)
+      mark('writer:rewind-detected', { circle: cid.slice(0, 8), localLen: status.downloadFrom, networkLen: status.downloadTo })
+    }
+    try { local.download({ start: status.downloadFrom, end: status.downloadTo }) } catch (e) { /* download is best-effort */ }
+    return true
+  } catch (e) { return false } // a guard bug must never block all appends
 }
 
 // Bounded snapshotCircle (proposal 2026-06-03c). A corrupt base stalls the
@@ -5492,6 +5526,27 @@ const flushStore = createStoreFlusher({
 function startStoreFlushTimer () {
   if (_storeFlushTimer) return
   _storeFlushTimer = setInterval(() => { flushStore('interval') }, STORE_FLUSH_INTERVAL_MS)
+}
+
+// Durability ordering (proposal 2026-06-27 item 4 / decision 5b). The interval
+// flush above leaves up to 5 min (or until the 64 MB write buffer fills) where
+// a just-appended writer block lives only in the WAL — if a crash loses the WAL
+// (the bad_alloc boot wedge), that block is gone locally but peers may already
+// hold it, leaving us behind the network on our own core: the truncation that
+// the rewind guard then has to clean up. Shrink that window: schedule a
+// coalesced flush ~1.5s after a writer append. Coalesced (not debounced/reset)
+// so a burst of appends still flushes within ~1.5s of the FIRST one, bounding
+// the durability gap regardless of append rate. Reuses the small-frequent
+// flusher, so it never grows into the giant first-flush that wedged boot.
+const DURABILITY_FLUSH_MS = 1500
+let _durabilityFlushTimer = null
+function scheduleDurabilityFlush () {
+  if (_durabilityFlushTimer) return
+  _durabilityFlushTimer = setTimeout(() => {
+    _durabilityFlushTimer = null
+    flushStore('writer-append').catch(() => {})
+  }, DURABILITY_FLUSH_MS)
+  if (_durabilityFlushTimer && _durabilityFlushTimer.unref) _durabilityFlushTimer.unref()
 }
 
 // Full-keyspace RocksDB compaction to reclaim dead SST left by overwritten

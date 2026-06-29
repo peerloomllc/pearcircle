@@ -115,6 +115,11 @@ Approach:
 
 Open review points: can we scope a shed to the offending peer+core specifically, or only the whole connection? If only the whole connection, a member who legitimately needs other circles served gets dropped — acceptable? Confirm the seeder reliably has the original branch (it usually does, but Non-goals: it is not an authority — if the seeder itself only has the forked branch, this degrades to "conflict recurs, circle stays needsRepair", which is safe, not corrupting).
 
+**Feasibility finding (2026-06-28) — item 2 DEFERRED.** Both halves lack a clean public API:
+- *Refuse/shed the offending peer:* hypercore's `replicator._handleData(data)` calls `core.checkConflict(data, this)` with the source Peer in scope, but `_onconflict` emits the public `'conflict'` event as `(length, fork, proof)` with NO peer, and its built-in reaction (`replicator.onconflict()`) notifies ALL peers and tears every session down. So our listener cannot tell which connection delivered the fork without patching hypercore or fragile timing correlation.
+- *Seeder-first re-sync:* `corestore.replicate(conn)` replicates the whole store over each connection and hypercore fetches each block from whichever peer has it (availability-based); there is no public "download this core from that peer first" priority.
+- *Why deferring is safe:* items 3 + 4 prevent the fork at the source, so post-repair recurrence is already unlikely; and the recovery half handles any recurrence gracefully (no crash, re-flag `needsRepair`), bounded by the user's manual Repair tap (decision 1), not an infinite loop. A robust item 2 needs an upstream hypercore affordance (surface the conflicting peer; or a per-core preferred-source download). Tracked as a follow-up, not shipped in this branch.
+
 ### Item 3 — Writer-core rewind guard (decision 5a)
 
 Surfaces: `base.local.length` (our writer core's local length), `base.local.peers[].remoteLength` (length each connected peer advertises for *that* core — already per-core, so correctly scoped), `base.local.download(range)`, `base.update()`.

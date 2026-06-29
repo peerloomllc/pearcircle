@@ -1,6 +1,6 @@
 # Fork-conflict recovery review
 
-**Status: recovery half APPROVED + merged 2026-06-28 (Tim, in-session). Prevention batch (items 2-4) PENDING REVIEW.** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
+**Status: recovery half APPROVED + merged 2026-06-28 (#132). Prevention items 3+4 APPROVED + merged 2026-06-28 (#133, Tim, in-session). Item 2 DEFERRED (no clean API).** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
 
 ## What is built and validated (recovery + seatbelt half)
 
@@ -9,14 +9,20 @@
 - **Validation.** `npm run verify` green (668 tests, pure decision + parser logic unit-tested). On-device boot clean on the TCL (D2) and Pixel 9 (D1), debug build: `faulthandlers:installed`, `init:done {circles:2}`, zero SIGABRT, worklet stable.
 - **Two first-cut regressions found + fixed on-device** (see `reference_bare_worklet_native_addon_traps`): `require('bare-abort')` dlopen-failed (→ `Bare.exit`); `_store.watch` yields corestore's internal Core without `.on` (→ session-level listeners).
 
-## Validation gap (must be acknowledged at sign-off)
+## Validation gap (narrowed 2026-06-28)
 
-**None of our test devices actually have the fork.** D1's earlier crash-loop was the `bare-abort` regression, not a real fork. The genuine fork is on Benjamin's *release* build, which we cannot deploy a debug build to. So the seatbelt/recovery has been validated only as **no-regression** — the actual fork-survival and `circle:repair`-heals-it paths are unexercised on hardware. Options to close this: a node repro harness that forces a writer-core fork (proposed in the proposal's Verify section), and/or a release-channel build for Benjamin once reviewed.
+**No test device has a real fork** (D1's earlier crash-loop was the `bare-abort` regression, not a fork; the genuine fork is on Benjamin's *release* build we can't deploy debug to). Originally this meant the fix was only no-regression-validated. Now narrowed by `tools/repro-fork.js`, which reproduces the bug in-process with real Corestore/Hypercore:
+- Reproduces the EXACT signature from Benjamin's log — `[hypercore] conflict detected in <disc> (writable=true,quorum=1)` — and confirms `parseConflictLog` matches it and the seatbelt would swallow the escaping `Closed` (Scenario B, PASS).
+- Confirms a same-fork truncation with no divergent append self-heals via replication (Scenario A, PASS), so the danger is truncate-then-append-before-resync — what the rewind guard targets.
+
+On-device seatbelt wiring CONFIRMED 2026-06-28 (TCL, throwaway debug build, since reverted): a debug hook emitted hypercore's exact conflict log line then threw the exact escaping `Error('Closed')`. Logcat showed the full chain — `conflict:log-detected` (the console-tap stamped `_lastConflictAt`) → `conflict:seatbelt-caught {kind:unhandledRejection, msg:Closed}` → zero SIGABRT, worklet alive. So Bare's `unhandledRejection` → `onWorkletFault` → swallow path works on real hardware against the real escaping rejection.
+
+Residual gap: the `circle:repair` heal has not been exercised on hardware against a genuine fork. A faithful on-device fork could not be forged — directly truncating `base.local` wedges autobase's mount (a crude-injection artifact, NOT the real bug, which boots fine and conflicts during replication). The crude injection corrupted the TCL's circle (since wiped with `pm clear`; TCL now fresh, needs re-pairing). Closing this last gap cleanly needs either an offline store-surgery harness or a release build for Benjamin. The repair machinery itself is the existing append-hang path, already validated for that path.
 
 ## Decisions to confirm (recorded 2026-06-28, please sign off)
 
 1. Repair trigger: auto-flag + manual tap. ✅ proposed, implemented.
-2. Idempotency: pin rebuilt base to seeder + refuse (shed) the conflicting peer. ⏳ design only.
+2. Idempotency: pin rebuilt base to seeder + refuse (shed) the conflicting peer. ⛔ DEFERRED 2026-06-28 — no clean hypercore API to identify/shed the offending peer or to prioritise the seeder as a download source (see proposal feasibility finding). Safe to defer: items 3+4 prevent the fork, recovery handles recurrence gracefully (bounded by manual Repair). Follow-up needs an upstream hypercore affordance.
 3. Circle-wide eviction: deferred, local repair only for v1. ✅ proposed.
 4. Remote forks: source-agnostic seatbelt. ✅ implemented (commit bd74b40).
 5. Prevention now, both guards (rewind guard + durability ordering) → T3. ⏳ design only.
@@ -31,9 +37,9 @@ Carried from the proposal's "Implementation design" section — these are what t
 
 ## Sign-off checklist
 
-- [ ] Decisions 1-5 confirmed.
-- [ ] Validation gap accepted (or a repro-harness / release-build path chosen first).
-- [ ] Open review points for items 2-4 resolved or explicitly deferred.
-- [ ] T3 tier acknowledged.
+- [x] Decisions 1-5 confirmed.
+- [x] Validation gap accepted: node repro reproduces Ben's exact signature; on-device seatbelt wiring confirmed on the TCL; residual `circle:repair`-on-hardware heal accepted as a follow-up (offline harness or release build).
+- [x] Open review points for items 2-4 resolved or explicitly deferred (item 2 deferred on the upstream-API finding).
+- [x] T3 tier acknowledged.
 
-_Approval line (fill on sign-off): Approved YYYY-MM-DD (Tim, in-session) — …_
+_Approved 2026-06-28 (Tim, in-session) — prevention items 3+4 merged via #133; item 2 deferred to an upstream hypercore ask._
