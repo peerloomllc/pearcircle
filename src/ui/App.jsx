@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
@@ -4974,20 +4974,22 @@ function CirclesSection ({ active = true, onChanged }) {
   // "Import from file" footer button, shown whether or not the user has any
   // circles (importing always mints a brand-new one).
   const importButton = (
-    <button
-      onClick={performImport}
-      disabled={importBusy}
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
-        marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
-        background: 'transparent', color: colors.text.secondary,
-        border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
-        fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
-        opacity: importBusy ? 0.6 : 1,
-      }}>
-      <DownloadSimple size={16} weight="regular" />
-      {importBusy ? 'Importing...' : 'Import circle from file'}
-    </button>
+    <div style={{ textAlign: 'center' }}>
+      <button
+        onClick={performImport}
+        disabled={importBusy}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
+          marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
+          background: 'transparent', color: colors.text.secondary,
+          border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
+          fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+          opacity: importBusy ? 0.6 : 1,
+        }}>
+        <DownloadSimple size={16} weight="regular" />
+        {importBusy ? 'Importing...' : 'Import circle from file'}
+      </button>
+    </div>
   )
 
   if (list.length === 0) {
@@ -5013,7 +5015,7 @@ function CirclesSection ({ active = true, onChanged }) {
   return (
     <>
       <p style={s.muted}>
-        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy.
+        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy. If you own a circle, its row also has icons to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places) or export its name, Places and settings to a file you can re-import later.
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
         {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
@@ -5311,19 +5313,23 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   // expanded Collapsible, or null when all are collapsed.
   const [openSection, setOpenSection] = useState(null)
   const toggleSection = (id) => setOpenSection((s) => (s === id ? null : id))
+  // Shared sub-section label inside the consolidated Collapsibles (Trips,
+  // Staying in sync, Display & map). Set marginTop per use (0 for the first
+  // label in a section, spacing.lg/xl to separate later ones).
+  const subLabel = { ...typography.caption, color: colors.text.secondary, marginBottom: spacing.sm, fontWeight: 400, textAlign: 'center' }
   // Battery banner / onboarding deep-link signal: when the sheet opens
-  // with initialExpand='battery', auto-expand Advanced and scroll the
-  // section into view so the user lands on the toggle instead of the
-  // top of Settings. Ref keeps it one-shot per sheet open.
-  const advancedRef = useRef(null)
+  // with initialExpand='battery', auto-expand "Staying in sync" (where the
+  // battery toggle now lives) and scroll it into view so the user lands on
+  // the toggle instead of the top of Settings. One-shot per sheet open.
+  const stayingSyncRef = useRef(null)
   const handledInitialExpandRef = useRef(null)
   useEffect(() => {
     if (!active) { handledInitialExpandRef.current = null; return }
     if (initialExpand === 'battery' && handledInitialExpandRef.current !== initialExpand) {
       handledInitialExpandRef.current = initialExpand
-      setOpenSection('advanced')
+      setOpenSection('stayingSync')
       requestAnimationFrame(() => {
-        try { advancedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
+        try { stayingSyncRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
       })
     }
   }, [active, initialExpand])
@@ -5522,33 +5528,25 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <LocationSharingSection active={active && openSection === 'locationSharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
       </Collapsible>
 
-      <Collapsible title='Trip sharing' icon={MapTrifold} open={openSection === 'tripSharing'} onToggle={() => toggleSection('tripSharing')} maxHeight='1200px'>
-        <TripsSharingSection active={active && openSection === 'tripSharing'} />
-      </Collapsible>
-
-      <Collapsible title='Trip notifications' icon={BellSimple} open={openSection === 'tripNotifications'} onToggle={() => toggleSection('tripNotifications')} maxHeight='1200px'>
+      {/* Trips: sharing + notifications for trips together. */}
+      <Collapsible title='Trips' icon={MapTrifold} open={openSection === 'trips'} onToggle={() => toggleSection('trips')} maxHeight='1800px'>
+        <p style={{ ...subLabel, marginTop: 0 }}>Trip sharing</p>
+        <TripsSharingSection active={active && openSection === 'trips'} />
+        <p style={{ ...subLabel, marginTop: spacing.xl }}>Trip notifications</p>
         <TripNotificationsSection />
       </Collapsible>
 
-      <Collapsible title='Sync reminder' icon={ArrowsClockwise} open={openSection === 'syncReminder'} onToggle={() => toggleSection('syncReminder')} maxHeight='1200px'>
+      {/* Staying in sync: everything that keeps the no-server P2P backend
+          running -- the daily open reminder, boot autostart (Android), and
+          the battery exemption. The 'battery' deep-link lands here. */}
+      <div ref={stayingSyncRef} />
+      <Collapsible title='Staying in sync' icon={ArrowsClockwise} open={openSection === 'stayingSync'} onToggle={() => toggleSection('stayingSync')} maxHeight='2600px'>
+        <p style={{ ...subLabel, marginTop: 0 }}>Daily reminder</p>
         <SyncReminderSection />
-      </Collapsible>
-
-      <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
-        <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Distance unit</p>
-        <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
-      </Collapsible>
-
-      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
-        <SeedersSection active={active && openSection === 'seeders'} />
-      </Collapsible>
-
-      <div ref={advancedRef} /><Collapsible title='Advanced' icon={Wrench} open={openSection === 'advanced'} onToggle={() => toggleSection('advanced')} maxHeight='1200px'>
+        <AutostartStatus />
         {battery.supported && (
-          <div style={{ marginBottom: spacing.lg }}>
-            <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Battery optimization</p>
+          <div style={{ marginTop: spacing.lg }}>
+            <p style={{ ...subLabel, marginTop: 0 }}>Battery optimization</p>
             {battery.exempt ? (
               <p style={s.muted}>
                 Battery optimization is off for PearCircle. Location sharing
@@ -5570,26 +5568,36 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
             {batteryError && <p style={s.error}>{batteryError}</p>}
           </div>
         )}
-        <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Map tiles</p>
+      </Collapsible>
+
+      <Collapsible title='Display & map' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')} maxHeight='1600px'>
+        <p style={{ ...subLabel, marginTop: 0 }}>Theme</p>
+        <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
+        <p style={{ ...subLabel, marginTop: spacing.lg }}>Distance unit</p>
+        <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
+        <p style={{ ...subLabel, marginTop: spacing.lg }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
         <TileCacheSection />
-        {/* Debug (peer-trip notification investigation 2026-06-11): fire a
-            synthetic completed trip through the real replication path so peers
-            should get a "completed a 1 mile trip" notification, with no drive.
-            Gated on window.__pearDebug (set from __DEV__ by the shell), so it
-            only appears on debug builds and never ships to release users. */}
-        {typeof window !== 'undefined' && window.__pearDebug && (
-          <>
-            <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: spacing.sm, fontWeight: 400 }}>Debug</p>
-            <button
-              style={{ ...s.primaryBtn, marginTop: spacing.sm }}
-              onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
-            >
-              Inject test trip
-            </button>
-          </>
-        )}
       </Collapsible>
+
+      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
+        <SeedersSection active={active && openSection === 'seeders'} />
+      </Collapsible>
+
+      {/* Advanced is debug-only now (battery moved to Staying in sync, map
+          tiles to Display & map), so it only appears on debug builds. Gated
+          on window.__pearDebug (set from __DEV__ by the shell). */}
+      {typeof window !== 'undefined' && window.__pearDebug && (
+        <Collapsible title='Advanced' icon={Wrench} open={openSection === 'advanced'} onToggle={() => toggleSection('advanced')} maxHeight='1200px'>
+          <p style={{ ...subLabel, marginTop: 0 }}>Debug</p>
+          <button
+            style={{ ...s.primaryBtn, marginTop: spacing.sm }}
+            onClick={() => { pear.call('trip:debugComplete', { distanceMeters: 1600 }).then((r) => { try { window.alert('Injected test trip (' + Math.round((r?.trip?.distanceMeters ?? 0)) + 'm). Watch peers for a notification.') } catch {} }).catch((e) => { try { window.alert('Inject failed: ' + (e?.message || e)) } catch {} }) }}
+          >
+            Inject test trip
+          </button>
+        </Collapsible>
+      )}
     </div>
   )
 }
@@ -6105,6 +6113,88 @@ function SyncReminderSection () {
         </div>
       )}
     </>
+  )
+}
+
+// "Autostart after restart" status (Android only), a sub-block of the
+// "Staying in sync" Settings section. PearCircle resumes background sharing
+// after a reboot or in-place update via the native BootReceiver, but only when
+// the gate is armed (sharing on in some circle) AND a location grant is held --
+// and only if the app was opened at least once since the update and never
+// force-stopped (an OS "stopped state" rule we can't read from inside the app).
+// This surfaces the readable parts so a user or the owner can see why a phone
+// isn't auto-resuming without pulling logcat. Battery exemption is shown by the
+// sibling block in the same section, so it's intentionally not repeated here
+// (and it gates staying-alive, not arming). Returns null on iOS (no boot-resume
+// path), hiding the whole sub-block there.
+function AutostartStatus () {
+  const [status, setStatus] = useState(null)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    const refresh = () => pear.call('shell:autostart:get')
+      .then((r) => { if (mountedRef.current) setStatus(r || { supported: false }) })
+      .catch(() => { if (mountedRef.current) setStatus({ supported: false }) })
+    refresh()
+    // Re-read on foreground so returning from system Settings (permission
+    // change) refreshes the readout without a manual action.
+    pear.on('app:state', ({ state }) => { if (state === 'active') refresh() })
+    return () => { mountedRef.current = false }
+  }, [])
+  // Stay hidden until we know it's supported: on iOS this resolves to
+  // supported:false and the sub-block never appears (no flash).
+  if (!status || status.supported === false) return null
+
+  const { gateEnabled, locationGranted, locationStatus } = status
+  const armed = gateEnabled && locationGranted
+  const headline = armed
+    ? 'Armed. PearCircle will reopen itself after a phone restart.'
+    : !gateEnabled
+        ? 'Not armed yet. Turn on location sharing for at least one circle and it arms automatically.'
+        : 'Not armed. Location permission is off.'
+
+  const factorRow = (ok, warn, label, hint) => (
+    <div style={{ display: 'flex', alignItems: 'flex-start', gap: spacing.sm, marginTop: spacing.sm }}>
+      <span style={{ marginTop: 1, flexShrink: 0, color: ok ? colors.success : warn ? colors.warn : colors.error }}>
+        {ok ? <CheckCircle size={16} weight='fill' /> : <Warning size={16} weight='fill' />}
+      </span>
+      <span style={{ ...typography.caption, color: colors.text.secondary, fontWeight: 400 }}>
+        <span style={{ color: colors.text.primary }}>{label}</span>{hint ? ` - ${hint}` : ''}
+      </span>
+    </div>
+  )
+
+  return (
+    <div style={{ marginTop: spacing.lg }}>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400, textAlign: 'center' }}>Autostart after restart</p>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: spacing.sm,
+        padding: spacing.md, borderRadius: radius.sm, marginBottom: spacing.md,
+        background: colors.surface.input,
+        border: `1px solid ${armed ? colors.success : colors.warn}`,
+      }}>
+        <span style={{ flexShrink: 0, color: armed ? colors.success : colors.warn }}>
+          {armed ? <CheckCircle size={20} weight='fill' /> : <Warning size={20} weight='fill' />}
+        </span>
+        <span style={{ ...typography.caption, color: colors.text.primary, fontWeight: 400 }}>{headline}</span>
+      </div>
+
+      {factorRow(gateEnabled, false, 'Location sharing on', gateEnabled ? null : 'off in every circle')}
+      {factorRow(
+        locationStatus === 'always',
+        locationStatus === 'whenInUse',
+        'Location permission',
+        locationStatus === 'always'
+          ? 'allowed all the time'
+          : locationStatus === 'whenInUse'
+              ? 'set it to "Allow all the time" for reliable background sharing'
+              : 'not granted'
+      )}
+
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: 0, fontWeight: 400 }}>
+        One thing Android hides from the app: after you update PearCircle you have to open it once, and never "Force stop" it, or the system blocks it from starting on its own until you reopen it.
+      </p>
+    </div>
   )
 }
 
