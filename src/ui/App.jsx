@@ -1287,12 +1287,57 @@ function RepairBanner ({ count, circleName, onRepair, onDismiss }) {
   )
 }
 
+// How long an in-process repair may run before we stop promising it will
+// finish and escalate to "leave and rejoin". A healthy re-sync converges well
+// under this; the wedges that never converge (oplog bloat, forked view) would
+// otherwise spin "Repairing…" forever.
+const REPAIR_ESCALATE_MS = 75_000
+
 // Indeterminate "Repairing…" indicator. circle:repair returns in seconds but
 // the actual re-sync from the seeder + writer re-admission run async and can
 // take a long time, so this persists (via the worklet's `repairing` flag)
-// until the rebuilt base is functional again. No action -- it's in progress.
-function RepairingBanner ({ count, circleName, needsRestart = false }) {
+// until the rebuilt base is functional again. While it's progressing there's
+// no action; once it crosses REPAIR_ESCALATE_MS (escalated) we tell the user
+// some wedges can't be repaired and point them at leave + rejoin.
+function RepairingBanner ({ count, circleName, needsRestart = false, escalated = false, onResolve }) {
   const target = count > 1 ? `${count} circles` : (circleName || 'circle')
+  const bannerStyle = {
+    position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+    padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+    background: 'rgba(26,26,26,0.92)',
+    borderBottom: `1px solid ${colors.border}`,
+  }
+  // Escalated: the re-sync isn't converging. Some wedges (stuck/bloated or
+  // forked data) can't be rebuilt from peers; the reliable fix is to leave the
+  // circle and rejoin from a fresh invite. Not shown for the restart-staged
+  // case, which still has a real path ("reopen the app").
+  if (escalated && !needsRestart) {
+    return (
+      <div style={bannerStyle}>
+        <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
+          <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>
+            Repair is taking longer than usual
+          </div>
+          <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+            Some stuck data can't be rebuilt this way. If {count > 1 ? 'a circle' : (circleName || 'the circle')} still looks out of sync, leave it and rejoin from a fresh invite (ask the circle's owner to send a new one).
+          </div>
+          {onResolve && (
+            <button
+              onClick={onResolve}
+              style={{
+                display: 'inline-block', marginTop: spacing.sm, padding: '6px 14px',
+                background: colors.primary, color: colors.text.onPrimary,
+                border: 'none', borderRadius: radius.sm,
+                fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400, cursor: 'pointer',
+              }}
+            >
+              Open circle settings
+            </button>
+          )}
+        </div>
+      </div>
+    )
+  }
   const label = needsRestart
     ? `Finishing repair of ${target}`
     : (count > 1 ? `Repairing ${count} circles…` : `Repairing ${circleName || 'circle'}…`)
@@ -1300,12 +1345,7 @@ function RepairingBanner ({ count, circleName, needsRestart = false }) {
     ? 'Reopen the app to finish repairing.'
     : 'This can take a while. Your circle will catch up in the background.'
   return (
-    <div style={{
-      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
-      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
-      background: 'rgba(26,26,26,0.92)',
-      borderBottom: `1px solid ${colors.border}`,
-    }}>
+    <div style={bannerStyle}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, padding: `0 ${spacing.lg}px` }}>
         {!needsRestart && (
           <span style={{
@@ -2194,6 +2234,13 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // re-surfaces next launch since the worklet persists the degraded flag).
   const [repairConfirmOpen, setRepairConfirmOpen] = useState(false)
   const [repairBannerDismissed, setRepairBannerDismissed] = useState(false)
+  // Repair watchdog: a normal re-sync converges, but a wedge whose cause is in
+  // the replicated data (lastSeen oplog bloat or a forked view) never becomes
+  // writable, so "Repairing…" would spin forever with no completion. After
+  // REPAIR_ESCALATE_MS of an in-process repair still unfinished, flip to
+  // "leave and rejoin" guidance. The staged-for-restart case is excluded (it
+  // has its own "reopen the app" message). See the watchdog effect below.
+  const [repairEscalated, setRepairEscalated] = useState(false)
   // Consecutive failures of the 3s home refresh. A wedged worklet makes every
   // circles:getAll throw; the catch used to swallow it silently, so the UI
   // froze on last-good data with no hint (UX audit item f). Count failures and,
@@ -2474,6 +2521,18 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const repairingCircles = circles.filter((c) => c.repairing || c.repairStaged)
   const repairStagedPending = repairingCircles.some((c) => c.repairStaged)
   const needRepairCircles = circles.filter((c) => c.needsRepair && !c.repairing && !c.repairStaged)
+
+  // Repair watchdog: arm a one-shot timer while an in-process repair runs; if it
+  // hasn't cleared (the circle never becomes writable) by REPAIR_ESCALATE_MS,
+  // flip repairEscalated so the banner offers leave + rejoin instead of an
+  // endless spinner. Resets whenever the repair clears or staging changes.
+  const repairInProgress = repairingCircles.length > 0 && !repairStagedPending
+  useEffect(() => {
+    if (!repairInProgress) { setRepairEscalated(false); return }
+    setRepairEscalated(false)
+    const id = setTimeout(() => setRepairEscalated(true), REPAIR_ESCALATE_MS)
+    return () => clearTimeout(id)
+  }, [repairInProgress])
 
   // Single top-of-map banner slot (UX audit item a). Exactly one banner renders
   // at top:0, chosen by priority so they can never stack (previously each
@@ -2802,6 +2861,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           count={repairingCircles.length}
           circleName={repairingCircles[0]?.circle?.name}
           needsRestart={repairStagedPending}
+          escalated={repairEscalated}
+          onResolve={() => setSheet({ name: 'settings', expand: 'circles' })}
         />
       )}
       {topBanner === 'repair' && (
@@ -5325,9 +5386,16 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   const handledInitialExpandRef = useRef(null)
   useEffect(() => {
     if (!active) { handledInitialExpandRef.current = null; return }
-    if (initialExpand === 'battery' && handledInitialExpandRef.current !== initialExpand) {
-      handledInitialExpandRef.current = initialExpand
-      setOpenSection('stayingSync')
+    if (!initialExpand || handledInitialExpandRef.current === initialExpand) return
+    // 'battery' (home battery banner) -> Staying in sync, scrolled into view.
+    // 'circles' (repair-escalation banner) -> Circles, where leave/recreate live.
+    const target = initialExpand === 'battery' ? 'stayingSync'
+      : initialExpand === 'circles' ? 'circles'
+      : null
+    if (!target) return
+    handledInitialExpandRef.current = initialExpand
+    setOpenSection(target)
+    if (target === 'stayingSync') {
       requestAnimationFrame(() => {
         try { stayingSyncRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) } catch {}
       })
