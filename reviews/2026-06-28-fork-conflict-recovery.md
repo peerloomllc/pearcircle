@@ -9,9 +9,13 @@
 - **Validation.** `npm run verify` green (668 tests, pure decision + parser logic unit-tested). On-device boot clean on the TCL (D2) and Pixel 9 (D1), debug build: `faulthandlers:installed`, `init:done {circles:2}`, zero SIGABRT, worklet stable.
 - **Two first-cut regressions found + fixed on-device** (see `reference_bare_worklet_native_addon_traps`): `require('bare-abort')` dlopen-failed (→ `Bare.exit`); `_store.watch` yields corestore's internal Core without `.on` (→ session-level listeners).
 
-## Validation gap (must be acknowledged at sign-off)
+## Validation gap (narrowed 2026-06-28)
 
-**None of our test devices actually have the fork.** D1's earlier crash-loop was the `bare-abort` regression, not a real fork. The genuine fork is on Benjamin's *release* build, which we cannot deploy a debug build to. So the seatbelt/recovery has been validated only as **no-regression** — the actual fork-survival and `circle:repair`-heals-it paths are unexercised on hardware. Options to close this: a node repro harness that forces a writer-core fork (proposed in the proposal's Verify section), and/or a release-channel build for Benjamin once reviewed.
+**No test device has a real fork** (D1's earlier crash-loop was the `bare-abort` regression, not a fork; the genuine fork is on Benjamin's *release* build we can't deploy debug to). Originally this meant the fix was only no-regression-validated. Now narrowed by `tools/repro-fork.js`, which reproduces the bug in-process with real Corestore/Hypercore:
+- Reproduces the EXACT signature from Benjamin's log — `[hypercore] conflict detected in <disc> (writable=true,quorum=1)` — and confirms `parseConflictLog` matches it and the seatbelt would swallow the escaping `Closed` (Scenario B, PASS).
+- Confirms a same-fork truncation with no divergent append self-heals via replication (Scenario A, PASS), so the danger is truncate-then-append-before-resync — what the rewind guard targets.
+
+Residual gap: the full Bare-runtime wiring (onConflictLog → `_lastConflictAt` → `onWorkletFault` swallow, worklet stays alive; and `circle:repair` heals on hardware) is still only exercised as no-regression on the TCL + Pixel 9, not against a live fork. Closing it fully needs either a debug-gated on-device fork injection (ships a debug hook + risks the test circle) or a release build for Benjamin.
 
 ## Decisions to confirm (recorded 2026-06-28, please sign off)
 
