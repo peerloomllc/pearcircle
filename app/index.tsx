@@ -1138,6 +1138,29 @@ export default function Index() {
       }
       return
     }
+    if (msg.method === 'shell:autostart:get') {
+      // Settings "Autostart after restart" diagnostic. Reads the native gate
+      // BootReceiver checks (autostart_enabled + location grant) plus the
+      // location granularity and battery exemption, so the UI can show armed /
+      // why-not. iOS has no boot-resume path -> supported:false (section hidden).
+      if (Platform.OS !== 'android' || !PearCircleLocation?.getAutostartStatus) {
+        respond(msg.id, { supported: false })
+        return
+      }
+      try {
+        const s = await PearCircleLocation.getAutostartStatus()
+        respond(msg.id, {
+          supported: true,
+          gateEnabled: !!s?.gateEnabled,
+          locationGranted: !!s?.locationGranted,
+          locationStatus: s?.locationStatus ?? 'denied',
+          batteryExempt: !!s?.batteryExempt,
+        })
+      } catch (err: any) {
+        respond(msg.id, { supported: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
     if (msg.method === 'shell:notif:mute:list') {
       // Return the current mute set as an array of '{circleId}:{placeId}'
       // keys. Cheap; called once on UI init and after sets to refresh state.

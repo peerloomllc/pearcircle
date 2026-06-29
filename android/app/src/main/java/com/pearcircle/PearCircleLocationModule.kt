@@ -76,6 +76,40 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         promise.resolve(true)
     }
 
+    // Snapshot for the Settings "Autostart after restart" diagnostic. Mirrors
+    // exactly what BootReceiver gates on (the autostart_enabled flag + a fine-
+    // or-coarse location grant) so "armed" here means a reboot will actually
+    // resume, plus the location granularity and battery exemption so the UI can
+    // point the user at the specific knob to fix. Pure read; never prompts.
+    // iOS has no boot-resume mechanism and omits this method, so the section is
+    // Android-only (the shell guards on its presence).
+    @ReactMethod
+    fun getAutostartStatus(promise: Promise) {
+        val fine = hasFineLocation()
+        val coarse = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val bgRequired = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        val bgGranted = !bgRequired ||
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+        val locationStatus = when {
+            !fine && !coarse -> "denied"
+            bgGranted -> "always"
+            else -> "whenInUse"
+        }
+        val batteryExempt = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            true
+        } else {
+            (ctx.getSystemService(Context.POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(ctx.packageName)
+        }
+        val map: WritableMap = Arguments.createMap()
+        map.putBoolean("gateEnabled", isAutostartEnabled(ctx))
+        map.putBoolean("locationGranted", fine || coarse)
+        map.putString("locationStatus", locationStatus)
+        map.putBoolean("batteryExempt", batteryExempt)
+        promise.resolve(map)
+    }
+
     // Battery optimization is the OEM/Doze gate that pauses the
     // foreground location service after extended idle. Asking the
     // user to exempt the app keeps sharing reliable but is opt-in

@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
@@ -5534,6 +5534,9 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <SyncReminderSection />
       </Collapsible>
 
+      {/* Renders its own Collapsible, or nothing on iOS (no boot-resume path). */}
+      <AutostartSection open={openSection === 'autostart'} onToggle={() => toggleSection('autostart')} />
+
       <Collapsible title='Display' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')}>
         <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Theme</p>
         <ThemeToggleSection mode={themeMode} onChange={setThemeMode} />
@@ -6105,6 +6108,88 @@ function SyncReminderSection () {
         </div>
       )}
     </>
+  )
+}
+
+// "Autostart after restart" diagnostic (Android only). PearCircle resumes
+// background sharing after a reboot or in-place update via the native
+// BootReceiver, but only when the gate is armed (sharing on in some circle)
+// AND a location grant is held -- and only if the app was opened at least once
+// since the update and never force-stopped (an OS "stopped state" rule we can't
+// read from inside the app). This surfaces the readable parts so a user or the
+// owner can see why a phone isn't auto-resuming without pulling logcat. Returns
+// null on iOS (no boot-resume path), so the whole section is hidden there.
+function AutostartSection ({ open, onToggle }) {
+  const [status, setStatus] = useState(null)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    const refresh = () => pear.call('shell:autostart:get')
+      .then((r) => { if (mountedRef.current) setStatus(r || { supported: false }) })
+      .catch(() => { if (mountedRef.current) setStatus({ supported: false }) })
+    refresh()
+    // Re-read on foreground so returning from system Settings (permission or
+    // battery change) refreshes the readout without a manual action.
+    pear.on('app:state', ({ state }) => { if (state === 'active') refresh() })
+    return () => { mountedRef.current = false }
+  }, [])
+  // Stay hidden until we know it's supported: on iOS this resolves to
+  // supported:false and the section never appears (no header flash).
+  if (!status || status.supported === false) return null
+
+  const { gateEnabled, locationGranted, locationStatus, batteryExempt } = status
+  const armed = gateEnabled && locationGranted
+  const headline = armed
+    ? 'Armed. PearCircle will reopen itself after a phone restart.'
+    : !gateEnabled
+        ? 'Not armed yet. Turn on location sharing for at least one circle and it arms automatically.'
+        : 'Not armed. Location permission is off.'
+
+  const factorRow = (ok, warn, label, hint) => (
+    <div style={{ display: 'flex', alignItems: 'flex-start', gap: spacing.sm, marginTop: spacing.sm }}>
+      <span style={{ marginTop: 1, flexShrink: 0, color: ok ? colors.success : warn ? colors.warn : colors.error }}>
+        {ok ? <CheckCircle size={16} weight='fill' /> : <Warning size={16} weight='fill' />}
+      </span>
+      <span style={{ ...typography.caption, color: colors.text.secondary, fontWeight: 400 }}>
+        <span style={{ color: colors.text.primary }}>{label}</span>{hint ? ` - ${hint}` : ''}
+      </span>
+    </div>
+  )
+
+  return (
+    <Collapsible title='Autostart after restart' icon={ArrowsClockwise} open={open} onToggle={onToggle} maxHeight='1200px'>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: spacing.sm,
+        padding: spacing.md, borderRadius: radius.sm, marginBottom: spacing.md,
+        background: colors.surface.input,
+        border: `1px solid ${armed ? colors.success : colors.warn}`,
+      }}>
+        <span style={{ flexShrink: 0, color: armed ? colors.success : colors.warn }}>
+          {armed ? <CheckCircle size={20} weight='fill' /> : <Warning size={20} weight='fill' />}
+        </span>
+        <span style={{ ...typography.caption, color: colors.text.primary, fontWeight: 400 }}>{headline}</span>
+      </div>
+
+      {factorRow(gateEnabled, false, 'Location sharing on', gateEnabled ? null : 'off in every circle')}
+      {factorRow(
+        locationStatus === 'always',
+        locationStatus === 'whenInUse',
+        'Location permission',
+        locationStatus === 'always'
+          ? 'allowed all the time'
+          : locationStatus === 'whenInUse'
+              ? 'set it to "Allow all the time" for reliable background sharing'
+              : 'not granted'
+      )}
+      {factorRow(
+        batteryExempt, !batteryExempt, 'Battery optimization',
+        batteryExempt ? 'not restricting the app' : 'exempt the app so it keeps running after it resumes'
+      )}
+
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.lg, marginBottom: 0, fontWeight: 400 }}>
+        One thing Android hides from the app: after you update PearCircle you have to open it once, and never "Force stop" it, or the system blocks it from starting on its own until you reopen it.
+      </p>
+    </Collapsible>
   )
 }
 
