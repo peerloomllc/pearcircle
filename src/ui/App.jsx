@@ -4974,20 +4974,22 @@ function CirclesSection ({ active = true, onChanged }) {
   // "Import from file" footer button, shown whether or not the user has any
   // circles (importing always mints a brand-new one).
   const importButton = (
-    <button
-      onClick={performImport}
-      disabled={importBusy}
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
-        marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
-        background: 'transparent', color: colors.text.secondary,
-        border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
-        fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
-        opacity: importBusy ? 0.6 : 1,
-      }}>
-      <DownloadSimple size={16} weight="regular" />
-      {importBusy ? 'Importing...' : 'Import circle from file'}
-    </button>
+    <div style={{ textAlign: 'center' }}>
+      <button
+        onClick={performImport}
+        disabled={importBusy}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
+          marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
+          background: 'transparent', color: colors.text.secondary,
+          border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
+          fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+          opacity: importBusy ? 0.6 : 1,
+        }}>
+        <DownloadSimple size={16} weight="regular" />
+        {importBusy ? 'Importing...' : 'Import circle from file'}
+      </button>
+    </div>
   )
 
   if (list.length === 0) {
@@ -5013,7 +5015,7 @@ function CirclesSection ({ active = true, onChanged }) {
   return (
     <>
       <p style={s.muted}>
-        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy.
+        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy. If you own a circle, its row also has icons to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places) or export its name, Places and settings to a file you can re-import later.
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
         {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
@@ -5314,7 +5316,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
   // Shared sub-section label inside the consolidated Collapsibles (Trips,
   // Staying in sync, Display & map). Set marginTop per use (0 for the first
   // label in a section, spacing.lg/xl to separate later ones).
-  const subLabel = { ...typography.caption, color: colors.text.secondary, marginBottom: spacing.sm, fontWeight: 400 }
+  const subLabel = { ...typography.caption, color: colors.text.secondary, marginBottom: spacing.sm, fontWeight: 400, textAlign: 'center' }
   // Battery banner / onboarding deep-link signal: when the sheet opens
   // with initialExpand='battery', auto-expand "Staying in sync" (where the
   // battery toggle now lives) and scroll it into view so the user lands on
@@ -6164,7 +6166,7 @@ function AutostartStatus () {
 
   return (
     <div style={{ marginTop: spacing.lg }}>
-      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Autostart after restart</p>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400, textAlign: 'center' }}>Autostart after restart</p>
       <div style={{
         display: 'flex', alignItems: 'center', gap: spacing.sm,
         padding: spacing.md, borderRadius: radius.sm, marginBottom: spacing.md,
