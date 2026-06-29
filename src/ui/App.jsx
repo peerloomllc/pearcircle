@@ -3676,6 +3676,17 @@ const PIN_DARK = '#1a1a1a'
 const SPOKE_PULSE_MS = 2400
 // Green band half-width as a fraction of the spoke's length.
 const SPOKE_BAND_W = 0.16
+// Expanded-cluster ring geometry. The fanned avatars sit on a regular
+// k-gon around the shared hub. Two knobs:
+//  - SPREAD_GAP < 1 pulls adjacent avatars in until they overlap a little
+//    (1 = exactly tangent; 1.5 was the old airy spread). A slight overlap
+//    reads as "same spot" while each face stays tappable.
+//  - SPREAD_MIN_RADIUS floors the ring so the avatars never close over the
+//    centre. The hub halo is r=9 and a non-selected avatar is 60px (r=30),
+//    so a 40px floor leaves 40-30=10px of clearance: the hub/vertex stays
+//    visible between the bubbles even where they overlap each other.
+const SPREAD_GAP = 0.95
+const SPREAD_MIN_RADIUS = 40
 
 // Build the gradient stops for a spoke's traveling band. bandPos in
 // [0, 1] is the band centre along the gradient (0 = avatar pin end, 1 =
@@ -4656,9 +4667,10 @@ function applyLayout (map, states, ctx) {
     const key = clusterKey(ids)
     const c = clusterCentroid(ids, pointMap)
     if (key === expandedKey) {
-      // Wider gap + a radius floor so the equidistant polygon spreads far
-      // enough to read the connector spokes clearly.
-      const ring = computeRingOffsets(ids, { gap: 1.5, minRadius: 120 })
+      // Tight spread: adjacent avatars sit close (overlapping a little in
+      // larger clusters) while the radius floor keeps the centre hub visible
+      // between them. See SPREAD_GAP / SPREAD_MIN_RADIUS.
+      const ring = computeRingOffsets(ids, { gap: SPREAD_GAP, minRadius: SPREAD_MIN_RADIUS })
       for (const id of ids) {
         const st = states.get(id)
         const own = pointMap.get(id)
