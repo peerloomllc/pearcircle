@@ -1,6 +1,6 @@
 # Fork-conflict recovery review
 
-**Status: recovery half APPROVED + merged 2026-06-28 (#132). Prevention items 3+4 IMPLEMENTED on `feature/fork-prevention` (PENDING REVIEW); item 2 DEFERRED (no clean API).** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
+**Status: recovery half APPROVED + merged 2026-06-28 (#132). Prevention items 3+4 APPROVED + merged 2026-06-28 (#133, Tim, in-session). Item 2 DEFERRED (no clean API).** Proposal `proposals/2026-06-27-fork-conflict-recovery.md`, branch `bugfix/fork-conflict-recovery`. T3 (the bundled prevention guards change the replication durability invariant). This record gates the prevention implementation (items 2-4); the recovery + seatbelt half is on-device no-regression-validated and merged ahead of the prevention work per owner direction (it is self-contained and strictly safer than today's hard crash).
 
 ## What is built and validated (recovery + seatbelt half)
 
@@ -37,9 +37,9 @@ Carried from the proposal's "Implementation design" section — these are what t
 
 ## Sign-off checklist
 
-- [ ] Decisions 1-5 confirmed.
-- [ ] Validation gap accepted (or a repro-harness / release-build path chosen first).
-- [ ] Open review points for items 2-4 resolved or explicitly deferred.
-- [ ] T3 tier acknowledged.
+- [x] Decisions 1-5 confirmed.
+- [x] Validation gap accepted: node repro reproduces Ben's exact signature; on-device seatbelt wiring confirmed on the TCL; residual `circle:repair`-on-hardware heal accepted as a follow-up (offline harness or release build).
+- [x] Open review points for items 2-4 resolved or explicitly deferred (item 2 deferred on the upstream-API finding).
+- [x] T3 tier acknowledged.
 
-_Approval line (fill on sign-off): Approved YYYY-MM-DD (Tim, in-session) — …_
+_Approved 2026-06-28 (Tim, in-session) — prevention items 3+4 merged via #133; item 2 deferred to an upstream hypercore ask._
