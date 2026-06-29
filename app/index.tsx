@@ -68,19 +68,14 @@ const DONATE_SHOWN_KEY = 'pc:donateReminder:shown'
 // history only converges while members' apps run the worklet (Activity-bound;
 // no reliable background autostart), so a circle with no always-on seeder goes
 // stale when everyone backgrounds/kills the app. A local notification nudges the
-// user to reopen. Reschedule-on-open semantics (see refreshSyncReminder): every
-// foreground cancels + re-arms a single one-shot, so it only ever fires after
-// ~a day of NO opens -- not a fixed daily ping. Default ON; the WebView toggles
-// it via shell:syncReminder:get/set. Stored as the string 'false' when disabled;
-// absent/anything else = enabled (default-on).
+// user to reopen. It's a fixed daily ping: a repeating DAILY trigger fires every
+// day at the user's chosen time (see refreshSyncReminder). Default ON; the
+// WebView toggles it via shell:syncReminder:get/set. Stored as the string
+// 'false' when disabled; absent/anything else = enabled (default-on).
 const SYNC_REMINDER_KEY = 'pc:syncReminder:enabled'
 const SYNC_REMINDER_TIME_KEY = 'pc:syncReminder:time'  // 'HH:MM' local; user-set, default 08:00
 const SYNC_REMINDER_DEFAULT_TIME = '08:00'             // 8am: a morning nudge before the day gets going
-const SYNC_REMINDER_ID = 'sync-reminder'               // stable id so re-arm is cancel+reschedule
-// Floor on how soon after an open the reminder may fire. A naive "next HH:MM"
-// can land just a few hours after an open; this keeps it to "~a day of no opens"
-// by skipping to the next HH:MM that's at least this far out.
-const SYNC_REMINDER_MIN_GAP_MS = 20 * 60 * 60 * 1000
+const SYNC_REMINDER_ID = 'sync-reminder'               // stable id so a settings change is cancel+reschedule
 // Shared copy for both the scheduled reminder and the test fire. Time-neutral
 // since the user picks the time.
 const SYNC_REMINDER_CONTENT = {
@@ -224,24 +219,12 @@ async function getSyncReminderTime(): Promise<{ hour: number, minute: number }> 
   } catch { return { hour: 8, minute: 0 } }
 }
 
-// The next local HH:MM that's at least SYNC_REMINDER_MIN_GAP_MS away. Walks
-// forward a day at a time (handles DST via local Date math). Because we re-arm
-// on every foreground (refreshSyncReminder), the effect is "the next HH:MM after
-// ~a day you didn't open the app".
-function nextSyncReminderDate(hour: number, minute: number): Date {
-  const now = Date.now()
-  const d = new Date()
-  d.setHours(hour, minute, 0, 0)
-  while (d.getTime() - now < SYNC_REMINDER_MIN_GAP_MS) {
-    d.setDate(d.getDate() + 1)
-  }
-  return d
-}
-
-// Cancel any pending reminder and, if enabled, re-arm a single one-shot. Called
-// on boot (after channels exist) and on every app foreground, so a user who
-// opens daily never sees it; one quiet nudge lands only after ~a day away.
-// Best-effort: notification permission may be denied (no-op then).
+// Cancel any pending reminder and, if enabled, schedule a single repeating
+// DAILY trigger that fires every day at the user's chosen time. Idempotent
+// (cancel + reschedule on the stable id), so it's safe to call on boot and
+// whenever the user changes the time/toggle. The OS keeps firing it daily on
+// its own -- no per-foreground re-arm. Best-effort: notification permission may
+// be denied (no-op then).
 async function refreshSyncReminder(): Promise<void> {
   try {
     await Notifications.cancelScheduledNotificationAsync(SYNC_REMINDER_ID)
@@ -253,8 +236,9 @@ async function refreshSyncReminder(): Promise<void> {
       identifier: SYNC_REMINDER_ID,
       content: SYNC_REMINDER_CONTENT,
       trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: nextSyncReminderDate(hour, minute),
+        type: Notifications.SchedulableTriggerInputTypes.DAILY,
+        hour,
+        minute,
         channelId: 'reminders',
       },
     })
@@ -827,9 +811,6 @@ export default function Index() {
       // that change outside the app (e.g. the battery-optimization
       // toggle reflects after the user dismisses the system dialog).
       emitEvent('app:state', { state: s })
-      // Re-arm the "open to sync" reminder: opening the app pushes the next
-      // nudge out ~a day, so a daily user never sees it (reschedule-on-open).
-      if (s === 'active') refreshSyncReminder().catch(() => {})
       // iOS: re-query authorization status whenever we come back to
       // foreground. The user may have gone to Settings via the home
       // banner, flipped the toggle, and bounced back -- in which case
