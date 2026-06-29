@@ -94,6 +94,29 @@ if (typeof document !== 'undefined' && !document.getElementById('pearcircle-focu
   document.head.appendChild(styleEl)
 }
 
+// Native time picker (Sync reminder reminder-time field). The <input type=time>
+// control renders inconsistently across WebViews and inline React styles can't
+// reach its shadow pseudo-elements, so we strip the native chrome and draw our
+// own caret (see SyncReminderSection) for pixel-identical layout on both:
+//  - iOS (WKWebView) gives the value pseudo an intrinsic min-width / right
+//    alignment that clips the digits on a narrow iPhone screen. appearance:none
+//    + left-aligning the value pseudo lets it shrink to the container. The
+//    native wheel picker still opens on tap (appearance:none doesn't suppress
+//    it on iOS), so we lose nothing.
+//  - Android (Chromium) draws ::-webkit-calendar-picker-indicator hard against
+//    the content edge; hiding it lets our own caret control the right buffer.
+if (typeof document !== 'undefined' && !document.getElementById('pearcircle-time-input')) {
+  const styleEl = document.createElement('style')
+  styleEl.id = 'pearcircle-time-input'
+  styleEl.textContent = `
+    input[type="time"] { text-align: left; min-width: 0; }
+    input[type="time"]::-webkit-date-and-time-value { text-align: left; margin: 0; min-width: 0; }
+    input[type="time"]::-webkit-calendar-picker-indicator { display: none; }
+    input[type="time"]::-webkit-inner-spin-button { display: none; -webkit-appearance: none; }
+  `
+  document.head.appendChild(styleEl)
+}
+
 // Theme palette. CSS variables on :root provide the dark default (matches
 // pre-theme behavior, no flash on cold start). [data-theme="light"]
 // overrides every variable in the light palette. JS toggles by setting
@@ -5991,9 +6014,9 @@ function TripNotificationsSection () {
 // A daily local reminder to open the app. PearCircle has no servers, so a
 // circle's history only catches up while members' apps are open; if nobody
 // opens it (and no always-on seeder is enrolled), everyone's view drifts
-// stale. The reminder only fires after ~a day of not opening the app (the
-// shell re-arms it on every foreground), so a daily user never sees it.
-// Reads/writes the shell preference via shell:syncReminder:get/set.
+// stale. The reminder fires every day at the user's chosen time (a repeating
+// DAILY trigger in the shell). Reads/writes the shell preference via
+// shell:syncReminder:get/set.
 function SyncReminderSection () {
   const [enabled, setEnabled] = useState(true)
   const [time, setTime] = useState('08:00')
@@ -6034,7 +6057,7 @@ function SyncReminderSection () {
   return (
     <>
       <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
-        PearCircle has no servers — your circles sync directly between members' phones, only while the app is running. A once-a-day reminder nudges you to open PearCircle so your latest location goes out and you catch up on everyone else. It stays quiet on any day you've already opened the app.
+        PearCircle has no servers — your circles sync directly between members' phones, only while the app is running. A daily reminder at the time you pick nudges you to open PearCircle so your latest location goes out and you catch up on everyone else.
       </p>
       <div style={{ display: 'flex', gap: spacing.sm }}>
         {btn('On', true)}
@@ -6043,17 +6066,30 @@ function SyncReminderSection () {
       {enabled && (
         <div style={{ marginTop: spacing.lg }}>
           <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>Reminder time</p>
-          <input
-            type='time'
-            value={time}
-            onChange={(e) => changeTime(e.currentTarget.value)}
-            style={{
-              width: '100%', padding: '10px', borderRadius: radius.sm,
-              background: colors.surface.input, color: colors.text.primary,
-              border: `1px solid ${colors.border}`,
-              fontFamily: typography.fontFamily, fontSize: 14,
-            }}
-          />
+          <div style={{ position: 'relative', width: '100%' }}>
+            <input
+              type='time'
+              value={time}
+              onChange={(e) => changeTime(e.currentTarget.value)}
+              style={{
+                width: '100%', boxSizing: 'border-box', minWidth: 0, margin: 0,
+                WebkitAppearance: 'none', appearance: 'none',
+                padding: '10px 38px 10px 12px', borderRadius: radius.sm,
+                background: colors.surface.input, color: colors.text.primary,
+                border: `1px solid ${colors.border}`,
+                fontFamily: typography.fontFamily, fontSize: 14,
+              }}
+            />
+            {/* Our own caret: native indicators are hidden (see the time-input
+                style block) so spacing is identical on iOS + Android. pointer-
+                events:none lets the tap fall through to the input's picker. */}
+            <CaretDown
+              size={16}
+              weight='bold'
+              color={colors.text.secondary}
+              style={{ position: 'absolute', right: 14, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+            />
+          </div>
         </div>
       )}
     </>
