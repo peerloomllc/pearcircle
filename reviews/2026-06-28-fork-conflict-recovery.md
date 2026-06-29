@@ -15,7 +15,9 @@
 - Reproduces the EXACT signature from Benjamin's log — `[hypercore] conflict detected in <disc> (writable=true,quorum=1)` — and confirms `parseConflictLog` matches it and the seatbelt would swallow the escaping `Closed` (Scenario B, PASS).
 - Confirms a same-fork truncation with no divergent append self-heals via replication (Scenario A, PASS), so the danger is truncate-then-append-before-resync — what the rewind guard targets.
 
-Residual gap: the full Bare-runtime wiring (onConflictLog → `_lastConflictAt` → `onWorkletFault` swallow, worklet stays alive; and `circle:repair` heals on hardware) is still only exercised as no-regression on the TCL + Pixel 9, not against a live fork. Closing it fully needs either a debug-gated on-device fork injection (ships a debug hook + risks the test circle) or a release build for Benjamin.
+On-device seatbelt wiring CONFIRMED 2026-06-28 (TCL, throwaway debug build, since reverted): a debug hook emitted hypercore's exact conflict log line then threw the exact escaping `Error('Closed')`. Logcat showed the full chain — `conflict:log-detected` (the console-tap stamped `_lastConflictAt`) → `conflict:seatbelt-caught {kind:unhandledRejection, msg:Closed}` → zero SIGABRT, worklet alive. So Bare's `unhandledRejection` → `onWorkletFault` → swallow path works on real hardware against the real escaping rejection.
+
+Residual gap: the `circle:repair` heal has not been exercised on hardware against a genuine fork. A faithful on-device fork could not be forged — directly truncating `base.local` wedges autobase's mount (a crude-injection artifact, NOT the real bug, which boots fine and conflicts during replication). The crude injection corrupted the TCL's circle (since wiped with `pm clear`; TCL now fresh, needs re-pairing). Closing this last gap cleanly needs either an offline store-surgery harness or a release build for Benjamin. The repair machinery itself is the existing append-hang path, already validated for that path.
 
 ## Decisions to confirm (recorded 2026-06-28, please sign off)
 
