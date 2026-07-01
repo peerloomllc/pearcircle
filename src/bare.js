@@ -46,7 +46,7 @@ const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
-const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
+const { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
@@ -433,6 +433,30 @@ const _circlePlaces = new Map() // "{circleId}|{placeId}" → state
 // classification on boot; alternating real crossings always pass.
 const _lastAppendedKind = new Map()
 
+// Crossings detected while the writer wasn't ready to append them. Keyed by
+// circleId|placeId, holding only the LATEST crossing per Place. This is the
+// no-resurrection backstop for the native OS region path: iOS fires
+// didEnterRegion/didExitRegion exactly once at the boundary, and on a
+// suspended-app wake the autobase can still be opening or rebuilding (not yet
+// writable) at that instant. Without this queue the crossing is dropped with
+// no history and no notification, and because the persisted classification
+// would advance, it never re-fires -- lost forever. Flushed from the 5s sweep
+// and on foreground once the writer is writable (proposal 2026-07-01).
+const _pendingTransitions = new Map()
+// circleIds for which we've re-pushed the OS region set since the writer last
+// became writable, so a registration that went stale while read-only self-heals.
+const _regionsPushedForWriter = new Set()
+
+// Rolling record of the last N geofence outcomes, surfaced in-app via
+// geofence:diag so a missed crossing is observable on a production build with
+// no devicectl access to the device (the affected phone is an App Store
+// install, not a dev-provisioned one). Newest last.
+const _geofenceLog = []
+function logGeofence (ev, placeId, kind, extra) {
+  _geofenceLog.push({ ev, place: placeId ? placeId.slice(0, 8) : null, kind: kind || null, at: Date.now(), ...(extra || {}) })
+  if (_geofenceLog.length > 40) _geofenceLog.shift()
+}
+
 function trackPlace (circleId, place) {
   const key = circleId + '|' + place.id
   const existing = _circlePlaces.get(key)
@@ -533,7 +557,11 @@ function pushRegionsToShell () {
     id: state.circleId + '|' + state.placeId,
     lat: state.lat,
     lon: state.lon,
-    radius: state.radiusMeters,
+    // Floor the OS-region radius at the iOS reliability minimum. New Places
+    // can't be created below it, but a legacy Place stored before that gate
+    // still needs its OS geofence widened or iOS may never fire the wake.
+    // The JS classifier keeps state.radiusMeters unchanged (see checkPlaceTransitions).
+    radius: Math.max(state.radiusMeters, MIN_PLACE_RADIUS_M),
   }))
   _lastRegionRankPos = _lastDevicePos
   send({ event: 'regions:set', data: { regions } })
@@ -623,6 +651,13 @@ const handlers = {
     // start's replay small (store maintenance). Fire-and-forget: never block
     // the IPC response on disk I/O, and flushStore swallows its own errors.
     if (!_appForeground) flushStore('background')
+    // On foreground, drain any crossings that queued while the writer was
+    // read-only and re-push the OS region set, so the map the user is about to
+    // look at reflects reality promptly (proposal 2026-07-01).
+    if (_appForeground) {
+      flushAllPendingTransitions().catch(() => {})
+      schedulePushRegionsToShell()
+    }
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
   },
@@ -1117,8 +1152,8 @@ const handlers = {
     }
     if (!Number.isFinite(lat) || lat < -90 || lat > 90) throw new Error('lat must be in [-90, 90]')
     if (!Number.isFinite(lon) || lon < -180 || lon > 180) throw new Error('lon must be in [-180, 180]')
-    if (!Number.isFinite(radiusMeters) || radiusMeters < 10 || radiusMeters > 10000) {
-      throw new Error('radiusMeters must be in [10, 10000]')
+    if (!Number.isFinite(radiusMeters) || radiusMeters < MIN_PLACE_RADIUS_M || radiusMeters > 10000) {
+      throw new Error('radiusMeters must be in [' + MIN_PLACE_RADIUS_M + ', 10000]')
     }
 
     const id = generatePlaceId()
@@ -1140,8 +1175,8 @@ const handlers = {
     if (typeof name !== 'string' || name.trim().length === 0 || name.length > 64) {
       throw new Error('name must be a non-empty string of at most 64 chars')
     }
-    if (!Number.isFinite(radiusMeters) || radiusMeters < 10 || radiusMeters > 10000) {
-      throw new Error('radiusMeters must be in [10, 10000]')
+    if (!Number.isFinite(radiusMeters) || radiusMeters < MIN_PLACE_RADIUS_M || radiusMeters > 10000) {
+      throw new Error('radiusMeters must be in [' + MIN_PLACE_RADIUS_M + ', 10000]')
     }
     const existing = await base.view.get('place:' + placeId)
     if (!existing || !existing.value) throw new Error('place not found')
@@ -2061,6 +2096,34 @@ const handlers = {
     return await handleRegionEvent('exit', id, ts)
   },
 
+  // Geofence health snapshot for the in-app diagnostics reveal. Read-only and
+  // cheap; safe to call from a production build. Lets us confirm on the actual
+  // device whether a Place's OS region should be registered, whether the writer
+  // is writable, and whether any crossing is stuck in the pending queue
+  // (proposal 2026-07-01).
+  'geofence:diag': async () => {
+    const circles = []
+    for (const [circleId, base] of _circleBases) {
+      circles.push({
+        circleId: circleId.slice(0, 8),
+        writable: !!(base && base.writable),
+        sharing: getCircleSharing(circleId).enabled,
+      })
+    }
+    const places = [..._circlePlaces.values()]
+    const selected = selectNearestRegions(places, _lastDevicePos, REGIONS_HARD_CAP)
+    return {
+      circles,
+      placeCount: places.length,
+      // How many Places SHOULD be registered as OS regions right now.
+      regionsMonitored: selected.length,
+      hasDevicePos: !!_lastDevicePos,
+      classifications: places.map((s) => ({ place: s.placeId.slice(0, 8), radius: s.radiusMeters, state: s.lastClassification })),
+      pending: [..._pendingTransitions.values()].map((p) => ({ place: p.placeId.slice(0, 8), kind: p.kind, ts: p.ts })),
+      recent: _geofenceLog.slice(-25),
+    }
+  },
+
   'trips:list': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const ourKey = b4a.toString(_identity.publicKey, 'hex')
@@ -2830,6 +2893,53 @@ async function appendTransition (base, placeId, kind, ts, { circleId = circleIdF
   return value
 }
 
+// Stash a crossing that could not be durably appended (writer not writable, or
+// the append threw). Only the latest crossing per Place is kept; a newer one
+// supersedes. We deliberately do NOT advance the persisted classification here
+// -- leaving it lets flushPendingTransitions re-detect and, if the crossing is
+// stale by flush time, appendTransition's same-kind guard makes it idempotent.
+function enqueuePendingTransition (circleId, placeId, kind, ts) {
+  _pendingTransitions.set(circleId + '|' + placeId, { circleId, placeId, kind, ts })
+  mark('transition:queued', { circleId: circleId.slice(0, 8), placeId: placeId.slice(0, 8), kind })
+  logGeofence('queued', placeId, kind)
+}
+
+// Append any queued crossings for a circle now that its writer is ready.
+// Advances + persists the dedup classifier only after the append succeeds, so
+// the crossing survives a suspend/force-quit exactly like the live path.
+async function flushPendingTransitions (circleId, base) {
+  if (_pendingTransitions.size === 0) return
+  if (!base || !base.writable) return
+  // Muted circles don't append; leave the crossing queued so it publishes if
+  // sharing is turned back on (rare; the live path never queues while muted).
+  if (!getCircleSharing(circleId).enabled) return
+  for (const [key, pend] of _pendingTransitions) {
+    if (pend.circleId !== circleId) continue
+    try {
+      const appended = await appendTransition(base, pend.placeId, pend.kind, pend.ts, { circleId })
+      _pendingTransitions.delete(key)
+      const state = _circlePlaces.get(key)
+      if (state) {
+        state.lastClassification = pend.kind === 'enter' ? 'inside' : 'outside'
+        await persistClassification(circleId, pend.placeId, state.lastClassification, pend.ts)
+      }
+      mark('transition:flushed', { circleId: circleId.slice(0, 8), placeId: pend.placeId.slice(0, 8), kind: pend.kind, appended: !!appended })
+      logGeofence('flushed', pend.placeId, pend.kind, { appended: !!appended })
+    } catch (e) {
+      // Still not durable; leave it queued and let the next sweep retry.
+      mark('transition:flush-fail', { circleId: circleId.slice(0, 8), err: e && e.message })
+      break
+    }
+  }
+}
+
+async function flushAllPendingTransitions () {
+  if (_pendingTransitions.size === 0) return
+  for (const [circleId, base] of _circleBases) {
+    try { await flushPendingTransitions(circleId, base) } catch {}
+  }
+}
+
 async function appendLastSeen (base, lat, lon, accuracy, ts, battery = null, isCharging = null) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return
   // Phase-2 cutover (proposal 2026-06-04 slice 3): skip the durable write once
@@ -2869,22 +2979,39 @@ async function handleRegionEvent (kind, id, ts) {
   if (!state) return { ok: false, reason: 'unknown_place' }
   const result = applyRegionEvent(state.lastClassification, kind)
   if (result.deduped) return { ok: true, deduped: true }
-  state.lastClassification = result.classification
-  // Persist the flip (even for muted circles below) so the dedup state and
-  // the recoverable baseline survive a suspend/force-quit (proposal 2026-05-30).
-  await persistClassification(circleId, placeId, result.classification, typeof ts === 'number' ? ts : Date.now())
-  // Per-circle mute: still update the dedup classifier above so a
-  // later resume doesn't replay the boundary cross, but suppress the
-  // autobase append for muted circles.
-  if (!getCircleSharing(circleId).enabled) return { ok: false, reason: 'sharing_disabled' }
-  const base = _circleBases.get(circleId)
-  if (!base || !base.writable) return { ok: false, reason: 'no_base' }
   const stamp = typeof ts === 'number' ? ts : Date.now()
+  const sharing = getCircleSharing(circleId).enabled
+  const base = _circleBases.get(circleId)
+  const decision = regionAppendDecision({ sharing, writable: !!(base && base.writable) })
+
+  // Writer isn't ready (opening / rebuilding / wedged on a suspended-app wake):
+  // DO NOT advance or persist the classifier. iOS fires the region event
+  // exactly once, so advancing here would strand the crossing forever -- no
+  // append now, and the recovered baseline would read as already-crossed. Queue
+  // it and let flushPendingTransitions append it once writable (2026-07-01).
+  if (decision === 'queue') {
+    enqueuePendingTransition(circleId, placeId, kind, stamp)
+    return { ok: false, reason: 'not_writable_queued' }
+  }
+
+  // Safe to advance + persist the dedup classifier now: either the circle is
+  // muted (append is intentionally suppressed) or the writer is ready and we
+  // are about to append durably. Persist so the baseline survives a
+  // suspend/force-quit (proposal 2026-05-30).
+  state.lastClassification = result.classification
+  await persistClassification(circleId, placeId, result.classification, stamp)
+
+  // Per-circle mute: dedup classifier is advanced above; suppress the append.
+  if (decision === 'muted') { logGeofence('muted', placeId, kind); return { ok: false, reason: 'sharing_disabled' } }
   try {
     await appendTransition(base, placeId, kind, stamp, { circleId })
+    logGeofence('region-append', placeId, kind)
     return { ok: true }
   } catch (e) {
-    return { ok: false, error: e?.message }
+    // Append failed after advancing the classifier (timeout / wedge). Queue for
+    // retry; the same-kind guard keeps the eventual flush idempotent.
+    enqueuePendingTransition(circleId, placeId, kind, stamp)
+    return { ok: false, error: e?.message, queued: true }
   }
 }
 
@@ -2911,11 +3038,16 @@ async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, is
     if (!getCircleSharing(state.circleId).enabled) continue
     try {
       await appendTransition(base, state.placeId, result.kind, ts, { circleId: state.circleId })
+      logGeofence('live-append', state.placeId, result.kind)
       // Pass battery so the post-transition lastSeen write stays byte-
       // identical to the location:update one (autobase apply dedupes).
       await appendLastSeen(base, lat, lon, accuracy, ts, battery)
     } catch (e) {
-      console.warn('[bare] failed to append transition', e?.message)
+      // The classifier already advanced above, so a dropped append would
+      // otherwise be lost (no re-detect). Queue it for the writable-flush
+      // retry, same backstop as the native region path.
+      enqueuePendingTransition(state.circleId, state.placeId, result.kind, ts)
+      console.warn('[bare] failed to append transition, queued for retry', e?.message)
     }
   }
 }
@@ -5893,6 +6025,18 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
       autoAppendSelfLastSeen(circleId).catch(() => {})
       // Publish our last-known core key once (idempotent, proposal 2026-06-04 2a).
       announceLastKnownCore(circleId).catch(() => {})
+      // Append any crossing that was detected while the writer wasn't ready
+      // (native region wake before the autobase finished opening/rebuilding).
+      // No-op unless something is queued for this circle (proposal 2026-07-01).
+      flushPendingTransitions(circleId, base).catch(() => {})
+      // Re-push the OS region set once per writable transition, so a
+      // registration that went stale while the writer was read-only self-heals.
+      if (base.writable && !_regionsPushedForWriter.has(circleId)) {
+        _regionsPushedForWriter.add(circleId)
+        schedulePushRegionsToShell()
+      } else if (!base.writable) {
+        _regionsPushedForWriter.delete(circleId)
+      }
       // Recompute the phase-2 lastSeen-write cutover (slice 3). Cheap two-range
       // view read; its inputs only move via apply or our own announce above.
       updateLastSeenCutover(circleId, base).catch(() => {})

@@ -8,6 +8,19 @@
 
 const EARTH_RADIUS_M = 6371000
 
+// Minimum Place radius, in metres. iOS OS-level region monitoring geofences
+// off cell towers and wifi rather than the GPS chip, so a CLCircularRegion
+// much below ~100-150m is unreliable: didEnterRegion / didExitRegion often
+// never fire, especially on a device moving through by car. 150m is the
+// practical floor. This serves two roles:
+//   - the minimum we accept in place:create / place:update (and the UI),
+//     so no NEW Place is ever defined below the reliable floor.
+//   - the value we clamp the OS-region copy up to for LEGACY Places already
+//     stored below it (pushRegionsToShell). The JS classifier keeps each
+//     Place's precise radiusMeters -- it runs against real GPS fixes and can
+//     be tighter than the OS layer.
+const MIN_PLACE_RADIUS_M = 150
+
 function haversineMeters (lat1, lon1, lat2, lon2) {
   const toRad = Math.PI / 180
   const dLat = (lat2 - lat1) * toRad
@@ -112,4 +125,21 @@ function selectNearestRegions (places, devicePos, cap) {
   return typeof cap === 'number' && cap >= 0 ? ordered.slice(0, cap) : ordered
 }
 
-module.exports = { haversineMeters, classify, applyRegionEvent, selectNearestRegions, EARTH_RADIUS_M }
+// Decide what to do with a fresh (non-deduped) crossing given whether the
+// circle is sharing-enabled and whether its writer is ready to append. The
+// load-bearing case is sharing-on + writer-NOT-writable: the caller MUST queue
+// the crossing and leave the classifier untouched, never advance-and-drop it.
+// iOS fires didEnterRegion/didExitRegion exactly once at the boundary, so
+// advancing the persisted classification while dropping the append would
+// strand the crossing forever -- no notification, no history, no re-fire
+// (proposal 2026-07-01). Pure.
+//   'append' -> writer ready: append, then advance the classifier.
+//   'queue'  -> writer not ready: stash for the writable flush; do NOT advance.
+//   'muted'  -> sharing off: advance the dedup classifier but suppress append.
+function regionAppendDecision ({ sharing, writable } = {}) {
+  if (sharing && !writable) return 'queue'
+  if (!sharing) return 'muted'
+  return 'append'
+}
+
+module.exports = { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M }
