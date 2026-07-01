@@ -36,7 +36,7 @@ const TRIP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 // trip list (and its map polylines) past this, which is the real UX lever for
 // the first-open render lag. Applied at the read boundary (mergeTripStreams
 // limit in trips:listFor); storage is bounded by TRIP_RETENTION_MS.
-const MAX_TRIPS_PER_MEMBER = 20
+const MAX_TRIPS_PER_MEMBER = 15
 
 function tripIsExpired (trip, now, retentionMs = TRIP_RETENTION_MS) {
   if (typeof now !== 'number' || !Number.isFinite(now)) return false

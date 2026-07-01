@@ -9,8 +9,8 @@ describe('TRIP_RETENTION_MS', () => {
 })
 
 describe('MAX_TRIPS_PER_MEMBER', () => {
-  test('is 20', () => {
-    expect(MAX_TRIPS_PER_MEMBER).toBe(20)
+  test('is 15', () => {
+    expect(MAX_TRIPS_PER_MEMBER).toBe(15)
   })
 })
 
