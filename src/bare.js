@@ -60,7 +60,7 @@ const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
-const { TRIP_RETENTION_MS, tripIsExpired } = require('./lib/tripRetention')
+const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
 const { TRANSITION_RETENTION_MS, transitionIsExpired } = require('./lib/transitionRetention')
 
 // Reject values stamped more than 5 minutes in the future against the local
@@ -2190,7 +2190,9 @@ const handlers = {
     }
 
     mark('trips:listFor:done', { circles: circleTrips.length })
-    return { trips: mergeTripStreams({ localTrips, circleTrips }) }
+    // Cap to the newest MAX_TRIPS_PER_MEMBER (2026-07-01): bounds the list and
+    // its map polylines so first open stays snappy even in a heavy-driving week.
+    return { trips: mergeTripStreams({ localTrips, circleTrips, limit: MAX_TRIPS_PER_MEMBER }) }
   },
 
   // Scan a single circle's autobase view for `trip:{pubkey}:*` rows

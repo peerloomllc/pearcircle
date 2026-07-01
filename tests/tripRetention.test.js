@@ -1,10 +1,16 @@
-const { TRIP_RETENTION_MS, tripIsExpired } = require('../src/lib/tripRetention')
+const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('../src/lib/tripRetention')
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
 describe('TRIP_RETENTION_MS', () => {
-  test('is 14 days', () => {
-    expect(TRIP_RETENTION_MS).toBe(14 * DAY_MS)
+  test('is 7 days', () => {
+    expect(TRIP_RETENTION_MS).toBe(7 * DAY_MS)
+  })
+})
+
+describe('MAX_TRIPS_PER_MEMBER', () => {
+  test('is 15', () => {
+    expect(MAX_TRIPS_PER_MEMBER).toBe(15)
   })
 })
 

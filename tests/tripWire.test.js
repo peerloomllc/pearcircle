@@ -191,6 +191,18 @@ describe('mergeTripStreams (view-layer dedup by startTs)', () => {
     expect(merged.map(t => t.startTs)).toEqual([2000, 1000])
   })
 
+  test('limit keeps only the newest N after sort', () => {
+    const trips = [1000, 4000, 2000, 5000, 3000].map((startTs) => ({ pubkey: a, startTs }))
+    const merged = mergeTripStreams({ localTrips: trips, limit: 3 })
+    expect(merged.map(t => t.startTs)).toEqual([5000, 4000, 3000])
+  })
+
+  test('limit undefined or non-positive means no cap', () => {
+    const trips = [1000, 2000, 3000].map((startTs) => ({ pubkey: a, startTs }))
+    expect(mergeTripStreams({ localTrips: trips }).length).toBe(3)
+    expect(mergeTripStreams({ localTrips: trips, limit: 0 }).length).toBe(3)
+  })
+
   test('any tombstone wins: deleted in circle A hides the trip even if circle B still has the original', () => {
     const original = { pubkey: a, startTs: 1000 }
     const tombstone = { pubkey: a, startTs: 1000, deleted: true }
