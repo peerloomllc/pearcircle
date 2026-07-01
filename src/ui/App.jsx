@@ -6781,6 +6781,18 @@ function Collapsible ({ title, icon: Icon, open, onToggle, maxHeight = '480px', 
 
 function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }) {
   const [walletModal, setWalletModal] = useState(false)
+  // Hidden geofence diagnostics: tap the version 7x to reveal. Production-safe
+  // (no debug gate) so a non-dev user can open it and screenshot the state when
+  // a crossing is missed, without any devicectl access (proposal 2026-07-01).
+  const [geoDiag, setGeoDiag] = useState(null)
+  const geoTapRef = useRef(0)
+  const revealGeoDiag = async () => {
+    geoTapRef.current += 1
+    if (geoTapRef.current < 7) return
+    geoTapRef.current = 0
+    try { setGeoDiag(await pear.call('geofence:diag') || { error: 'no data' }) }
+    catch (e) { setGeoDiag({ error: String(e?.message ?? e) }) }
+  }
   // initialExpand opens a single section on navigation (e.g., the
   // donation reminder modal hands us 'support' so the user lands on
   // the Support-development collapsible already open). Per-section
@@ -6927,12 +6939,15 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         </div>
       </Collapsible>
 
-      <div style={{ textAlign: 'center', fontSize: 11, fontWeight: 300, color: colors.text.muted, paddingTop: spacing.base, paddingBottom: spacing.xs, fontFamily: typography.fontFamily }}>
+      <div onClick={revealGeoDiag} style={{ textAlign: 'center', fontSize: 11, fontWeight: 300, color: colors.text.muted, paddingTop: spacing.base, paddingBottom: spacing.xs, fontFamily: typography.fontFamily, cursor: 'default' }}>
         v{APP_VERSION}
       </div>
 
       {walletModal && (
         <LightningWalletModal onClose={() => setWalletModal(false)} />
+      )}
+      {geoDiag && (
+        <GeofenceDiagModal diag={geoDiag} onClose={() => setGeoDiag(null)} />
       )}
     </div>
   )
@@ -6982,6 +6997,69 @@ function LightningWalletModal ({ onClose }) {
         <p style={{ ...body, textAlign: 'center', marginTop: spacing.base, marginBottom: 0 }}>
           After installing, return here and tap BTC again.
         </p>
+      </div>
+    </BottomSheet>
+  )
+}
+
+// Hidden geofence health panel (revealed by tapping the version 7x in About).
+// Read-only snapshot of the worklet's geofence:diag: writer state per circle,
+// how many Places should be OS-monitored, any crossing stuck in the pending
+// queue, and the recent geofence event log. Meant to be screenshotted and sent
+// when a crossing is missed on a device we can't devicectl into.
+function GeofenceDiagModal ({ diag, onClose }) {
+  const label = { fontSize: 12, fontWeight: 400, color: colors.text.primary, fontFamily: typography.fontFamily }
+  const mono = { fontSize: 11, fontWeight: 300, color: colors.text.secondary, fontFamily: typography.monoFamily, lineHeight: 1.6, wordBreak: 'break-word' }
+  const fmtTime = (ts) => {
+    if (!Number.isFinite(ts)) return '?'
+    const d = new Date(ts)
+    const p = (n) => String(n).padStart(2, '0')
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+  }
+  return (
+    <BottomSheet onClose={onClose} zIndex={300}>
+      <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px`, maxHeight: '70vh', overflowY: 'auto' }}>
+        <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.md, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
+          <MapPin size={18} weight='thin' /> Location health
+        </div>
+        {diag.error ? (
+          <p style={mono}>error: {diag.error}</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.md }}>
+            <div>
+              <div style={label}>Circles</div>
+              {(diag.circles || []).map((c) => (
+                <div key={c.circleId} style={mono}>
+                  {c.circleId} · writer {c.writable ? 'writable' : 'NOT writable'} · sharing {c.sharing ? 'on' : 'off'}
+                </div>
+              ))}
+              {(diag.circles || []).length === 0 && <div style={mono}>none</div>}
+            </div>
+            <div>
+              <div style={label}>Places</div>
+              <div style={mono}>{diag.placeCount} defined · {diag.regionsMonitored} monitored by OS · device fix {diag.hasDevicePos ? 'known' : 'unknown'}</div>
+              {(diag.classifications || []).map((c, i) => (
+                <div key={i} style={mono}>{c.place} · {c.radius}m · {c.state || 'no baseline'}</div>
+              ))}
+            </div>
+            <div>
+              <div style={label}>Pending (queued, not yet appended)</div>
+              {(diag.pending || []).length === 0
+                ? <div style={mono}>none</div>
+                : (diag.pending || []).map((p, i) => (
+                    <div key={i} style={mono}>{p.place} · {p.kind} · {fmtTime(p.ts)}</div>
+                  ))}
+            </div>
+            <div>
+              <div style={label}>Recent events</div>
+              {(diag.recent || []).length === 0
+                ? <div style={mono}>none</div>
+                : (diag.recent || []).slice().reverse().map((e, i) => (
+                    <div key={i} style={mono}>{fmtTime(e.at)} · {e.ev}{e.place ? ' · ' + e.place : ''}{e.kind ? ' · ' + e.kind : ''}{e.appended === false ? ' · (dup)' : ''}</div>
+                  ))}
+            </div>
+          </div>
+        )}
       </div>
     </BottomSheet>
   )

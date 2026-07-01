@@ -1,4 +1,4 @@
-const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('../src/lib/geofence')
+const { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('../src/lib/geofence')
 
 describe('haversineMeters', () => {
   test('zero distance for identical points', () => {
@@ -204,5 +204,34 @@ describe('selectNearestRegions (proximity ranking for the OS region cap)', () =>
   test('preserves the other fields on each place', () => {
     const out = selectNearestRegions([near], dev, 20)
     expect(out[0]).toEqual(near)
+  })
+})
+
+describe('regionAppendDecision (no-resurrection guard for the native region path)', () => {
+  test('sharing on + writer NOT writable => queue (never advance-and-drop)', () => {
+    // The load-bearing case: a native crossing arriving before the autobase is
+    // writable must be queued, so the caller leaves the classifier untouched
+    // and the crossing is not lost forever.
+    expect(regionAppendDecision({ sharing: true, writable: false })).toBe('queue')
+  })
+
+  test('sharing on + writer writable => append', () => {
+    expect(regionAppendDecision({ sharing: true, writable: true })).toBe('append')
+  })
+
+  test('muted circle => muted regardless of writer state', () => {
+    expect(regionAppendDecision({ sharing: false, writable: true })).toBe('muted')
+    expect(regionAppendDecision({ sharing: false, writable: false })).toBe('muted')
+  })
+})
+
+describe('MIN_PLACE_RADIUS_M (iOS region-monitoring reliability floor)', () => {
+  test('is at least 100m, the practical iOS floor', () => {
+    expect(MIN_PLACE_RADIUS_M).toBeGreaterThanOrEqual(100)
+  })
+
+  test('flooring a small radius lifts it to the minimum, leaves a large one', () => {
+    expect(Math.max(50, MIN_PLACE_RADIUS_M)).toBe(MIN_PLACE_RADIUS_M)
+    expect(Math.max(400, MIN_PLACE_RADIUS_M)).toBe(400)
   })
 })

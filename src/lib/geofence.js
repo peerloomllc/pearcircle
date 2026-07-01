@@ -125,4 +125,21 @@ function selectNearestRegions (places, devicePos, cap) {
   return typeof cap === 'number' && cap >= 0 ? ordered.slice(0, cap) : ordered
 }
 
-module.exports = { haversineMeters, classify, applyRegionEvent, selectNearestRegions, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M }
+// Decide what to do with a fresh (non-deduped) crossing given whether the
+// circle is sharing-enabled and whether its writer is ready to append. The
+// load-bearing case is sharing-on + writer-NOT-writable: the caller MUST queue
+// the crossing and leave the classifier untouched, never advance-and-drop it.
+// iOS fires didEnterRegion/didExitRegion exactly once at the boundary, so
+// advancing the persisted classification while dropping the append would
+// strand the crossing forever -- no notification, no history, no re-fire
+// (proposal 2026-07-01). Pure.
+//   'append' -> writer ready: append, then advance the classifier.
+//   'queue'  -> writer not ready: stash for the writable flush; do NOT advance.
+//   'muted'  -> sharing off: advance the dedup classifier but suppress append.
+function regionAppendDecision ({ sharing, writable } = {}) {
+  if (sharing && !writable) return 'queue'
+  if (!sharing) return 'muted'
+  return 'append'
+}
+
+module.exports = { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M }
