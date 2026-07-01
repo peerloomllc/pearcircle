@@ -46,7 +46,7 @@ const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
-const { haversineMeters, classify, applyRegionEvent, selectNearestRegions } = require('./lib/geofence')
+const { haversineMeters, classify, applyRegionEvent, selectNearestRegions, MIN_PLACE_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
@@ -533,7 +533,11 @@ function pushRegionsToShell () {
     id: state.circleId + '|' + state.placeId,
     lat: state.lat,
     lon: state.lon,
-    radius: state.radiusMeters,
+    // Floor the OS-region radius at the iOS reliability minimum. New Places
+    // can't be created below it, but a legacy Place stored before that gate
+    // still needs its OS geofence widened or iOS may never fire the wake.
+    // The JS classifier keeps state.radiusMeters unchanged (see checkPlaceTransitions).
+    radius: Math.max(state.radiusMeters, MIN_PLACE_RADIUS_M),
   }))
   _lastRegionRankPos = _lastDevicePos
   send({ event: 'regions:set', data: { regions } })
@@ -1117,8 +1121,8 @@ const handlers = {
     }
     if (!Number.isFinite(lat) || lat < -90 || lat > 90) throw new Error('lat must be in [-90, 90]')
     if (!Number.isFinite(lon) || lon < -180 || lon > 180) throw new Error('lon must be in [-180, 180]')
-    if (!Number.isFinite(radiusMeters) || radiusMeters < 10 || radiusMeters > 10000) {
-      throw new Error('radiusMeters must be in [10, 10000]')
+    if (!Number.isFinite(radiusMeters) || radiusMeters < MIN_PLACE_RADIUS_M || radiusMeters > 10000) {
+      throw new Error('radiusMeters must be in [' + MIN_PLACE_RADIUS_M + ', 10000]')
     }
 
     const id = generatePlaceId()
@@ -1140,8 +1144,8 @@ const handlers = {
     if (typeof name !== 'string' || name.trim().length === 0 || name.length > 64) {
       throw new Error('name must be a non-empty string of at most 64 chars')
     }
-    if (!Number.isFinite(radiusMeters) || radiusMeters < 10 || radiusMeters > 10000) {
-      throw new Error('radiusMeters must be in [10, 10000]')
+    if (!Number.isFinite(radiusMeters) || radiusMeters < MIN_PLACE_RADIUS_M || radiusMeters > 10000) {
+      throw new Error('radiusMeters must be in [' + MIN_PLACE_RADIUS_M + ', 10000]')
     }
     const existing = await base.view.get('place:' + placeId)
     if (!existing || !existing.value) throw new Error('place not found')

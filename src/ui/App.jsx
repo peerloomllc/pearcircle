@@ -6,6 +6,7 @@ import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
+import { MIN_PLACE_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import {
@@ -3440,7 +3441,7 @@ function EditPlaceForm ({ initial, onCancel, onSaved }) {
     setError(null)
     const radNum = parseFloat(radius)
     if (!name.trim()) { setError('Name is required'); return }
-    if (!Number.isFinite(radNum) || radNum < 10 || radNum > 10000) { setError('Radius must be between 10 and 10000 metres'); return }
+    if (!Number.isFinite(radNum) || radNum < MIN_PLACE_RADIUS_M || radNum > 10000) { setError('Radius must be between ' + MIN_PLACE_RADIUS_M + ' and 10000 metres'); return }
     setSubmitting(true)
     try {
       const r = await pear.call('place:update', {
@@ -3464,7 +3465,7 @@ function EditPlaceForm ({ initial, onCancel, onSaved }) {
       <label style={s.label}>Name</label>
       <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
-      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
+      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='150' />
       <button style={s.primaryBtn} disabled={submitting} onClick={submit}>
         {submitting ? 'Saving...' : 'Save changes'}
       </button>
@@ -3491,7 +3492,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
     circles.length === 1 ? circles[0].circleId : null,
   )
   const [name, setName] = useState('')
-  const [radius, setRadius] = useState('100')
+  const [radius, setRadius] = useState(String(MIN_PLACE_RADIUS_M))
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
 
@@ -3507,7 +3508,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
     }
     const radNum = parseFloat(radius)
     if (!name.trim()) { setError('Name is required'); return }
-    if (!Number.isFinite(radNum) || radNum < 10 || radNum > 10000) { setError('Radius must be between 10 and 10000 metres'); return }
+    if (!Number.isFinite(radNum) || radNum < MIN_PLACE_RADIUS_M || radNum > 10000) { setError('Radius must be between ' + MIN_PLACE_RADIUS_M + ' and 10000 metres'); return }
     setSubmitting(true)
     try {
       const r = await pear.call('place:create', {
@@ -3578,7 +3579,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
       </div>
       <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
-      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='100' />
+      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='150' />
       <button style={s.primaryBtn} disabled={submitting || !coords || !targetCircleId} onClick={submit}>
         {submitting ? 'Saving...' : 'Save place'}
       </button>
