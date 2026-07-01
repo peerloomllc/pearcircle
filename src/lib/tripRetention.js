@@ -25,7 +25,18 @@
 // re-replication from a 91-day-stale peer would be filtered by rule 1
 // anyway.
 
-const TRIP_RETENTION_MS = 14 * 24 * 60 * 60 * 1000
+// 7 days (was 14, 2026-07-01 product decision). Most trip review happens
+// within the past week; a shorter window keeps the per-circle autobase view
+// (which holds every member's trips, not just self) small and cuts the trip-
+// list map render on first open.
+const TRIP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+// Hard ceiling on trips shown/loaded per member, newest-first (2026-07-01).
+// Independent of the time window: even a heavy-driving week can't push the
+// trip list (and its map polylines) past this, which is the real UX lever for
+// the first-open render lag. Applied at the read boundary (mergeTripStreams
+// limit in trips:listFor); storage is bounded by TRIP_RETENTION_MS.
+const MAX_TRIPS_PER_MEMBER = 20
 
 function tripIsExpired (trip, now, retentionMs = TRIP_RETENTION_MS) {
   if (typeof now !== 'number' || !Number.isFinite(now)) return false
@@ -41,4 +52,4 @@ function tripIsExpired (trip, now, retentionMs = TRIP_RETENTION_MS) {
   return now - ts > retentionMs
 }
 
-module.exports = { TRIP_RETENTION_MS, tripIsExpired }
+module.exports = { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired }

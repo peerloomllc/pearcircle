@@ -83,7 +83,10 @@ function shouldReplicateTrip (sharingRow) {
 // appears as deleted in one circle and not in another, the deleted
 // view wins and the trip is hidden. This matches user intent ("I
 // deleted this trip; nobody should see it anywhere I can control").
-function mergeTripStreams ({ localTrips = [], circleTrips = [] } = {}) {
+// `limit` (optional): keep only the newest N trips after merge/dedup/sort.
+// Undefined or non-positive means no cap. Used to bound the trip list + its map
+// polylines per member (MAX_TRIPS_PER_MEMBER) so first open stays snappy.
+function mergeTripStreams ({ localTrips = [], circleTrips = [], limit } = {}) {
   const byKey = new Map()   // `${pubkey}:${startTs}` -> trip object
   const deletedKeys = new Set()
 
@@ -108,7 +111,8 @@ function mergeTripStreams ({ localTrips = [], circleTrips = [] } = {}) {
     if (!byKey.has(k)) byKey.set(k, t)
   }
 
-  return [...byKey.values()].sort((a, b) => b.startTs - a.startTs)
+  const sorted = [...byKey.values()].sort((a, b) => b.startTs - a.startTs)
+  return typeof limit === 'number' && limit > 0 ? sorted.slice(0, limit) : sorted
 }
 
 module.exports = {
