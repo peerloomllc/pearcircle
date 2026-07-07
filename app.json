@@ -11,6 +11,9 @@
       "bundleIdentifier": "com.pearcircle",
       "buildNumber": "16",
       "infoPlist": {
+        "LSApplicationQueriesSchemes": [
+          "lightning"
+        ],
         "NSCameraUsageDescription": "Used to scan circle invite QR codes and set your profile photo",
         "NSPhotoLibraryUsageDescription": "Used to set your profile photo",
         "NSMicrophoneUsageDescription": "Required by AVCaptureSession for QR scanning",
