@@ -6713,10 +6713,16 @@ function RegionDownloadModal ({ onClose }) {
 }
 
 // AboutView mirrors PearGuard's AboutTab pattern: brand header, plain
-// prose sections explaining the model, a couple of action buttons. No
-// donation flow yet (PearCircle hasn't shipped to stores; can layer in
-// later with the same iOS guideline 3.1.1 gating PearGuard uses).
+// prose sections explaining the model, a couple of action buttons.
+// PearCircle is live on the App Store + Android, so iOS guideline 3.1.1
+// applies: donations must route to Safari/web (never IAP). Both paths
+// below satisfy that -- a lightning: handler if a wallet is installed,
+// else the wallet picker whose primary action opens the Strike tip page
+// in the browser.
 const LIGHTNING_ADDRESS = 'peerloomllc@strike.me'
+// Hosted Strike tip page. Zero-install donation path for the "no wallet
+// detected" sheet -- opens in the browser, no Lightning wallet required.
+const STRIKE_TIP_URL = 'https://strike.me/peerloomllc/'
 
 const LIGHTNING_WALLETS = [
   { name: 'Strike',            url: 'https://strike.me',          desc: 'Simple Lightning payments' },
@@ -6966,10 +6972,25 @@ function LightningWalletModal ({ onClose }) {
         <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.xs + 2, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
           <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
         </div>
-        <p style={{ ...body, marginBottom: spacing.lg, textAlign: 'left' }}>
-          No Lightning wallet was detected on your device. Bitcoin
-          Lightning is a fast, low-fee payment network built on top of
-          Bitcoin. To send a tip, install one of these wallets:
+        <p style={{ ...body, marginBottom: spacing.base, textAlign: 'left' }}>
+          Bitcoin Lightning is a fast, low-fee payment network built on
+          top of Bitcoin. The quickest way to tip is right in your
+          browser -- no wallet needed:
+        </p>
+        <button
+          onClick={() => { openURL(STRIKE_TIP_URL); onClose() }}
+          style={{
+            width: '100%', padding: `${spacing.md}px ${spacing.base}px`,
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.lg, cursor: 'pointer',
+            fontFamily: typography.fontFamily, fontSize: 15, fontWeight: 400,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
+          }}
+        >
+          <Lightning size={16} weight='fill' /> Tip on the Web
+        </button>
+        <p style={{ ...body, textAlign: 'center', margin: `${spacing.base}px 0` }}>
+          or pay from your own Lightning wallet:
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm + 2 }}>
           {LIGHTNING_WALLETS.map((w) => (
