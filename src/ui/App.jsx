@@ -6728,7 +6728,7 @@ const STRIKE_TIP_URL = 'https://strike.me/peerloomllc/'
 // reuse is fine -- Strike credits deposits to any address it issued.
 // Reused public addresses are visible on-chain (accepted for a public
 // donation address). Empty string hides the on-chain row until set.
-const BTC_ONCHAIN_ADDRESS = ''
+const BTC_ONCHAIN_ADDRESS = 'bc1q0kksenz3j4u9ppe6f4krclvzwxk7sjy00cc9cf'
 
 const LIGHTNING_WALLETS = [
   { name: 'Strike',            url: 'https://strike.me',          desc: 'Simple Lightning payments' },
@@ -7027,7 +7027,7 @@ function CopyField ({ value, hint }) {
 function LightningWalletModal ({ detected = false, onClose }) {
   const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
   const body = { ...typography.body, color: colors.text.secondary, lineHeight: 1.7 }
-  const secLabel = { ...typography.caption, color: colors.text.secondary, fontWeight: 400, margin: `${spacing.lg}px 0 ${spacing.sm}px` }
+  const secLabel = { ...typography.caption, color: colors.text.secondary, fontWeight: 400, margin: `${spacing.lg}px 0 ${spacing.sm}px`, textAlign: 'center' }
   const primaryBtn = {
     width: '100%', padding: `${spacing.md}px ${spacing.base}px`,
     background: colors.primary, color: colors.text.onPrimary,
@@ -7043,7 +7043,7 @@ function LightningWalletModal ({ detected = false, onClose }) {
           <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
         </div>
         <p style={{ ...body, marginBottom: spacing.base, textAlign: 'left' }}>
-          Support PearCircle with Bitcoin — over Lightning (fast and
+          Support PearCircle with Bitcoin over Lightning (fast and
           low-fee){BTC_ONCHAIN_ADDRESS ? ' or on-chain' : ''}.
         </p>
 
@@ -7057,7 +7057,7 @@ function LightningWalletModal ({ detected = false, onClose }) {
         )}
 
         <p style={{ ...secLabel, marginTop: detected ? spacing.base : spacing.md }}>Lightning address</p>
-        <CopyField value={LIGHTNING_ADDRESS} hint='Paste into any Lightning, ecash, or web wallet.' />
+        <CopyField value={LIGHTNING_ADDRESS} hint='Paste into any Lightning, ecash or web wallet.' />
 
         <div style={{ marginTop: spacing.base }}>
           <button onClick={() => { openURL(STRIKE_TIP_URL); onClose() }} style={detected ? outlineBtn : primaryBtn}>
@@ -7071,7 +7071,7 @@ function LightningWalletModal ({ detected = false, onClose }) {
         {BTC_ONCHAIN_ADDRESS && (
           <>
             <p style={secLabel}>On-chain Bitcoin</p>
-            <CopyField value={BTC_ONCHAIN_ADDRESS} hint='On-chain BTC. Higher fees — Lightning is cheaper for small tips.' />
+            <CopyField value={BTC_ONCHAIN_ADDRESS} hint='On-chain BTC. Higher fees, so Lightning is cheaper for small tips.' />
           </>
         )}
 
