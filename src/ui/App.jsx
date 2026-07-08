@@ -6987,7 +6987,7 @@ function LightningWalletModal ({ onClose }) {
             display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
           }}
         >
-          <Lightning size={16} weight='fill' /> Tip on the Web
+          <Lightning size={16} weight='fill' /> Tip on the Web <Lightning size={16} weight='fill' />
         </button>
         <p style={{ ...body, textAlign: 'center', margin: `${spacing.base}px 0` }}>
           or pay from your own Lightning wallet:
