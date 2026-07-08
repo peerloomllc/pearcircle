@@ -59,8 +59,8 @@ export const colorsRaw = {
     muted:     '#666666',
     onPrimary: '#0a1f23',
   },
-  border: '#2a2a2a',
-  divider: '#222222',
+  border: '#4d4d4d',
+  divider: '#2e2e2e',
 }
 
 // Manrope-300 (Light) is the only weight we ship via fonts.js, matching
