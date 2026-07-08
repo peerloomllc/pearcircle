@@ -6729,6 +6729,10 @@ const STRIKE_TIP_URL = 'https://strike.me/peerloomllc/'
 // Reused public addresses are visible on-chain (accepted for a public
 // donation address). Empty string hides the on-chain row until set.
 const BTC_ONCHAIN_ADDRESS = 'bc1q0kksenz3j4u9ppe6f4krclvzwxk7sjy00cc9cf'
+// Shared height for every option box in the donation sheet (primary
+// buttons, copy fields, wallet rows) so the stack reads as one uniform
+// column. Sized to fit the tallest content (a two-line wallet row).
+const DONATE_OPTION_MIN_H = 56
 
 const LIGHTNING_WALLETS = [
   { name: 'Strike',            url: 'https://strike.me',          desc: 'Simple Lightning payments' },
@@ -6994,6 +6998,7 @@ function CopyField ({ value, hint }) {
         display: 'flex', alignItems: 'center', gap: spacing.sm,
         background: colors.surface.card, border: `1px solid ${colors.border}`,
         borderRadius: radius.lg, padding: `${spacing.sm + 2}px ${spacing.md}px`,
+        minHeight: DONATE_OPTION_MIN_H, boxSizing: 'border-box',
       }}>
         <span style={{
           flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -7012,7 +7017,7 @@ function CopyField ({ value, hint }) {
         </button>
       </div>
       {hint && (
-        <p style={{ ...typography.caption, color: colors.text.muted, margin: `${spacing.xs}px 0 0`, lineHeight: 1.5 }}>{hint}</p>
+        <p style={{ ...typography.caption, color: colors.text.muted, margin: `${spacing.xs}px 0 0`, lineHeight: 1.5, textAlign: 'center' }}>{hint}</p>
       )}
     </div>
   )
@@ -7030,19 +7035,19 @@ function LightningWalletModal ({ detected = false, onClose }) {
   const secLabel = { ...typography.caption, color: colors.text.secondary, fontWeight: 400, margin: `${spacing.lg}px 0 ${spacing.sm}px`, textAlign: 'center' }
   const primaryBtn = {
     width: '100%', padding: `${spacing.md}px ${spacing.base}px`,
+    minHeight: DONATE_OPTION_MIN_H, boxSizing: 'border-box',
     background: colors.primary, color: colors.text.onPrimary,
     border: 'none', borderRadius: radius.lg, cursor: 'pointer',
     fontFamily: typography.fontFamily, fontSize: 15, fontWeight: 400,
     display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
   }
-  const outlineBtn = { ...primaryBtn, background: 'transparent', color: colors.text.primary, border: `1px solid ${colors.border}` }
   return (
     <BottomSheet onClose={onClose} zIndex={300}>
       <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px`, maxHeight: '80vh', overflowY: 'auto' }}>
         <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.xs + 2, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
           <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
         </div>
-        <p style={{ ...body, marginBottom: spacing.base, textAlign: 'left' }}>
+        <p style={{ ...body, marginBottom: spacing.base, textAlign: 'center' }}>
           Support PearCircle with Bitcoin over Lightning (fast and
           low-fee){BTC_ONCHAIN_ADDRESS ? ' or on-chain' : ''}.
         </p>
@@ -7060,7 +7065,7 @@ function LightningWalletModal ({ detected = false, onClose }) {
         <CopyField value={LIGHTNING_ADDRESS} hint='Paste into any Lightning, ecash or web wallet.' />
 
         <div style={{ marginTop: spacing.base }}>
-          <button onClick={() => { openURL(STRIKE_TIP_URL); onClose() }} style={detected ? outlineBtn : primaryBtn}>
+          <button onClick={() => { openURL(STRIKE_TIP_URL); onClose() }} style={primaryBtn}>
             <Lightning size={16} weight='fill' /> Show a QR / pay in a browser <Lightning size={16} weight='fill' />
           </button>
           <p style={{ ...typography.caption, color: colors.text.muted, margin: `${spacing.xs}px 0 0`, textAlign: 'center', lineHeight: 1.5 }}>
@@ -7089,7 +7094,8 @@ function LightningWalletModal ({ detected = false, onClose }) {
                     background: colors.surface.card,
                     border: `1px solid ${colors.border}`,
                     borderRadius: radius.lg,
-                    padding: `${spacing.md}px ${spacing.base}px`,
+                    padding: `${spacing.sm + 2}px ${spacing.base}px`,
+                    minHeight: DONATE_OPTION_MIN_H, boxSizing: 'border-box',
                     display: 'flex', alignItems: 'center', gap: spacing.md,
                     cursor: 'pointer', width: '100%', textAlign: 'left',
                     fontFamily: typography.fontFamily,
