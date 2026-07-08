@@ -78,6 +78,20 @@ if [ "${SKIP_SYNC:-0}" != "1" ]; then
     "${MAC_MINI}:${MAC_REPO_PATH}/"
 fi
 
+# ── 1b. Install JS deps on Mac mini ─────────────────────────────────────────
+# rsync excludes node_modules/ (regenerated on the build host), so a native
+# module added locally (e.g. expo-clipboard) shows up in the synced
+# package.json but is missing from the Mac's node_modules. Expo autolinking
+# then silently omits its pod and the Metro bundle can't resolve the import,
+# so the archive fails. Running npm install after every sync keeps the Mac's
+# node_modules in step with package.json. Skipped alongside SKIP_SYNC (no new
+# code synced -> deps already in place). bash -lc so /opt/homebrew/bin (node)
+# is on PATH, same as the pod install step below.
+if [ "${SKIP_SYNC:-0}" != "1" ]; then
+  step "npm install on $MAC_MINI"
+  ssh "$MAC_MINI" "bash -lc 'cd $MAC_REPO_PATH && npm install'" | tail -3
+fi
+
 # ── 2. Pod install on Mac mini ──────────────────────────────────────────────
 # UTF-8 env vars are required: bash -lc returns ASCII-8BIT by default on
 # this Mac, and CocoaPods' UnicodeNormalize crashes without UTF-8.
