@@ -11,6 +11,7 @@ import * as Linking from 'expo-linking'
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Notifications from 'expo-notifications'
 import * as Haptics from 'expo-haptics'
+import * as Clipboard from 'expo-clipboard'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { makeStartLock, autostartGateValue } from '@/src/lib/backendBootstrap'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -1518,6 +1519,24 @@ export default function Index() {
         respond(msg.id, { ok: true, can: !!can })
       } catch (err: any) {
         respond(msg.id, { ok: false, can: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:clipboard') {
+      // Copy text to the OS clipboard. Used by the donation sheet's copy
+      // buttons (Lightning address, on-chain BTC address). Routes through
+      // the shell because navigator.clipboard is unreliable in the WebView
+      // -- its about:blank base URL isn't treated as a secure context.
+      const text = msg.args?.text
+      if (typeof text !== 'string' || text.length === 0) {
+        respond(msg.id, { ok: false, error: 'text must be a non-empty string' })
+        return
+      }
+      try {
+        await Clipboard.setStringAsync(text)
+        respond(msg.id, { ok: true })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
       }
       return
     }

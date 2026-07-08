@@ -6715,14 +6715,20 @@ function RegionDownloadModal ({ onClose }) {
 // AboutView mirrors PearGuard's AboutTab pattern: brand header, plain
 // prose sections explaining the model, a couple of action buttons.
 // PearCircle is live on the App Store + Android, so iOS guideline 3.1.1
-// applies: donations must route to Safari/web (never IAP). Both paths
-// below satisfy that -- a lightning: handler if a wallet is installed,
-// else the wallet picker whose primary action opens the Strike tip page
-// in the browser.
+// applies: donations must route to Safari/web (never IAP). The BTC flow
+// satisfies that -- a lightning: handoff to an installed wallet, the
+// Strike tip page in the browser, or copy-to-paste addresses. Fiat lives
+// on the separate USD button (buymeacoffee), so this flow is BTC-only.
 const LIGHTNING_ADDRESS = 'peerloomllc@strike.me'
-// Hosted Strike tip page. Zero-install donation path for the "no wallet
-// detected" sheet -- opens in the browser, no Lightning wallet required.
+// Hosted Strike tip page (Lightning invoice QR + web pay). Good for
+// scanning from another device or paying on desktop.
 const STRIKE_TIP_URL = 'https://strike.me/peerloomllc/'
+// Static on-chain BTC address for donors who prefer L1 over Lightning.
+// A Strike deposit address: custodial, derived from Strike's xpub, so
+// reuse is fine -- Strike credits deposits to any address it issued.
+// Reused public addresses are visible on-chain (accepted for a public
+// donation address). Empty string hides the on-chain row until set.
+const BTC_ONCHAIN_ADDRESS = ''
 
 const LIGHTNING_WALLETS = [
   { name: 'Strike',            url: 'https://strike.me',          desc: 'Simple Lightning payments' },
@@ -6787,6 +6793,9 @@ function Collapsible ({ title, icon: Icon, open, onToggle, maxHeight = '480px', 
 
 function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }) {
   const [walletModal, setWalletModal] = useState(false)
+  // Whether an installed app claims the lightning: scheme. Probed on BTC
+  // tap; drives the donation sheet's hero (open-in-wallet vs copy/install).
+  const [lnDetected, setLnDetected] = useState(false)
   // Hidden geofence diagnostics: tap the version 7x to reveal. Production-safe
   // (no debug gate) so a non-dev user can open it and screenshot the state when
   // a crossing is missed, without any devicectl access (proposal 2026-07-01).
@@ -6830,14 +6839,18 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
     } catch {}
   }
 
+  // Always open the sheet as a chooser (Option 2): probe for an installed
+  // Lightning wallet so the sheet can offer "open in your wallet" up top,
+  // but still surface copy-address / QR / on-chain so a wallet owner who
+  // prefers on-chain (or an undetected/web/ecash wallet) has a path too.
   const handleDonateBTC = async () => {
+    let can = false
     try {
       const r = await pear.call('shell:canOpenURL', { url: 'lightning:test' })
-      if (r?.can) openURL('lightning:' + LIGHTNING_ADDRESS)
-      else setWalletModal(true)
-    } catch {
-      setWalletModal(true)
-    }
+      can = !!r?.can
+    } catch {}
+    setLnDetected(can)
+    setWalletModal(true)
   }
 
   const reportIssue = () => openURL('https://github.com/peerloomllc/pearcircle/issues')
@@ -6950,7 +6963,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
       </div>
 
       {walletModal && (
-        <LightningWalletModal onClose={() => setWalletModal(false)} />
+        <LightningWalletModal detected={lnDetected} onClose={() => setWalletModal(false)} />
       )}
       {geoDiag && (
         <GeofenceDiagModal diag={geoDiag} onClose={() => setGeoDiag(null)} />
@@ -6959,65 +6972,142 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
   )
 }
 
-// "No Lightning wallet detected" picker. Shared between the AboutView
-// Support-development section and the two-week DonationReminderModal
-// so the wallet recommendations stay in one place. Bottom-sheet
-// shaped; tapping a wallet opens its install URL and dismisses.
-function LightningWalletModal ({ onClose }) {
+// A monospace address row with a Copy button that flashes "Copied" on
+// success. Routes through shell:clipboard (navigator.clipboard is
+// unreliable in the about:blank WebView). Used for the Lightning and
+// on-chain addresses in the donation sheet.
+function CopyField ({ value, hint }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      const r = await pear.call('shell:clipboard', { text: value })
+      if (r?.ok !== false) {
+        haptic('light')
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1600)
+      }
+    } catch {}
+  }
+  return (
+    <div>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: spacing.sm,
+        background: colors.surface.card, border: `1px solid ${colors.border}`,
+        borderRadius: radius.lg, padding: `${spacing.sm + 2}px ${spacing.md}px`,
+      }}>
+        <span style={{
+          flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          fontFamily: typography.monoFamily, fontSize: 13, color: colors.text.primary,
+        }}>{value}</span>
+        <button
+          onClick={copy}
+          style={{
+            flexShrink: 0, background: 'transparent', border: 'none', cursor: 'pointer',
+            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+            color: copied ? colors.success : colors.primary,
+            display: 'flex', alignItems: 'center', gap: 4,
+          }}
+        >
+          {copied ? <><CheckCircle size={14} weight='fill' /> Copied</> : 'Copy'}
+        </button>
+      </div>
+      {hint && (
+        <p style={{ ...typography.caption, color: colors.text.muted, margin: `${spacing.xs}px 0 0`, lineHeight: 1.5 }}>{hint}</p>
+      )}
+    </div>
+  )
+}
+
+// BTC donation sheet (Option 2: always a chooser). `detected` reflects
+// whether an installed app claims the lightning: scheme. When true, the
+// hero is a one-tap handoff to that wallet; either way the sheet offers
+// copy-to-paste addresses (Lightning + optional on-chain) and the Strike
+// QR/browser page, plus an install list when no wallet was detected. Fiat
+// is handled by the separate USD button, so this stays BTC-only.
+function LightningWalletModal ({ detected = false, onClose }) {
   const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
   const body = { ...typography.body, color: colors.text.secondary, lineHeight: 1.7 }
+  const secLabel = { ...typography.caption, color: colors.text.secondary, fontWeight: 400, margin: `${spacing.lg}px 0 ${spacing.sm}px` }
+  const primaryBtn = {
+    width: '100%', padding: `${spacing.md}px ${spacing.base}px`,
+    background: colors.primary, color: colors.text.onPrimary,
+    border: 'none', borderRadius: radius.lg, cursor: 'pointer',
+    fontFamily: typography.fontFamily, fontSize: 15, fontWeight: 400,
+    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
+  }
+  const outlineBtn = { ...primaryBtn, background: 'transparent', color: colors.text.primary, border: `1px solid ${colors.border}` }
   return (
     <BottomSheet onClose={onClose} zIndex={300}>
-      <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px` }}>
+      <div style={{ padding: `0 ${spacing.lg}px ${spacing.lg}px`, maxHeight: '80vh', overflowY: 'auto' }}>
         <div style={{ fontSize: 18, fontWeight: 400, color: colors.text.primary, marginBottom: spacing.xs + 2, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, fontFamily: typography.fontFamily }}>
           <Lightning size={18} weight='thin' /> Bitcoin Lightning <Lightning size={18} weight='thin' />
         </div>
         <p style={{ ...body, marginBottom: spacing.base, textAlign: 'left' }}>
-          Bitcoin Lightning is a fast, low-fee payment network built on
-          top of Bitcoin. The quickest way to tip is right in your
-          browser -- no wallet needed:
+          Support PearCircle with Bitcoin — over Lightning (fast and
+          low-fee){BTC_ONCHAIN_ADDRESS ? ' or on-chain' : ''}.
         </p>
-        <button
-          onClick={() => { openURL(STRIKE_TIP_URL); onClose() }}
-          style={{
-            width: '100%', padding: `${spacing.md}px ${spacing.base}px`,
-            background: colors.primary, color: colors.text.onPrimary,
-            border: 'none', borderRadius: radius.lg, cursor: 'pointer',
-            fontFamily: typography.fontFamily, fontSize: 15, fontWeight: 400,
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
-          }}
-        >
-          <Lightning size={16} weight='fill' /> Tip on the Web <Lightning size={16} weight='fill' />
-        </button>
-        <p style={{ ...body, textAlign: 'center', margin: `${spacing.base}px 0` }}>
-          or pay from your own Lightning wallet:
-        </p>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm + 2 }}>
-          {LIGHTNING_WALLETS.map((w) => (
-            <button
-              key={w.name}
-              onClick={() => openURL(w.url)}
-              style={{
-                background: colors.surface.card,
-                border: `1px solid ${colors.border}`,
-                borderRadius: radius.lg,
-                padding: `${spacing.md}px ${spacing.base}px`,
-                display: 'flex', alignItems: 'center', gap: spacing.md,
-                cursor: 'pointer', width: '100%', textAlign: 'left',
-                fontFamily: typography.fontFamily,
-              }}
-            >
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 14, fontWeight: 400, color: colors.text.primary }}>{w.name}</div>
-                <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted }}>{w.desc}</div>
-              </div>
-              <ArrowSquareOut size={14} weight='thin' color={colors.text.muted} />
+
+        {detected && (
+          <>
+            <button onClick={() => { openURL('lightning:' + LIGHTNING_ADDRESS); onClose() }} style={primaryBtn}>
+              <Lightning size={16} weight='fill' /> Open in your Lightning wallet <Lightning size={16} weight='fill' />
             </button>
-          ))}
+            <p style={{ ...body, textAlign: 'center', margin: `${spacing.base}px 0 0` }}>or use another method:</p>
+          </>
+        )}
+
+        <p style={{ ...secLabel, marginTop: detected ? spacing.base : spacing.md }}>Lightning address</p>
+        <CopyField value={LIGHTNING_ADDRESS} hint='Paste into any Lightning, ecash, or web wallet.' />
+
+        <div style={{ marginTop: spacing.base }}>
+          <button onClick={() => { openURL(STRIKE_TIP_URL); onClose() }} style={detected ? outlineBtn : primaryBtn}>
+            <Lightning size={16} weight='fill' /> Show a QR / pay in a browser <Lightning size={16} weight='fill' />
+          </button>
+          <p style={{ ...typography.caption, color: colors.text.muted, margin: `${spacing.xs}px 0 0`, textAlign: 'center', lineHeight: 1.5 }}>
+            Scan from another device or on desktop.
+          </p>
         </div>
-        <p style={{ ...body, textAlign: 'center', marginTop: spacing.base, marginBottom: 0 }}>
-          After installing, return here and tap BTC again.
-        </p>
+
+        {BTC_ONCHAIN_ADDRESS && (
+          <>
+            <p style={secLabel}>On-chain Bitcoin</p>
+            <CopyField value={BTC_ONCHAIN_ADDRESS} hint='On-chain BTC. Higher fees — Lightning is cheaper for small tips.' />
+          </>
+        )}
+
+        {!detected && (
+          <>
+            <p style={{ ...body, textAlign: 'center', margin: `${spacing.lg}px 0 ${spacing.sm}px` }}>
+              Don't have a Lightning wallet?
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm + 2 }}>
+              {LIGHTNING_WALLETS.map((w) => (
+                <button
+                  key={w.name}
+                  onClick={() => openURL(w.url)}
+                  style={{
+                    background: colors.surface.card,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radius.lg,
+                    padding: `${spacing.md}px ${spacing.base}px`,
+                    display: 'flex', alignItems: 'center', gap: spacing.md,
+                    cursor: 'pointer', width: '100%', textAlign: 'left',
+                    fontFamily: typography.fontFamily,
+                  }}
+                >
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 400, color: colors.text.primary }}>{w.name}</div>
+                    <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted }}>{w.desc}</div>
+                  </div>
+                  <ArrowSquareOut size={14} weight='thin' color={colors.text.muted} />
+                </button>
+              ))}
+            </div>
+            <p style={{ ...body, textAlign: 'center', marginTop: spacing.base, marginBottom: 0 }}>
+              After installing, return here and tap BTC again.
+            </p>
+          </>
+        )}
       </div>
     </BottomSheet>
   )
