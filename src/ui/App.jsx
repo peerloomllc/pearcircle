@@ -3214,14 +3214,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           You're not in any circles yet. Use the menu above to create one or join via an invite link.
         </div>
       ) : (
-        // One pill, two targets. Keeps the old FAB's shape and both counts at
-        // a glance, but each half opens only its own list.
+        // Two equal-width pills, each opening only its own list.
         <div data-tour='members-fab' style={s.fab}>
-          <button style={s.fabSegment} onClick={() => setSheetOpen('members')}>
+          <button style={s.fabPill} onClick={() => setSheetOpen('members')}>
             Members ({memberCount})
           </button>
-          <span style={s.fabDivider} aria-hidden='true' />
-          <button style={s.fabSegment} onClick={() => setSheetOpen('places')}>
+          <button style={s.fabPill} onClick={() => setSheetOpen('places')}>
             Places ({placeCount})
           </button>
         </div>
@@ -8555,35 +8553,36 @@ const s = {
   // Map-overlay pill: theme-stable since it floats over light tiles.
   // Text and border use the raw (dark-mode) values so light-mode UI
   // doesn't render dark text on a dark fab.
-  // The pill itself is now a container; padding moved to the segments so each
-  // half gets a full-height tap target rather than a text-sized one.
+  // Two standalone pills rather than one segmented pill: the gear and info
+  // buttons flanking them are already separate pills, so that's the overlay's
+  // existing vocabulary for distinct tap targets.
+  //
+  // width:max-content is load-bearing. The grid is absolutely positioned, so
+  // its width is indefinite (shrink-to-fit), and 1fr tracks under an indefinite
+  // width fall back to max-content -- each pill sizes to its own label and they
+  // come out unequal (measured 227px vs 193px). Pinning the width to
+  // max-content makes it definite, so the two 1fr tracks split it evenly and
+  // "Members (12)" and "Places (3)" stay the same width.
   fab: {
     position: 'absolute',
     bottom: 'calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 20px)',
     left: '50%', transform: 'translateX(-50%)',
-    display: 'flex', alignItems: 'stretch',
-    background: 'rgba(26,26,26,0.92)',
+    display: 'grid', gridAutoFlow: 'column', gridAutoColumns: '1fr',
+    width: 'max-content',
+    gap: 8,
+    zIndex: 5,
+  },
+  fabPill: {
+    padding: '10px 18px',
+    background: 'rgba(26,26,26,0.92)', color: colorsRaw.text.primary,
     border: `1px solid ${colorsRaw.border}`, borderRadius: 999,
     backdropFilter: 'blur(8px)',
     WebkitBackdropFilter: 'blur(8px)',
     boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
-    zIndex: 5,
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-  },
-  fabSegment: {
-    padding: '10px 18px',
-    background: 'transparent', color: colorsRaw.text.primary,
-    border: 'none',
     fontSize: 14, fontWeight: 300,
     cursor: 'pointer',
     whiteSpace: 'nowrap',
     fontFamily: typography.fontFamily,
-  },
-  // flexShrink:0 or the 1px rule collapses to nothing under flex shrinking.
-  fabDivider: {
-    width: 1, flexShrink: 0, alignSelf: 'stretch', margin: '6px 0',
-    background: colorsRaw.border,
   },
   dropdownBtn: {
     display: 'flex', alignItems: 'center', gap: 6, flex: 1,
