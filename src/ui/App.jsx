@@ -2688,29 +2688,31 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     focusMember(initialFocus.pubkey, { openSheet: false })
   }, [initialFocus, focusMember])
 
-  // Long-press on the map opens the add-place form pre-filled with
-  // the touched coords. The form picks (or asks for) the target
-  // circle from `writableCircles`, so this works in both filtered
-  // and "All circles" modes as long as the user is a writer
-  // somewhere. No-op when the user has no writable circle (read-only
-  // joiner, pending writer-add, etc).
+  // Long-press on the map opens the dedicated add-place sheet pre-filled
+  // with the touched coords. The form asks for the target circle from
+  // `writableCircles`, so this works in both filtered and "All circles"
+  // modes as long as the user is a writer somewhere. No-op when the user
+  // has no writable circle (read-only joiner, pending writer-add, etc).
   const onMapLongPress = useCallback(([lng, lat]) => {
     if (writableCircles.length === 0) return
     setEditingPlace(null)
     setPendingPlaceCoords({ lat, lon: lng })
     setShowAddPlace(true)
-    setSheetOpen(true)
   }, [writableCircles])
 
+  const closeAddPlace = useCallback(() => {
+    setShowAddPlace(false)
+    setPendingPlaceCoords(null)
+  }, [])
+
   // Dismissing the bottom sheet (scrim tap or drag-to-close) cancels
-  // any pending add/edit/delete-confirm flow, so reopening the sheet
+  // any pending edit/delete-confirm flow, so reopening the sheet
   // is a fresh state. Without this the user gets the surprise of
   // returning to a half-filled edit form they thought they'd dismissed.
+  // Add-place lives in its own sheet and clears itself on close.
   useEffect(() => {
     if (sheetOpen) return
     setEditingPlace(null)
-    setShowAddPlace(false)
-    setPendingPlaceCoords(null)
     setConfirmingDeletePlace(null)
     setDeleteError(null)
   }, [sheetOpen])
@@ -3348,16 +3350,6 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               onSaved={async () => { setEditingPlace(null); await refresh() }}
             />
           )}
-          {!editingPlace && writableCircles.length > 0 && showAddPlace && (
-            <AddPlaceForm
-              key={pendingPlaceCoords ? `lp:${pendingPlaceCoords.lat}:${pendingPlaceCoords.lon}` : 'manual'}
-              circles={writableCircles}
-              myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
-              initialCoords={pendingPlaceCoords}
-              onCancel={() => { setShowAddPlace(false); setPendingPlaceCoords(null) }}
-              onAdded={async () => { setShowAddPlace(false); setPendingPlaceCoords(null); await refresh() }}
-            />
-          )}
           {actionTargetCircleId && !actionTargetWritable && (
             <p style={s.muted}>Read-only until owner adds you as a writer.</p>
           )}
@@ -3372,6 +3364,25 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               onClose={() => { if (deletingPlaceId !== confirmingDeletePlace.id) setConfirmingDeletePlace(null) }}
             />
           )}
+        </BottomSheet>
+      )}
+
+      {/* Place creation gets its own sheet rather than riding along at the
+          bottom of the circle sheet: a new place needs a target circle, a
+          name and a radius, and nothing about the member or place lists
+          informs those. Mounted independently of `sheetOpen` so a map
+          long-press goes straight here. */}
+      {showAddPlace && writableCircles.length > 0 && (
+        <BottomSheet onClose={closeAddPlace}>
+          <h3 style={s.h3}>New place</h3>
+          <AddPlaceForm
+            key={pendingPlaceCoords ? `lp:${pendingPlaceCoords.lat}:${pendingPlaceCoords.lon}` : 'manual'}
+            circles={writableCircles}
+            myLastSeen={myPubkey ? data.lastSeen?.[myPubkey] : null}
+            initialCoords={pendingPlaceCoords}
+            onCancel={closeAddPlace}
+            onAdded={async () => { closeAddPlace(); await refresh() }}
+          />
         </BottomSheet>
       )}
     </div>
@@ -3486,9 +3497,12 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
       ? { lat: myLastSeen.lat, lon: myLastSeen.lon, source: 'current' }
       : null
   )
-  // Target circle: when the user has exactly one writable circle in
-  // scope we auto-pick it; otherwise they choose from the list.
-  // `circles` is non-empty when this form is shown (gated upstream).
+  // Target circle: the picker is always shown, so the circle a place
+  // lands in is visible before saving rather than inferred from whatever
+  // scope the map happened to be in. A lone writable circle is
+  // preselected — there is nothing to choose between — but the choice is
+  // still on screen. `circles` is non-empty when this form is shown
+  // (gated upstream).
   const [targetCircleId, setTargetCircleId] = useState(
     circles.length === 1 ? circles[0].circleId : null,
   )
@@ -3535,27 +3549,23 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
           Long-press the map to pick a spot, or wait for your current location.
         </div>
       )}
-      {circles.length > 1 && (
-        <>
-          <label style={s.label}>Add to circle</label>
-          <div style={s.durationRow}>
-            {[...circles].sort((a, b) => byName(a.circle?.name, b.circle?.name)).map(c => (
-              <button
-                key={c.circleId}
-                style={{
-                  ...s.durationBtn,
-                  ...(targetCircleId === c.circleId
-                    ? { background: colors.surface.elevated, color: colors.primary, borderColor: colors.primary }
-                    : null),
-                }}
-                onClick={() => setTargetCircleId(c.circleId)}
-              >
-                {c.circle?.name || CIRCLE_NAME_PENDING}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+      <label style={s.label}>Add to circle</label>
+      <div style={s.durationRow}>
+        {[...circles].sort((a, b) => byName(a.circle?.name, b.circle?.name)).map(c => (
+          <button
+            key={c.circleId}
+            style={{
+              ...s.durationBtn,
+              ...(targetCircleId === c.circleId
+                ? { background: colors.surface.elevated, color: colors.primary, borderColor: colors.primary }
+                : null),
+            }}
+            onClick={() => setTargetCircleId(c.circleId)}
+          >
+            {c.circle?.name || CIRCLE_NAME_PENDING}
+          </button>
+        ))}
+      </div>
       <label style={s.label}>Name</label>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, marginBottom: 8 }}>
         {PLACE_PRESETS.map(({ label, Icon }) => {
