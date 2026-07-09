@@ -148,8 +148,8 @@ if (typeof document !== 'undefined' && !document.getElementById('pearcircle-them
       --color-surface-card: #1a1a1a;
       --color-surface-elevated: #252525;
       --color-surface-input: #1c1c1c;
-      --color-border: #2a2a2a;
-      --color-divider: #222222;
+      --color-border: #4d4d4d;
+      --color-divider: #2e2e2e;
     }
     [data-theme="light"] {
       --color-primary: #5BAF3A;
@@ -5993,24 +5993,14 @@ function TripsSharingSection ({ active = true }) {
               padding: `${spacing.sm}px 0`, borderBottom: `1px solid ${colors.divider}`,
             }}
           >
-            <div style={{ ...typography.body, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div style={{ ...typography.body, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: spacing.md }}>
               {c.name}
             </div>
-            <button
-              onClick={() => setConfirming({ circleId: c.circleId, name: c.name, value: !on })}
+            <ToggleSwitch
+              on={on}
               disabled={busy}
-              style={{
-                padding: '8px 14px', borderRadius: radius.sm,
-                background: on ? colors.primary : 'transparent',
-                color: on ? colors.text.onPrimary : colors.text.primary,
-                border: `1px solid ${on ? colors.primary : colors.border}`,
-                cursor: busy ? 'default' : 'pointer',
-                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 13,
-                opacity: busy ? 0.5 : 1,
-              }}
-            >
-              {on ? 'Sharing' : 'Off'}
-            </button>
+              onChange={() => setConfirming({ circleId: c.circleId, name: c.name, value: !on })}
+            />
           </div>
         )
       })}
@@ -6083,31 +6073,13 @@ function TripNotificationsSection () {
     try { await pear.call('tripNotifications:set', { enabled: value }) } catch {}
     setEnabled(value)
   }, [enabled])
-  const btn = (label, value) => (
-    <button
-      onClick={() => toggle(value)}
-      style={{
-        flex: 1, padding: '10px', borderRadius: radius.sm,
-        background: enabled === value ? colors.primary : 'transparent',
-        color: enabled === value ? colors.text.onPrimary : colors.text.primary,
-        border: `1px solid ${enabled === value ? colors.primary : colors.border}`,
-        cursor: 'pointer',
-        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
-      }}
-    >
-      {label}
-    </button>
-  )
   return (
-    <>
-      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
+      <span style={{ ...typography.caption, color: colors.text.secondary, flex: 1 }}>
         Notify when a circle member finishes a trip. Trips are still recorded either way.
-      </p>
-      <div style={{ display: 'flex', gap: spacing.sm }}>
-        {btn('On', true)}
-        {btn('Off', false)}
-      </div>
-    </>
+      </span>
+      <ToggleSwitch on={enabled} onChange={toggle} />
+    </div>
   )
 }
 
@@ -6139,29 +6111,14 @@ function SyncReminderSection () {
     try { await pear.call('shell:syncReminder:set', { time: value }) }
     catch { setTime(prev) }
   }, [time])
-  const btn = (label, value) => (
-    <button
-      onClick={() => toggle(value)}
-      style={{
-        flex: 1, padding: '10px', borderRadius: radius.sm,
-        background: enabled === value ? colors.primary : 'transparent',
-        color: enabled === value ? colors.text.onPrimary : colors.text.primary,
-        border: `1px solid ${enabled === value ? colors.primary : colors.border}`,
-        cursor: 'pointer',
-        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
-      }}
-    >
-      {label}
-    </button>
-  )
   return (
     <>
-      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm }}>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base }}>
         PearCircle has no servers — your circles sync directly between members' phones, only while the app is running. A daily reminder at the time you pick nudges you to open PearCircle so your latest location goes out and you catch up on everyone else.
       </p>
-      <div style={{ display: 'flex', gap: spacing.sm }}>
-        {btn('On', true)}
-        {btn('Off', false)}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
+        <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Daily reminder</span>
+        <ToggleSwitch on={enabled} onChange={toggle} />
       </div>
       {enabled && (
         <div style={{ marginTop: spacing.lg }}>
