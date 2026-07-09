@@ -3114,30 +3114,21 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         </div>
       </div>
 
-      {/* Floating gear (Settings) bottom-left, info (About) bottom-right.
-          Same circular FAB style; sit above the bottom sheet handle and
-          below the sheet itself. Sharing-paused indicator overlays the
-          gear so the user notices when they're not broadcasting. */}
+      {/* Bottom overlay row: gear (Settings), the Members/Places pills, info
+          (About). One flex row rather than three independently positioned
+          elements -- the gear and info used to be pinned to the left and right
+          edges while the pills were centered, so nothing stopped them
+          colliding once the pills grew (two-digit counts on a small screen).
+          The row itself is pointer-transparent so map drags land between the
+          controls; each control re-enables pointer events. Sharing-paused
+          indicator overlays the gear so the user notices when they're not
+          broadcasting. */}
+      <div style={s.bottomBar}>
       <button
         type='button'
         onClick={() => setSheet({ name: 'settings' })}
         aria-label='Settings'
-        style={{
-          position: 'absolute',
-          left: 16,
-          bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 16px)`,
-          width: 44, height: 44, borderRadius: '50%',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          background: 'rgba(26,26,26,0.92)',
-          backdropFilter: 'blur(8px)',
-          WebkitBackdropFilter: 'blur(8px)',
-          // Map-overlay FAB: theme-stable since it floats over light tiles.
-          border: `1px solid ${colorsRaw.border}`,
-          color: colorsRaw.text.primary,
-          cursor: 'pointer',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
-          zIndex: 5,
-        }}
+        style={s.overlayIconBtn}
       >
         <GearSix size={22} weight='thin' />
         {!sharing && (
@@ -3153,28 +3144,33 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           />
         )}
       </button>
+
+      {/* Two equal-width pills, each opening only its own list. Sized by the
+          row's free space (grid 1fr 1fr on a definite width), so they shrink
+          together on narrow screens instead of pushing into the icons. */}
+      {circles.length === 0
+        ? <div style={{ flex: 1 }} />
+        : (
+          <div data-tour='members-fab' style={s.fabGroup}>
+            <button style={s.fabPill} onClick={() => setSheetOpen('members')}>
+              Members ({memberCount})
+            </button>
+            <button style={s.fabPill} onClick={() => setSheetOpen('places')}>
+              Places ({placeCount})
+            </button>
+          </div>
+        )}
+
       <button
         type='button'
         onClick={() => setSheet({ name: 'about' })}
         aria-label='About'
-        style={{
-          position: 'absolute',
-          right: 16,
-          bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 16px)`,
-          width: 44, height: 44, borderRadius: '50%',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          background: 'rgba(26,26,26,0.92)',
-          backdropFilter: 'blur(8px)',
-          WebkitBackdropFilter: 'blur(8px)',
-          border: `1px solid ${colorsRaw.border}`,
-          color: colorsRaw.text.primary,
-          cursor: 'pointer',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
-          zIndex: 5,
-        }}
+        style={s.overlayIconBtn}
       >
         <InfoIcon size={22} weight='thin' />
       </button>
+      </div>
+
       {/* Find-me FAB stacked above the About FAB. Plain camera helper:
           tap = flyTo self's last-known coords, no focus-mode change, no
           sheet. Dimmed/no-op when we don't have a fix yet (selfSeen is
@@ -3209,19 +3205,9 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         <NavigationArrow size={22} weight='thin' />
       </button>
 
-      {circles.length === 0 ? (
+      {circles.length === 0 && (
         <div style={s.emptyHint}>
           You're not in any circles yet. Use the menu above to create one or join via an invite link.
-        </div>
-      ) : (
-        // Two equal-width pills, each opening only its own list.
-        <div data-tour='members-fab' style={s.fab}>
-          <button style={s.fabPill} onClick={() => setSheetOpen('members')}>
-            Members ({memberCount})
-          </button>
-          <button style={s.fabPill} onClick={() => setSheetOpen('places')}>
-            Places ({placeCount})
-          </button>
         </div>
       )}
 
@@ -8553,27 +8539,45 @@ const s = {
   // Map-overlay pill: theme-stable since it floats over light tiles.
   // Text and border use the raw (dark-mode) values so light-mode UI
   // doesn't render dark text on a dark fab.
-  // Two standalone pills rather than one segmented pill: the gear and info
-  // buttons flanking them are already separate pills, so that's the overlay's
-  // existing vocabulary for distinct tap targets.
-  //
-  // width:max-content is load-bearing. The grid is absolutely positioned, so
-  // its width is indefinite (shrink-to-fit), and 1fr tracks under an indefinite
-  // width fall back to max-content -- each pill sizes to its own label and they
-  // come out unequal (measured 227px vs 193px). Pinning the width to
-  // max-content makes it definite, so the two 1fr tracks split it evenly and
-  // "Members (12)" and "Places (3)" stay the same width.
-  fab: {
-    position: 'absolute',
-    bottom: 'calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 20px)',
-    left: '50%', transform: 'translateX(-50%)',
-    display: 'grid', gridAutoFlow: 'column', gridAutoColumns: '1fr',
-    width: 'max-content',
-    gap: 8,
+  // Single row for the whole bottom overlay. pointerEvents:'none' so a map drag
+  // that starts in the gaps between controls still pans the map; each control
+  // turns pointer events back on.
+  bottomBar: {
+    position: 'absolute', left: 0, right: 0,
+    bottom: 'calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 16px)',
+    // 12px padding + 6px gaps rather than 16/8: on a 360px-wide screen the two
+    // 44px icons leave the pills 106px of content box at the roomier values,
+    // and "Members (9)" already overflows that by a pixel.
+    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '0 12px', boxSizing: 'border-box',
     zIndex: 5,
+    pointerEvents: 'none',
+  },
+  // Map-overlay FAB: theme-stable since it floats over light tiles.
+  overlayIconBtn: {
+    position: 'relative', flexShrink: 0,
+    width: 44, height: 44, borderRadius: '50%',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    background: 'rgba(26,26,26,0.92)',
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    border: `1px solid ${colorsRaw.border}`,
+    color: colorsRaw.text.primary,
+    cursor: 'pointer',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+    pointerEvents: 'auto',
+  },
+  // flex:1 gives the group a definite width, so the two 1fr columns split it
+  // evenly and the pills stay equal regardless of label length. maxWidth plus
+  // auto margins keeps them from stretching absurdly wide on a tablet.
+  fabGroup: {
+    flex: 1, minWidth: 0, maxWidth: 420, margin: '0 auto',
+    display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 6,
+    pointerEvents: 'auto',
   },
   fabPill: {
-    padding: '10px 18px',
+    padding: '10px',
+    minWidth: 0,
     background: 'rgba(26,26,26,0.92)', color: colorsRaw.text.primary,
     border: `1px solid ${colorsRaw.border}`, borderRadius: 999,
     backdropFilter: 'blur(8px)',
@@ -8581,7 +8585,7 @@ const s = {
     boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
     fontSize: 14, fontWeight: 300,
     cursor: 'pointer',
-    whiteSpace: 'nowrap',
+    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
     fontFamily: typography.fontFamily,
   },
   dropdownBtn: {
