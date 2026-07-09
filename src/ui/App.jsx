@@ -2265,7 +2265,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // dragging the sheet down keeps the focus state (top bar visible,
   // map still flown-to). Tapping the focus bar re-opens.
   const [memberSheetVisible, setMemberSheetVisible] = useState(false)
-  const [sheetOpen, setSheetOpen] = useState(false)
+  // null when closed, otherwise 'members' | 'places'. Members and places live
+  // in separate sheets reached from separate FAB segments: stacked in one
+  // sheet, a circle with a handful of each meant scrolling past everyone to
+  // reach the places.
+  const [sheetOpen, setSheetOpen] = useState(null)
+  const [selectedPlaceKey, setSelectedPlaceKey] = useState(null) // '{circleId}:{placeId}' whose detail sheet is open
   const [showAddPlace, setShowAddPlace] = useState(false)
   const [pendingPlaceCoords, setPendingPlaceCoords] = useState(null) // { lat, lon } from a map long-press, prefilled into AddPlaceForm
   const [editingPlace, setEditingPlace] = useState(null) // { circleId, id, name, radiusMeters } or null
@@ -2582,7 +2587,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     setSelectedPubkey(pubkey)
     setMemberSheetVisible(openSheet)
     setMenuOpen(false)
-    setSheetOpen(false)
+    setSheetOpen(null)
     const seen = data.lastSeen?.[pubkey]
     if (seen) {
       justFocusedRef.current = true
@@ -2644,7 +2649,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     setSelectedPubkey(pubkey)
     setMemberSheetVisible(false)
     setMenuOpen(false)
-    setSheetOpen(false)
+    setSheetOpen(null)
     if (seen) {
       justFocusedRef.current = true
       mapApiRef.current?.flyTo({
@@ -2705,17 +2710,39 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     setPendingPlaceCoords(null)
   }, [])
 
-  // Dismissing the bottom sheet (scrim tap or drag-to-close) cancels
-  // any pending edit/delete-confirm flow, so reopening the sheet
-  // is a fresh state. Without this the user gets the surprise of
-  // returning to a half-filled edit form they thought they'd dismissed.
-  // Add-place lives in its own sheet and clears itself on close.
+  // Dismissing the place detail sheet (scrim tap or drag-to-close) cancels
+  // any pending edit/delete-confirm flow, so reopening it is a fresh state.
+  // Without this the user gets the surprise of returning to a half-filled
+  // edit form they thought they'd dismissed. Keyed on the detail sheet
+  // rather than the list sheet because edit and delete now hang off the
+  // detail sheet. Add-place lives in its own sheet and clears itself.
   useEffect(() => {
-    if (sheetOpen) return
+    if (selectedPlaceKey) return
     setEditingPlace(null)
     setConfirmingDeletePlace(null)
     setDeleteError(null)
-  }, [sheetOpen])
+  }, [selectedPlaceKey])
+
+  // Resolved from the live places list rather than stashed at tap time, so an
+  // edit or a background refresh is reflected in the open detail sheet, and a
+  // place deleted out from under us collapses the sheet instead of showing a
+  // stale copy.
+  const selectedPlace = useMemo(() => {
+    if (!selectedPlaceKey) return null
+    return data.places.find((p) => p.circleId + ':' + p.id === selectedPlaceKey) ?? null
+  }, [selectedPlaceKey, data.places])
+
+  const selectedPlaceCircle = useMemo(() => (
+    selectedPlace ? circles.find((c) => c.circleId === selectedPlace.circleId) ?? null : null
+  ), [selectedPlace, circles])
+
+  // Fly first, open the sheet second: the camera settles behind the sheet so
+  // dismissing it reveals the place already centered, matching what tapping a
+  // member row does.
+  const openPlaceDetail = useCallback((p) => {
+    mapApiRef.current?.flyTo({ center: [p.lon, p.lat], zoom: 16, duration: 1100 })
+    setSelectedPlaceKey(p.circleId + ':' + p.id)
+  }, [])
 
   const deletePlace = useCallback(async (place) => {
     setDeleteError(null)
@@ -2723,8 +2750,10 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     try {
       await pear.call('place:delete', { circleId: place.circleId, placeId: place.id })
       setConfirmingDeletePlace(null)
-      // Close any open edit form pointing at the just-deleted place.
+      // Close any open edit form pointing at the just-deleted place, and the
+      // detail sheet it was opened from -- it now describes nothing.
       setEditingPlace((cur) => (cur && cur.id === place.id ? null : cur))
+      setSelectedPlaceKey((cur) => (cur === place.circleId + ':' + place.id ? null : cur))
       await refresh()
     } catch (e) {
       setDeleteError(String(e?.message ?? e))
@@ -3185,9 +3214,17 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           You're not in any circles yet. Use the menu above to create one or join via an invite link.
         </div>
       ) : (
-        <button data-tour='members-fab' style={s.fab} onClick={() => setSheetOpen(true)}>
-          Members ({memberCount}) · Places ({placeCount})
-        </button>
+        // One pill, two targets. Keeps the old FAB's shape and both counts at
+        // a glance, but each half opens only its own list.
+        <div data-tour='members-fab' style={s.fab}>
+          <button style={s.fabSegment} onClick={() => setSheetOpen('members')}>
+            Members ({memberCount})
+          </button>
+          <span style={s.fabDivider} aria-hidden='true' />
+          <button style={s.fabSegment} onClick={() => setSheetOpen('places')}>
+            Places ({placeCount})
+          </button>
+        </div>
       )}
 
       {selectedMember && memberSheetVisible && (
@@ -3228,8 +3265,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         />
       )}
 
-      {sheetOpen && (
-        <BottomSheet onClose={() => setSheetOpen(false)}>
+      {sheetOpen === 'members' && (
+        <BottomSheet onClose={() => setSheetOpen(null)}>
           <h3 style={s.h3}>Members ({memberCount})</h3>
           {memberCount === 0 ? (
             <p style={s.muted}>No members visible yet. Waiting for sync...</p>
@@ -3260,111 +3297,93 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               })}
             </ul>
           )}
+        </BottomSheet>
+      )}
 
+      {sheetOpen === 'places' && (
+        <BottomSheet onClose={() => setSheetOpen(null)}>
           <h3 style={s.h3}>Places ({placeCount})</h3>
           {placeCount === 0 ? (
             <p style={s.muted}>No places yet.</p>
           ) : (
             <ul style={s.memberList}>
-              {data.places.map(p => {
-                const placeCircle = circles.find(c => c.circleId === p.circleId)
-                const placeWritable = !!placeCircle?.writable
-                const muteKey = p.circleId + ':' + p.id
-                const isMuted = mutedPlaces.has(muteKey)
-                const isDeleting = deletingPlaceId === p.id
-                const focusOn = (e) => {
-                  // Don't fly the camera if a row-internal button (mute,
-                  // edit, delete) was tapped.
-                  if (e.target.closest('button')) return
-                  // Imperative call: avoids any state-batching weirdness
-                  // around the same-render BottomSheet unmount.
-                  mapApiRef.current?.flyTo({
-                    center: [p.lon, p.lat], zoom: 16, duration: 1100,
-                  })
-                  setSheetOpen(false)
-                }
-                return (
-                  <li key={p.circleId + ':' + p.id} style={{ ...s.memberItem, cursor: 'pointer' }} onClick={focusOn}>
-                    <div style={s.placeRowHeader}>
-                      <div style={s.memberName}>{p.name}</div>
-                      <div style={s.placeRowActions}>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); toggleMute(p) }}
-                          title={isMuted ? 'Unmute notifications' : 'Mute notifications'}
-                          aria-label={isMuted ? 'Unmute notifications' : 'Mute notifications'}
-                          style={{
-                            ...iconBtnStyle({ disabled: false }),
-                            color: isMuted ? colors.warn : colors.text.secondary,
-                            borderColor: isMuted ? colors.warn : colors.border,
-                            background: 'transparent',
-                          }}>
-                          {isMuted
-                            ? <BellSimpleSlash size={18} weight="regular" />
-                            : <BellSimple size={18} weight="regular" />}
-                        </button>
-                        {placeWritable && (
-                          <>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                setEditingPlace({
-                                  circleId: p.circleId,
-                                  id: p.id,
-                                  name: p.name,
-                                  radiusMeters: p.radiusMeters,
-                                })
-                                setShowAddPlace(false)
-                                setConfirmingDeletePlace(null)
-                              }}
-                              disabled={isDeleting}
-                              title="Edit place"
-                              aria-label="Edit place"
-                              style={iconBtnStyle({ disabled: isDeleting })}>
-                              <PencilSimple size={18} weight="regular" />
-                            </button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); setConfirmingDeletePlace(p) }}
-                              disabled={isDeleting}
-                              title="Delete place"
-                              aria-label="Delete place"
-                              style={iconBtnStyle({ disabled: isDeleting, destructive: true })}>
-                              <Trash size={18} weight="regular" />
-                            </button>
-                          </>
-                        )}
-                      </div>
+              {data.places.map(p => (
+                <li
+                  key={p.circleId + ':' + p.id}
+                  style={{ ...s.memberItem, cursor: 'pointer' }}
+                  onClick={() => openPlaceDetail(p)}
+                >
+                  <div style={s.placeRowHeader}>
+                    <div style={s.placeRowName}>
+                      <PlaceIcon name={p.name} size={15} />
+                      <span style={s.placeRowLabel}>{p.name}</span>
                     </div>
-                    <div style={s.placeRadiusLine}>{Math.round(p.radiusMeters)}m radius</div>
-                  </li>
-                )
-              })}
+                    {/* Mute is the only per-place state worth surfacing on the
+                        row; everything else moved into the detail sheet. */}
+                    {mutedPlaces.has(p.circleId + ':' + p.id) && (
+                      <BellSimpleSlash size={16} weight='regular' style={{ color: colors.warn, flexShrink: 0 }} />
+                    )}
+                  </div>
+                </li>
+              ))}
             </ul>
-          )}
-          {deleteError && <p style={s.error}>{deleteError}</p>}
-
-          {editingPlace && (
-            <EditPlaceForm
-              key={editingPlace.circleId + ':' + editingPlace.id}
-              initial={editingPlace}
-              onCancel={() => setEditingPlace(null)}
-              onSaved={async () => { setEditingPlace(null); await refresh() }}
-            />
           )}
           {actionTargetCircleId && !actionTargetWritable && (
             <p style={s.muted}>Read-only until owner adds you as a writer.</p>
           )}
-          {confirmingDeletePlace && (
-            <ConfirmSheet
-              title="Delete place?"
-              message={<>Delete <strong>{confirmingDeletePlace.name}</strong>? Members will stop getting notifications about arrivals at and departures from this place. This cannot be undone.</>}
-              confirmLabel="Delete"
-              destructive
-              busy={deletingPlaceId === confirmingDeletePlace.id}
-              onConfirm={() => deletePlace(confirmingDeletePlace)}
-              onClose={() => { if (deletingPlaceId !== confirmingDeletePlace.id) setConfirmingDeletePlace(null) }}
-            />
-          )}
         </BottomSheet>
+      )}
+
+      {selectedPlace && (
+        <PlaceDetailSheet
+          place={selectedPlace}
+          // Only worth naming the circle when there's more than one to confuse
+          // it with. Name lives under `.circle`, writability at the top level.
+          circleName={circles.length > 1 ? (selectedPlaceCircle?.circle?.name ?? null) : null}
+          writable={!!selectedPlaceCircle?.writable}
+          muted={mutedPlaces.has(selectedPlace.circleId + ':' + selectedPlace.id)}
+          busy={deletingPlaceId === selectedPlace.id}
+          error={deleteError}
+          onToggleMute={() => toggleMute(selectedPlace)}
+          onShowOnMap={() => { setSelectedPlaceKey(null); setSheetOpen(null) }}
+          onEdit={() => {
+            setEditingPlace({
+              circleId: selectedPlace.circleId,
+              id: selectedPlace.id,
+              name: selectedPlace.name,
+              radiusMeters: selectedPlace.radiusMeters,
+            })
+            setShowAddPlace(false)
+            setConfirmingDeletePlace(null)
+          }}
+          onDelete={() => setConfirmingDeletePlace(selectedPlace)}
+          onClose={() => setSelectedPlaceKey(null)}
+        />
+      )}
+
+      {/* Edit and delete-confirm hang off the place detail sheet rather than
+          the list, so they survive the list sheet closing underneath. */}
+      {editingPlace && (
+        <BottomSheet onClose={() => setEditingPlace(null)} zIndex={240}>
+          {/* EditPlaceForm draws its own "Edit place" heading. */}
+          <EditPlaceForm
+            key={editingPlace.circleId + ':' + editingPlace.id}
+            initial={editingPlace}
+            onCancel={() => setEditingPlace(null)}
+            onSaved={async () => { setEditingPlace(null); await refresh() }}
+          />
+        </BottomSheet>
+      )}
+      {confirmingDeletePlace && (
+        <ConfirmSheet
+          title="Delete place?"
+          message={<>Delete <strong>{confirmingDeletePlace.name}</strong>? Members will stop getting notifications about arrivals at and departures from this place. This cannot be undone.</>}
+          confirmLabel="Delete"
+          destructive
+          busy={deletingPlaceId === confirmingDeletePlace.id}
+          onConfirm={() => deletePlace(confirmingDeletePlace)}
+          onClose={() => { if (deletingPlaceId !== confirmingDeletePlace.id) setConfirmingDeletePlace(null) }}
+        />
       )}
 
       {/* Place creation gets its own sheet rather than riding along at the
@@ -7926,6 +7945,99 @@ function formatAbsoluteTime (ts) {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time
 }
 
+// Detail sheet for a single place, the counterpart to MemberDetailSheet. The
+// mute / edit / delete actions used to sit inline on every place row, which
+// made each row twice the height of a member row for actions that are used
+// rarely. Sits above the places list (zIndex 220) rather than replacing it, so
+// dismissing returns to the list.
+//
+// Props:
+//   place        — the live place record { circleId, id, name, lat, lon, radiusMeters }
+//   circleName   — which circle owns it, or null
+//   writable     — whether we may edit/delete (owner added us as a writer)
+//   muted        — per-device notification mute state for this place
+//   busy         — a place:delete IPC is in flight for this place
+//   error        — last delete error, if any
+//   onShowOnMap  — dismiss everything; the camera already flew here on open
+function PlaceDetailSheet ({ place, circleName, writable, muted, busy = false, error = null, onToggleMute, onShowOnMap, onEdit, onDelete, onClose }) {
+  if (!place) return null
+  const Icon = placeIconFor(place.name) || MapPin
+  return (
+    <BottomSheet onClose={onClose} zIndex={220}>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.sm, paddingTop: spacing.sm, paddingBottom: spacing.base }}>
+        <Icon size={56} weight='thin' style={{ color: colors.text.secondary }} />
+        <h2 style={{ ...typography.heading, margin: 0, color: colors.text.primary, textAlign: 'center' }}>{place.name}</h2>
+        <div style={{ ...typography.caption, color: colors.text.secondary }}>
+          {Math.round(place.radiusMeters)}m radius{circleName ? ` · ${circleName}` : ''}
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm, marginTop: spacing.base }}>
+        <button
+          onClick={onShowOnMap}
+          style={{
+            width: '100%', padding: '12px', borderRadius: radius.md,
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', cursor: 'pointer',
+            fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+          }}
+        >
+          Show on map
+        </button>
+        <button
+          onClick={onToggleMute}
+          style={{
+            width: '100%', padding: '12px', borderRadius: radius.md,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+            background: 'transparent', color: muted ? colors.warn : colors.text.primary,
+            border: `1px solid ${muted ? colors.warn : colors.border}`, cursor: 'pointer',
+            fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+          }}
+        >
+          {muted
+            ? <><BellSimpleSlash size={18} weight='regular' /> Notifications muted</>
+            : <><BellSimple size={18} weight='regular' /> Notifications on</>}
+        </button>
+        {writable ? (
+          <>
+            <button
+              onClick={onEdit}
+              disabled={busy}
+              style={{
+                width: '100%', padding: '12px', borderRadius: radius.md,
+                background: 'transparent', color: colors.text.primary,
+                border: `1px solid ${colors.border}`, cursor: busy ? 'default' : 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+                opacity: busy ? 0.5 : 1,
+              }}
+            >
+              Edit place
+            </button>
+            <button
+              onClick={onDelete}
+              disabled={busy}
+              style={{
+                width: '100%', padding: '12px', borderRadius: radius.md,
+                background: 'transparent', color: colors.error,
+                border: `1px solid ${colors.error}`, cursor: busy ? 'default' : 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+                opacity: busy ? 0.5 : 1,
+              }}
+            >
+              {busy ? 'Deleting…' : 'Delete place'}
+            </button>
+          </>
+        ) : (
+          <p style={{ ...typography.caption, color: colors.text.secondary, textAlign: 'center', margin: 0 }}>
+            Read-only until the owner adds you as a writer.
+          </p>
+        )}
+        {error && <p style={{ ...typography.caption, color: colors.error, margin: 0 }}>{error}</p>}
+      </div>
+    </BottomSheet>
+  )
+}
+
 // Slide-up modal sheet, ported from pearcal-native/src/ui/App.jsx:5777.
 // Tap-to-dismiss on the scrim; drag the handle down >60px to close.
 // onClose runs after the slide-out finishes so the parent can unmount.
@@ -8400,8 +8512,8 @@ const s = {
   memberRow: { display: 'flex', alignItems: 'flex-start', gap: spacing.md },
   memberName: { fontSize: 15, fontWeight: 400 },
   placeRowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.sm },
-  placeRowActions: { display: 'flex', gap: 6, flexShrink: 0 },
-  placeRadiusLine: { fontSize: typography.micro.fontSize, color: colors.text.muted, marginTop: spacing.xs, fontFamily: typography.monoFamily },
+  placeRowName: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, fontSize: 15, fontWeight: 400 },
+  placeRowLabel: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   coordsMissing: { fontSize: typography.caption.fontSize, color: colors.warn, padding: `${spacing.sm}px ${spacing.md}px`, background: colors.surface.elevated, border: `1px solid ${colors.warn}`, borderRadius: radius.md, marginBottom: spacing.md, lineHeight: 1.4 },
   avatarRow: { display: 'flex', alignItems: 'center', gap: spacing.base, marginBottom: spacing.base },
   // Avatar placeholder bg + initial color stay literal: this is a stable
@@ -8443,20 +8555,35 @@ const s = {
   // Map-overlay pill: theme-stable since it floats over light tiles.
   // Text and border use the raw (dark-mode) values so light-mode UI
   // doesn't render dark text on a dark fab.
+  // The pill itself is now a container; padding moved to the segments so each
+  // half gets a full-height tap target rather than a text-sized one.
   fab: {
     position: 'absolute',
     bottom: 'calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 20px)',
     left: '50%', transform: 'translateX(-50%)',
-    padding: '10px 18px',
-    background: 'rgba(26,26,26,0.92)', color: colorsRaw.text.primary,
+    display: 'flex', alignItems: 'stretch',
+    background: 'rgba(26,26,26,0.92)',
     border: `1px solid ${colorsRaw.border}`, borderRadius: 999,
-    fontSize: 14, fontWeight: 300,
     backdropFilter: 'blur(8px)',
     WebkitBackdropFilter: 'blur(8px)',
     boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
-    zIndex: 5, cursor: 'pointer',
+    zIndex: 5,
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+  },
+  fabSegment: {
+    padding: '10px 18px',
+    background: 'transparent', color: colorsRaw.text.primary,
+    border: 'none',
+    fontSize: 14, fontWeight: 300,
+    cursor: 'pointer',
     whiteSpace: 'nowrap',
     fontFamily: typography.fontFamily,
+  },
+  // flexShrink:0 or the 1px rule collapses to nothing under flex shrinking.
+  fabDivider: {
+    width: 1, flexShrink: 0, alignSelf: 'stretch', margin: '6px 0',
+    background: colorsRaw.border,
   },
   dropdownBtn: {
     display: 'flex', alignItems: 'center', gap: 6, flex: 1,
