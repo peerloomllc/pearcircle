@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -3387,7 +3387,7 @@ const PLACE_PRESETS = [
   { label: 'Work', Icon: Briefcase },
   { label: 'School', Icon: GraduationCap },
   { label: 'Gym', Icon: Barbell },
-  { label: 'Store', Icon: Storefront },
+  { label: 'Church', Icon: Church },
   { label: 'Park', Icon: Tree },
   { label: 'Friends', Icon: UsersThree },
   { label: 'Doctor', Icon: FirstAid },
@@ -3397,6 +3397,7 @@ const PLACE_ICON_RULES = [
   { re: /\b(work|office|job|hq)\b/, Icon: Briefcase },
   { re: /\b(school|college|university|campus|class|daycare|preschool)\b/, Icon: GraduationCap },
   { re: /\b(gym|fitness|workout|crossfit|yoga)\b/, Icon: Barbell },
+  { re: /\b(church|chapel|parish|cathedral|temple|mosque|synagogue)\b/, Icon: Church },
   { re: /\b(store|shop|mall|market|grocery|groceries|errand|errands)\b/, Icon: Storefront },
   { re: /\b(park|playground|trail|garden)\b/, Icon: Tree },
   { re: /\b(doctor|dentist|clinic|hospital|medical|pharmacy|vet)\b/, Icon: FirstAid },
