@@ -60,12 +60,12 @@ main:
     # entrypoint points --data-dir at <mount>/data.
     main: /root
   gpu-acceleration: false
-# The base seeder image published for Umbrel is amd64 only today; aarch64 (for
-# an arm Start9 server) is a follow-up once the seeder image ships a multi-arch
-# manifest.
+# The pinned base image is a multi-arch manifest list (amd64 + arm64), so both
+# a typical x86 Start9 server and an arm one (Raspberry Pi) are supported.
 hardware-requirements:
   arch:
     - x86_64
+    - aarch64
 # HTTP GET against the dashboard proves the worklet host is up and serving.
 health-checks:
   web-ui:

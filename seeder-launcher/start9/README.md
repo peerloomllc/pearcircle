@@ -5,9 +5,9 @@ worklet, dashboard, and on-disk state as the desktop launcher and the Umbrel app
 ([`../umbrel/`](../umbrel/)); this wraps it for StartOS's `.s9pk` format.
 
 Targets **StartOS 0.3.5.x** (the stable channel). That release line packages a
-service as a `manifest.yaml`, a Docker image tar, and deno-bundled TypeScript
-procedures, packed with `start-sdk pack`. The newer 0.4.x TypeScript SDK is a
-separate follow-up.
+service as a `manifest.yaml`, one Docker image tar per arch, and deno-bundled
+TypeScript procedures, packed with `start-sdk pack`. The newer 0.4.x TypeScript
+SDK is a separate follow-up.
 
 ## Layout
 
@@ -76,9 +76,17 @@ in `instructions.md` as "turn off WiFi to pair." A full fix (same-LAN too) would
 require **host networking**, which the 0.3.5.x manifest does not expose - a
 possible future item (or via the 0.4.x SDK).
 
+## Architectures
+
+Universal s9pk carrying **x86_64 + aarch64** (a typical x86 Start9 server and an
+arm one, e.g. a Raspberry Pi). The pinned base image is a multi-arch manifest
+list, so each arch tar just pulls its own layer. Building the arm64 tar on an
+x86 host runs a tiny apt step under qemu (`qemu-user-static` binfmt); the arm64
+image was smoke-tested under emulation (boots, dashboard serves, worklet reaches
+`init:done` in seed mode). Real arm-hardware P2P is unverified for lack of an arm
+Start9 box.
+
 ## Open items
 
-- **amd64 only** for now: the pinned base image is amd64. aarch64 (for an arm
-  Start9 server) needs the seeder image published as a multi-arch manifest first.
 - **Distribution**: publish to a PeerLoom community registry (analogous to the
   Umbrel community store) so users can add it by URL.

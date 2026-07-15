@@ -1,11 +1,14 @@
 # Build the PearCircle seeder .s9pk for StartOS 0.3.5.x.
 #
-#   make            build + verify the s9pk (x86_64)
+#   make            build + verify a universal s9pk (x86_64 + aarch64)
 #   make install    install to the server in ~/.embassy/config.yaml
 #   make clean       remove build artifacts
 #
-# Requires: deno, yq, the StartOS SDK (start-sdk / start-cli), and either
-# docker (buildx) OR podman + skopeo. See scripts/build-image-tar.sh.
+# The pinned base image is a multi-arch manifest list (amd64 + arm64), so each
+# arch tar just pulls its own layer. Building the arm64 tar on an amd64 host runs
+# a tiny apt step under qemu emulation, so qemu-user-static (binfmt) must be
+# registered. Requires: deno, yq, the StartOS SDK (start-sdk / start-cli), and
+# either docker (buildx) OR podman. See scripts/build-image-tar.sh.
 
 PKG_ID := $(shell yq e ".id" < manifest.yaml)
 PKG_VERSION := $(shell yq e ".version" < manifest.yaml)
@@ -38,12 +41,18 @@ clean:
 scripts/embassy.js: $(TS_FILES)
 	deno run --allow-read --allow-write --allow-env --allow-net scripts/bundle.ts
 
-# Build the runtime image for amd64 and export it as a docker-archive tar the
+# Build a per-arch runtime image and export it as a docker-archive tar the
 # packer loads, tagged start9/<id>/main:<version>. Uses docker if present, else
-# podman + a RepoTags normalization (see scripts/build-image-tar.sh).
+# podman + a RepoTags normalization (see scripts/build-image-tar.sh). The tar
+# name (x86_64 / aarch64) selects the build --platform.
 docker-images/x86_64.tar: Dockerfile docker_entrypoint.sh scripts/build-image-tar.sh
-	bash scripts/build-image-tar.sh $(PKG_ID) $(PKG_VERSION) docker-images/x86_64.tar
+	bash scripts/build-image-tar.sh $(PKG_ID) $(PKG_VERSION) docker-images/x86_64.tar linux/amd64
 
-$(PKG_ID).s9pk: manifest.yaml instructions.md icon.png LICENSE scripts/embassy.js docker-images/x86_64.tar
-	@echo "start-sdk: packing $(PKG_ID) v$(PKG_VERSION) ..."
+docker-images/aarch64.tar: Dockerfile docker_entrypoint.sh scripts/build-image-tar.sh
+	bash scripts/build-image-tar.sh $(PKG_ID) $(PKG_VERSION) docker-images/aarch64.tar linux/arm64
+
+# Universal s9pk carries both arch images; the manifest's hardware-requirements
+# lists x86_64 + aarch64 so StartOS installs the right one per server.
+$(PKG_ID).s9pk: manifest.yaml instructions.md icon.png LICENSE scripts/embassy.js docker-images/x86_64.tar docker-images/aarch64.tar
+	@echo "start-sdk: packing $(PKG_ID) v$(PKG_VERSION) (x86_64 + aarch64) ..."
 	@start-sdk pack
