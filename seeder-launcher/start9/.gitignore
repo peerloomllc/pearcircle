@@ -2,3 +2,4 @@
 *.s9pk
 docker-images/
 scripts/embassy.js
+*.s9pk.sha256
