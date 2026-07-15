@@ -4,7 +4,8 @@
 #   make install    install to the server in ~/.embassy/config.yaml
 #   make clean       remove build artifacts
 #
-# Requires: docker (buildx), deno, yq, and the StartOS SDK (start-sdk / start-cli).
+# Requires: deno, yq, the StartOS SDK (start-sdk / start-cli), and either
+# docker (buildx) OR podman + skopeo. See scripts/build-image-tar.sh.
 
 PKG_ID := $(shell yq e ".id" < manifest.yaml)
 PKG_VERSION := $(shell yq e ".version" < manifest.yaml)
@@ -38,13 +39,10 @@ scripts/embassy.js: $(TS_FILES)
 	deno run --allow-read --allow-write --allow-env --allow-net scripts/bundle.ts
 
 # Build the runtime image for amd64 and export it as a docker-archive tar the
-# packer loads. buildx pulls + selects the amd64 layer of the pinned base image.
-docker-images/x86_64.tar: Dockerfile docker_entrypoint.sh
-	mkdir -p docker-images
-	docker buildx build \
-		--tag start9/$(PKG_ID)/main:$(PKG_VERSION) \
-		--platform=linux/amd64 \
-		-o type=docker,dest=docker-images/x86_64.tar .
+# packer loads, tagged start9/<id>/main:<version>. Uses docker if present, else
+# podman + a RepoTags normalization (see scripts/build-image-tar.sh).
+docker-images/x86_64.tar: Dockerfile docker_entrypoint.sh scripts/build-image-tar.sh
+	bash scripts/build-image-tar.sh $(PKG_ID) $(PKG_VERSION) docker-images/x86_64.tar
 
 $(PKG_ID).s9pk: manifest.yaml instructions.md icon.png LICENSE scripts/embassy.js docker-images/x86_64.tar
 	@echo "start-sdk: packing $(PKG_ID) v$(PKG_VERSION) ..."
