@@ -37,12 +37,13 @@ under `/root/data` (identity, per-circle enrollments, retention state, logs).
 
 ## Build
 
-Requires `docker` (buildx), `deno`, `yq`, and the StartOS SDK (`start-sdk` /
-`start-cli`). See <https://docs.start9.com/0.3.5.x/developer-docs/packaging>.
+Requires `deno`, `yq`, the StartOS SDK (`start-sdk` / `start-cli`), and either
+`docker` (buildx) or `podman` (+ `qemu-user-static` for the arm64 tar on an x86
+host). See <https://docs.start9.com/0.3.5.x/developer-docs/packaging>.
 
 ```bash
 cd seeder-launcher/start9
-make            # build + verify pearcircle-seeder.s9pk (x86_64)
+make            # build + verify a universal pearcircle-seeder.s9pk (x86_64 + aarch64)
 ```
 
 ## Install on a server
