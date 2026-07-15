@@ -58,13 +58,27 @@ make install    # or: start-cli package install pearcircle-seeder.s9pk
 
 Or upload the `.s9pk` through the StartOS UI (System > Sideload Service).
 
-## Status / open items
+## Status
+
+Validated end to end on StartOS 0.3.5.1 (returned-feline): sideloaded, service
+runs, dashboard reachable, and a real circle enrolls + replicates
+(`totalBytesReplicated` climbs, `seeder:block-downloaded` events flow).
+
+### Known caveat: same-WiFi pairing
+
+StartOS runs the service on an isolated podman bridge, so the seeder is not
+discoverable via **LAN local discovery**. A phone on the **same WiFi as the
+server** therefore can't pair (local multicast doesn't cross the bridge, and
+home routers rarely NAT-hairpin). On **cellular / remote**, the phone reaches the
+seeder over the DHT (the container gets an endpoint-independent "cone" NAT
+mapping, verified via STUN) and pairing + replication work normally. Documented
+in `instructions.md` as "turn off WiFi to pair." A full fix (same-LAN too) would
+require **host networking**, which the 0.3.5.x manifest does not expose - a
+possible future item (or via the 0.4.x SDK).
+
+## Open items
 
 - **amd64 only** for now: the pinned base image is amd64. aarch64 (for an arm
   Start9 server) needs the seeder image published as a multi-arch manifest first.
-- **Holepunch through StartOS's podman network is the key thing to smoke-test**:
-  enroll a circle and confirm the seeder actually connects to a peer and
-  replicates. Outbound UDP for Hyperswarm/DHT worked through Umbrel's Docker NAT;
-  StartOS's network path is stricter and must be verified on a real box.
 - **Distribution**: publish to a PeerLoom community registry (analogous to the
   Umbrel community store) so users can add it by URL.

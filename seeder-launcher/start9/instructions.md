@@ -14,6 +14,13 @@ stays in sync even when every member's phone is offline.
 The seeder now replicates that circle's encrypted blocks. Repeat for each circle
 you want kept online.
 
+> **If pairing times out:** turn **off WiFi** on your phone (use cellular) and
+> try again. StartOS runs the seeder in an isolated container, so a phone on the
+> **same WiFi as your server** can't discover it locally; on cellular the phone
+> reaches it over the internet and pairing completes in seconds. This only
+> affects the one-time pairing - once enrolled, replication works regardless of
+> which network your phone is on.
+
 ## What it can and cannot see
 
 The blocks it stores stay **encrypted** - the seeder keeps your circle available
