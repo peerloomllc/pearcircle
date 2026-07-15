@@ -14,10 +14,10 @@
 #
 # Env:
 #   IMAGE        base image repo (default ghcr.io/peerloomllc/pearcircle-seeder)
-#   WEBSITE_DIR  optional clone of the website repo. If set, regenerate the
-#                /package/v0 registry metadata into it and bump _redirects to the
-#                new release tag. Commit + push + merge to main yourself to
-#                deploy (Cloudflare deploys on merge to main).
+#
+# Publishing the built s9pk to the website community registry is a separate,
+# post-release step: publish-start9-registry.sh (it must run after the GitHub
+# release + s9pk asset exist).
 #
 # Requires: the StartOS SDK toolchain (start-sdk), deno, yq, skopeo, and docker
 # or podman (+ qemu-user-static for the arm64 image tar on an x86 host).
@@ -81,22 +81,6 @@ S9PK="$START9_DIR/pearcircle-seeder.s9pk"
 [ -f "$S9PK" ] || { echo "build-start9-s9pk: make produced no s9pk" >&2; exit 1; }
 ( cd "$START9_DIR" && sha256sum "pearcircle-seeder.s9pk" > "pearcircle-seeder.s9pk.sha256" )
 echo "==> s9pk ready: $S9PK ($(du -h "$S9PK" | cut -f1))"
-
-# --- optional: regenerate website registry metadata + bump _redirects -------
-if [ -n "${WEBSITE_DIR:-}" ]; then
-  if [ -d "$WEBSITE_DIR" ]; then
-    echo "==> regenerating registry metadata into $WEBSITE_DIR ..."
-    OUT_DIR="$WEBSITE_DIR" SKIP_S9PK=1 bash "$START9_DIR/registry/build-registry.sh" "$S9PK"
-    if [ -f "$WEBSITE_DIR/_redirects" ]; then
-      sed -i -E "s#(releases/download/)v[0-9.]+(/pearcircle-seeder\.s9pk)#\1v${VERSION}\2#" \
-        "$WEBSITE_DIR/_redirects"
-      echo "    _redirects s9pk target bumped to v$VERSION"
-    fi
-    echo "    Website registry updated — commit + push + merge to main to deploy."
-  else
-    echo "    WARNING: WEBSITE_DIR=$WEBSITE_DIR not found — skipping registry regen." >&2
-  fi
-fi
 
 echo ""
 echo "==> Done. Review + commit the pinned start9/ files with the release:"

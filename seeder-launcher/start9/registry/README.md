@@ -44,19 +44,28 @@ for local testing): `node registry/serve-registry.js 8099`.
 
 ### Deployed at www.peerloomllc.com (Cloudflare)
 
-The live registry is the PeerLoom website (a Cloudflare static-assets project).
-Regenerate the metadata straight into the website repo, skipping the s9pk (it is
-720 MiB, over Cloudflare's 25 MiB per-file limit, so it lives on a GitHub Release
-and the site redirects to it):
+The live registry is the PeerLoom website (a Cloudflare project that deploys on
+merge to `main`). Its `_headers` sets the per-route Content-Types and `_redirects`
+sends `/package/v0/pearcircle-seeder.s9pk` to the GitHub Release asset (the s9pk
+is 720 MiB, over Cloudflare's 25 MiB per-file limit). Registry URL users add:
+`https://www.peerloomllc.com`.
+
+On a seeder release this is automated end to end by the release pipeline:
+`build-start9-s9pk.sh` builds + uploads the s9pk to the tag, then
+`seeder-launcher/scripts/publish-start9-registry.sh` regenerates the metadata,
+bumps `_redirects` to the new tag, and (with `WEBSITE_REGISTRY_PR=1`) opens +
+squash-merges the website PR — the merge is the deploy. `release.sh` runs both
+(step 5d + 7b) when `WEBSITE_DIR` points at a website clone.
+
+To refresh it by hand (e.g. a metadata-only fix), run against a website clone:
 
 ```bash
-OUT_DIR=/path/to/website SKIP_S9PK=1 bash registry/build-registry.sh
+# print the git/gh steps:
+WEBSITE_DIR=/path/to/website bash seeder-launcher/scripts/publish-start9-registry.sh
+# or do it automatically (commit + PR + merge = deploy):
+WEBSITE_DIR=/path/to/website WEBSITE_REGISTRY_PR=1 \
+  bash seeder-launcher/scripts/publish-start9-registry.sh
 ```
-
-The website's `_headers` sets the per-route Content-Types and `_redirects` sends
-`/package/v0/pearcircle-seeder.s9pk` to the GitHub Release. On a seeder release,
-re-run the above, upload the new `.s9pk` to the release, bump the version in
-`_redirects`, and deploy. Registry URL users add: `https://www.peerloomllc.com`.
 
 Other hosting options, best first:
 - **Caddy / nginx on a VPS**, or **S3 + CloudFront**, or **Cloudflare Pages**
