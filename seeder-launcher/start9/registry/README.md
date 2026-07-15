@@ -42,7 +42,23 @@ thing a static host must get right:
 `serve-registry.js` is a reference implementation of exactly these rules (used
 for local testing): `node registry/serve-registry.js 8099`.
 
-Hosting options, best first:
+### Deployed at www.peerloomllc.com (Cloudflare)
+
+The live registry is the PeerLoom website (a Cloudflare static-assets project).
+Regenerate the metadata straight into the website repo, skipping the s9pk (it is
+720 MiB, over Cloudflare's 25 MiB per-file limit, so it lives on a GitHub Release
+and the site redirects to it):
+
+```bash
+OUT_DIR=/path/to/website SKIP_S9PK=1 bash registry/build-registry.sh
+```
+
+The website's `_headers` sets the per-route Content-Types and `_redirects` sends
+`/package/v0/pearcircle-seeder.s9pk` to the GitHub Release. On a seeder release,
+re-run the above, upload the new `.s9pk` to the release, bump the version in
+`_redirects`, and deploy. Registry URL users add: `https://www.peerloomllc.com`.
+
+Other hosting options, best first:
 - **Caddy / nginx on a VPS**, or **S3 + CloudFront**, or **Cloudflare Pages**
   (`_headers` file) - anywhere you control per-route Content-Type. HTTPS.
 - **Start9 Pages** (serves over Tor `.onion`) - Start9's own static-hosting path;

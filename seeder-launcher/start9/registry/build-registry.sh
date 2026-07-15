@@ -21,12 +21,21 @@
 #
 # Usage: build-registry.sh [path-to-s9pk]   (default ../pearcircle-seeder.s9pk)
 # Requires: start-sdk (manifest inspection), node (JSON assembly).
+#
+# Env:
+#   OUT_DIR     where to write the tree (default ./dist). Point this at a static
+#               site (e.g. the website repo root) to deploy the registry there.
+#   SKIP_S9PK   set to 1 to NOT copy the (large) .s9pk into the tree. Use this
+#               when the host serves the s9pk elsewhere (e.g. a GitHub Release)
+#               and redirects /package/v0/<id>.s9pk to it — the 720 MiB s9pk is
+#               over Cloudflare Pages' 25 MiB per-file limit, so the website
+#               deploy skips it and relies on a _redirects rule.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$HERE/.." && pwd)"
 S9PK="${1:-$PKG_DIR/pearcircle-seeder.s9pk}"
-OUT="$HERE/dist"
+OUT="${OUT_DIR:-$HERE/dist}"
 REGISTRY_NAME="${REGISTRY_NAME:-PeerLoom Registry}"
 CATEGORIES_JSON="${CATEGORIES_JSON:-[\"featured\",\"networking\"]}"
 # published-at is not read from the clock (kept reproducible); override to stamp.
@@ -37,7 +46,10 @@ command -v start-sdk >/dev/null || { echo "build-registry: start-sdk not on PATH
 command -v node >/dev/null || { echo "build-registry: node not on PATH" >&2; exit 1; }
 
 echo "==> generating registry from $(basename "$S9PK")"
-rm -rf "$OUT"
+# Only clean the tree we own (OUT/package). NEVER `rm -rf "$OUT"` — OUT_DIR may
+# point at a shared static site (e.g. the website repo root), and wiping it
+# would destroy unrelated files.
+rm -rf "$OUT/package"
 V0="$OUT/package/v0"
 mkdir -p "$V0/version" "$V0/manifest" "$V0/release-notes" "$V0/instructions" "$V0/license" "$V0/icon"
 
@@ -51,7 +63,11 @@ echo "    id=$PKG_ID version=$PKG_VER"
 cp "$PKG_DIR/instructions.md" "$V0/instructions/$PKG_ID"
 cp "$PKG_DIR/LICENSE" "$V0/license/$PKG_ID"
 cp "$PKG_DIR/icon.png" "$V0/icon/$PKG_ID"
-cp "$S9PK" "$V0/$PKG_ID.s9pk"
+if [ "${SKIP_S9PK:-}" = "1" ]; then
+  echo "    SKIP_S9PK=1: not copying the s9pk (host must serve/redirect /package/v0/$PKG_ID.s9pk)"
+else
+  cp "$S9PK" "$V0/$PKG_ID.s9pk"
+fi
 
 # Per-id endpoints that just re-serve the manifest / a version stub.
 cp "$V0/manifest.tmp.json" "$V0/manifest/$PKG_ID"
