@@ -1,0 +1,4 @@
+# Build artifacts
+*.s9pk
+docker-images/
+scripts/embassy.js
