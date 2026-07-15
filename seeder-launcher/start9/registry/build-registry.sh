@@ -36,7 +36,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$HERE/.." && pwd)"
 S9PK="${1:-$PKG_DIR/pearcircle-seeder.s9pk}"
 OUT="${OUT_DIR:-$HERE/dist}"
-REGISTRY_NAME="${REGISTRY_NAME:-PeerLoom Registry}"
+REGISTRY_NAME="${REGISTRY_NAME:-PeerLoom LLC}"
 CATEGORIES_JSON="${CATEGORIES_JSON:-[\"featured\",\"networking\"]}"
 # published-at is not read from the clock (kept reproducible); override to stamp.
 PUBLISHED_AT="${PUBLISHED_AT:-1970-01-01T00:00:00Z}"
