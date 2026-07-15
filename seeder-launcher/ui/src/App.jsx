@@ -234,6 +234,9 @@ function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
             ? <img src={qr} alt="pairing QR code" style={{ width: 240, height: 240, background: '#fff', borderRadius: 8, padding: 8 }} />
             : <div class="empty">generating…</div>}
           <div class="empty" style={{ marginTop: 10 }}>Scan with the PearCircle app. Expires in {remaining}s.</div>
+          <div class="empty" style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
+            Tip: if the phone won't connect, turn off its WiFi so it pairs over cellular. A seeder on a home server often can't be found over the same WiFi.
+          </div>
           <div class="row" style={{ justifyContent: 'center', marginTop: 12 }}>
             <button class="ghost" onClick={close}>Cancel</button>
           </div>

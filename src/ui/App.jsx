@@ -1727,7 +1727,7 @@ function SeedersSection ({ active = true }) {
       setError(/invalid pairing link/i.test(m)
         ? 'That QR is not a seeder pairing code.'
         : (/timed out/i.test(m)
-          ? "Could not reach the seeder. Make sure its dashboard is showing the QR, then try again."
+          ? "Could not reach the seeder. If your phone is on the same WiFi as the seeder, turn WiFi off (use cellular) and try again: a seeder running on a home server often can only be paired over the internet. Also check its dashboard is showing the QR."
           : m))
     } finally { setPairing(false) }
   }, [refresh])
@@ -1893,7 +1893,8 @@ function SeedersSection ({ active = true }) {
             {pairing ? 'Pairing...' : 'Scan seeder QR'}
           </button>
           <p style={{ ...s.muted, textAlign: 'center', marginTop: spacing.sm, marginBottom: 0 }}>
-            On the seeder's dashboard, tap "Pair a phone" and scan the code.
+            On the seeder's dashboard, tap "Pair a phone" and scan the code. Tip:
+            if it won't connect, turn off WiFi so your phone pairs over cellular.
           </p>
         </>
       )}
