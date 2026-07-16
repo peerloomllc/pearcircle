@@ -230,7 +230,11 @@ function setupSeederAdmissionChannel ({ conn, role, circleId, bootstrap, seederP
     if (role !== 'seed' || !announceMessage) return false
     try {
       const payload = { pubkey: seederPubkey }
-      if (typeof label === 'string' && label.length > 0) payload.label = label
+      // `label` may be a string or a getter — resolve it at send time so a
+      // seeder nickname changed after the channel opened re-announces with the
+      // new value (proposal 2026-07-15-seeder-nickname).
+      const lbl = typeof label === 'function' ? label() : label
+      if (typeof lbl === 'string' && lbl.length > 0) payload.label = lbl.slice(0, 128)
       // Seeder build version (proposal 2026-06-05-seeder-update slice 1), so
       // members can surface "update available". Additive + optional: an old
       // member ignores the unknown field, an old seeder simply omits it.

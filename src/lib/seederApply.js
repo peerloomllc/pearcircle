@@ -151,9 +151,23 @@ function buildSeederAdmission ({ seederPubkey, adminPubkeyHex, label, existing, 
     updatedAt: now,
     v: 1,
   }
-  const resolvedLabel = (typeof label === 'string' && label.length > 0) ? label : inheritedLabel
+  // label semantics: undefined = not provided, keep the existing label; a
+  // non-empty string = set it; null or '' = explicitly clear it (an operator
+  // who blanked the seeder nickname, proposal 2026-07-15-seeder-nickname).
+  const resolvedLabel = label === undefined
+    ? inheritedLabel
+    : ((typeof label === 'string' && label.length > 0) ? label : null)
   if (resolvedLabel) out.label = resolvedLabel
   return out
+}
+
+// Normalize an operator-set seeder nickname: trim, strip control chars, cap
+// length. Returns null for empty/blank input (falls back to the hex pubkey).
+function sanitizeSeederNickname (raw) {
+  if (typeof raw !== 'string') return null
+  // Strip C0 control chars + DEL, then trim and cap length.
+  const clean = raw.replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 48)
+  return clean.length > 0 ? clean : null
 }
 
 // Build the unsigned value for a `left` tombstone — the seeder operator left
@@ -188,4 +202,4 @@ function buildSeederGone ({ existing, byPubkeyHex, now }) {
   return out
 }
 
-module.exports = { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone }
+module.exports = { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname }

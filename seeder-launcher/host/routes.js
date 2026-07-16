@@ -150,6 +150,23 @@ function routes () {
       match: (url) => url.pathname === '/api/pair/close',
       handler: async (req, ctx) => ctx.worklet.call('seeder:pair:close'),
     },
+    {
+      // Operator nickname (proposal 2026-07-15-seeder-nickname): the friendly
+      // name members' apps show instead of the seeder's hex pubkey.
+      method: 'GET',
+      match: (url) => url.pathname === '/api/nickname',
+      handler: async (req, ctx) => ctx.worklet.call('seeder:nickname:get'),
+    },
+    {
+      // Set/clear it. The worklet sanitizes, persists, and re-announces to
+      // members. An empty string clears it (members fall back to the hex).
+      method: 'POST',
+      match: (url) => url.pathname === '/api/nickname',
+      handler: async (req, ctx) => {
+        const body = await jsonBody(req)
+        return ctx.worklet.call('seeder:nickname:set', { nickname: body.nickname })
+      },
+    },
   ]
 }
 

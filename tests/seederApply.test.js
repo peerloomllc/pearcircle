@@ -2,7 +2,7 @@
 // Proposal 2026-05-19-blind-seeder-peers slice 3a.
 
 const b4a = require('b4a')
-const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone } = require('../src/lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('../src/lib/seederApply')
 const { signValue, verifyValueWithSigner } = require('../src/lib/sign')
 const { generateKeypair } = require('../src/identity')
 
@@ -464,5 +464,51 @@ describe('buildSeederAdmission', () => {
     const existing = { pubkey: seederHex, addedBy: 'short', addedAt: now - 1000 }
     const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, existing, now })
     expect(out.addedBy).toBe(adminHex)
+  })
+})
+
+// Operator nickname (proposal 2026-07-15-seeder-nickname): the `label` field
+// doubles as the seeder's self-set display name. buildSeederAdmission must be
+// able to set, clear, and inherit it, and sanitizeSeederNickname normalizes it.
+describe('seeder nickname label semantics', () => {
+  const adminHex = 'a'.repeat(64)
+  const seederHex = 'b'.repeat(64)
+  const now = 1714867200000
+  const withLabel = { pubkey: seederHex, addedBy: adminHex, addedAt: now - 1000, label: 'Home Pi' }
+
+  test('non-empty string sets the label', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: 'Office NAS', existing: null, now })
+    expect(out.label).toBe('Office NAS')
+  })
+  test('undefined inherits the existing label', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: undefined, existing: withLabel, now })
+    expect(out.label).toBe('Home Pi')
+  })
+  test('null explicitly clears the label (back to hex)', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: null, existing: withLabel, now })
+    expect('label' in out).toBe(false)
+  })
+  test('empty string clears the label', () => {
+    const out = buildSeederAdmission({ seederPubkey: seederHex, adminPubkeyHex: adminHex, label: '', existing: withLabel, now })
+    expect('label' in out).toBe(false)
+  })
+})
+
+describe('sanitizeSeederNickname', () => {
+  test('trims surrounding whitespace', () => {
+    expect(sanitizeSeederNickname('  Home Pi  ')).toBe('Home Pi')
+  })
+  test('caps length at 48', () => {
+    expect(sanitizeSeederNickname('x'.repeat(100)).length).toBe(48)
+  })
+  test('strips control characters', () => {
+    const input = 'Home' + String.fromCharCode(0, 9, 31) + 'Pi'
+    expect(sanitizeSeederNickname(input)).toBe('HomePi')
+  })
+  test('blank / non-string returns null', () => {
+    expect(sanitizeSeederNickname('   ')).toBe(null)
+    expect(sanitizeSeederNickname('')).toBe(null)
+    expect(sanitizeSeederNickname(null)).toBe(null)
+    expect(sanitizeSeederNickname(42)).toBe(null)
   })
 })

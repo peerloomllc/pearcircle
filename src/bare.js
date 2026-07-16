@@ -38,7 +38,7 @@ const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
 const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLastKnown')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
-const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone } = require('./lib/seederApply')
+const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('./lib/seederApply')
 const { shouldAcceptSupersede } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
@@ -144,6 +144,11 @@ let _seedMode = false
 // 2026-06-05-seeder-update slice 1). Reported via seeder:status and announced
 // to members so the app can surface "update available". null when unknown.
 let _seederVersion = null
+// Seed-mode: operator-set nickname (proposal 2026-07-15-seeder-nickname). One
+// global name per seeder device, persisted in _localDb and sent as the announce
+// `label` for every circle so members show it instead of the hex pubkey. null =
+// unset (members fall back to `Seeder <hex>`).
+let _seederNickname = null
 // Member-side: remote seeder pubkey hex → its reported build version, learned
 // from the admission announce. Advisory + in-memory; surfaced by
 // circle:seeders:list so the mobile app can flag out-of-date seeders.
@@ -4054,6 +4059,7 @@ async function mountSeederCircle (enrollment) {
       circleId,
       bootstrap,
       seederPubkey: seederPubkeyHex,
+      label: () => _seederNickname,
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
       onAdmitted: handleSeederAdmittedNotice,
@@ -4065,6 +4071,21 @@ async function mountSeederCircle (enrollment) {
     mark('seeder:announce-channel-open', { circleId, remote: 'post-mount' })
   }
   return _seederCircles.get(circleId)
+}
+
+// Re-send the announce (which now carries the current nickname) on every live
+// admission channel, so an operator nickname change propagates to connected
+// members without waiting for a reconnect (proposal 2026-07-15-seeder-nickname).
+function reannounceSeederToAll () {
+  for (const conn of _seederActiveConns) {
+    const perConn = _seederAdmissionChannels.get(conn)
+    if (!perConn) continue
+    for (const handle of perConn.values()) {
+      if (typeof handle?.sendAnnounce === 'function') {
+        try { handle.sendAnnounce() } catch {}
+      }
+    }
+  }
 }
 
 // Seed-mode handler for an inbound revocation notice on the admission
@@ -5087,6 +5108,19 @@ async function handleSeederAnnounce (circleId, base, { pubkey, label, version },
   // last-known core keys.
   if (existing && existing.revoked !== true && existing.left !== true) {
     mark('admission:dedup', { circleId, seeder: pubkey.slice(0, 8) })
+    // Propagate an operator nickname change (proposal 2026-07-15-seeder-nickname):
+    // if the seeder now announces a different name, rewrite the shared row so
+    // every member converges on it. Only on an actual change + when writable.
+    const nn = sanitizeSeederNickname(label)
+    const cur = typeof existing.label === 'string' ? existing.label : null
+    if (nn !== cur && base.writable) {
+      try {
+        await approveSeederRow(circleId, pubkey, nn) // null clears back to hex
+        mark('seeder:nickname-updated', { circleId, seeder: pubkey.slice(0, 8) })
+      } catch (e) {
+        mark('seeder:nickname-update-failed', { circleId, err: e?.message ?? String(e) })
+      }
+    }
     markConnSeederAndPush(circleId, conn)
     return
   }
@@ -5116,7 +5150,7 @@ async function handleSeederAnnounce (circleId, base, { pubkey, label, version },
     return
   }
   try {
-    await approveSeederRow(circleId, pubkey, label ?? undefined)
+    await approveSeederRow(circleId, pubkey, sanitizeSeederNickname(label) ?? undefined)
     mark('admission:auto-admitted', { circleId, seeder: pubkey.slice(0, 8) })
     send({ event: 'seeder:admitted', data: { circleId, pubkey } })
     markConnSeederAndPush(circleId, conn)
@@ -5339,7 +5373,9 @@ function onSeederSwarmConnection (conn, info) {
       circleId,
       bootstrap: enrollment?.bootstrap,
       seederPubkey: seederPubkeyHex,
-      label: enrollment?.label,
+      // Global operator nickname wins; fall back to any per-enrollment label
+      // (proposal 2026-07-15-seeder-nickname). Getter so a rename re-announces.
+      label: () => _seederNickname ?? enrollment?.label ?? null,
       version: _seederVersion,
       onRevoked: handleSeederRevocationNotice,
       onAdmitted: handleSeederAdmittedNotice,
@@ -5765,6 +5801,14 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     _seedMode = true
     mark('init:identity-ready', { fresh: seederIdentity.fresh, mode: 'seed' })
 
+    // Load the persisted operator nickname (proposal 2026-07-15-seeder-nickname)
+    // before the swarm comes up, so the first announce already carries it.
+    try {
+      const nnNode = await _localDb.get('seeder:nickname')
+      const nn = nnNode?.value?.nickname
+      _seederNickname = typeof nn === 'string' && nn.length > 0 ? nn : null
+    } catch {}
+
     _swarm = new Hyperswarm({ keyPair: _identity })
     _swarm.on('connection', onSeederSwarmConnection)
     mark('init:swarm-created', { mode: 'seed' })
@@ -5801,6 +5845,16 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
       // returns the QR link; close tears the session down.
       openPairSession: openSeederPairSession,
       closePairSession: closeSeederPairSession,
+      // Operator nickname (proposal 2026-07-15-seeder-nickname). get returns the
+      // current value; set persists it, updates the in-memory copy, and
+      // re-announces to every live member so a rename propagates immediately.
+      getNickname: () => _seederNickname,
+      setNickname: async (nickname) => {
+        _seederNickname = typeof nickname === 'string' && nickname.length > 0 ? nickname : null
+        await _localDb.put('seeder:nickname', { nickname: _seederNickname, updatedAt: Date.now() })
+        reannounceSeederToAll()
+        return _seederNickname
+      },
     })
 
     // Mirror persisted seeder:revoked:* rows into the in-memory set so the

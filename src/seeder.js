@@ -23,6 +23,7 @@
 const b4a = require('b4a')
 const { generateKeypair } = require('./identity')
 const { parseSeedInvite } = require('./invite')
+const { sanitizeSeederNickname } = require('./lib/seederApply')
 
 // IPC methods the seed-mode worklet exposes. Anything else returns
 // not-permitted-in-seed-mode so the seeder cannot accidentally act like
@@ -37,6 +38,8 @@ const SEED_METHODS = Object.freeze([
   'seeder:retention:sweep',
   'seeder:pair:open',
   'seeder:pair:close',
+  'seeder:nickname:get',
+  'seeder:nickname:set',
 ])
 
 /**
@@ -171,12 +174,14 @@ async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
  *   Called by seeder:leave before the persistence rows are deleted so the host can
  *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps, openPairSession, closePairSession }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps, openPairSession, closePairSession, getNickname, setNickname }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
     'seeder:status': async () => ({
       pubkey: pubkeyHex,
+      // Operator nickname (proposal 2026-07-15-seeder-nickname); null when unset.
+      nickname: typeof getNickname === 'function' ? (getNickname() ?? null) : null,
       // Build version stamped in by the launcher host at init (proposal
       // 2026-06-05-seeder-update slice 1); null when run without one.
       version: typeof version === 'string' && version.length > 0 ? version : null,
@@ -297,6 +302,19 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version
     'seeder:pair:close': async () => {
       if (typeof closePairSession === 'function') closePairSession('closed')
       return { ok: true }
+    },
+
+    // Operator nickname (proposal 2026-07-15-seeder-nickname). get returns the
+    // current value; set sanitizes, persists, and re-announces it to members so
+    // the app shows it instead of the hex pubkey. Blank clears it (back to hex).
+    'seeder:nickname:get': async () => ({
+      nickname: typeof getNickname === 'function' ? (getNickname() ?? null) : null,
+    }),
+    'seeder:nickname:set': async ({ nickname } = {}) => {
+      if (typeof setNickname !== 'function') throw new Error('nickname unavailable')
+      const clean = sanitizeSeederNickname(nickname)
+      const saved = await setNickname(clean)
+      return { ok: true, nickname: saved ?? null }
     },
   }
 }
