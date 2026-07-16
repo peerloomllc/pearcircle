@@ -44,6 +44,8 @@ export const api = {
   restart: () => jsonFetch('/api/restart', { method: 'POST' }),
   pairOpen: () => jsonFetch('/api/pair/open', { method: 'POST' }),
   pairClose: () => jsonFetch('/api/pair/close', { method: 'POST' }),
+  nicknameGet: () => jsonFetch('/api/nickname'),
+  nicknameSet: (nickname) => jsonFetch('/api/nickname', { method: 'POST', body: JSON.stringify({ nickname }) }),
   update: () => jsonFetch('/api/update'),
   applyUpdate: () => jsonFetch('/api/update/apply', { method: 'POST' }),
 }

@@ -335,6 +335,43 @@ function UpdateBanner ({ update, applyState, setApplyState }) {
 // Status + the enrolled-circles list folded into one Overview panel: the
 // seeder's identity/uptime/bytes and what it's actually seeding belong
 // together. Per-circle retention/leave controls live on each Circle row.
+// Editable operator nickname (proposal 2026-07-15-seeder-nickname). What
+// members' apps show instead of the hex pubkey; blank clears it back to hex.
+function NicknameField ({ status, setError }) {
+  const current = status?.nickname ?? ''
+  const [value, setValue] = useState('')
+  const [touched, setTouched] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  // Sync from the authoritative status until the user edits (avoids the 5s
+  // snapshot clobbering in-progress typing); resume syncing after a save.
+  useEffect(() => { if (!touched) setValue(current) }, [current, touched])
+  const dirty = value.trim() !== current
+  const save = async () => {
+    setSaving(true); setError(null); setSaved(false)
+    try {
+      await api.nicknameSet(value.trim())
+      setTouched(false); setSaved(true); setTimeout(() => setSaved(false), 1500)
+    } catch (e) { setError(e.message) }
+    finally { setSaving(false) }
+  }
+  return (
+    <div class="row">
+      <div class="label">Nickname</div>
+      <div class="row" style={{ gap: 8, flex: 1, minWidth: 0 }}>
+        <input
+          value={value}
+          maxLength={48}
+          placeholder="e.g. Home Pi (shown in members' apps)"
+          onInput={(e) => { setTouched(true); setValue(e.target.value) }}
+          style={{ flex: 1, minWidth: 0 }}
+        />
+        <button onClick={save} disabled={saving || !dirty}>{saving ? '…' : (saved ? '✓' : 'Save')}</button>
+      </div>
+    </div>
+  )
+}
+
 function Status ({ status, circles, onChanged, setError }) {
   return (
     <div class="panel">
@@ -342,6 +379,7 @@ function Status ({ status, circles, onChanged, setError }) {
       {!status && <div class="empty">awaiting first snapshot…</div>}
       {status && (
         <div>
+          <NicknameField status={status} setError={setError} />
           <div class="row"><div class="label">Pubkey</div><div class="mono pubkey">{status.pubkey}</div></div>
           <div class="row"><div class="label">Uptime</div><div>{formatUptime(status.uptime)}</div></div>
           <div class="row"><div class="label">Replicated</div><div>{formatBytes(status.totalBytesReplicated || 0)}</div></div>
