@@ -309,6 +309,14 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--p
 .tabs button { flex: 1; }
 .stack { display: flex; flex-direction: column; gap: 12px; }
 .stack.center { align-items: center; }
+/* themed confirm dialog */
+.modal.confirm { max-width: 400px; }
+.modal.confirm h3 { font-size: 16.5px; font-weight: 500; margin: 0 0 8px; }
+.modal.confirm .hint { margin: 0 0 20px; line-height: 1.5; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 10px; }
+button.destructive { background: #e0503f; color: #fff; }
+button.destructive:hover:not(:disabled) { filter: brightness(1.07); }
+
 .toast { border-radius: 9px; padding: 9px 12px; font-size: 13px; margin-bottom: 12px; }
 .toast.error { background: color-mix(in srgb, var(--bad) 15%, var(--surface)); border: 1px solid color-mix(in srgb, var(--bad) 40%, transparent); color: var(--bad); }
 .msg-good { color: var(--good); font-size: 13px; }

@@ -41,6 +41,39 @@ async function copyText (text) {
   } catch { return false }
 }
 
+/* ---- themed confirm dialog (replaces window.confirm) ---------------------- */
+let _pushConfirm = null
+function askConfirm (opts) {
+  return new Promise((resolve) => {
+    if (!_pushConfirm) { resolve(window.confirm(opts.message || opts.title)); return }
+    _pushConfirm({ ...opts, resolve })
+  })
+}
+function ConfirmHost () {
+  const [c, setC] = useState(null)
+  useEffect(() => { _pushConfirm = setC; return () => { _pushConfirm = null } }, [])
+  useEffect(() => {
+    if (!c) return
+    const h = (e) => { if (e.key === 'Escape') { c.resolve(false); setC(null) } }
+    document.addEventListener('keydown', h)
+    return () => document.removeEventListener('keydown', h)
+  }, [c])
+  if (!c) return null
+  const close = (v) => { c.resolve(v); setC(null) }
+  return (
+    <div class="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) close(false) }}>
+      <div class="modal confirm" role="alertdialog" aria-modal="true" aria-label={c.title}>
+        <h3>{c.title}</h3>
+        {c.message && <p class="hint">{c.message}</p>}
+        <div class="confirm-actions">
+          <button class="ghost" onClick={() => close(false)}>{c.cancelLabel || 'Cancel'}</button>
+          <button class={c.danger ? 'destructive' : ''} onClick={() => close(true)} autofocus>{c.confirmLabel || 'Confirm'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ---- theme (system default, manual override persisted) -------------------- */
 function useTheme () {
   const initial = () => {
@@ -163,6 +196,7 @@ export function App () {
           <Support />
         </Modal>
       )}
+      <ConfirmHost />
     </div>
   )
 }
@@ -278,7 +312,12 @@ function CircleRow ({ circle, wsConnected, onChanged, setError }) {
     catch (e) { setError(e.message) }
   }
   const leave = async () => {
-    if (!confirm(`Leave ${circle.name || circle.circleId.slice(0, 8)}? The seeder stops replicating its blocks.`)) return
+    const ok = await askConfirm({
+      title: `Leave ${circle.name || circle.circleId.slice(0, 8)}?`,
+      message: 'This seeder stops replicating the circle’s blocks. Members re-admit it if you add it again.',
+      confirmLabel: 'Leave', danger: true,
+    })
+    if (!ok) return
     setError(null)
     try { await api.leave(circle.circleId); onChanged() } catch (e) { setError(e.message) }
   }
@@ -459,7 +498,12 @@ function Maintenance ({ setError }) {
     } catch (e) { setError(e.message) } finally { setSweeping(false) }
   }
   const restart = async () => {
-    if (!confirm('Restart the seeder? It briefly disconnects, re-syncs, and runs a retention sweep on boot.')) return
+    const ok = await askConfirm({
+      title: 'Restart the seeder?',
+      message: 'It briefly disconnects, re-syncs, and runs a retention sweep on boot.',
+      confirmLabel: 'Restart',
+    })
+    if (!ok) return
     setMsg(null); setError(null); setRestarting(true)
     try { await api.restart(); setMsg('Seeder restarted.') } catch (e) { setError(e.message) } finally { setRestarting(false) }
   }
