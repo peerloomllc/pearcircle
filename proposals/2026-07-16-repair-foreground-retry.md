@@ -16,6 +16,20 @@ Reported 2026-07-16 by Tim on a real device, in a circle whose banner offered Re
 
 All three symptoms are explained by the staged path, and the trace matches exactly.
 
+### Confirmed: the worklet survived the swipe-away
+Established 2026-07-16, and worth recording because the obvious test device gives the wrong answer.
+
+The copy Tim saw after reopening — "Reopen the app to finish repairing" — renders only when `repairStaged` is true, and `_repairStaged` (`src/bare.js:214`) is an **in-memory-only** Set. It cannot survive a process restart. Seeing that exact string after a reopen is therefore proof that the worklet process was never restarted, which is the whole bug.
+
+Device behavior differs, and the difference is load-bearing:
+
+| Gesture | Pixel 9 (stock, reported) | TCL test phone (measured) |
+|---|---|---|
+| Home / app-switch | worklet survives (same pid, uptime runs through) | worklet survives (same pid 26303, `coldstart worklet+56170ms` across the cycle) |
+| Swipe away from recents | **worklet survives** (deduced from the banner copy) | **worklet killed**, location FGS does not restart it |
+
+Stock Android keeps a process holding an active foreground service (`PearCircleLocationService`, `foregroundServiceType="location"`) alive when its task is swiped away; the TCL reaps it anyway. So **the TCL cannot reproduce this class of bug** — it destroys the in-memory state the bug depends on. Reproduce worklet-lifetime bugs on the Pixel, or by backgrounding rather than swiping.
+
 ### Why the banner survived a reopen
 `circle:repair` (`src/bare.js:1737-1810`) has two endings. The good ending (`:1777-1797`) builds the gen+1 base in-process, swaps it in, and clears the flags. The staged ending (`:1798-1809`) runs when `buildCircleAutobase` loses the 18s race at `:1772`: it keeps the OLD base mounted, sets `_repairStaged`, persists `circleRepairing:{id}`, and emits `circle:repaired {restartRequired: true}`.
 
@@ -72,7 +86,12 @@ The one persisted change is the additive `attempts` field inside `circleRepairin
 - New `node` test: `attempts` round-trips through `circleRepairing:{id}` across a simulated boot, and a value written without the field reads back as 0.
 - New `jsdom` test: confirming the modal shows `RepairingBanner` with a spinner before any worklet event arrives.
 - New `jsdom` test: an escalated circle shows the leave-and-rejoin copy even when `needsRestart` is true (the case `:1315` excludes today).
-- Device smoke reproducing the report: force the staged path, confirm the tap shows a spinner immediately, then dismiss and reopen (**not** force-stop) and confirm the banner clears on its own.
+- Device smoke reproducing the report: force the staged path, confirm the tap shows a spinner immediately, then dismiss and reopen (**not** force-stop) and confirm the banner clears on its own. **Must run on the Pixel**, per the table above — the TCL kills the worklet on swipe-away and would pass this vacuously.
+
+### Validation status (2026-07-16)
+- `npm run verify` green (711 tests, 47 suites); Android debug build installs and launches clean on the TCL, worklet ready at +1.8s, no regression from the component move.
+- The `app:state` foreground path was exercised on-device (`conn:probe {"reason":"foreground"}` fires from the handler the retry now hangs off).
+- **Not exercised: the retry itself.** It only runs for a staged circle, which needs a genuinely wedged Autobase — the same environmental block the parent proposal hit (2026-06-03, "Not yet observed on-device"). The escalation math and retry gating are unit-tested; the wiring that calls them is reviewed, not proven. Real validation waits for the next wedge on the Pixel.
 
 ## Rollback
 Part A is one helper plus a branch in the `app:state` handler — single-commit revert restores the wait-for-restart behavior. Part B is UI-local state. Part C adds one snapshot flag and one field inside an existing value; a revert leaves stray `attempts` fields that old code already ignores, so no cleanup is needed.
