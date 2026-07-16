@@ -1,10 +1,10 @@
 # Repair: finish the staged rebuild on foreground, and show real progress
 
 ## Goal
-Make a staged `circle:repair` complete when the user reopens the app, instead of stranding an undismissable "Reopen the app to finish repairing" banner that only a force-stop can clear.
+Make a staged `circle:repair` complete when the user reopens the app — and escalate to leave-and-rejoin when it cannot — instead of stranding an undismissable "Reopen the app to finish repairing" banner that only a force-stop can clear.
 
 ## Tier
-T2. Amends `proposals/2026-06-03-autobase-append-hang.md` (Part B) and its gen+1 remount strategy. No wire-protocol, IPC envelope, or Hyperbee-key change: `circleDegraded:{id}` / `circleRepairing:{id}` keep their shapes and meanings. What changes is *when* the gen+1 mount is retried, so it lands in the same tier as the mechanism it amends.
+T2. Amends `proposals/2026-06-03-autobase-append-hang.md` (Part B) and its gen+1 remount strategy. No wire-protocol or IPC envelope change, and no new Hyperbee key: `circleDegraded:{id}` is untouched and `circleRepairing:{id}` gains one additive field in its value. What changes is *when* the gen+1 mount is retried, so it lands in the same tier as the mechanism it amends.
 
 ## Background — what was observed on-device
 Reported 2026-07-16 by Tim on a real device, in a circle whose banner offered Repair:
@@ -43,24 +43,40 @@ The member-detail sheet already gets this right (`src/ui/App.jsx:7263`, `:7384-7
 - Add a local `repairPending` state in `App.jsx`, set on modal confirm and cleared once the circle reports `repairing || repairStaged` or the `circle:repaired` event arrives. Feed it into `repairingBannerEligible` so `RepairingBanner` with its spinner takes the slot immediately, covering the up-to-18s dead zone.
 - Render the spinner in the `needsRestart` variant too. With Part A the restart state is transient rather than terminal, so an indeterminate indicator is now honest.
 
+### Part C — Auto-escalate a repair that will not converge
+A staged repair can never escalate today. The watchdog only arms for `repairInProgress = repairingCircles.length > 0 && !repairStagedPending` (`src/ui/App.jsx:2536`), and the escalated banner bails out on `escalated && !needsRestart` (`src/ui/App.jsx:1315`) — deliberately, because "reopen the app" was believed to be a real path. Part A makes that belief testable: if the mount still loses the race after repeated foregrounds, the wedge is one the gen+1 rebuild cannot fix (bloated oplog, forked view), and no amount of reopening will help.
+
+- Count failed mount attempts per circle, persisted in the existing `circleRepairing:{id}` value as an additive `attempts` field. The key and its meaning are unchanged; old code ignores the field.
+- After `REPAIR_MAX_ATTEMPTS` failures (proposed **3** total: the original `circle:repair` plus two foreground retries), mark the circle escalated and stop auto-retrying. Continuing to burn an 18s mount on every foreground buys nothing once it is established that the mount does not converge.
+- Surface it as a per-circle `repairEscalated` flag in the `circles:getAll` snapshot (`src/bare.js:3225-3233`), alongside `needsRepair` / `repairing` / `repairStaged`.
+- UI: `RepairingBanner` shows the existing leave-and-rejoin copy and its "Open circle settings" button when the circle is escalated, **including** the `needsRestart` case — so the `escalated && !needsRestart` guard at `:1315` relaxes to fire on the worklet flag regardless of staging. The 75s `REPAIR_ESCALATE_MS` watchdog stays as-is for the non-staged path, which has no attempt count to key off.
+- The escalated state clears the same way everything else does: if the circle ever becomes writable, `clearRepairing` (`src/bare.js:1107`, `:2803-2809`) deletes `circleRepairing:{id}` and the attempt count with it.
+
+This gives every repair a terminal state. It either completes, or it tells the user to leave and rejoin. Neither outcome requires a force-stop, which is what went wrong in the report.
+
 ### Out of scope
-- The 75s escalation watchdog (`REPAIR_ESCALATE_MS`, `src/ui/App.jsx:1295`) and its leave-and-rejoin guidance stay as the backstop for a retry that keeps failing.
 - No auto-repair on `circle:degraded`. Repair still changes the local writer key, so it stays user-driven per the parent proposal.
+- No auto-*leave*. Escalation surfaces the guidance and the settings entry point; leaving a circle needs a fresh invite to undo, so it stays a deliberate user action.
 - No change to the 18s mount timeout. Tuning it is a separate on-device question.
 
 ## Compat
-Peer-invisible: repair is a device-local rebuild and no message crosses the wire. An old-code peer sees only the same gen+1 writer re-admission it already handles. `circleDegraded:{id}` and `circleRepairing:{id}` are unchanged, so a device that boots old code after this change (or vice versa) hydrates the same state; the worst case is the pre-change behavior, i.e. waiting for a restart. No migration.
+Peer-invisible: repair is a device-local rebuild and no message crosses the wire. An old-code peer sees only the same gen+1 writer re-admission it already handles.
+
+The one persisted change is the additive `attempts` field inside `circleRepairing:{id}`. Both directions are safe: old code reading a new value ignores the field and behaves exactly as it does today (wait for restart); new code reading an old value finds `attempts` undefined and treats it as 0, costing at most a fresh set of retries for a repair staged before the upgrade. `circleDegraded:{id}` is untouched. No migration.
 
 ## Verify
 - `npm run verify` green.
 - New `node` test: a staged repair (mount loses the race) followed by an `app:state active` retries the mount, and on success clears `_repairStaged`, clears `circleRepairing:{id}`, and emits `circle:repaired {restartRequired: false}`.
 - New `node` test: two `app:state active` events in quick succession while a retry is in flight produce exactly one mount attempt.
+- New `node` test: a mount that never converges escalates on the `REPAIR_MAX_ATTEMPTS`-th failure, sets `repairEscalated` in the snapshot, and attempts no further mount on the next foreground.
+- New `node` test: `attempts` round-trips through `circleRepairing:{id}` across a simulated boot, and a value written without the field reads back as 0.
 - New `jsdom` test: confirming the modal shows `RepairingBanner` with a spinner before any worklet event arrives.
+- New `jsdom` test: an escalated circle shows the leave-and-rejoin copy even when `needsRestart` is true (the case `:1315` excludes today).
 - Device smoke reproducing the report: force the staged path, confirm the tap shows a spinner immediately, then dismiss and reopen (**not** force-stop) and confirm the banner clears on its own.
 
 ## Rollback
-Part A is one helper plus a branch in the `app:state` handler — single-commit revert restores the wait-for-restart behavior. Part B is UI-local state. Neither writes a new persisted field, so a revert needs no cleanup.
+Part A is one helper plus a branch in the `app:state` handler — single-commit revert restores the wait-for-restart behavior. Part B is UI-local state. Part C adds one snapshot flag and one field inside an existing value; a revert leaves stray `attempts` fields that old code already ignores, so no cleanup is needed.
 
 ## Open questions
-- Should a staged repair that survives N foreground retries auto-escalate to the leave-and-rejoin flow, or keep only the 75s watchdog copy?
-- Should `RepairingBanner` gain a dismiss control as a last-resort escape, given the banner is now self-clearing and dismissing it would hide a genuinely unfinished repair?
+- Is 3 the right `REPAIR_MAX_ATTEMPTS`? It is a guess. Each attempt costs up to 18s of mount, and the failure mode it screens for (bloated oplog / forked view) is unlikely to heal between foregrounds, so a lower number may serve users better. Worth tuning on-device.
+- Should `RepairingBanner` gain a dismiss control as a last-resort escape? Part C arguably removes the need: every repair now reaches a terminal state with an actionable button, and dismissing would hide a genuinely unfinished repair.
