@@ -159,7 +159,7 @@ export function App () {
         </Modal>
       )}
       {modal === 'support' && (
-        <Modal title="Support PearCircle" onClose={() => setModal(null)}>
+        <Modal title="Support Development" onClose={() => setModal(null)}>
           <Support />
         </Modal>
       )}
@@ -206,7 +206,7 @@ function TopBar ({ status, wsConnected, version, theme, onToggleTheme, onOpen, s
           {menuOpen && (
             <div class="menu" role="menu">
               <button onClick={() => { setMenuOpen(false); onOpen('maintenance') }}><Wrench /> Maintenance</button>
-              <button onClick={() => { setMenuOpen(false); onOpen('support') }}><Heart /> Support PearCircle</button>
+              <button onClick={() => { setMenuOpen(false); onOpen('support') }}><Heart /> Support Development</button>
             </div>
           )}
         </div>

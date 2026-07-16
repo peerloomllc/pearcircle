@@ -278,7 +278,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--p
   border-radius: 12px; box-shadow: var(--shadow); padding: 6px; overflow: hidden;
 }
 .menu button, .menu a {
-  display: flex; align-items: center; gap: 10px; width: 100%;
+  display: flex; align-items: center; justify-content: flex-start; gap: 10px; width: 100%;
   background: transparent; color: var(--text); border: 0; text-align: left;
   padding: 9px 10px; border-radius: 8px; font-size: 13.5px; font-weight: 450; cursor: pointer; text-decoration: none;
 }
@@ -334,7 +334,9 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--p
   .circle { flex-wrap: wrap; align-items: flex-start; column-gap: 12px; row-gap: 8px; }
   .circle .live { margin-top: 6px; }
   .circle-name .id { flex-basis: 100%; }
-  .circle-controls { flex-basis: 100%; margin-left: 22px; }
+  /* full-width row, no indent → equal left/right inset (the list's padding);
+     the select shares the row with Leave instead of overflowing it. */
+  .circle-controls { flex-basis: 100%; margin-left: 0; }
   .circle-controls select { flex: 1 1 auto; min-width: 0; }
 }
 @media (max-width: 380px) {
