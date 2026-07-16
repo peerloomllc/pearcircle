@@ -54,6 +54,7 @@ const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
 const { buildExport, validateImport } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
+const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -211,7 +212,9 @@ const _cutoverBlockedMarked = new Set() // circleIds we've logged a cutover-bloc
 let _forceAutobaseLastSeen = false
 const _degradedCircles = new Set() // circleIds whose base append/read timed out (wedged local Autobase); surfaced as needsRepair, persisted as circleDegraded:{id}, healed by nukeTip on boot / circle:repair (proposal 2026-06-03-autobase-append-hang)
 const _repairingCircles = new Set() // circleIds whose circle:repair is in flight: rebuilt but still re-syncing / awaiting writer re-admission. Surfaced as `repairing`, persisted as circleRepairing:{id}, cleared when the base is writable again
-const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks.
+const _repairStaged = new Set() // circleIds whose rebuild couldn't be mounted in-process (the in-app remount hangs) and is staged for the next app launch. In-memory only; surfaced as `repairStaged` so the UI asks the user to reopen the app. The OLD base stays mounted meanwhile so the circle never blanks. Retried on every foreground (proposal 2026-07-16), since the worklet outlives the UI and a swipe-away never restarts it.
+const _repairMounting = new Set() // circleIds inside the gen+1 mount race right now, whether from circle:repair or a foreground retry. One mount per circle: two would race to swap _circleBases and leave the loser's base orphaned but live (proposal 2026-07-16)
+const _repairEscalated = new Set() // circleIds whose rebuild lost the mount race REPAIR_MAX_ATTEMPTS times: it won't converge (bloated oplog / forked view), so we stop retrying and the UI offers leave + rejoin. Surfaced as `repairEscalated`, persisted in the circleRepairing:{id} value (proposal 2026-07-16)
 let _lastConflictAt = 0 // ts of the most recent hypercore 'conflict' event; gates the post-conflict seatbelt so it only swallows a fork's fallout, not unrelated bugs (proposal 2026-06-27-fork-conflict-recovery)
 const _rewoundCircles = new Set() // circleIds whose local writer core is behind the network (truncated); appends are blocked while the original tail downloads, then self-clears (proposal 2026-06-27 item 3)
 let _faultHandlersInstalled = false // guards installFaultHandlers against re-running on init retry (lock-contention reattempts)
@@ -663,6 +666,12 @@ const handlers = {
       flushAllPendingTransitions().catch(() => {})
       schedulePushRegionsToShell()
     }
+    // A staged rebuild waits for a fresh process, but this worklet outlives the
+    // UI, so a swipe-away + reopen never delivered one — the banner said "reopen
+    // the app" and nothing but a force-stop could satisfy it. Retry the mount
+    // here instead (proposal 2026-07-16). Fire-and-forget: the mount race can
+    // run REPAIR_MOUNT_TIMEOUT_MS and must not block this handler's response.
+    if (_appForeground && _repairStaged.size) retryStagedRepairs().catch(() => {})
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
   },
@@ -1760,53 +1769,9 @@ const handlers = {
     // 2. Persist the new generation so the next launch boots into the fresh
     //    namespace even if everything below is interrupted.
     await _localDb.put('circles:joined:' + circleId, { ...record.value, rebuildGen: newGen }).catch(() => {})
-    // 3. BUILD the rebuilt base WITHOUT touching the live one, bounded. The old
-    //    base stays mounted the whole time, so a hung build can never leave the
-    //    circle unmounted ("not in any circles"). The in-app remount of a fresh
-    //    namespace can still hang while the old base is around; if it does we
-    //    fall through to staging it for the next launch.
-    let newBase = null
-    try {
-      newBase = await Promise.race([
-        buildCircleAutobase(circleId, bootstrap, encryptionKey || null, newGen),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('repair_mount_timeout')), 18000)),
-      ])
-    } catch (e) {
-      mark('circle:repair:mount-staged', { circleId: circleId.slice(0, 8), newGen, err: e?.message })
-    }
-    if (newBase) {
-      // 4a. Built in-process — swap atomically. Abandon the old base (no
-      //     Autobase.close(); it hangs) and install the rebuilt one. Mark
-      //     repairing so the indicator runs until it is writable again.
-      _circleBases.delete(circleId)
-      _circleBases.set(circleId, newBase)
-      openPairChannelsForCircle(circleId, newBase)
-      clearDegraded(circleId)
-      _firstLastSeenWriteMarked.delete(circleId)
-      _firstWriterMarked.delete(circleId)
-      _lastAppendedPos.delete(circleId)
-      _lastGoodSnapshot.delete(circleId)
-      _repairStaged.delete(circleId)
-      // Re-announce the (namespace-stable) last-known core key into the rebuilt
-      // view, which starts empty (proposal 2026-06-04 slice 2a).
-      _lastKnownAnnounced.delete(circleId)
-      setRepairing(circleId)
-      mark('circle:repair:done', { circleId: circleId.slice(0, 8), newGen, writable: !!newBase.writable })
-      send({ event: 'circle:repaired', data: { circleId, restartRequired: false } })
-      return { ok: true, writable: !!newBase.writable }
-    }
-    // 4b. In-app remount hung. Keep the OLD base mounted (circle stays visible)
-    //     and stage the rebuild for the next launch, where the boot mount loop
-    //     opens gen+1 cleanly. clearDegraded so the old base's stalls don't read
-    //     as "needs repair"; _repairStaged surfaces "reopen to finish"; the
-    //     persisted circleRepairing flag resumes "Repairing…" after the restart.
-    //     We do NOT add to _repairingCircles now — the old base is writable,
-    //     which would clear it prematurely in circles:getAll.
-    clearDegraded(circleId)
-    _repairStaged.add(circleId)
-    _localDb.put('circleRepairing:' + circleId, { ts: Date.now() }).catch(() => {})
-    send({ event: 'circle:repaired', data: { circleId, restartRequired: true } })
-    return { ok: true, staged: true, restartRequired: true }
+    // 3. BUILD the rebuilt base and swap it in, bounded. Shared with the
+    //    foreground retry so the two endings can never drift apart.
+    return attemptRepairMount(circleId, { bootstrap, encryptionKey, newGen })
   },
 
   'circles:list': async () => {
@@ -2803,9 +2768,137 @@ function setRepairing (circleId) {
 function clearRepairing (circleId) {
   if (!_repairingCircles.has(circleId)) return
   _repairingCircles.delete(circleId)
+  // Drops the persisted failed-attempt count with it: the repair converged, so
+  // a future one starts from a clean slate rather than inheriting an old tally.
+  _repairEscalated.delete(circleId)
   _localDb.del('circleRepairing:' + circleId).catch(() => {})
   mark('circle:repair:settled', { circleId: circleId.slice(0, 8) })
   send({ event: 'circle:repairing', data: { circleId, repairing: false } })
+}
+
+// How long the gen+1 mount may take before we stage it. The old base is still
+// mounted meanwhile, so this bounds a hang, not the repair itself.
+const REPAIR_MOUNT_TIMEOUT_MS = 18000
+
+// Mount the circle's rebuilt (gen `newGen`) Autobase and swap it in, bounded.
+// Shared by the user-triggered circle:repair and the foreground retry
+// (proposal 2026-07-16) so their two endings can't drift apart. Caller owns the
+// gen bump + writer-pin clear: a retry re-mounts the SAME gen, since bumping
+// again would orphan another core set and derive yet another writer key to be
+// re-admitted.
+async function attemptRepairMount (circleId, opts = {}) {
+  // One mount per circle at a time. A foreground retry can otherwise race a
+  // user-triggered circle:repair (the member sheet still offers one) and both
+  // would swap _circleBases — the loser's base stays live but unreferenced,
+  // replicating into a view nothing reads.
+  if (_repairMounting.has(circleId)) {
+    mark('circle:repair:mount-in-flight', { circleId: circleId.slice(0, 8) })
+    return { ok: false, reason: 'repair_in_flight' }
+  }
+  _repairMounting.add(circleId)
+  try {
+    return await runRepairMount(circleId, opts)
+  } finally {
+    _repairMounting.delete(circleId)
+  }
+}
+
+async function runRepairMount (circleId, { bootstrap, encryptionKey, newGen } = {}) {
+  // BUILD without touching the live one. The old base stays mounted the whole
+  // time, so a hung build can never leave the circle unmounted ("not in any
+  // circles"). The in-app remount of a fresh namespace can still hang while the
+  // old base is around; if it does we stage it.
+  let newBase = null
+  try {
+    newBase = await Promise.race([
+      buildCircleAutobase(circleId, bootstrap, encryptionKey || null, newGen),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('repair_mount_timeout')), REPAIR_MOUNT_TIMEOUT_MS)),
+    ])
+  } catch (e) {
+    mark('circle:repair:mount-staged', { circleId: circleId.slice(0, 8), newGen, err: e?.message })
+  }
+  if (newBase) {
+    // Built in-process — swap atomically. Abandon the old base (no
+    // Autobase.close(); it hangs) and install the rebuilt one. Mark repairing
+    // so the indicator runs until it is writable again.
+    _circleBases.delete(circleId)
+    _circleBases.set(circleId, newBase)
+    openPairChannelsForCircle(circleId, newBase)
+    clearDegraded(circleId)
+    _firstLastSeenWriteMarked.delete(circleId)
+    _firstWriterMarked.delete(circleId)
+    _lastAppendedPos.delete(circleId)
+    _lastGoodSnapshot.delete(circleId)
+    _repairStaged.delete(circleId)
+    _repairEscalated.delete(circleId)
+    // Re-announce the (namespace-stable) last-known core key into the rebuilt
+    // view, which starts empty (proposal 2026-06-04 slice 2a).
+    _lastKnownAnnounced.delete(circleId)
+    setRepairing(circleId)
+    mark('circle:repair:done', { circleId: circleId.slice(0, 8), newGen, writable: !!newBase.writable })
+    send({ event: 'circle:repaired', data: { circleId, restartRequired: false } })
+    return { ok: true, writable: !!newBase.writable }
+  }
+  // In-app remount hung. Keep the OLD base mounted (circle stays visible) and
+  // stage the rebuild for the next foreground, which retries this same mount —
+  // and for the next launch, where the boot mount loop opens gen+1 cleanly.
+  // clearDegraded so the old base's stalls don't read as "needs repair";
+  // _repairStaged surfaces "reopen to finish"; the persisted circleRepairing
+  // flag resumes "Repairing…" after a restart. We do NOT add to
+  // _repairingCircles now — the old base is writable, which would clear it
+  // prematurely in circles:getAll.
+  clearDegraded(circleId)
+  _repairStaged.add(circleId)
+  // Count the failure and escalate once it's established this mount won't
+  // converge (proposal 2026-07-16 Part C). Read-modify-write is safe here: the
+  // _repairMounting guard means only one attempt per circle is ever in flight.
+  const prev = await _localDb.get('circleRepairing:' + circleId).catch(() => null)
+  const next = recordRepairFailure(prev?.value, Date.now())
+  if (next.escalated) {
+    _repairEscalated.add(circleId)
+    mark('circle:repair:escalated', { circleId: circleId.slice(0, 8), newGen, attempts: next.attempts })
+  }
+  await _localDb.put('circleRepairing:' + circleId, next).catch(() => {})
+  send({ event: 'circle:repaired', data: { circleId, restartRequired: true, escalated: next.escalated } })
+  return { ok: true, staged: true, restartRequired: true, escalated: next.escalated }
+}
+
+// Retry every staged rebuild. Called on foreground: the worklet outlives the
+// UI (it keeps running for background location), so a swipe-away and reopen
+// returns the same process with the same _repairStaged — which is exactly why
+// "reopen the app to finish repairing" used to strand the user until a
+// force-stop (proposal 2026-07-16).
+//
+// Fire-and-forget from the app:state handler: each attempt can sit in the mount
+// race for REPAIR_MOUNT_TIMEOUT_MS, and awaiting that inside a handler would
+// wedge the IPC dispatcher — the exact failure mode proposal 2026-06-03 exists
+// to prevent.
+async function retryStagedRepairs () {
+  for (const circleId of Array.from(_repairStaged)) {
+    // attemptRepairMount enforces the one-mount-per-circle rule; this just
+    // avoids the DB read when there's plainly nothing to do.
+    if (!shouldRetryStagedRepair({
+      staged: true,
+      escalated: _repairEscalated.has(circleId),
+      inFlight: _repairMounting.has(circleId),
+    })) continue
+    try {
+      const record = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+      if (!record?.value?.bootstrap) continue
+      // Re-mount the gen the original repair already bumped to and persisted.
+      // Bumping again would orphan another core set and derive yet another
+      // writer key for the owner to re-admit.
+      const gen = typeof record.value.rebuildGen === 'number' ? record.value.rebuildGen : 0
+      mark('circle:repair:retry', { circleId: circleId.slice(0, 8), gen })
+      await attemptRepairMount(circleId, {
+        bootstrap: record.value.bootstrap,
+        encryptionKey: record.value.encryptionKey,
+        newGen: gen,
+      })
+    } catch (e) {
+      mark('circle:repair:retry-failed', { circleId: circleId.slice(0, 8), err: e?.message })
+    }
+  }
 }
 
 // Drop-in for `await base.append(op)` on the automatic/background write paths.
@@ -3228,9 +3321,13 @@ async function snapshotCircle (circleId, base) {
     // indicator; supersedes needsRepair in the UI.
     repairing: _repairingCircles.has(circleId),
     // True when the rebuild was staged because the in-app remount hung: the
-    // old base is still mounted and the rebuild applies on the next launch.
-    // The UI shows "reopen the app to finish".
+    // old base is still mounted and the rebuild is retried on the next
+    // foreground. The UI shows "reopen the app to finish".
     repairStaged: _repairStaged.has(circleId),
+    // True once the rebuild has lost the mount race REPAIR_MAX_ATTEMPTS times:
+    // it isn't going to converge, so the UI stops promising a repair and offers
+    // leave + rejoin instead (proposal 2026-07-16).
+    repairEscalated: _repairEscalated.has(circleId),
   }
 }
 
@@ -5988,12 +6085,18 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // A repair can take a long time, so it may span an app restart. Re-arm the
   // in-flight repairing state so the "Repairing…" indicator persists; the
   // circles:getAll poll clears it once the rebuilt base is writable again.
-  for await (const { key } of _localDb.createReadStream({
+  for await (const { key, value } of _localDb.createReadStream({
     gt: 'circleRepairing:', lt: 'circleRepairing:~',
   })) {
-    _repairingCircles.add(key.slice('circleRepairing:'.length))
+    const circleId = key.slice('circleRepairing:'.length)
+    _repairingCircles.add(circleId)
+    // Re-arm a given-up repair so it shows leave-and-rejoin straight away
+    // rather than spinning out the UI-side watchdog again (proposal
+    // 2026-07-16). A value written before that proposal has no attempt count
+    // and reads back as not-escalated.
+    if (repairValueEscalated(value)) _repairEscalated.add(circleId)
   }
-  if (_repairingCircles.size) mark('circle:repairing-persisted', { count: _repairingCircles.size })
+  if (_repairingCircles.size) mark('circle:repairing-persisted', { count: _repairingCircles.size, escalated: _repairEscalated.size })
 
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced
