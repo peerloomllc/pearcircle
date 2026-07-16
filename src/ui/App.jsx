@@ -17,6 +17,7 @@ import {
 import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
+import { RepairBanner, RepairingBanner, RepairConfirmModal, REPAIR_ESCALATE_MS } from './components/RepairBanners.jsx'
 import appConfig from '../../app.json'
 
 const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
@@ -1241,178 +1242,6 @@ function SyncInterruptedBanner ({ onDismiss }) {
   )
 }
 
-// Top-of-map nudge when one or more circles are wedged (needsRepair) and not
-// already repairing. Primary, discoverable surface for the rebuild -- the
-// per-avatar member-sheet button is too hidden for most users to find. The
-// action opens a confirm-with-explainer first (repair pauses sharing and
-// rebuilds from peers), it isn't a one-tap toggle. Dismissible per session;
-// the persisted degraded flag re-surfaces it next launch.
-function RepairBanner ({ count, circleName, onRepair, onDismiss }) {
-  const headline = count > 1 ? `${count} circles need repair` : `${circleName || 'A circle'} needs repair`
-  return (
-    <div style={{
-      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
-      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
-      background: 'rgba(26,26,26,0.92)',
-      borderBottom: `1px solid ${colors.border}`,
-    }}>
-      <button
-        onClick={onDismiss}
-        aria-label='Dismiss'
-        style={{
-          position: 'absolute',
-          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
-          right: spacing.sm,
-          background: 'transparent', border: 'none', color: colors.text.secondary,
-          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
-        }}
-      >×</button>
-      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
-        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{headline}</div>
-        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
-          {count > 1 ? 'Their data is stuck' : "This circle's data is stuck"}, so members' locations may be out of sync. Repairing rebuilds {count > 1 ? 'them' : 'it'} from your peers.
-        </div>
-        <button
-          onClick={onRepair}
-          style={{
-            display: 'inline-block', marginTop: spacing.sm, padding: '6px 14px',
-            background: colors.primary, color: colors.text.onPrimary,
-            border: 'none', borderRadius: radius.sm,
-            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400, cursor: 'pointer',
-          }}
-        >
-          Repair
-        </button>
-      </div>
-    </div>
-  )
-}
-
-// How long an in-process repair may run before we stop promising it will
-// finish and escalate to "leave and rejoin". A healthy re-sync converges well
-// under this; the wedges that never converge (oplog bloat, forked view) would
-// otherwise spin "Repairing…" forever.
-const REPAIR_ESCALATE_MS = 75_000
-
-// Indeterminate "Repairing…" indicator. circle:repair returns in seconds but
-// the actual re-sync from the seeder + writer re-admission run async and can
-// take a long time, so this persists (via the worklet's `repairing` flag)
-// until the rebuilt base is functional again. While it's progressing there's
-// no action; once it crosses REPAIR_ESCALATE_MS (escalated) we tell the user
-// some wedges can't be repaired and point them at leave + rejoin.
-function RepairingBanner ({ count, circleName, needsRestart = false, escalated = false, onResolve }) {
-  const target = count > 1 ? `${count} circles` : (circleName || 'circle')
-  const bannerStyle = {
-    position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
-    padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
-    background: 'rgba(26,26,26,0.92)',
-    borderBottom: `1px solid ${colors.border}`,
-  }
-  // Escalated: the re-sync isn't converging. Some wedges (stuck/bloated or
-  // forked data) can't be rebuilt from peers; the reliable fix is to leave the
-  // circle and rejoin from a fresh invite. Not shown for the restart-staged
-  // case, which still has a real path ("reopen the app").
-  if (escalated && !needsRestart) {
-    return (
-      <div style={bannerStyle}>
-        <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
-          <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>
-            Repair is taking longer than usual
-          </div>
-          <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
-            Some stuck data can't be rebuilt this way. If {count > 1 ? 'a circle' : (circleName || 'the circle')} still looks out of sync, leave it and rejoin from a fresh invite (ask the circle's owner to send a new one).
-          </div>
-          {onResolve && (
-            <button
-              onClick={onResolve}
-              style={{
-                display: 'inline-block', marginTop: spacing.sm, padding: '6px 14px',
-                background: colors.primary, color: colors.text.onPrimary,
-                border: 'none', borderRadius: radius.sm,
-                fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400, cursor: 'pointer',
-              }}
-            >
-              Open circle settings
-            </button>
-          )}
-        </div>
-      </div>
-    )
-  }
-  const label = needsRestart
-    ? `Finishing repair of ${target}`
-    : (count > 1 ? `Repairing ${count} circles…` : `Repairing ${circleName || 'circle'}…`)
-  const sub = needsRestart
-    ? 'Reopen the app to finish repairing.'
-    : 'This can take a while. Your circle will catch up in the background.'
-  return (
-    <div style={bannerStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, padding: `0 ${spacing.lg}px` }}>
-        {!needsRestart && (
-          <span style={{
-            width: 15, height: 15, borderRadius: '50%', flexShrink: 0,
-            border: `2px solid ${colors.border}`, borderTopColor: colors.primary,
-            animation: 'pearcircle-focus-spin 0.8s linear infinite', display: 'inline-block',
-          }} />
-        )}
-        <div style={{ textAlign: needsRestart ? 'center' : 'left' }}>
-          <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>{label}</div>
-          <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
-            {sub}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// Confirm-with-explainer before a rebuild, since it pauses sharing and runs a
-// long re-sync. Repairs every wedged circle on confirm.
-function RepairConfirmModal ({ circles, onConfirm, onCancel }) {
-  const single = circles.length === 1
-  const name = single ? (circles[0]?.circle?.name || 'this circle') : `${circles.length} circles`
-  return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 360,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'rgba(0,0,0,0.7)', padding: spacing.lg,
-    }}>
-      <div style={{
-        width: '100%', maxWidth: 360,
-        background: colors.surface.card, borderRadius: radius.lg,
-        padding: spacing.lg, boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-      }}>
-        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary }}>
-          Repair {name}?
-        </h2>
-        <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
-          This rebuilds {single ? 'the circle' : 'these circles'} from your peers to fix the stuck data. Your sharing pauses briefly and it can take a while to catch up. Your identity and history are kept.
-        </p>
-        <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.base }}>
-          <button
-            onClick={onCancel}
-            style={{
-              flex: 1, padding: '12px', background: 'transparent',
-              color: colors.text.secondary, border: `1px solid ${colors.border}`,
-              borderRadius: radius.md, fontFamily: typography.fontFamily, fontSize: 14, cursor: 'pointer',
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            style={{
-              flex: 1, padding: '12px', background: colors.primary, color: colors.text.onPrimary,
-              border: 'none', borderRadius: radius.md, fontFamily: typography.fontFamily, fontSize: 14, fontWeight: 400, cursor: 'pointer',
-            }}
-          >
-            Repair
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 // Modal alert shown when a circle leaves the user involuntarily: the
 // owner deleted it (kind 'deleted', circle:deleted) or the owner removed
@@ -2236,6 +2065,12 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // re-surfaces next launch since the worklet persists the degraded flag).
   const [repairConfirmOpen, setRepairConfirmOpen] = useState(false)
   const [repairBannerDismissed, setRepairBannerDismissed] = useState(false)
+  // True from the moment Repair is confirmed until circle:repair settles. The
+  // worklet only flips `repairing` / `repairStaged` once its mount race is
+  // over (up to 18s), so without this the tap went unacknowledged: the user
+  // kept looking at the needs-repair banner and its still-live Repair button
+  // (proposal 2026-07-16 Part B).
+  const [repairPending, setRepairPending] = useState(false)
   // Repair watchdog: a normal re-sync converges, but a wedge whose cause is in
   // the replicated data (lastSeen oplog bloat or a forked view) never becomes
   // writable, so "Repairing…" would spin forever with no completion. After
@@ -2528,6 +2363,14 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const repairingCircles = circles.filter((c) => c.repairing || c.repairStaged)
   const repairStagedPending = repairingCircles.some((c) => c.repairStaged)
   const needRepairCircles = circles.filter((c) => c.needsRepair && !c.repairing && !c.repairStaged)
+  // The worklet gave up on a rebuild (it lost the mount race too many times to
+  // be converging). Overrides the timer-based watchdog below: this one is a
+  // fact, not a guess (proposal 2026-07-16 Part C).
+  const repairEscalatedByWorklet = repairingCircles.some((c) => c.repairEscalated)
+  // Who the "Repairing…" banner is about. Between the Repair tap and the
+  // worklet's first flag there are no repairing circles yet, so fall back to
+  // the circles we just asked to repair.
+  const repairTargets = repairingCircles.length > 0 ? repairingCircles : (repairPending ? needRepairCircles : [])
 
   // Repair watchdog: arm a one-shot timer while an in-process repair runs; if it
   // hasn't cleared (the circle never becomes writable) by REPAIR_ESCALATE_MS,
@@ -2549,7 +2392,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const permissionBannerEligible = permissionStatus !== 'always' && permissionStatus !== 'unknown' && permissionStatus !== 'notDetermined' && !bannerDismissed
   const batteryBannerEligible = battery.supported === true && !battery.exempt && !batteryBannerDismissed
   const networkBannerEligible = networkLocationOff && !networkBannerDismissed && (!selfSeen || (Date.now() - (selfSeen.ts ?? 0)) > NETWORK_BANNER_STALE_MS)
-  const repairingBannerEligible = repairingCircles.length > 0
+  const repairingBannerEligible = repairTargets.length > 0
   const repairBannerEligible = !repairBannerDismissed && needRepairCircles.length > 0
   const syncBannerEligible = syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed
   const topBanner = tourActive ? null
@@ -2891,10 +2734,10 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           entry point; tapping Repair opens the confirm-with-explainer. */}
       {topBanner === 'repairing' && (
         <RepairingBanner
-          count={repairingCircles.length}
-          circleName={repairingCircles[0]?.circle?.name}
+          count={repairTargets.length}
+          circleName={repairTargets[0]?.circle?.name}
           needsRestart={repairStagedPending}
-          escalated={repairEscalated}
+          escalated={repairEscalated || repairEscalatedByWorklet}
           onResolve={() => setSheet({ name: 'settings', expand: 'circles' })}
         />
       )}
@@ -2919,9 +2762,14 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           onCancel={() => setRepairConfirmOpen(false)}
           onConfirm={() => {
             setRepairConfirmOpen(false)
-            for (const c of needRepairCircles) {
+            // Acknowledge the tap immediately; circle:repair only resolves once
+            // the worklet's mount race is over, and by then its own flags drive
+            // the banner. Settles on failure too, so a throw can't strand the
+            // spinner (proposal 2026-07-16 Part B).
+            setRepairPending(true)
+            Promise.all(needRepairCircles.map((c) => (
               pear.call('circle:repair', { circleId: c.circleId }).catch(() => {})
-            }
+            ))).then(() => setRepairPending(false))
           }}
         />
       )}
