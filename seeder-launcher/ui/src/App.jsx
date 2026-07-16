@@ -15,6 +15,10 @@ const DONATE = {
   bmcUrl: 'https://buymeacoffee.com/peerloomllc?new=1',
 }
 
+// Brand mark = the real app icon, reused from the favicon already inlined in
+// index.html (no duplicated data URI, no external asset).
+const BRAND_ICON = typeof document !== 'undefined' ? (document.querySelector('link[rel="icon"]')?.href || '') : ''
+
 /* ---- inline icons (no icon font / external asset) ------------------------- */
 const Icon = ({ d, ...p }) => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" {...p}><path d={d} /></svg>
@@ -215,9 +219,7 @@ function TopBar ({ status, wsConnected, version, theme, onToggleTheme, onOpen, s
   return (
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M14.5 3.2c-.9.2-1.7.8-2.2 1.6-.4-.2-.8-.3-1.3-.3C7.7 4.5 5 8.3 5 12.9 5 17 7.3 21 10.8 21c1 0 1.6-.4 2.2-.4s1.2.4 2.2.4c2.4 0 4.2-1.9 5.1-4.5-2-.9-3.1-3.4-2.2-5.6.4-1 1.2-1.8 2.1-2.2-.9-1.6-2.5-2.7-4.3-2.7-.2 0-.5 0-.7.1.4-1 .3-2 0-2.9z" /></svg>
-        </span>
+        <img class="brand-mark" src={BRAND_ICON} alt="" aria-hidden="true" />
         <div>
           <div class="brand-name">PearCircle Seeder</div>
           <div class="brand-sub">keeping your circles alive</div>
