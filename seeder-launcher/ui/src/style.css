@@ -220,7 +220,7 @@ a { color: var(--primary-strong); }
 @media (prefers-reduced-motion: reduce) { .live { animation: none; } }
 
 .circle-main { flex: 1; min-width: 0; }
-.circle-name { font-weight: 500; font-size: 14.5px; display: flex; align-items: center; gap: 8px; }
+.circle-name { font-weight: 500; font-size: 14.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .circle-name .id { color: var(--subtle); font-size: 11.5px; font-weight: 400; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .circle-state { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
 .circle-state.rev { color: var(--warn); }
@@ -328,6 +328,14 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--p
   .stat .lbl { font-size: 11.5px; }
   .overlay { padding: 0; align-items: flex-end; }
   .modal { max-width: none; border-radius: 18px 18px 0 0; max-height: 92dvh; }
+
+  /* circle rows: name/state on row 1, controls drop to a full-width row 2 so
+     nothing collides on a phone (the retention select is wide). */
+  .circle { flex-wrap: wrap; align-items: flex-start; column-gap: 12px; row-gap: 8px; }
+  .circle .live { margin-top: 6px; }
+  .circle-name .id { flex-basis: 100%; }
+  .circle-controls { flex-basis: 100%; margin-left: 22px; }
+  .circle-controls select { flex: 1 1 auto; min-width: 0; }
 }
 @media (max-width: 380px) {
   .stat .lbl { font-size: 10.5px; }
