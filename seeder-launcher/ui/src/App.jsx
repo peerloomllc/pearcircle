@@ -1,14 +1,61 @@
 import { h } from 'preact'
-import { useEffect, useState, useCallback } from 'preact/hooks'
+import { useEffect, useState, useCallback, useRef } from 'preact/hooks'
 import QRCode from 'qrcode'
 import { api, openWs, formatBytes, formatUptime } from './api.js'
 
 const RETENTION_OPTIONS = [
-  { label: 'Forever', value: null },
-  { label: '30 days', value: 30 * 86400_000 },
-  { label: '7 days', value: 7 * 86400_000 },
-  { label: '24 hours', value: 86400_000 },
+  { label: 'Keep forever', value: null },
+  { label: 'Keep 30 days', value: 30 * 86400_000 },
+  { label: 'Keep 7 days', value: 7 * 86400_000 },
+  { label: 'Keep 24 hours', value: 86400_000 },
 ]
+
+const DONATE = {
+  lnAddress: 'peerloomllc@strike.me',
+  bmcUrl: 'https://buymeacoffee.com/peerloomllc?new=1',
+}
+
+/* ---- inline icons (no icon font / external asset) ------------------------- */
+const Icon = ({ d, ...p }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" {...p}><path d={d} /></svg>
+)
+const Sun = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+const Moon = () => <Icon d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+const Gear = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.3a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.3 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 7 2.7h.1A1.7 1.7 0 0 0 8.3 1V1a2 2 0 1 1 4 0v.1A1.7 1.7 0 0 0 15 2.3a1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>
+const Close = () => <Icon d="M18 6 6 18M6 6l12 12" />
+const Copy = () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" /></svg>
+const Plus = () => <Icon d="M12 5v14M5 12h14" />
+const Wrench = () => <Icon d="M14.7 6.3a4 4 0 0 0-5 5L3 18l3 3 6.7-6.7a4 4 0 0 0 5-5l-2.8 2.8-2.1-.7-.7-2.1z" />
+const Heart = () => <Icon d="M20.8 5.6a5 5 0 0 0-7.1 0L12 7.3l-1.7-1.7a5 5 0 0 0-7.1 7.1L12 21l8.8-8.3a5 5 0 0 0 0-7.1z" />
+
+/* ---- clipboard (works on the seeder's plain-http origin) ------------------ */
+async function copyText (text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true }
+  } catch {}
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.focus(); ta.select()
+    const ok = document.execCommand('copy'); document.body.removeChild(ta); return ok
+  } catch { return false }
+}
+
+/* ---- theme (system default, manual override persisted) -------------------- */
+function useTheme () {
+  const initial = () => {
+    const saved = localStorage.getItem('seeder-theme')
+    if (saved === 'light' || saved === 'dark') return saved
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+  }
+  const [theme, setTheme] = useState(initial)
+  useEffect(() => { document.documentElement.dataset.theme = theme }, [theme])
+  const toggle = () => setTheme((t) => {
+    const next = t === 'dark' ? 'light' : 'dark'
+    localStorage.setItem('seeder-theme', next); return next
+  })
+  return [theme, toggle]
+}
 
 export function App () {
   const [status, setStatus] = useState(null)
@@ -19,19 +66,17 @@ export function App () {
   const [update, setUpdate] = useState(null)
   const [applyState, setApplyState] = useState(null)
   const [pairResult, setPairResult] = useState(null)
+  const [modal, setModal] = useState(null) // 'add' | 'maintenance' | 'support' | null
+  const [theme, toggleTheme] = useTheme()
 
   useEffect(() => {
     const ws = openWs({
       onMessage: (msg) => {
         setWsConnected(true)
         if (msg.type === 'event' && msg.name === 'seeder:pair:result') {
-          setPairResult(msg.data || { enrolled: 0, names: [] })
-          return
+          setPairResult(msg.data || { enrolled: 0, names: [] }); return
         }
         if (msg.type === 'snapshot') {
-          // A healthy snapshot means the worklet is up — clear any stale
-          // error (e.g. the transient "worklet exited" from a Restart, which
-          // would otherwise linger after it comes back).
           if (msg.status && !msg.status.error) { setStatus(msg.status); setError(null) }
           if (msg.circles && !msg.circles.error) setCircles(msg.circles.circles ?? [])
           if (msg.launcherVersion) setVersion(msg.launcherVersion)
@@ -46,305 +91,137 @@ export function App () {
     return () => ws.close()
   }, [])
 
-  return (
-    <div>
-      <h1>PearCircle Seeder</h1>
-      <div class="sub">
-        <span class={'dot ' + (wsConnected ? 'good' : 'bad')} />
-        {wsConnected ? 'connected to worklet' : 'connecting…'}
-        {version && <span class="version"> · v{version}</span>}
-      </div>
+  const refresh = () => api.circles().then((c) => setCircles(c.circles ?? [])).catch(() => {})
+  const liveCount = circles.filter((c) => !c.revoked).length
 
-      {error && <div class="toast error">{error}</div>}
+  return (
+    <div class="app">
+      <TopBar
+        status={status} wsConnected={wsConnected} version={version} theme={theme}
+        onToggleTheme={toggleTheme} onOpen={setModal} setError={setError}
+      />
 
       {update && update.updateAvailable && (
-        <UpdateBanner update={update} applyState={applyState} setApplyState={setApplyState} />
+        <UpdateBar update={update} applyState={applyState} setApplyState={setApplyState} />
       )}
+      {error && <div class="toast error" style={{ flex: '0 0 auto' }}>{error}</div>}
 
-      <Status status={status} circles={circles} onChanged={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
-      <AddCircles pairResult={pairResult} clearPairResult={() => setPairResult(null)} onAdded={() => api.circles().then((c) => setCircles(c.circles ?? []))} setError={setError} />
-      <Maintenance setError={setError} />
-      <Support />
-    </div>
-  )
-}
-
-// Donation / support. Two no-account rails the dashboard renders entirely
-// client-side (no tracking, no phone-home, no host network call): a Lightning
-// address for sats and Buy Me a Coffee for USD/card. The QR is built from the
-// constants below, so blanking either string drops that rail. The dashboard is
-// often viewed on a laptop while paying from a phone, hence a QR for both.
-const DONATE = {
-  lnAddress: 'peerloomllc@strike.me',
-  bmcUrl: 'https://buymeacoffee.com/peerloomllc?new=1',
-}
-
-// Copy that also works on the seeder's plain-http origin (Umbrel proxy): the
-// async Clipboard API needs a secure context, so fall back to execCommand.
-async function copyText (text) {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch {}
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.focus(); ta.select()
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok
-  } catch { return false }
-}
-
-function Support () {
-  const [tab, setTab] = useState('ln') // 'ln' | 'bmc'
-  const [qr, setQr] = useState(null)
-  const [copied, setCopied] = useState(false)
-
-  // Lightning Address QR = the bare address (what wallet scanners expect);
-  // Buy Me a Coffee QR = the page URL.
-  const qrPayload = tab === 'ln' ? DONATE.lnAddress : DONATE.bmcUrl
-  const copyValue = tab === 'ln' ? DONATE.lnAddress : DONATE.bmcUrl
-
-  useEffect(() => {
-    let cancelled = false
-    setQr(null)
-    QRCode.toDataURL(qrPayload, { width: 200, margin: 1, errorCorrectionLevel: 'M' })
-      .then((url) => { if (!cancelled) setQr(url) })
-      .catch(() => { if (!cancelled) setQr(null) })
-    return () => { cancelled = true }
-  }, [qrPayload])
-
-  const onCopy = async () => {
-    if (await copyText(copyValue)) { setCopied(true); setTimeout(() => setCopied(false), 1500) }
-  }
-
-  return (
-    <div class="panel">
-      <h2>Support PearCircle</h2>
-      <div class="empty" style={{ marginBottom: 14 }}>
-        No accounts, no servers, no subscriptions. If running this seeder is useful, a tip helps keep PearCircle free — entirely optional.
-      </div>
-      <div class="row" style={{ gap: 10, justifyContent: 'center', marginBottom: 14 }}>
-        <button class={tab === 'ln' ? '' : 'ghost'} style={{ flex: 1, maxWidth: 180 }} onClick={() => setTab('ln')}>⚡ BTC ⚡</button>
-        <button class={tab === 'bmc' ? '' : 'ghost'} style={{ flex: 1, maxWidth: 180 }} onClick={() => setTab('bmc')}>💲 USD 💲</button>
-      </div>
-      <div style={{ textAlign: 'center' }}>
-        {qr
-          ? <img src={qr} alt={tab === 'ln' ? 'Lightning donation QR code' : 'Buy Me a Coffee QR code'}
-                 style={{ width: 200, height: 200, background: '#fff', borderRadius: 8, padding: 8 }} />
-          : <div class="empty">generating…</div>}
-        <div class="empty" style={{ marginTop: 10 }}>
-          {tab === 'ln'
-            ? 'Scan with any bitcoin lightning wallet to donate sats (pick your own amount), or copy the address.'
-            : 'Scan to open Buy Me a Coffee on your phone, or open it here to donate by card.'}
+      <div class="main">
+        <div class="stats">
+          <div class="stat hero">
+            <div class="num">{status ? liveCount : '—'}</div>
+            <div class="lbl">{liveCount === 1 ? 'circle kept alive' : 'circles kept alive'}</div>
+          </div>
+          <div class="stat">
+            <div class="num small">{status ? formatUptime(status.uptime) : '—'}</div>
+            <div class="lbl">uptime</div>
+          </div>
+          <div class="stat">
+            <div class="num small">{status ? formatBytes(status.totalBytesReplicated || 0) : '—'}</div>
+            <div class="lbl">replicated</div>
+          </div>
         </div>
-        <div style={{ marginTop: 12 }}>
-          <div class="mono" style={{ color: 'var(--muted)', wordBreak: 'break-all' }}>{copyValue}</div>
-          <div class="row" style={{ gap: 10, justifyContent: 'center', marginTop: 10 }}>
-            <button class="ghost" onClick={onCopy}>{copied ? 'Copied' : 'Copy'}</button>
-            {tab === 'bmc' && (
-              <button onClick={() => window.open(DONATE.bmcUrl, '_blank', 'noopener,noreferrer')}>Open</button>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Circles</h2>
+            <span class="count">{circles.length ? `· ${circles.length}` : ''}</span>
+          </div>
+          <div class="list">
+            {!status && <div class="empty">Connecting to the seeder…</div>}
+            {status && circles.length === 0 && (
+              <div class="empty">
+                <strong>No circles yet.</strong><br />
+                Add one below — pair a phone or paste a seed invite from a member's Settings → Seeders.
+              </div>
             )}
+            {circles.map((c) => (
+              <CircleRow key={c.circleId} circle={c} wsConnected={wsConnected} onChanged={refresh} setError={setError} />
+            ))}
           </div>
         </div>
       </div>
+
+      <div class="actionbar">
+        <Identity status={status} />
+        <div class="spacer" />
+        <button onClick={() => setModal('add')}><Plus />Add circles</button>
+      </div>
+
+      {modal === 'add' && (
+        <Modal title="Add circles" onClose={() => setModal(null)}>
+          <AddCircles pairResult={pairResult} clearPairResult={() => setPairResult(null)} onAdded={refresh} setError={setError} />
+        </Modal>
+      )}
+      {modal === 'maintenance' && (
+        <Modal title="Maintenance" onClose={() => setModal(null)}>
+          <Maintenance setError={setError} />
+        </Modal>
+      )}
+      {modal === 'support' && (
+        <Modal title="Support PearCircle" onClose={() => setModal(null)}>
+          <Support />
+        </Modal>
+      )}
     </div>
   )
 }
 
-// QR pairing: show a QR a phone scans to push its circles to this seeder, no
-// copy-paste (proposal 2026-06-22). The phone-side push + enroll completes over
-// P2P; the worklet emits seeder:pair:result, which arrives as pairResult.
-function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
-  const [link, setLink] = useState(null)
-  const [qr, setQr] = useState(null)
-  const [remaining, setRemaining] = useState(0)
-  const [busy, setBusy] = useState(false)
-
-  const close = async () => {
-    setLink(null); setQr(null); setRemaining(0)
-    try { await api.pairClose() } catch {}
-  }
-
-  const open = async () => {
-    setBusy(true); setError(null); clearPairResult()
-    try {
-      const r = await api.pairOpen()
-      if (r?.error) { setError(r.error); return }
-      setLink(r.link)
-      setRemaining(Math.round((r.ttlMs || 300000) / 1000))
-    } catch (e) { setError(e.message) }
-    finally { setBusy(false) }
-  }
-
-  // Render the link as a QR data URL whenever it changes.
+/* ---- top bar -------------------------------------------------------------- */
+function TopBar ({ status, wsConnected, version, theme, onToggleTheme, onOpen, setError }) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef(null)
   useEffect(() => {
-    if (!link) { setQr(null); return }
-    let cancelled = false
-    QRCode.toDataURL(link, { width: 240, margin: 1, errorCorrectionLevel: 'M' })
-      .then((url) => { if (!cancelled) setQr(url) })
-      .catch(() => { if (!cancelled) setQr(null) })
-    return () => { cancelled = true }
-  }, [link])
-
-  // Countdown; auto-close when the TTL runs out (the worklet enforces the real one).
-  useEffect(() => {
-    if (!link) return
-    if (remaining <= 0) { close(); return }
-    const t = setTimeout(() => setRemaining(remaining - 1), 1000)
-    return () => clearTimeout(t)
-  }, [link, remaining])
-
-  // A successful pairing arrived: stop showing the QR and refresh the circle list.
-  useEffect(() => {
-    if (!pairResult) return
-    setLink(null); setQr(null); setRemaining(0)
-    api.pairClose().catch(() => {})
-    if (typeof onPaired === 'function') onPaired()
-  }, [pairResult])
+    if (!menuOpen) return
+    const h = (e) => { if (!menuRef.current?.contains(e.target)) setMenuOpen(false) }
+    document.addEventListener('mousedown', h)
+    return () => document.removeEventListener('mousedown', h)
+  }, [menuOpen])
 
   return (
-    <div>
-      {pairResult ? (
-        <div style={{ textAlign: 'center', color: 'var(--good)', padding: '8px 0' }}>
-          Paired — now seeding {pairResult.enrolled} circle{pairResult.enrolled === 1 ? '' : 's'}
-          {Array.isArray(pairResult.names) && pairResult.names.length > 0 ? ` (${pairResult.names.join(', ')})` : ''}.
-          <div class="row" style={{ justifyContent: 'center', marginTop: 12 }}>
-            <button class="ghost" onClick={clearPairResult}>Done</button>
-          </div>
-        </div>
-      ) : !link ? (
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M14.5 3.2c-.9.2-1.7.8-2.2 1.6-.4-.2-.8-.3-1.3-.3C7.7 4.5 5 8.3 5 12.9 5 17 7.3 21 10.8 21c1 0 1.6-.4 2.2-.4s1.2.4 2.2.4c2.4 0 4.2-1.9 5.1-4.5-2-.9-3.1-3.4-2.2-5.6.4-1 1.2-1.8 2.1-2.2-.9-1.6-2.5-2.7-4.3-2.7-.2 0-.5 0-.7.1.4-1 .3-2 0-2.9z" /></svg>
+        </span>
         <div>
-          <div class="empty" style={{ textAlign: 'center', marginBottom: 12 }}>
-            Link this seeder to a phone's circles by QR — no copy-paste. Tap below, then in the PearCircle app open Seeders → Scan seeder QR.
-          </div>
-          <div class="row" style={{ justifyContent: 'center' }}>
-            <button onClick={open} disabled={busy}>{busy ? 'Starting…' : 'Pair a phone'}</button>
-          </div>
+          <div class="brand-name">PearCircle Seeder</div>
+          <div class="brand-sub">keeping your circles alive</div>
         </div>
-      ) : (
-        <div style={{ textAlign: 'center' }}>
-          {qr
-            ? <img src={qr} alt="pairing QR code" style={{ width: 240, height: 240, background: '#fff', borderRadius: 8, padding: 8 }} />
-            : <div class="empty">generating…</div>}
-          <div class="empty" style={{ marginTop: 10 }}>Scan with the PearCircle app. Expires in {remaining}s.</div>
-          <div class="empty" style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
-            Tip: if the phone won't connect, turn off its WiFi so it pairs over cellular. A seeder on a home server often can't be found over the same WiFi.
-          </div>
-          <div class="row" style={{ justifyContent: 'center', marginTop: 12 }}>
-            <button class="ghost" onClick={close}>Cancel</button>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// On-demand maintenance controls. Retention sweeps already run at startup and
-// every 24h; these apply a just-changed retention policy immediately (or claw
-// back disk now) without waiting or restarting from a shell.
-function Maintenance ({ setError }) {
-  const [sweeping, setSweeping] = useState(false)
-  const [restarting, setRestarting] = useState(false)
-  const [msg, setMsg] = useState(null)
-
-  const sweep = async () => {
-    setMsg(null); setError(null); setSweeping(true)
-    try {
-      const r = await api.sweepNow()
-      const w = r?.writer?.cleared ?? 0
-      const b = r?.bootstrap?.cleared ?? 0
-      const total = w + b
-      const bytes = (r?.writer?.clearedBytes ?? 0) + (r?.bootstrap?.clearedBytes ?? 0)
-      setMsg(total === 0
-        ? 'Swept — nothing past the retention window to reclaim.'
-        : `Swept — cleared ${total} block${total === 1 ? '' : 's'} (${w} writer-core, ${b} bootstrap), ~${formatBytes(bytes)} freed. Disk space is reclaimed on the next compaction.`)
-    } catch (e) { setError(e.message) }
-    finally { setSweeping(false) }
-  }
-
-  const restart = async () => {
-    if (!confirm('Restart the seeder? It will briefly disconnect, re-sync, and run a retention sweep on boot.')) return
-    setMsg(null); setError(null); setRestarting(true)
-    try {
-      await api.restart()
-      setMsg('Seeder restarted.')
-    } catch (e) { setError(e.message) }
-    finally { setRestarting(false) }
-  }
-
-  return (
-    <div class="panel">
-      <h2>Maintenance</h2>
-      <div class="empty" style={{ marginBottom: 12, textAlign: 'center' }}>
-        Retention sweeps run automatically at startup and every 24h. Use these to apply a changed retention policy right away.
       </div>
-      <div class="row" style={{ gap: 10, justifyContent: 'center' }}>
-        <button onClick={sweep} disabled={sweeping || restarting}>{sweeping ? 'Sweeping…' : 'Run sweep now'}</button>
-        <button class="ghost" onClick={restart} disabled={sweeping || restarting}>{restarting ? 'Restarting…' : 'Restart seeder'}</button>
-      </div>
-      {msg && <div style={{ marginTop: 10, color: 'var(--good)', fontSize: 13, textAlign: 'center' }}>{msg}</div>}
-    </div>
-  )
-}
 
-// Update-available banner with the one-click "Update now" action (proposal
-// 2026-06-05-seeder-update slices 2+3a). Self-apply platforms restart the
-// service; platforms that need the privileged helper (macOS .pkg / Linux .deb,
-// slice 3b) or that can't self-apply fall back to a verified download link.
-function UpdateBanner ({ update, applyState, setApplyState }) {
-  const [busy, setBusy] = useState(false)
-  const onUpdate = async () => {
-    setBusy(true)
-    try { setApplyState(await api.applyUpdate()) }
-    catch (e) { setApplyState({ status: 'error', error: String(e?.message ?? e) }) }
-    finally { setBusy(false) }
-  }
-  const st = applyState?.status
-  const downloadHref = update.assetUrl || update.releaseUrl
-  return (
-    <div class="toast update" style={{ textAlign: 'center' }}>
-      <div>Update available: v{update.latestVersion}</div>
-      {st === 'restarting' && <div>Updating — the seeder will restart on v{update.latestVersion}.</div>}
-      {st === 'applying-via-helper' && <div>Installing v{update.latestVersion} — the seeder will restart shortly.</div>}
-      {(st === 'needs-helper') && (
-        <div>This build installs with a system installer.{' '}
-          <a href={downloadHref} target="_blank" rel="noreferrer">Download v{update.latestVersion}</a></div>
-      )}
-      {st === 'error' && (
-        <div>Update failed ({applyState.error}).{' '}
-          <a href={downloadHref} target="_blank" rel="noreferrer">Download instead</a></div>
-      )}
-      {(st !== 'restarting' && st !== 'applying-via-helper') && (
-        <div style={{ marginTop: 8 }}>
-          <button onClick={onUpdate} disabled={busy || st === 'running'}>
-            {busy || st === 'running' ? 'Updating…' : 'Update now'}
-          </button>
+      <Nickname status={status} setError={setError} />
+
+      <div class="topbar-right">
+        <span class="pill" title={wsConnected ? 'Connected to the worklet' : 'Reconnecting'}>
+          <span class={'dot ' + (wsConnected ? 'good' : 'bad')} />
+          {wsConnected ? 'live' : 'offline'}
+          {version && <span class="v">· v{version}</span>}
+        </span>
+        <button class="iconbtn" onClick={onToggleTheme} aria-label="Toggle theme" title={theme === 'dark' ? 'Switch to light' : 'Switch to dark'}>
+          {theme === 'dark' ? <Sun /> : <Moon />}
+        </button>
+        <div class="menuwrap" ref={menuRef}>
+          <button class="iconbtn" onClick={() => setMenuOpen((v) => !v)} aria-label="Menu" aria-expanded={menuOpen}><Gear /></button>
+          {menuOpen && (
+            <div class="menu" role="menu">
+              <button onClick={() => { setMenuOpen(false); onOpen('maintenance') }}><Wrench /> Maintenance</button>
+              <button onClick={() => { setMenuOpen(false); onOpen('support') }}><Heart /> Support PearCircle</button>
+            </div>
+          )}
         </div>
-      )}
-    </div>
+      </div>
+    </header>
   )
 }
 
-// Status + the enrolled-circles list folded into one Overview panel: the
-// seeder's identity/uptime/bytes and what it's actually seeding belong
-// together. Per-circle retention/leave controls live on each Circle row.
-// Editable operator nickname (proposal 2026-07-15-seeder-nickname). What
-// members' apps show instead of the hex pubkey; blank clears it back to hex.
-function NicknameField ({ status, setError }) {
+// Operator nickname (proposal 2026-07-15-seeder-nickname), inline in the bar.
+function Nickname ({ status, setError }) {
   const current = status?.nickname ?? ''
   const [value, setValue] = useState('')
   const [touched, setTouched] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
-  // Sync from the authoritative status until the user edits (avoids the 5s
-  // snapshot clobbering in-progress typing); resume syncing after a save.
   useEffect(() => { if (!touched) setValue(current) }, [current, touched])
   const dirty = value.trim() !== current
   const save = async () => {
@@ -352,44 +229,188 @@ function NicknameField ({ status, setError }) {
     try {
       await api.nicknameSet(value.trim())
       setTouched(false); setSaved(true); setTimeout(() => setSaved(false), 1500)
-    } catch (e) { setError(e.message) }
-    finally { setSaving(false) }
+    } catch (e) { setError(e.message) } finally { setSaving(false) }
   }
   return (
-    <div class="row">
-      <div class="label">Nickname</div>
-      <div class="row" style={{ gap: 8, flex: 1, minWidth: 0 }}>
-        <input
-          value={value}
-          maxLength={48}
-          placeholder="e.g. Home Pi (shown in members' apps)"
-          onInput={(e) => { setTouched(true); setValue(e.target.value) }}
-          style={{ flex: 1, minWidth: 0 }}
-        />
-        <button onClick={save} disabled={saving || !dirty}>{saving ? '…' : (saved ? '✓' : 'Save')}</button>
+    <div class={'nick' + (dirty ? ' dirty' : '')}>
+      <input
+        value={value} maxLength={48}
+        placeholder="Name this seeder…"
+        title="Shown in members' apps instead of the hex key"
+        onInput={(e) => { setTouched(true); setValue(e.target.value) }}
+        onKeyDown={(e) => { if (e.key === 'Enter' && dirty) save() }}
+      />
+      <button class={'save small' + (saved ? ' show' : '')} onClick={save} disabled={saving || (!dirty && !saved)}>
+        {saving ? '…' : (saved ? 'Saved' : 'Save')}
+      </button>
+    </div>
+  )
+}
+
+/* ---- identity (action bar left) ------------------------------------------- */
+function Identity ({ status }) {
+  const [copied, setCopied] = useState(false)
+  if (!status?.pubkey) return <div class="identity" />
+  const pk = status.pubkey
+  const short = pk.slice(0, 8) + '…' + pk.slice(-6)
+  const copy = async () => { if (await copyText(pk)) { setCopied(true); setTimeout(() => setCopied(false), 1200) } }
+  return (
+    <div class="identity" title={pk}>
+      <span class="mono">{short}</span>
+      <button class="iconbtn" style={{ width: 28, height: 28 }} onClick={copy} aria-label="Copy seeder key">
+        {copied ? <span style={{ color: 'var(--good)', fontSize: 12 }}>✓</span> : <Copy />}
+      </button>
+    </div>
+  )
+}
+
+/* ---- circle row ----------------------------------------------------------- */
+function CircleRow ({ circle, wsConnected, onChanged, setError }) {
+  const [retention, setRetention] = useState(undefined)
+  useEffect(() => {
+    api.retentionGet(circle.circleId)
+      .then((r) => setRetention(r.pruneOlderThan ?? null))
+      .catch((e) => setError(e.message))
+  }, [circle.circleId])
+  const setRet = async (value) => {
+    setError(null)
+    try { await api.retentionSet(circle.circleId, value); setRetention(value) }
+    catch (e) { setError(e.message) }
+  }
+  const leave = async () => {
+    if (!confirm(`Leave ${circle.name || circle.circleId.slice(0, 8)}? The seeder stops replicating its blocks.`)) return
+    setError(null)
+    try { await api.leave(circle.circleId); onChanged() } catch (e) { setError(e.message) }
+  }
+  const revoked = circle.revoked
+  return (
+    <div class="circle">
+      <span class={'live' + (revoked ? ' warn' : (wsConnected ? '' : ' off'))} aria-hidden="true" />
+      <div class="circle-main">
+        <div class="circle-name">
+          {circle.name || '(unnamed circle)'}
+          <span class="id">{circle.circleId.slice(0, 10)}…</span>
+          {revoked && <span class="badge revoked">revoked</span>}
+        </div>
+        <div class={'circle-state' + (revoked ? ' rev' : '')}>
+          {revoked ? 'A member removed this seeder — leave to clear it' : (wsConnected ? 'Seeding' : 'Waiting for connection')}
+        </div>
+      </div>
+      <div class="circle-controls">
+        {!revoked && (
+          <select
+            value={retention === undefined ? '' : (retention === null ? 'null' : String(retention))}
+            onChange={(e) => { const v = e.currentTarget.value; setRet(v === 'null' ? null : Number(v)) }}
+            disabled={retention === undefined}
+            title="How long this seeder keeps the circle's blocks"
+          >
+            {RETENTION_OPTIONS.map((o) => (
+              <option key={String(o.value)} value={o.value === null ? 'null' : String(o.value)}>{o.label}</option>
+            ))}
+          </select>
+        )}
+        <button class="ghost small danger" onClick={leave}>Leave</button>
       </div>
     </div>
   )
 }
 
-function Status ({ status, circles, onChanged, setError }) {
+/* ---- modal wrapper -------------------------------------------------------- */
+function Modal ({ title, onClose, children }) {
+  useEffect(() => {
+    const h = (e) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', h)
+    return () => document.removeEventListener('keydown', h)
+  }, [])
   return (
-    <div class="panel">
-      <h2>Status</h2>
-      {!status && <div class="empty">awaiting first snapshot…</div>}
-      {status && (
-        <div>
-          <NicknameField status={status} setError={setError} />
-          <div class="row"><div class="label">Pubkey</div><div class="mono pubkey">{status.pubkey}</div></div>
-          <div class="row"><div class="label">Uptime</div><div>{formatUptime(status.uptime)}</div></div>
-          <div class="row"><div class="label">Replicated</div><div>{formatBytes(status.totalBytesReplicated || 0)}</div></div>
+    <div class="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div class="modal" role="dialog" aria-modal="true" aria-label={title}>
+        <div class="modal-head">
+          <h3>{title}</h3>
+          <button class="iconbtn" onClick={onClose} aria-label="Close"><Close /></button>
         </div>
-      )}
-      <div class="section-head">Seeding {circles.length} circle{circles.length === 1 ? '' : 's'}</div>
-      {circles.length === 0 && <div class="empty">no circles yet — paste a seed invite below to start</div>}
-      {circles.map((c) => (
-        <Circle key={c.circleId} circle={c} onChanged={onChanged} setError={setError} />
-      ))}
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/* ---- add circles (pair / paste) ------------------------------------------- */
+function AddCircles ({ pairResult, clearPairResult, onAdded, setError }) {
+  const [tab, setTab] = useState('pair')
+  return (
+    <div>
+      <div class="tabs">
+        <button class={tab === 'pair' ? '' : 'ghost'} onClick={() => setTab('pair')}>Pair a phone</button>
+        <button class={tab === 'paste' ? '' : 'ghost'} onClick={() => setTab('paste')}>Paste invite</button>
+      </div>
+      {tab === 'pair'
+        ? <PairPhone pairResult={pairResult} clearPairResult={clearPairResult} onPaired={onAdded} setError={setError} />
+        : <Enroll onEnrolled={onAdded} setError={setError} />}
+    </div>
+  )
+}
+
+function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
+  const [link, setLink] = useState(null)
+  const [qr, setQr] = useState(null)
+  const [remaining, setRemaining] = useState(0)
+  const [busy, setBusy] = useState(false)
+
+  const close = async () => { setLink(null); setQr(null); setRemaining(0); try { await api.pairClose() } catch {} }
+  const open = async () => {
+    setBusy(true); setError(null); clearPairResult()
+    try {
+      const r = await api.pairOpen()
+      if (r?.error) { setError(r.error); return }
+      setLink(r.link); setRemaining(Math.round((r.ttlMs || 300000) / 1000))
+    } catch (e) { setError(e.message) } finally { setBusy(false) }
+  }
+  useEffect(() => {
+    if (!link) { setQr(null); return }
+    let cancelled = false
+    QRCode.toDataURL(link, { width: 240, margin: 1, errorCorrectionLevel: 'M' })
+      .then((url) => { if (!cancelled) setQr(url) }).catch(() => { if (!cancelled) setQr(null) })
+    return () => { cancelled = true }
+  }, [link])
+  useEffect(() => {
+    if (!link) return
+    if (remaining <= 0) { close(); return }
+    const t = setTimeout(() => setRemaining(remaining - 1), 1000)
+    return () => clearTimeout(t)
+  }, [link, remaining])
+  useEffect(() => {
+    if (!pairResult) return
+    setLink(null); setQr(null); setRemaining(0)
+    api.pairClose().catch(() => {})
+    if (typeof onPaired === 'function') onPaired()
+  }, [pairResult])
+
+  if (pairResult) {
+    return (
+      <div class="stack center">
+        <div class="msg-good center">
+          Paired — now seeding {pairResult.enrolled} circle{pairResult.enrolled === 1 ? '' : 's'}
+          {Array.isArray(pairResult.names) && pairResult.names.length ? ` (${pairResult.names.join(', ')})` : ''}.
+        </div>
+        <button class="ghost" onClick={clearPairResult}>Done</button>
+      </div>
+    )
+  }
+  if (!link) {
+    return (
+      <div class="stack center">
+        <p class="hint center">Show a QR to link this seeder to a phone's circles — no copy-paste. In the PearCircle app: <strong>Seeders → Scan seeder QR</strong>.</p>
+        <button onClick={open} disabled={busy}>{busy ? 'Starting…' : 'Show pairing QR'}</button>
+      </div>
+    )
+  }
+  return (
+    <div class="stack center">
+      {qr ? <img class="qr" src={qr} alt="pairing QR code" /> : <div class="empty">generating…</div>}
+      <div class="hint center">Scan with the PearCircle app. Expires in {remaining}s.</div>
+      <div class="hint center" style={{ opacity: 0.85 }}>Won't connect? Turn off the phone's WiFi so it pairs over cellular — a seeder on a home server often can't be found over the same WiFi.</div>
+      <button class="ghost" onClick={close}>Cancel</button>
     </div>
   )
 }
@@ -398,15 +419,9 @@ function Enroll ({ onEnrolled, setError }) {
   const [invite, setInvite] = useState('')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)
-
   const submit = useCallback(async (e) => {
-    e.preventDefault()
-    setMsg(null); setError(null); setBusy(true)
+    e.preventDefault(); setMsg(null); setError(null); setBusy(true)
     try {
-      // The paste may be a bundle (one /circle/seed URL per line, minted
-      // by the mobile "Set up a seeder device" action) or a single
-      // invite. The host splits + enrolls each, returning per-circle
-      // results.
       const res = await api.enroll(invite.trim())
       const enrolled = res.enrolled ?? 0
       const failed = res.failed ?? 0
@@ -414,111 +429,106 @@ function Enroll ({ onEnrolled, setError }) {
       const parts = [`enrolled in ${enrolled} circle${enrolled === 1 ? '' : 's'}`]
       if (already > 0) parts.push(`${already} already enrolled`)
       if (failed > 0) parts.push(`${failed} failed`)
-      setMsg(parts.join(', '))
-      setInvite('')
-      onEnrolled()
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
+      setMsg(parts.join(', ')); setInvite(''); onEnrolled()
+    } catch (err) { setError(err.message) } finally { setBusy(false) }
   }, [invite])
-
   return (
-    <form onSubmit={submit} style={{ marginTop: 12 }}>
-      <textarea
-        placeholder="Paste a seed invite, or a bundle (one per line) from a PearCircle member's Settings → Seeders"
-        value={invite}
-        onInput={(e) => setInvite(e.currentTarget.value)}
-      />
-      <div class="row" style={{ marginTop: 12, justifyContent: 'center' }}>
-        <button type="submit" disabled={busy || !invite.trim()}>{busy ? 'enrolling…' : 'Enroll'}</button>
-      </div>
-      {msg && (
-        <div style={{ marginTop: 10, textAlign: 'center', color: 'var(--good)', fontSize: 13 }}>
-          {msg}
-        </div>
-      )}
+    <form onSubmit={submit} class="stack">
+      <p class="hint">Paste a seed invite, or a bundle (one per line) from a member's <strong>Settings → Seeders</strong>.</p>
+      <textarea placeholder="pear://pearcircle/circle/seed?…" value={invite} onInput={(e) => setInvite(e.currentTarget.value)} />
+      <button type="submit" class="block" disabled={busy || !invite.trim()}>{busy ? 'Enrolling…' : 'Enroll'}</button>
+      {msg && <div class="msg-good center">{msg}</div>}
     </form>
   )
 }
 
-// "Add circles" combines the two ways to link circles to this seeder: QR
-// pairing (primary) and pasting an invite (tucked behind an expander). Both are
-// the same function - adding circles - so they live in one section.
-function AddCircles ({ pairResult, clearPairResult, onAdded, setError }) {
-  const [pasteOpen, setPasteOpen] = useState(false)
+/* ---- maintenance ---------------------------------------------------------- */
+function Maintenance ({ setError }) {
+  const [sweeping, setSweeping] = useState(false)
+  const [restarting, setRestarting] = useState(false)
+  const [msg, setMsg] = useState(null)
+  const sweep = async () => {
+    setMsg(null); setError(null); setSweeping(true)
+    try {
+      const r = await api.sweepNow()
+      const w = r?.writer?.cleared ?? 0, b = r?.bootstrap?.cleared ?? 0, total = w + b
+      const bytes = (r?.writer?.clearedBytes ?? 0) + (r?.bootstrap?.clearedBytes ?? 0)
+      setMsg(total === 0
+        ? 'Swept — nothing past the retention window to reclaim.'
+        : `Swept — cleared ${total} block${total === 1 ? '' : 's'}, ~${formatBytes(bytes)} freed. Disk is reclaimed on the next compaction.`)
+    } catch (e) { setError(e.message) } finally { setSweeping(false) }
+  }
+  const restart = async () => {
+    if (!confirm('Restart the seeder? It briefly disconnects, re-syncs, and runs a retention sweep on boot.')) return
+    setMsg(null); setError(null); setRestarting(true)
+    try { await api.restart(); setMsg('Seeder restarted.') } catch (e) { setError(e.message) } finally { setRestarting(false) }
+  }
   return (
-    <div class="panel">
-      <h2>Add circles</h2>
-      <PairPhone pairResult={pairResult} clearPairResult={clearPairResult} onPaired={onAdded} setError={setError} />
-      <button
-        onClick={() => setPasteOpen((v) => !v)}
-        style={{
-          width: '100%', marginTop: 14, padding: '4px 0', background: 'transparent',
-          border: 0, color: 'var(--muted)', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit',
-        }}>
-        {pasteOpen ? '▾ Or paste an invite instead' : '▸ Or paste an invite instead'}
-      </button>
-      {pasteOpen && <Enroll onEnrolled={onAdded} setError={setError} />}
+    <div class="stack">
+      <p class="hint">Retention sweeps run automatically at startup and every 24h. Use these to apply a just-changed retention policy right away, or reclaim disk now.</p>
+      <button class="block" onClick={sweep} disabled={sweeping || restarting}>{sweeping ? 'Sweeping…' : 'Run sweep now'}</button>
+      <button class="ghost block" onClick={restart} disabled={sweeping || restarting}>{restarting ? 'Restarting…' : 'Restart seeder'}</button>
+      {msg && <div class="msg-good center">{msg}</div>}
     </div>
   )
 }
 
-function Circle ({ circle, onChanged, setError }) {
-  const [retention, setRetention] = useState(undefined)
-
+/* ---- support -------------------------------------------------------------- */
+function Support () {
+  const [tab, setTab] = useState('ln')
+  const [qr, setQr] = useState(null)
+  const [copied, setCopied] = useState(false)
+  const value = tab === 'ln' ? DONATE.lnAddress : DONATE.bmcUrl
   useEffect(() => {
-    api.retentionGet(circle.circleId)
-      .then((r) => setRetention(r.pruneOlderThan ?? null))
-      .catch((e) => setError(e.message))
-  }, [circle.circleId])
-
-  const setRet = async (value) => {
-    setError(null)
-    try {
-      await api.retentionSet(circle.circleId, value)
-      setRetention(value)
-    } catch (e) { setError(e.message) }
-  }
-
-  const leave = async () => {
-    if (!confirm(`Leave circle ${circle.name || circle.circleId.slice(0, 8)}? The seeder will stop replicating its blocks.`)) return
-    setError(null)
-    try {
-      await api.leave(circle.circleId)
-      onChanged()
-    } catch (e) { setError(e.message) }
-  }
-
+    let cancelled = false; setQr(null)
+    QRCode.toDataURL(value, { width: 200, margin: 1, errorCorrectionLevel: 'M' })
+      .then((url) => { if (!cancelled) setQr(url) }).catch(() => { if (!cancelled) setQr(null) })
+    return () => { cancelled = true }
+  }, [value])
+  const onCopy = async () => { if (await copyText(value)) { setCopied(true); setTimeout(() => setCopied(false), 1500) } }
   return (
-    <div class={'circle' + (circle.revoked ? ' revoked' : '')}>
-      <div class="circle-name">
-        {circle.name || '(unnamed)'}
-        {circle.revoked && <span class="badge revoked">revoked</span>}
+    <div class="stack center">
+      <p class="hint center">No accounts, no servers, no subscriptions. If running this seeder is useful, a tip helps keep PearCircle free — entirely optional.</p>
+      <div class="tabs" style={{ width: '100%' }}>
+        <button class={tab === 'ln' ? '' : 'ghost'} onClick={() => setTab('ln')}>⚡ Bitcoin</button>
+        <button class={tab === 'bmc' ? '' : 'ghost'} onClick={() => setTab('bmc')}>💲 Card / USD</button>
       </div>
-      <div class="circle-meta mono">{circle.circleId}</div>
-      {circle.revoked && (
-        <div class="circle-note">
-          A member of this circle revoked this seeder; it can no longer sync the circle. Use Leave to remove it.
-        </div>
+      {qr ? <img class="qr" src={qr} alt="donation QR code" /> : <div class="empty">generating…</div>}
+      <div class="hint center">
+        {tab === 'ln' ? 'Scan with any Lightning wallet (pick your own amount), or copy the address.' : 'Scan to open Buy Me a Coffee, or open it here to pay by card.'}
+      </div>
+      <div class="mono center" style={{ color: 'var(--muted)', fontSize: 12, wordBreak: 'break-all' }}>{value}</div>
+      <div class="row" style={{ display: 'flex', gap: 10 }}>
+        <button class="ghost" onClick={onCopy}>{copied ? 'Copied' : 'Copy'}</button>
+        {tab === 'bmc' && <button onClick={() => window.open(DONATE.bmcUrl, '_blank', 'noopener,noreferrer')}>Open</button>}
+      </div>
+    </div>
+  )
+}
+
+/* ---- update bar ----------------------------------------------------------- */
+function UpdateBar ({ update, applyState, setApplyState }) {
+  const [busy, setBusy] = useState(false)
+  const onUpdate = async () => {
+    setBusy(true)
+    try { setApplyState(await api.applyUpdate()) }
+    catch (e) { setApplyState({ status: 'error', error: String(e?.message ?? e) }) }
+    finally { setBusy(false) }
+  }
+  const st = applyState?.status
+  const href = update.assetUrl || update.releaseUrl
+  return (
+    <div class="updatebar">
+      <div class="grow">
+        <strong>Update available: v{update.latestVersion}</strong>
+        {st === 'restarting' && <span> — restarting on v{update.latestVersion}.</span>}
+        {st === 'applying-via-helper' && <span> — installing, will restart shortly.</span>}
+        {st === 'needs-helper' && <span> — installs with a system installer. <a href={href} target="_blank" rel="noreferrer">Download</a></span>}
+        {st === 'error' && <span> — update failed. <a href={href} target="_blank" rel="noreferrer">Download instead</a></span>}
+      </div>
+      {(st !== 'restarting' && st !== 'applying-via-helper') && (
+        <button class="small" onClick={onUpdate} disabled={busy || st === 'running'}>{busy || st === 'running' ? 'Updating…' : 'Update now'}</button>
       )}
-      <div class="circle-controls">
-        <label class="label" style={{ minWidth: 0 }}>retain</label>
-        <select
-          value={retention === undefined ? '' : (retention === null ? 'null' : String(retention))}
-          onChange={(e) => {
-            const v = e.currentTarget.value
-            setRet(v === 'null' ? null : Number(v))
-          }}
-          disabled={retention === undefined}
-        >
-          {RETENTION_OPTIONS.map((o) => (
-            <option key={String(o.value)} value={o.value === null ? 'null' : String(o.value)}>{o.label}</option>
-          ))}
-        </select>
-        <button class="ghost danger" onClick={leave}>Leave</button>
-      </div>
     </div>
   )
 }
