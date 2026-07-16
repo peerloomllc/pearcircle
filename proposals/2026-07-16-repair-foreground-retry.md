@@ -96,6 +96,9 @@ The one persisted change is the additive `attempts` field inside `circleRepairin
 ## Rollback
 Part A is one helper plus a branch in the `app:state` handler — single-commit revert restores the wait-for-restart behavior. Part B is UI-local state. Part C adds one snapshot flag and one field inside an existing value; a revert leaves stray `attempts` fields that old code already ignores, so no cleanup is needed.
 
+## Resolved questions (2026-07-16)
+- **`REPAIR_MAX_ATTEMPTS` stays 3.** The original worry — that each attempt costs up to 18s of mount — mostly evaporates on inspection: the retry is fire-and-forget from the `app:state` handler, so it costs background IO rather than any user-visible delay. Retrying is cheap, and escalating is what *stops* the retries, so an early escalation is the more expensive mistake. Still worth revisiting against a real wedge.
+- **No dismiss control on `RepairingBanner`.** Part C gives every repair a terminal state with an actionable button, so the dead end this proposal exists to fix is gone. A dismiss would mainly hide a genuinely unfinished repair and leave the circle silently out of sync.
+
 ## Open questions
-- Is 3 the right `REPAIR_MAX_ATTEMPTS`? It is a guess. Each attempt costs up to 18s of mount, and the failure mode it screens for (bloated oplog / forked view) is unlikely to heal between foregrounds, so a lower number may serve users better. Worth tuning on-device.
-- Should `RepairingBanner` gain a dismiss control as a last-resort escape? Part C arguably removes the need: every repair now reaches a terminal state with an actionable button, and dismissing would hide a genuinely unfinished repair.
+- None blocking. The retry path itself is unvalidated on-device (see validation status above); the next real wedge on the Pixel is the test.
