@@ -166,6 +166,13 @@ bump_official_store () {
     local base
     base="$(git remote show upstream 2>/dev/null | sed -n 's/.*HEAD branch: //p')"
     base="${base:-master}"
+    # The PR is cross-fork (our fork's branch -> upstream). gh needs the head
+    # qualified as OWNER:branch, or it looks for the branch on the base repo and
+    # fails with "No commits between ... / Head sha can't be blank". Derive the
+    # fork owner from origin.
+    local fork_owner
+    fork_owner="$(git remote get-url origin 2>/dev/null | sed -E 's#\.git$##; s#.*[:/]([^/]+)/[^/]+$#\1#')"
+    fork_owner="${fork_owner:-peerloomllc}"
     # Fresh branch off upstream tip (reset if a same-version branch lingers from a re-run).
     git checkout -q -B "$branch" "upstream/${base}"
     bump_manifest "${app}/umbrel-app.yml" "${app}/docker-compose.yml"
@@ -177,12 +184,12 @@ bump_official_store () {
         echo "    (nothing to commit — manifest already at $VERSION)"; }
       git push -q -f origin "$branch"
       local pr
-      pr="$(gh pr list --repo "$OFFICIAL_UPSTREAM" --head "$branch" --state open \
+      pr="$(gh pr list --repo "$OFFICIAL_UPSTREAM" --head "${fork_owner}:$branch" --state open \
               --json url -q '.[0].url' 2>/dev/null || true)"
       if [ -n "$pr" ]; then
         echo "    refreshed existing PR: $pr"
       else
-        gh pr create --repo "$OFFICIAL_UPSTREAM" --base "$base" --head "$branch" \
+        gh pr create --repo "$OFFICIAL_UPSTREAM" --base "$base" --head "${fork_owner}:$branch" \
           --title "pearcircle-seeder: update to ${VERSION}" \
           --body "Bump PearCircle Seeder to ${VERSION} (image pinned to the multi-arch manifest-list digest)." \
           || echo "    WARNING: gh pr create failed — push landed, open the PR manually."
@@ -192,7 +199,7 @@ bump_official_store () {
       echo "      cd $dir"
       echo "      git add ${app}/ && git commit -m 'pearcircle-seeder: update to ${VERSION}'"
       echo "      git push -f origin $branch"
-      echo "      gh pr create --repo $OFFICIAL_UPSTREAM --base ${base:-master} --head $branch \\"
+      echo "      gh pr create --repo $OFFICIAL_UPSTREAM --base ${base:-master} --head ${fork_owner}:$branch \\"
       echo "        --title 'pearcircle-seeder: update to ${VERSION}'"
     fi
   )
