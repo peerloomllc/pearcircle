@@ -27,22 +27,54 @@ The data directory `C:\ProgramData\PearCircle Seeder` is left in place so a rein
 
 ## Build from source
 
-The Windows installer is driven from the Linux or macOS side and compiled on a Windows build VM.
+The Windows installer is a cross-build: every binary in the payload is a
+prebuilt Windows artifact (`node.exe` from nodejs.org, `bare.exe` from the
+`bare-runtime-win32-x64` npm package, `nssm.exe` checked into the repo), the
+worklet is cross-packed with `bare-pack --host win32-x64`, and the only compile
+step is `makensis`. Nothing has to *run* on Windows, so you can build it two
+ways.
 
-Prereqs on the build VM (Windows 10 or 11):
+### On Linux / macOS - no VM (recommended)
 
-- Node.js and npm on PATH
-- NSIS (`makensis`) on PATH
-- `tar` (built in on Windows 10+)
-- key-based SSH access from the build host
+`makensis` runs natively on Linux/macOS and the stock MUI2 + nsExec plugins the
+installer uses ship with it, so the whole thing builds locally.
 
-Build from the repo:
+Prereqs:
+
+- Node.js and npm
+- NSIS (`makensis`) - Fedora: `dnf install mingw32-nsis`; Debian/Ubuntu: `apt install nsis`; macOS: `brew install makensis`
+- `curl`, `tar`, `unzip`
+
+One-time: the `bare-runtime-win32-x64` package is an optional npm dep gated to
+`os=win32`, so a normal `npm install` on a non-Windows host *skips* it. Force it
+into the repo `node_modules` once:
+
+```bash
+npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 --force --no-save
+```
+
+Then build:
+
+```bash
+cd seeder-launcher
+bash scripts/build-windows-local.sh          # or: bash scripts/build-windows-local.sh 0.1.0
+```
+
+The installer lands in `seeder-launcher/dist/windows/` with a `.sha256` sidecar.
+
+### On a Windows build VM (original path)
+
+Prereqs on the VM (Windows 10 or 11): Node.js + npm, NSIS (`makensis`), `tar`
+(built in on Windows 10+), and key-based SSH from the build host.
 
 ```bash
 cd seeder-launcher
 bash scripts/build-windows.sh          # or: bash scripts/build-windows.sh 0.1.0
 ```
 
-`build-windows.sh` packs the source, ships it to the VM (`WINDOWS_VM_HOST`, default `ben@192.168.50.157`), runs `scripts/windows-remote-build.ps1` there, and retrieves the installer to `seeder-launcher/dist/windows/`.
+`build-windows.sh` packs the source, ships it to the VM (`WINDOWS_VM_HOST`,
+default `ben@192.168.50.157`), runs `scripts/windows-remote-build.ps1` there,
+and retrieves the installer to `seeder-launcher/dist/windows/`.
 
-The installer is currently unsigned, so SmartScreen warns on first run. Authenticode signing is a later step.
+Either way the installer is currently unsigned, so SmartScreen warns on first
+run. Authenticode signing is a later step.
