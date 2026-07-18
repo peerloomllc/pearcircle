@@ -5,10 +5,18 @@ Marketplace, instead of manually sideloading the `.s9pk` (and it gives them
 "update available" notifications on new releases).
 
 A StartOS 0.3.5.x registry is just an HTTP host that answers the marketplace
-protocol's `GET /package/v0/...` endpoints. For a single app that's a **static
-file tree** - no database, no registry service, no signing keyring (the s9pk is
-self-signed by `start-sdk pack`; StartOS only checks the signature is internally
-valid). `build-registry.sh` generates that tree from the built `.s9pk`.
+protocol's `GET /package/v0/...` endpoints — a **static file tree**, no database,
+no registry service, no signing keyring (the s9pk is self-signed by `start-sdk
+pack`; StartOS only checks the signature is internally valid). `build-registry.sh`
+generates that tree from the built `.s9pk`.
+
+**Combined (multi-package) registry:** PeerLoom serves one registry
+(`peerloomllc.com`) that lists several seeders (pearcircle-seeder, pearcal-seeder,
+…). `build-registry.sh` is **merge-aware** — it upserts *this* package into
+whatever tree already exists at `OUT_DIR` and leaves the others untouched (only
+`index`/`latest`/`info` are merged; the per-id files are namespaced by id). Every
+app publishing into the shared tree must use merge-aware tooling like this; a
+legacy `rm -rf package`-style generator would drop the other packages.
 
 ## Generate
 
