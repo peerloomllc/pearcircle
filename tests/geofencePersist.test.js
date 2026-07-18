@@ -110,10 +110,15 @@ describe('recover a crossing across a simulated cold boot', () => {
     }
     expect(state.lastClassification).toBe('inside')
 
-    // First fix after the wake is outside the radius -> recovered exit.
-    const r = classify(150, RADIUS, state.lastClassification)
-    expect(r.kind).toBe('exit')
-    expect(r.classification).toBe('outside')
+    // Post-wake fixes are outside the radius -> recovered exit. The dwell rule
+    // (bugfix/geofence-flap-hardening) needs two consecutive confirming fixes
+    // before committing, so recovery costs one extra fix (~10s) but still fires.
+    const first = classify(150, RADIUS, state.lastClassification, undefined, { pending: null, count: 0 })
+    expect(first.kind).toBeNull() // candidate exit, not yet committed
+    expect(first.classification).toBe('inside')
+    const second = classify(150, RADIUS, first.classification, undefined, first.dwell)
+    expect(second.kind).toBe('exit')
+    expect(second.classification).toBe('outside')
   })
 
   test('still inside after the wake fires nothing (no spurious exit)', async () => {

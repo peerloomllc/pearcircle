@@ -46,7 +46,7 @@ const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
-const { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('./lib/geofence')
+const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
@@ -477,6 +477,9 @@ function trackPlace (circleId, place) {
     // Preserve classification across rename/move so we don't fire a
     // spurious enter just because the user relocated a Place.
     lastClassification: existing?.lastClassification ?? null,
+    // In-memory dwell state for the 2-consecutive-fix confirmation (never
+    // persisted; a cold boot simply re-confirms). Preserved across rename/move.
+    geoDwell: existing?.geoDwell ?? { pending: null, count: 0 },
   })
   schedulePushRegionsToShell()
 }
@@ -1286,6 +1289,7 @@ const handlers = {
     const tracked = _circlePlaces.get(circleId + '|' + placeId)
     if (tracked) {
       tracked.lastClassification = kind === 'enter' ? 'inside' : 'outside'
+      tracked.geoDwell = { pending: null, count: 0 }
       await persistClassification(circleId, placeId, tracked.lastClassification, stamp)
     }
 
@@ -3021,6 +3025,7 @@ async function flushPendingTransitions (circleId, base) {
       const state = _circlePlaces.get(key)
       if (state) {
         state.lastClassification = pend.kind === 'enter' ? 'inside' : 'outside'
+        state.geoDwell = { pending: null, count: 0 }
         await persistClassification(circleId, pend.placeId, state.lastClassification, pend.ts)
       }
       mark('transition:flushed', { circleId: circleId.slice(0, 8), placeId: pend.placeId.slice(0, 8), kind: pend.kind, appended: !!appended })
@@ -3099,6 +3104,9 @@ async function handleRegionEvent (kind, id, ts) {
   // are about to append durably. Persist so the baseline survives a
   // suspend/force-quit (proposal 2026-05-30).
   state.lastClassification = result.classification
+  // The OS region event is authoritative for this boundary; drop any half-
+  // formed JS-classifier dwell candidate so it can't shortcut the next fix.
+  state.geoDwell = { pending: null, count: 0 }
   await persistClassification(circleId, placeId, result.classification, stamp)
 
   // Per-circle mute: dedup classifier is advanced above; suppress the append.
@@ -3116,14 +3124,24 @@ async function handleRegionEvent (kind, id, ts) {
 }
 
 async function checkPlaceTransitions (lat, lon, accuracy, ts, battery = null, isCharging = null) {
+  // Accuracy gate: a fix too blurry to trust can't drive a transition at all
+  // (GrapheneOS network-location fallback jumps hundreds of metres). Gated
+  // fixes still update lastSeen / the map upstream; they just don't touch the
+  // geofence state or the dwell counter (bugfix/geofence-flap-hardening).
+  if (!isFixUsable(accuracy)) {
+    logGeofence('gated', null, null, { accuracy: Math.round(accuracy) })
+    return
+  }
   for (const state of _circlePlaces.values()) {
     const base = _circleBases.get(state.circleId)
     if (!base || !base.writable) continue
     const dist = haversineMeters(lat, lon, state.lat, state.lon)
     const prev = state.lastClassification
-    // Pass the fix's accuracy so a low-confidence reading can't bounce an
-    // at-home user out of the radius and back in (phantom exit, 2026-06-10).
-    const result = classify(dist, state.radiusMeters, prev, accuracy)
+    // Pass the fix's accuracy (uncertainty-circle read) and the running dwell
+    // state so a low-confidence or single-outlier reading can't bounce an
+    // at-home user out of the radius and back in (phantom pair, 2026-07-18).
+    const result = classify(dist, state.radiusMeters, prev, accuracy, state.geoDwell)
+    state.geoDwell = result.dwell
     state.lastClassification = result.classification
     // Persist on any change of stored state, including the null->baseline
     // establishment, so the inside/outside is on disk to recover a crossing
