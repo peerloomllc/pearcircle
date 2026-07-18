@@ -24,8 +24,6 @@ DONE.md
 
 # Release pipeline. scripts/app.conf is tracked since it's app-config rather
 # than credentials.
-scripts/ios-appstore.sh
-scripts/frame-android-screenshots.sh
 scripts/assets/
 scripts/.env
 .env
