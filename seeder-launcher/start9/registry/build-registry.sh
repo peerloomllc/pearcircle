@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
-# Generate a static StartOS 0.3.5.x community-registry tree for the PearCircle
-# seeder from the built .s9pk. The output is a plain file tree that implements
-# the marketplace protocol's GET endpoints; host it on any static HTTPS server
-# (see README.md) and users add the URL via Marketplace -> Change -> Add custom
-# registry.
+# Generate/refresh a static StartOS 0.3.5.x community-registry tree for the
+# PearCircle seeder from the built .s9pk. The output is a plain file tree that
+# implements the marketplace protocol's GET endpoints; host it on any static
+# HTTPS server (see README.md) and users add the URL via Marketplace -> Change
+# -> Add custom registry.
+#
+# COMBINED registry: this UPSERTS the PearCircle package into whatever tree
+# already exists at OUT_DIR — it does NOT wipe it — so one registry
+# (peerloomllc.com) can list several PeerLoom seeders (e.g. pearcircle-seeder +
+# pearcal-seeder). The per-id files (manifest/instructions/license/icon/version/
+# release-notes) are namespaced by id and simply (over)written for THIS id; only
+# the three shared aggregates are merged: `index` (array — this id's entry is
+# replaced in place), `latest` ({id:ver}), and `info` (categories are unioned).
+# Any other package's entries are preserved untouched.
+#
+# NOTE: every app publishing into the shared tree must use merge-aware tooling
+# like this — a legacy `rm -rf package`-style generator would drop the others.
 #
 # The JSON shapes mirror the live Start9 registry (registry.start9.com):
 #   /package/v0/info                     {name, categories[]}
@@ -27,9 +39,9 @@
 #               site (e.g. the website repo root) to deploy the registry there.
 #   SKIP_S9PK   set to 1 to NOT copy the (large) .s9pk into the tree. Use this
 #               when the host serves the s9pk elsewhere (e.g. a GitHub Release)
-#               and redirects /package/v0/<id>.s9pk to it — the 720 MiB s9pk is
-#               over Cloudflare Pages' 25 MiB per-file limit, so the website
-#               deploy skips it and relies on a _redirects rule.
+#               and redirects /package/v0/<id>.s9pk to it — the s9pk is over
+#               Cloudflare Pages' 25 MiB per-file limit, so the website deploy
+#               skips it and relies on a _redirects rule.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -45,11 +57,8 @@ PUBLISHED_AT="${PUBLISHED_AT:-1970-01-01T00:00:00Z}"
 command -v start-sdk >/dev/null || { echo "build-registry: start-sdk not on PATH" >&2; exit 1; }
 command -v node >/dev/null || { echo "build-registry: node not on PATH" >&2; exit 1; }
 
-echo "==> generating registry from $(basename "$S9PK")"
-# Only clean the tree we own (OUT/package). NEVER `rm -rf "$OUT"` — OUT_DIR may
-# point at a shared static site (e.g. the website repo root), and wiping it
-# would destroy unrelated files.
-rm -rf "$OUT/package"
+echo "==> upserting $(basename "$S9PK") into registry at $OUT"
+# Create (never wipe) the tree — OUT may hold OTHER packages' entries.
 V0="$OUT/package/v0"
 mkdir -p "$V0/version" "$V0/manifest" "$V0/release-notes" "$V0/instructions" "$V0/license" "$V0/icon"
 
@@ -69,13 +78,12 @@ else
   cp "$S9PK" "$V0/$PKG_ID.s9pk"
 fi
 
-# Per-id endpoints that just re-serve the manifest / a version stub.
+# Per-id manifest endpoint.
 cp "$V0/manifest.tmp.json" "$V0/manifest/$PKG_ID"
 
 REGISTRY_NAME="$REGISTRY_NAME" CATEGORIES_JSON="$CATEGORIES_JSON" \
 PUBLISHED_AT="$PUBLISHED_AT" PKG_ID="$PKG_ID" PKG_VER="$PKG_VER" \
-ICON_PATH="$PKG_DIR/icon.png" INSTR_PATH="$PKG_DIR/instructions.md" \
-LIC_PATH="$PKG_DIR/LICENSE" MANIFEST_PATH="$V0/manifest.tmp.json" V0="$V0" \
+ICON_PATH="$PKG_DIR/icon.png" MANIFEST_PATH="$V0/manifest.tmp.json" V0="$V0" \
 node <<'NODE'
 const fs = require('fs')
 const p = process.env
@@ -85,14 +93,16 @@ const iconB64 = fs.readFileSync(p.ICON_PATH).toString('base64')
 const categories = JSON.parse(p.CATEGORIES_JSON)
 const releaseNotes = manifest['release-notes'] || ''
 
+const file = (rel) => `${p.V0}/${rel}`
+const readJSON = (rel, fallback) => {
+  try { return JSON.parse(fs.readFileSync(file(rel), 'utf8')) } catch { return fallback }
+}
 const write = (rel, data) =>
-  fs.writeFileSync(`${p.V0}/${rel}`, typeof data === 'string' ? data : JSON.stringify(data))
+  fs.writeFileSync(file(rel), typeof data === 'string' ? data : JSON.stringify(data))
 
-// /package/v0/info
-write('info', { name: p.REGISTRY_NAME, categories })
-
-// /package/v0/index  (one entry; icon is RAW base64, instructions/license are PATHS)
-write('index', [{
+// This package's /package/v0/index entry (icon is RAW base64; instructions /
+// license are PATHS).
+const entry = {
   categories,
   'dependency-metadata': {},
   icon: iconB64,
@@ -101,16 +111,32 @@ write('index', [{
   manifest,
   'published-at': p.PUBLISHED_AT,
   versions: [ver],
-}])
+}
 
-// /package/v0/latest  and  /package/v0/version/<id>
-write('latest', { [id]: ver })
+// --- MERGE the three shared aggregates (preserve other packages) -----------
+// index: replace this id's entry in place, keep every other package's.
+const index = readJSON('index', [])
+const merged = (Array.isArray(index) ? index : []).filter((e) => e?.manifest?.id !== id)
+merged.push(entry)
+// stable order by id so re-runs produce a deterministic diff
+merged.sort((a, b) => String(a?.manifest?.id).localeCompare(String(b?.manifest?.id)))
+write('index', merged)
+
+// latest: {id: version} for ALL packages.
+const latest = readJSON('latest', {})
+latest[id] = ver
+write('latest', latest)
+
+// info: {name, categories} — union categories across all packages.
+const info = readJSON('info', { name: p.REGISTRY_NAME, categories: [] })
+const cats = new Set([...(info.categories || []), ...categories])
+write('info', { name: p.REGISTRY_NAME, categories: [...cats] })
+
+// --- per-id endpoints ------------------------------------------------------
 write(`version/${id}`, { version: ver })
-
-// /package/v0/release-notes/<id>
 write(`release-notes/${id}`, { [ver]: releaseNotes })
 
-console.log('    wrote info, index, latest, version, release-notes')
+console.log(`    merged: index (${merged.length} package(s)), latest, info; wrote version, release-notes`)
 NODE
 
 rm -f "$V0/manifest.tmp.json"
