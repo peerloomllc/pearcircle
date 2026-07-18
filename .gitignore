@@ -22,9 +22,8 @@ assets/app-ui.bundle
 TODO.md
 DONE.md
 
-# Release pipeline (local-only, mirrors PearCal/PearGuard pattern).
-# scripts/app.conf is tracked since it's app-config rather than credentials.
-scripts/release.sh
+# Release pipeline. scripts/app.conf is tracked since it's app-config rather
+# than credentials.
 scripts/ios-appstore.sh
 scripts/frame-android-screenshots.sh
 scripts/assets/
@@ -35,8 +34,9 @@ scripts/.env
 # scripts from a release (only Windows survived), so a fresh clone could no
 # longer build the seeder installers. The scripts default to personal build
 # hosts via overridable env vars (e.g. WINDOWS_VM_HOST, MAC_MINI_HOST) and
-# bake in no secrets, so tracking them is safe. (scripts/release.sh and
-# scripts/.env stay untracked.)
+# bake in no secrets, so tracking them is safe. scripts/release.sh is tracked
+# for the same reason (it sources all credentials from scripts/.env, which
+# stays untracked).
 
 # Store-listing assets and the Zapstore publish manifest live locally.
 # Screenshots, framed bezel composites, store-listing copy, icon and
