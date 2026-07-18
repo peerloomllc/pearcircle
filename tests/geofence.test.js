@@ -1,4 +1,18 @@
-const { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('../src/lib/geofence')
+const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES } = require('../src/lib/geofence')
+
+// Thread prev-classification + dwell through a sequence of fixes, exactly as
+// checkPlaceTransitions does. Each entry is [distance, accuracy?]; returns the
+// per-fix { classification, kind } results.
+function runFixes (radius, seq, startPrev = null) {
+  let prev = startPrev
+  let dwell = { pending: null, count: 0 }
+  return seq.map(([d, acc]) => {
+    const r = classify(d, radius, prev, acc, dwell)
+    prev = r.classification
+    dwell = r.dwell
+    return { classification: r.classification, kind: r.kind }
+  })
+}
 
 describe('haversineMeters', () => {
   test('zero distance for identical points', () => {
@@ -32,80 +46,174 @@ describe('haversineMeters', () => {
 })
 
 describe('classify state machine', () => {
+  test('return shape includes classification, kind, and dwell', () => {
+    expect(classify(50, 100, null)).toEqual({
+      classification: 'inside',
+      kind: null,
+      dwell: { pending: null, count: 0 },
+    })
+  })
+
   test('first observation inside establishes baseline silently', () => {
-    expect(classify(50, 100, null)).toEqual({ classification: 'inside', kind: null })
+    const r = classify(50, 100, null)
+    expect(r.classification).toBe('inside')
+    expect(r.kind).toBeNull()
   })
 
   test('first observation outside is silent', () => {
-    expect(classify(150, 100, null)).toEqual({ classification: 'outside', kind: null })
-  })
-
-  test('outside → inside fires enter', () => {
-    expect(classify(50, 100, 'outside')).toEqual({ classification: 'inside', kind: 'enter' })
-  })
-
-  test('inside → outside fires exit', () => {
-    expect(classify(150, 100, 'inside')).toEqual({ classification: 'outside', kind: 'exit' })
+    const r = classify(150, 100, null)
+    expect(r.classification).toBe('outside')
+    expect(r.kind).toBeNull()
   })
 
   test('inside → inside is silent', () => {
-    expect(classify(50, 100, 'inside')).toEqual({ classification: 'inside', kind: null })
+    expect(classify(50, 100, 'inside')).toMatchObject({ classification: 'inside', kind: null })
   })
 
   test('outside → outside is silent', () => {
-    expect(classify(150, 100, 'outside')).toEqual({ classification: 'outside', kind: null })
+    expect(classify(150, 100, 'outside')).toMatchObject({ classification: 'outside', kind: null })
   })
 
-  test('exact radius is treated as inside', () => {
-    expect(classify(100, 100, 'outside')).toEqual({ classification: 'inside', kind: 'enter' })
+  describe('dwell: 2 consecutive confirming fixes required to commit a crossing', () => {
+    test('a lone outside fix does NOT fire an exit (candidate pending)', () => {
+      const r = classify(150, 100, 'inside')
+      expect(r).toEqual({
+        classification: 'inside', // held
+        kind: null,
+        dwell: { pending: 'outside', count: 1 },
+      })
+    })
+
+    test('a second consecutive outside fix commits the exit', () => {
+      const [first, second] = runFixes(100, [[150], [150]], 'inside')
+      expect(first).toEqual({ classification: 'inside', kind: null })
+      expect(second).toEqual({ classification: 'outside', kind: 'exit' })
+    })
+
+    test('a lone inside fix does NOT fire an enter, the second one does', () => {
+      const [first, second] = runFixes(100, [[50], [50]], 'outside')
+      expect(first).toEqual({ classification: 'outside', kind: null })
+      expect(second).toEqual({ classification: 'inside', kind: 'enter' })
+    })
+
+    test('an agreeing fix between two outside fixes resets the dwell (no exit)', () => {
+      // inside -> [outside(pending), inside(resets), outside(pending again)]:
+      // the crossing never gets two IN A ROW, so no exit fires.
+      const out = runFixes(100, [[150], [50], [150]], 'inside')
+      expect(out.map((r) => r.kind)).toEqual([null, null, null])
+      expect(out.map((r) => r.classification)).toEqual(['inside', 'inside', 'inside'])
+    })
+
+    test('DWELL_FIXES is 2 (guards the tests above)', () => {
+      expect(DWELL_FIXES).toBe(2)
+    })
   })
 
-  describe('accuracy-aware exit hysteresis', () => {
-    test('a noisy fix just outside the radius does NOT fire a phantom exit', () => {
-      // At home, sitting still; one fix reads 120m off a 100m radius with 60m
-      // accuracy. radius + min(60,100) = 160; 120 <= 160 -> stay inside.
-      expect(classify(120, 100, 'inside', 60)).toEqual({ classification: 'inside', kind: null })
+  describe('uncertainty-circle read (symmetric, uncapped)', () => {
+    test('a noisy fix just outside the radius reads ambiguous, no exit', () => {
+      // 120m off a 100m radius with 60m accuracy: near edge = 60m (inside the
+      // radius), so the fix is ambiguous and cannot even become an exit
+      // candidate. State holds.
+      expect(classify(120, 100, 'inside', 60)).toEqual({
+        classification: 'inside',
+        kind: null,
+        dwell: { pending: null, count: 0 },
+      })
     })
 
-    test('a confidently-outside fix still fires the exit', () => {
-      // 250m out with 30m accuracy: 250 > 100 + 30 -> real departure.
-      expect(classify(250, 100, 'inside', 30)).toEqual({ classification: 'outside', kind: 'exit' })
+    test('a confidently-outside fix becomes an exit candidate, commits on the second', () => {
+      // 250m out with 30m accuracy: near edge = 220m > 100m -> confidently out.
+      const [first, second] = runFixes(100, [[250, 30], [250, 30]], 'inside')
+      expect(first.kind).toBeNull()
+      expect(second).toEqual({ classification: 'outside', kind: 'exit' })
     })
 
-    test('the margin is capped at the radius so a garbage fix cannot trap inside', () => {
-      // 1km accuracy would otherwise push the exit threshold to ~1.1km; the
-      // cap holds it at radius+radius = 200m, so 250m still exits.
-      expect(classify(250, 100, 'inside', 1000)).toEqual({ classification: 'outside', kind: 'exit' })
+    test('a garbage fix (huge accuracy) can never even become a candidate', () => {
+      // 1500m off with 2000m accuracy: near edge = -500m, far edge = 3500m.
+      // Straddles the boundary -> ambiguous -> holds forever no matter how
+      // many arrive. This is the km-off GrapheneOS network fix.
+      const out = runFixes(100, [[1500, 2000], [1500, 2000], [1500, 2000]], 'inside')
+      expect(out.every((r) => r.kind === null && r.classification === 'inside')).toBe(true)
     })
 
-    test('entry is not damped by accuracy (real arrivals register promptly)', () => {
-      expect(classify(90, 100, 'outside', 60)).toEqual({ classification: 'inside', kind: 'enter' })
+    test('entry is damped symmetrically: a blurry inside fix cannot enter', () => {
+      // 90m in with 60m accuracy: far edge = 150m > 100m -> ambiguous, no enter.
+      expect(classify(90, 100, 'outside', 60)).toEqual({
+        classification: 'outside',
+        kind: null,
+        dwell: { pending: null, count: 0 },
+      })
     })
 
-    test('zero/absent accuracy preserves the plain distance<=radius behaviour', () => {
-      expect(classify(120, 100, 'inside', 0)).toEqual({ classification: 'outside', kind: 'exit' })
-      expect(classify(120, 100, 'inside')).toEqual({ classification: 'outside', kind: 'exit' })
+    test('zero/absent accuracy collapses to a plain distance read', () => {
+      // With no accuracy the fix is confident, so two in a row commit.
+      expect(runFixes(100, [[120, 0], [120, 0]], 'inside')[1]).toEqual({ classification: 'outside', kind: 'exit' })
+      expect(runFixes(100, [[120], [120]], 'inside')[1]).toEqual({ classification: 'outside', kind: 'exit' })
+    })
+  })
+
+  describe('the phantom "left … / arrived …" flap does not fire (2026-07-18)', () => {
+    test('a single km-off fix among clean at-home fixes commits nothing', () => {
+      // At Home (400m radius), sitting still ~30m from centre. One GrapheneOS
+      // network fix lands 1500m away (±40m, so "confidently" outside), then the
+      // stream returns to clean at-home fixes. The lone outlier is a candidate
+      // but never gets a second consecutive confirmation -> no exit, no enter,
+      // no phantom pair.
+      const out = runFixes(400, [
+        [30, 15],    // inside, clean
+        [1500, 40],  // lone outlier: confidently outside -> candidate
+        [35, 15],    // back home, clean -> resets candidate
+        [28, 15],    // still home
+      ], 'inside')
+      expect(out.map((r) => r.kind)).toEqual([null, null, null, null])
+      expect(out.every((r) => r.classification === 'inside')).toBe(true)
     })
   })
 
   test('a sequence simulating a walk produces the right transitions', () => {
     const radius = 100
-    const points = [
-      { d: 200, expectClass: 'outside', expectKind: null },   // start outside
-      { d: 150, expectClass: 'outside', expectKind: null },   // approaching
-      { d: 80,  expectClass: 'inside',  expectKind: 'enter' }, // crossed in
-      { d: 20,  expectClass: 'inside',  expectKind: null },   // walking around
-      { d: 90,  expectClass: 'inside',  expectKind: null },   // still inside
-      { d: 120, expectClass: 'outside', expectKind: 'exit' }, // crossed out
-      { d: 300, expectClass: 'outside', expectKind: null },   // far away
-    ]
-    let state = null
-    for (const p of points) {
-      const r = classify(p.d, radius, state)
-      expect(r.classification).toBe(p.expectClass)
-      expect(r.kind).toBe(p.expectKind)
-      state = r.classification
-    }
+    const out = runFixes(radius, [
+      [200], // start outside (baseline)
+      [150], // approaching, still outside
+      [80],  // crossed in: candidate enter
+      [70],  // confirms: ENTER
+      [20],  // walking around
+      [90],  // still inside
+      [120], // crossed out: candidate exit
+      [140], // confirms: EXIT
+      [300], // far away
+    ], null)
+    expect(out.map((r) => r.classification)).toEqual([
+      'outside', 'outside', 'outside', 'inside', 'inside', 'inside', 'inside', 'outside', 'outside',
+    ])
+    expect(out.map((r) => r.kind)).toEqual([
+      null, null, null, 'enter', null, null, null, 'exit', null,
+    ])
+  })
+})
+
+describe('isFixUsable (accuracy gate)', () => {
+  test('ACCURACY_CEILING_M is 150', () => {
+    expect(ACCURACY_CEILING_M).toBe(150)
+  })
+
+  test('a clean fix is usable', () => {
+    expect(isFixUsable(40)).toBe(true)
+  })
+
+  test('a fix exactly at the ceiling is usable', () => {
+    expect(isFixUsable(150)).toBe(true)
+  })
+
+  test('a fix worse than the ceiling is gated out', () => {
+    expect(isFixUsable(151)).toBe(false)
+    expect(isFixUsable(2000)).toBe(false)
+  })
+
+  test('absent / NaN accuracy is trusted (older callers, tests)', () => {
+    expect(isFixUsable(undefined)).toBe(true)
+    expect(isFixUsable(null)).toBe(true)
+    expect(isFixUsable(NaN)).toBe(true)
   })
 })
 

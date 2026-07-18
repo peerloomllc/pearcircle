@@ -21,6 +21,33 @@ const EARTH_RADIUS_M = 6371000
 //     be tighter than the OS layer.
 const MIN_PLACE_RADIUS_M = 150
 
+// A fix whose reported horizontal accuracy (radius of uncertainty, metres) is
+// worse than this is too blurry to drive a geofence transition and is ignored
+// by the classifier. On GrapheneOS a phone sitting still at home loses the GPS
+// chip and falls back to network/wifi location, which routinely reports a
+// position hundreds of metres off the truth with a large error radius; a lone
+// such fix bounces an at-home user "outside" a 400m radius and the next clean
+// fix bounces them back, producing the phantom "left … / arrived …" pair. The
+// gate is applied at ingest (checkPlaceTransitions), so a gated fix still
+// updates lastSeen / the map, it just can't move geofence state. A fix with no
+// accuracy supplied (older callers, unit tests) is trusted. See
+// bugfix/geofence-flap-hardening (2026-07-18).
+const ACCURACY_CEILING_M = 150
+
+// Number of consecutive usable fixes that must agree on a boundary crossing
+// before the classifier commits it. Network-location noise arrives as isolated
+// outliers, so requiring a second confirming fix (~10s apart on the device
+// stream) discards the single-outlier flap while adding only one fix of latency
+// to a genuine crossing.
+const DWELL_FIXES = 2
+
+// Is this fix confident enough to drive a transition? False only when a finite
+// accuracy is supplied AND it exceeds the ceiling. Absent/NaN accuracy is
+// trusted (preserves older-caller and unit-test behaviour).
+function isFixUsable (accuracy) {
+  return !(Number.isFinite(accuracy) && accuracy > ACCURACY_CEILING_M)
+}
+
 function haversineMeters (lat1, lon1, lat2, lon2) {
   const toRad = Math.PI / 180
   const dLat = (lat2 - lat1) * toRad
@@ -31,46 +58,83 @@ function haversineMeters (lat1, lon1, lat2, lon2) {
   return 2 * EARTH_RADIUS_M * Math.asin(Math.sqrt(a))
 }
 
-// Pure state machine for transition detection. Given a measured distance
-// to a place's centre, the place's radius, and the previous classification,
-// returns the next classification and a transition kind if the boundary
-// was crossed.
+// Pure state machine for transition detection. Given a measured distance to a
+// place's centre, the place's radius, the previous confirmed classification,
+// the fix's accuracy, and the running dwell state, returns the next confirmed
+// classification, a transition kind if a crossing was committed this fix, and
+// the next dwell state.
 //
 // `prev` is one of:
 //   null       — no baseline yet (first-ever observation, or cold start
 //                before classification was persisted). Establishes the
 //                baseline silently; no transition fires. Notifications
 //                only happen when the user actually crosses the boundary.
-//   'inside'   — last observation was within the radius
-//   'outside'  — last observation was outside the radius
+//   'inside'   — last confirmed observation was within the radius
+//   'outside'  — last confirmed observation was outside the radius
 //
-// `accuracy` (optional, metres) is the fix's own horizontal error estimate.
-// When present it becomes a hysteresis margin on the EXIT side: an already-
-// inside user must measure clear of `radius + min(accuracy, radius)` before
-// we register a departure. A single noisy fix (common when a phone sits
-// still at home and the GPS error balloons) reads tens of metres off the
-// real position; without the margin that lone fix bounces the user "outside"
-// and the next clean fix bounces them back, producing the phantom
-// "left … / arrived …" pair seen 2026-06-10. Margin is capped at the radius
-// so a garbage fix can't trap a user inside forever, and it is 0 when no
-// accuracy is supplied (older callers, unit tests) — preserving the plain
-// distance<=radius behaviour. Entry is intentionally NOT damped: we want
-// real arrivals to register promptly.
+// Two layers of anti-flap protection, both replacing the old capped exit
+// margin (which let a garbage fix past `radius + radius` still fire an exit,
+// and left entry entirely undamped — the 2026-07-18 flap bug):
 //
-// Returns `{ classification, kind }` where kind is 'enter', 'exit', or null.
-function classify (distance, radius, prev, accuracy) {
-  const margin =
-    Number.isFinite(accuracy) && accuracy > 0 ? Math.min(accuracy, radius) : 0
-  if (prev === 'inside') {
-    if (distance > radius + margin) return { classification: 'outside', kind: 'exit' }
-    return { classification: 'inside', kind: null }
+//   1. Uncertainty-circle read. `accuracy` (metres, optional) is the fix's own
+//      horizontal error radius. A fix reads 'outside' only if even its NEAREST
+//      edge clears the boundary (`distance - accuracy > radius`), and 'inside'
+//      only if its FARTHEST edge is within (`distance + accuracy <= radius`).
+//      In the ambiguous band between, the fix supports neither side and the
+//      confirmed state holds. This is symmetric: a blurry fix can neither
+//      exit nor enter. Absent/zero accuracy collapses to the plain
+//      distance-vs-radius read (older callers, unit tests).
+//
+//   2. Dwell. A fix that disagrees with the confirmed state is only a
+//      CANDIDATE crossing; `DWELL_FIXES` consecutive supporting fixes are
+//      required before the crossing is committed and a kind fires. Any fix
+//      that agrees with the confirmed state — or is ambiguous — clears a
+//      half-formed candidate, so a lone outlier can never accumulate.
+//
+// `dwell` is `{ pending, count }` (the value returned by the previous call);
+// `pending` is the candidate side awaiting confirmation ('inside'/'outside'/
+// null) and `count` how many consecutive fixes have supported it. Omit it on
+// the first call. It is in-memory runtime state only — never persisted — so a
+// cold boot simply re-confirms, no correctness loss.
+//
+// Returns `{ classification, kind, dwell }` where kind is 'enter', 'exit', or
+// null.
+function classify (distance, radius, prev, accuracy, dwell) {
+  const acc = Number.isFinite(accuracy) && accuracy > 0 ? accuracy : 0
+  const priorPending =
+    dwell && (dwell.pending === 'inside' || dwell.pending === 'outside')
+      ? dwell.pending
+      : null
+  const priorCount = dwell && Number.isFinite(dwell.count) ? dwell.count : 0
+  const cleared = { pending: null, count: 0 }
+
+  // Uncertainty-circle read of this single fix (layer 1).
+  let observation = null
+  if (distance - acc > radius) observation = 'outside'
+  else if (distance + acc <= radius) observation = 'inside'
+
+  // No confirmed baseline yet: a confident observation establishes it silently;
+  // an ambiguous fix leaves us unbaselined. Never fires a transition.
+  if (prev !== 'inside' && prev !== 'outside') {
+    return { classification: observation != null ? observation : (prev != null ? prev : null), kind: null, dwell: cleared }
   }
-  if (prev === 'outside') {
-    if (distance <= radius) return { classification: 'inside', kind: 'enter' }
-    return { classification: 'outside', kind: null }
+
+  // Fix agrees with the confirmed state, or is ambiguous: hold, and drop any
+  // half-formed candidate so a stray fix can't accumulate toward a crossing.
+  if (observation === null || observation === prev) {
+    return { classification: prev, kind: null, dwell: cleared }
   }
-  // prev === null (or any non-inside/outside): silent baseline.
-  return { classification: distance <= radius ? 'inside' : 'outside', kind: null }
+
+  // Fix disagrees with the confirmed state: a candidate crossing (layer 2).
+  const count = priorPending === observation ? priorCount + 1 : 1
+  if (count >= DWELL_FIXES) {
+    return {
+      classification: observation,
+      kind: observation === 'inside' ? 'enter' : 'exit',
+      dwell: cleared,
+    }
+  }
+  return { classification: prev, kind: null, dwell: { pending: observation, count } }
 }
 
 // Dedup helper for native CLCircularRegion / GeofencingClient events
@@ -142,4 +206,4 @@ function regionAppendDecision ({ sharing, writable } = {}) {
   return 'append'
 }
 
-module.exports = { haversineMeters, classify, applyRegionEvent, selectNearestRegions, regionAppendDecision, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M }
+module.exports = { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES }
