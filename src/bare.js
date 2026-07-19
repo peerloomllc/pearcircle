@@ -130,7 +130,20 @@ function reshipTrace () {
 // declaration is fine (same as reshipTrace).
 const _tripTraceQueue = []
 let _tripTraceLastFlush = 0
+let _lastFixTraceTs = 0
 const TRIP_TRACE_FLUSH_MS = 15_000
+// Sample per-fix breadcrumbs at most this often. A steady drive emits fixes
+// several times a second; logging each would roll the append-mode log's most
+// diagnostic head (arming + mode escalation) out of the shell's size cap. A
+// ~10s sample still shows stream density, speed, and mode; lifecycle events
+// (phase / mode / finalize / discard / replicate) are never sampled.
+const FIX_TRACE_SAMPLE_MS = 10_000
+// Compact per-boot id stamped on fix/phase lines. Because trips.log is
+// append-mode, this id CHANGING mid-drive is the reliable proof the worklet
+// restarted and lost its in-memory _tripState -- more robust than the one-shot
+// session-start line, which can be lost if the first fix beats the shell's
+// trips:trace listener. Cycles every ~1000s, far longer than any restart gap.
+const _bootId = _bootTs % 1000000
 function flushTripTrace () {
   if (_tripTraceQueue.length === 0) return
   try {
@@ -140,7 +153,13 @@ function flushTripTrace () {
   } catch { /* shell not attached yet; keep queued for the next flush */ }
 }
 function traceTrip (name, extra, flushNow) {
-  const line = Date.now() + ' ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')
+  // Every line carries the per-boot id `s`. The shell watches it and emits a
+  // session-start marker whenever it changes -- which detects a restart even
+  // though the worklet's own earliest lines are lost (send() doesn't throw when
+  // the shell's trips:trace listener isn't attached yet, so a startup line is
+  // dropped, not requeued). The shell is by definition ready when it receives a
+  // line, so moving session-start generation there makes it reliable.
+  const line = Date.now() + ' ' + name + ' ' + JSON.stringify({ ...(extra || {}), s: _bootId })
   _tripTraceQueue.push(line)
   if (flushNow || Date.now() - _tripTraceLastFlush > TRIP_TRACE_FLUSH_MS) flushTripTrace()
 }
@@ -2049,21 +2068,30 @@ const handlers = {
     // future trips replicating, never resurrects past ones. Policy
     // lives in shouldReplicateTrip.
     try {
+      // Durability marker, emitted on the first fix of the session rather than
+      // at init:done — the shell's trips:trace listener isn't attached that
+      // early, so a one-shot init ship is lost (coldstart.log survives only by
+      // re-shipping). Because trips.log is append-mode, a fresh session-start
+      // line between a trip's arm and finalize is proof the worklet restarted
+      // mid-drive and lost its in-memory _tripState.
       const sp = typeof speed === 'number' ? speed : null
       const prevState = _tripState
       const prevPhase = prevState.phase
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
       _tripState = r.state
-      // Per-fix breadcrumb (throttled): stream density, speed, the adaptive
-      // mode, and the phase each fix lands in. This is the raw signal that
-      // separates the idle-trap (sparse low-speed fixes, trip never arms) from
-      // a durability gap (arms, then a session-start gap appears mid-drive).
-      traceTrip('fix', {
-        spd: sp == null ? null : Math.round(sp * 10) / 10,
-        acc: Number.isFinite(accuracy) ? Math.round(accuracy) : null,
-        mode: _lastAdaptiveMode,
-        ph: prevPhase,
-      })
+      // Per-fix breadcrumb (sampled ~10s): stream density, speed, the adaptive
+      // mode, and the phase each fix lands in. The raw signal that separates the
+      // idle-trap (sparse low-speed fixes, trip never arms) from a durability
+      // gap (the boot id `s` changes mid-drive -> the worklet restarted).
+      if (Date.now() - _lastFixTraceTs > FIX_TRACE_SAMPLE_MS) {
+        _lastFixTraceTs = Date.now()
+        traceTrip('fix', {
+          spd: sp == null ? null : Math.round(sp * 10) / 10,
+          acc: Number.isFinite(accuracy) ? Math.round(accuracy) : null,
+          mode: _lastAdaptiveMode,
+          ph: prevPhase,
+        })
+      }
       if (r.state.phase !== prevPhase) {
         traceTrip('phase', { from: prevPhase, to: r.state.phase, spd: sp == null ? null : Math.round(sp) }, true)
       }
@@ -6395,10 +6423,6 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // expo-file-system path is known-good. Android-side: the shell
   // ignores this event; logcat already has the same lines.
   send({ event: 'coldstart:trace', data: { lines: _coldStartLines.slice() } })
-  // Durability marker: because trips.log is append-mode, a fresh session line
-  // appearing between a trip's arm and finalize is proof the worklet restarted
-  // mid-drive and lost its in-memory _tripState (Part A of the trip proposal).
-  traceTrip('session-start', { boot: _bootTs }, true)
   send({
     event: 'ready',
     data: {

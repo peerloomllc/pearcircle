@@ -381,6 +381,15 @@ async function fireMembershipNotification(payload: any, kind: 'memberJoined' | '
 // Grep `adb logcat` for `coldstart` to see the interleaved timeline. The
 // `shell:worklet-started` mark records the offset between the two clocks.
 const _shellT0 = Date.now()
+// Last per-boot id seen on a trips:trace line; a change means the worklet
+// restarted, so the shell writes a session-start marker into trips.log.
+let _tripsLastBootId: string | null = null
+// Serializes trips.log appends. The handler is async and does a
+// read-modify-write, so two batches arriving close together (common during the
+// startup flush burst) would both read the same file and the second write would
+// clobber the first, silently dropping lines. Chaining every write behind the
+// previous one makes the append atomic w.r.t. itself.
+let _tripsWriteChain: Promise<void> = Promise.resolve()
 function shellMark(name: string, extra?: any) {
   const dt = Date.now() - _shellT0
   if (extra !== undefined) console.warn('[coldstart shell+' + dt + 'ms] ' + name + ' ' + JSON.stringify(extra))
@@ -884,10 +893,26 @@ export default function Index() {
     // cross-restart history that answers "did the worklet die mid-drive?". A
     // size cap keeps it bounded: once past TRIPS_LOG_CAP we drop the oldest
     // whole lines. Pull with `xcrun devicectl ... copy from ... Documents/trips.log`.
-    onEvent('trips:trace', async (data) => {
-      try {
-        const lines = Array.isArray(data?.lines) ? data.lines : []
-        if (lines.length === 0) return
+    onEvent('trips:trace', (data) => {
+      const rawLines = Array.isArray(data?.lines) ? data.lines : []
+      if (rawLines.length === 0) return
+      // Emit a session-start marker whenever the per-boot id `s` changes. The
+      // worklet's own earliest lines can be lost (its send() doesn't throw
+      // before this listener attaches), so generating the marker here — where
+      // we're guaranteed ready — makes restart detection reliable. A fresh `s`
+      // between a trip's arm and finalize means the worklet restarted and lost
+      // its in-memory _tripState.
+      const lines: string[] = []
+      for (const ln of rawLines) {
+        const m = /"s":(\d+)/.exec(ln)
+        if (m && m[1] !== _tripsLastBootId) {
+          _tripsLastBootId = m[1]
+          lines.push(Date.now() + ' session-start {"s":' + m[1] + '}')
+        }
+        lines.push(ln)
+      }
+      // Append behind the previous write so concurrent batches can't clobber.
+      _tripsWriteChain = _tripsWriteChain.then(async () => {
         const path = FileSystem.documentDirectory + 'trips.log'
         const TRIPS_LOG_CAP = 262144 // 256 KiB
         let existing = ''
@@ -901,9 +926,7 @@ export default function Index() {
           body = body.slice(cut >= 0 ? cut + 1 : body.length - TRIPS_LOG_CAP)
         }
         await FileSystem.writeAsStringAsync(path, body)
-      } catch (e: any) {
-        console.warn('trips trace write failed', e?.message)
-      }
+      }).catch((e: any) => { console.warn('trips trace write failed', e?.message) })
     })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
