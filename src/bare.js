@@ -58,7 +58,7 @@ const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryS
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
-const { newTripState, stepTrip } = require('./lib/trip')
+const { newTripState, stepTrip, polylineDistanceMeters, TRIP_MIN_DURATION_MS, TRIP_MIN_DISTANCE_M } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
@@ -115,6 +115,34 @@ mark('worklet:loaded')
 // bounded one-shot events, never per location update, so no IPC flood.
 function reshipTrace () {
   try { send({ event: 'coldstart:trace', data: { lines: _coldStartLines.slice() } }) } catch {}
+}
+
+// Trip-lifecycle trace (proposal 2026-07-18-background-trip-capture, Part A).
+// A SEPARATE, APPEND-mode log from coldstart.log: coldstart.log is rewritten on
+// every cold start, which would erase exactly the cross-restart history the
+// durability question needs (did the worklet die mid-drive?). Lines are queued
+// and shipped to the shell as `trips:trace`, which APPENDS them to
+// FileSystem.documentDirectory/trips.log. Per-fix lines are throttled so they
+// can't flood IPC in tracking mode (fixes can arrive several times a second);
+// lifecycle events (mode / phase / finalize / discard / replicate) pass
+// flushNow=true and ship immediately, and backgrounding flushes before iOS can
+// suspend us. `send` is resolved at call time, so defining this above its
+// declaration is fine (same as reshipTrace).
+const _tripTraceQueue = []
+let _tripTraceLastFlush = 0
+const TRIP_TRACE_FLUSH_MS = 15_000
+function flushTripTrace () {
+  if (_tripTraceQueue.length === 0) return
+  try {
+    send({ event: 'trips:trace', data: { lines: _tripTraceQueue.slice() } })
+    _tripTraceQueue.length = 0
+    _tripTraceLastFlush = Date.now()
+  } catch { /* shell not attached yet; keep queued for the next flush */ }
+}
+function traceTrip (name, extra, flushNow) {
+  const line = Date.now() + ' ' + name + (extra !== undefined ? ' ' + JSON.stringify(extra) : '')
+  _tripTraceQueue.push(line)
+  if (flushNow || Date.now() - _tripTraceLastFlush > TRIP_TRACE_FLUSH_MS) flushTripTrace()
 }
 
 const _firstPeerMarked = new Set()      // circleIds with peer:first-connected emitted
@@ -630,6 +658,9 @@ function runLocationModeDriver () {
   if (nextMode != null) {
     _lastAdaptiveMode = nextMode
     send({ event: 'location:mode:set', data: { mode: nextMode } })
+    // The idle<->tracking flip is the key idle-trap signal: continuous fast
+    // fixes only flow in 'tracking', so a trip that never escalates never arms.
+    traceTrip('mode', { to: nextMode, phase: _tripState.phase, fg: _appForeground, motion: motionIsRecent() }, true)
   }
 }
 
@@ -661,7 +692,7 @@ const handlers = {
     // user swipes the app away, so flush the WAL now to keep the next cold
     // start's replay small (store maintenance). Fire-and-forget: never block
     // the IPC response on disk I/O, and flushStore swallows its own errors.
-    if (!_appForeground) flushStore('background')
+    if (!_appForeground) { flushStore('background'); traceTrip('app-background', { phase: _tripState.phase }, true) }
     // On foreground, drain any crossings that queued while the writer was
     // read-only and re-push the OS region set, so the map the user is about to
     // look at reflects reality promptly (proposal 2026-07-01).
@@ -2019,13 +2050,46 @@ const handlers = {
     // lives in shouldReplicateTrip.
     try {
       const sp = typeof speed === 'number' ? speed : null
+      const prevState = _tripState
+      const prevPhase = prevState.phase
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
       _tripState = r.state
+      // Per-fix breadcrumb (throttled): stream density, speed, the adaptive
+      // mode, and the phase each fix lands in. This is the raw signal that
+      // separates the idle-trap (sparse low-speed fixes, trip never arms) from
+      // a durability gap (arms, then a session-start gap appears mid-drive).
+      traceTrip('fix', {
+        spd: sp == null ? null : Math.round(sp * 10) / 10,
+        acc: Number.isFinite(accuracy) ? Math.round(accuracy) : null,
+        mode: _lastAdaptiveMode,
+        ph: prevPhase,
+      })
+      if (r.state.phase !== prevPhase) {
+        traceTrip('phase', { from: prevPhase, to: r.state.phase, spd: sp == null ? null : Math.round(sp) }, true)
+      }
+      // A drive that ended below the min duration/distance is discarded as a
+      // silent cooldown->idle with no completed record; reconstruct it from the
+      // prior state so the trace shows why a real drive produced nothing.
+      if (prevPhase === 'cooldown' && r.state.phase === 'idle' && !r.completed) {
+        const distM = Math.round(polylineDistanceMeters(prevState.polyline))
+        const durMs = (prevState.cooldownStartTs ?? stamp) - (prevState.startTs ?? stamp)
+        traceTrip('discard', {
+          durMs,
+          distM,
+          reason: durMs < TRIP_MIN_DURATION_MS ? 'duration' : distM < TRIP_MIN_DISTANCE_M ? 'distance' : 'unknown',
+        }, true)
+      }
       // Re-evaluate the adaptive location mode now that trip phase may
       // have changed. The foreground and motion escalations re-run the
       // driver from their own IPC handlers.
       runLocationModeDriver()
       if (r.completed) {
+        traceTrip('finalize', {
+          durMs: r.completed.durationMs,
+          distM: Math.round(r.completed.distanceMeters),
+          maxSpd: Math.round((r.completed.maxSpeedMps ?? 0) * 10) / 10,
+          pts: r.completed.polyline.length,
+        }, true)
         const tripKey = 'trips:' + ourKey + ':' + r.completed.startTs
         const trip = {
           pubkey: ourKey,
@@ -2404,18 +2468,19 @@ async function replicateTripToOptedInCircles (ourKey, trip) {
   // pulled by a peer (instrumentTripUpload), vs (c) a receiver-side gate.
   let replicated = 0
   for (const [circleId, base] of _circleBases) {
-    if (!base.writable) { mark('trip:replicate-skip', { circleId: circleId.slice(0, 8), reason: 'not-writable' }); continue }
+    if (!base.writable) { mark('trip:replicate-skip', { circleId: circleId.slice(0, 8), reason: 'not-writable' }); traceTrip('replicate-skip', { circle: circleId.slice(0, 8), reason: 'not-writable' }, true); continue }
     // If location sharing is muted for this circle, trips are too:
     // sharing your route is strictly more revealing than sharing
     // presence, so the stricter gate wins.
     const locOn = getCircleSharing(circleId).enabled
     const row = await _localDb.get('trips:sharing:' + circleId)
     const shareOn = shouldReplicateTrip(row)
-    if (!locOn || !shareOn) { mark('trip:replicate-skip', { circleId: circleId.slice(0, 8), locOn, shareOn }); continue }
+    if (!locOn || !shareOn) { mark('trip:replicate-skip', { circleId: circleId.slice(0, 8), locOn, shareOn }); traceTrip('replicate-skip', { circle: circleId.slice(0, 8), reason: !locOn ? 'loc-off' : 'share-off' }, true); continue }
     const ok = await safeAppend(base, { type: 'put', key, value: signedValue }, 'trip')
-    if (ok) { replicated++; instrumentTripUpload(base, circleId) }
+    if (ok) { replicated++; instrumentTripUpload(base, circleId); traceTrip('replicate-append', { circle: circleId.slice(0, 8) }, true) }
   }
   mark('trip:replicated', { circles: replicated, distanceMeters: trip.distanceMeters })
+  traceTrip('replicated', { circles: replicated, distM: Math.round(trip.distanceMeters) }, true)
   reshipTrace()
 }
 
@@ -6330,6 +6395,10 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // expo-file-system path is known-good. Android-side: the shell
   // ignores this event; logcat already has the same lines.
   send({ event: 'coldstart:trace', data: { lines: _coldStartLines.slice() } })
+  // Durability marker: because trips.log is append-mode, a fresh session line
+  // appearing between a trip's arm and finalize is proof the worklet restarted
+  // mid-drive and lost its in-memory _tripState (Part A of the trip proposal).
+  traceTrip('session-start', { boot: _bootTs }, true)
   send({
     event: 'ready',
     data: {

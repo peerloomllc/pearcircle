@@ -879,6 +879,32 @@ export default function Index() {
         console.warn('coldstart trace write failed', e?.message)
       }
     })
+    // Trip-lifecycle trace (proposal 2026-07-18, Part A). Unlike coldstart.log
+    // (rewritten each cold start), trips.log is APPENDED to, so it retains the
+    // cross-restart history that answers "did the worklet die mid-drive?". A
+    // size cap keeps it bounded: once past TRIPS_LOG_CAP we drop the oldest
+    // whole lines. Pull with `xcrun devicectl ... copy from ... Documents/trips.log`.
+    onEvent('trips:trace', async (data) => {
+      try {
+        const lines = Array.isArray(data?.lines) ? data.lines : []
+        if (lines.length === 0) return
+        const path = FileSystem.documentDirectory + 'trips.log'
+        const TRIPS_LOG_CAP = 262144 // 256 KiB
+        let existing = ''
+        try {
+          const info = await FileSystem.getInfoAsync(path)
+          if (info.exists) existing = await FileSystem.readAsStringAsync(path)
+        } catch { /* first write, no file yet */ }
+        let body = existing + lines.join('\n') + '\n'
+        if (body.length > TRIPS_LOG_CAP) {
+          const cut = body.indexOf('\n', body.length - TRIPS_LOG_CAP)
+          body = body.slice(cut >= 0 ? cut + 1 : body.length - TRIPS_LOG_CAP)
+        }
+        await FileSystem.writeAsStringAsync(path, body)
+      } catch (e: any) {
+        console.warn('trips trace write failed', e?.message)
+      }
+    })
     onEvent('peer:connected', (data) => emitEvent('peer:connected', data))
     onEvent('peer:disconnected', (data) => emitEvent('peer:disconnected', data))
     onEvent('circle:writer:added', (data) => emitEvent('circle:writer:added', data))
