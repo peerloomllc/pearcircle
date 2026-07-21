@@ -7,7 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class PearCirclePackage : ReactPackage {
     override fun createNativeModules(ctx: ReactApplicationContext): List<NativeModule> =
-        listOf(PearCircleLocationModule(ctx))
+        listOf(PearCircleLocationModule(ctx), WebViewRecoveryModule(ctx))
 
     override fun createViewManagers(ctx: ReactApplicationContext): List<ViewManager<*, *>> =
         emptyList()
