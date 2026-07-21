@@ -156,9 +156,77 @@ function stepTrip (state, { lat, lon, ts, speed }) {
   return { state, completed: null }
 }
 
+// The ts of the most recent activity in an in-flight trip: the last point
+// added to the polyline, falling back to the arming/start anchor. Used to tell
+// a trip that is still accumulating across background wakes from one whose drive
+// actually ended while the worklet was suspended.
+function lastActivityTs (state) {
+  if (state.polyline && state.polyline.length > 0) {
+    return state.polyline[state.polyline.length - 1][2]
+  }
+  return state.cooldownStartTs ?? state.startTs ?? state.armingStartTs ?? null
+}
+
+// Replay a batch of fixes (ORDERED BY ts) through stepTrip, starting from
+// `state`. Returns the final state and every trip completed during the batch.
+// Pure and ts-driven, so replaying the native durable fix log reconstructs the
+// exact same trip(s) the live path would have, across worklet lifetimes. The
+// caller persists each completed trip and checkpoints the returned state.
+function replayTrip (state, fixes) {
+  const completed = []
+  for (const fix of fixes) {
+    const r = stepTrip(state, fix)
+    state = r.state
+    if (r.completed) completed.push(r.completed)
+  }
+  return { state, completed }
+}
+
+// Finalize (or discard) an in-flight trip whose drive has clearly ended while
+// the worklet was suspended -- the drain saw no further fixes, so stepTrip's
+// arrival-triggered cooldown-elapse never fired. If the last activity is at
+// least a cooldown-window behind `nowTs`, apply the SAME finalize decision the
+// cooldown-elapse branch of stepTrip would (min duration/distance -> a trip or a
+// discard); otherwise the trip is still live and is returned untouched so it can
+// keep accumulating on the next wake. This is what lets a trip that spans
+// several disjoint background wakes actually finalize on a later one, rather
+// than waiting for a coincidental post-cooldown fix to arrive.
+function settleStaleTrip (state, nowTs) {
+  const last = lastActivityTs(state)
+  if (last == null || nowTs - last < TRIP_COOLDOWN_DURATION_MS) {
+    return { state, completed: null }
+  }
+  // Arming never promoted to a real trip: just reset.
+  if (state.phase === 'arming' || state.phase === 'idle') {
+    return { state: newTripState(), completed: null }
+  }
+  // active or cooldown: the drive is over. End at the cooldown anchor for a
+  // trip already coasting, else at the last real point we captured.
+  const endTs = state.phase === 'cooldown' ? state.cooldownStartTs : last
+  const distanceMeters = polylineDistanceMeters(state.polyline)
+  const durationMs = endTs - state.startTs
+  if (durationMs < TRIP_MIN_DURATION_MS || distanceMeters < TRIP_MIN_DISTANCE_M) {
+    return { state: newTripState(), completed: null }
+  }
+  return {
+    state: newTripState(),
+    completed: {
+      startTs: state.startTs,
+      endTs,
+      polyline: state.polyline,
+      distanceMeters,
+      durationMs,
+      maxSpeedMps: state.maxSpeedMps,
+    },
+  }
+}
+
 module.exports = {
   newTripState,
   stepTrip,
+  replayTrip,
+  settleStaleTrip,
+  lastActivityTs,
   polylineDistanceMeters,
   TRIP_START_THRESHOLD_MPS,
   TRIP_ARMING_DURATION_MS,
