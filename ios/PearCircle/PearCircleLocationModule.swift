@@ -76,6 +76,37 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // path while the user stays put inside the circle.
   private var pendingSelfRecenter = false
 
+  // Durable background fix log (proposal 2026-07-18-background-trip-capture,
+  // Part B). A trip only materializes if the worklet processes a continuous fix
+  // stream through its whole drive, but on a backgrounded iPhone the worklet is
+  // killed and SLC-relaunched repeatedly mid-drive, so the in-memory trip is
+  // lost before it can finalize (measured: 57 trips reached active, 0 created
+  // over 48h). The single-slot pendingLocation only holds the newest fix, so
+  // intermittent background wakes can't be replayed into a trip after the fact.
+  // Here we durably append EVERY fix that arrives while JS is detached to a
+  // flat append-only file; on a later worklet wake the shell drains the slice
+  // through the one JS trip machine (stepTrip), which is ts-driven so a replay
+  // reconstructs the identical trip. Trip-only: fixes delivered while JS IS
+  // attached go through the live location:update path and are not logged here,
+  // so the drain never double-processes a fix the trip machine already saw.
+  private lazy var fixLogURL: URL = {
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    // In Documents so it is pullable with `xcrun devicectl ... copy from ...
+    // Documents/fixbuffer.log`, same as coldstart.log / trips.log.
+    return docs.appendingPathComponent("fixbuffer.log")
+  }()
+  private let fixLogQueue = DispatchQueue(label: "com.pearcircle.fixlog")
+  private var fixLogAppendsSinceCompact = 0
+  // Age backstop: a device that never drains cannot grow the file past trip
+  // retention (14d), matching the JS side's pruneOldTrips cutoff.
+  private static let FIX_LOG_MAX_AGE_MS: Double = 14 * 24 * 60 * 60 * 1000
+  // Hard line cap backstop, dropping oldest, so a pathological never-draining
+  // device is bounded even within the age window.
+  private static let FIX_LOG_MAX_LINES = 20000
+  // Compact (age + cap) after this many appends so append stays O(1) and the
+  // file is swept without reading it on every fix.
+  private static let FIX_LOG_COMPACT_EVERY = 500
+
   // CoreMotion activity monitoring (proposal 2026-05-21). Feeds the
   // worklet a trip-detector-independent "device started moving" signal
   // so it can leave SLC-only "idle" mode promptly, closing the
@@ -800,6 +831,93 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     }
   }
 
+  // MARK: - Durable fix log (Part B)
+
+  // Append one fix as a JSON line. Runs on fixLogQueue so it can't race a
+  // concurrent flush/ack. Interpolated Doubles use "." regardless of locale.
+  private func appendFixToLog(lat: Double, lon: Double, ts: Double, speed: Double, accuracy: Double) {
+    let line = "{\"ts\":\(ts),\"lat\":\(lat),\"lon\":\(lon),\"speed\":\(speed),\"accuracy\":\(accuracy)}\n"
+    guard let data = line.data(using: .utf8) else { return }
+    fixLogQueue.async {
+      if let handle = try? FileHandle(forWritingTo: self.fixLogURL) {
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write(data)
+      } else {
+        // File doesn't exist yet.
+        try? data.write(to: self.fixLogURL, options: .atomic)
+      }
+      self.fixLogAppendsSinceCompact += 1
+      if self.fixLogAppendsSinceCompact >= PearCircleLocationModule.FIX_LOG_COMPACT_EVERY {
+        self.fixLogAppendsSinceCompact = 0
+        self.compactFixLogLocked(dropThroughTs: nil)
+      }
+    }
+  }
+
+  private func parseFixLine(_ line: Substring) -> [String: Any]? {
+    guard let data = line.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return obj
+  }
+
+  // Rewrite the log dropping entries older than the age backstop and, when
+  // given, entries at or below an acked drain cursor; then enforce the hard
+  // line cap by dropping oldest. MUST run on fixLogQueue.
+  private func compactFixLogLocked(dropThroughTs: Double?) {
+    guard let content = try? String(contentsOf: fixLogURL, encoding: .utf8) else { return }
+    let nowMs = Date().timeIntervalSince1970 * 1000
+    let minTs = nowMs - PearCircleLocationModule.FIX_LOG_MAX_AGE_MS
+    var kept: [Substring] = []
+    var droppedAge = 0
+    for line in content.split(separator: "\n") {
+      guard let obj = parseFixLine(line), let ts = obj["ts"] as? Double else { continue }
+      if ts < minTs { droppedAge += 1; continue }
+      if let cut = dropThroughTs, ts <= cut { continue }
+      kept.append(line)
+    }
+    if kept.count > PearCircleLocationModule.FIX_LOG_MAX_LINES {
+      let over = kept.count - PearCircleLocationModule.FIX_LOG_MAX_LINES
+      kept.removeFirst(over)
+      NSLog("[PearCircleLocation] fixlog line cap dropped \(over) oldest entries")
+    }
+    if droppedAge > 0 {
+      NSLog("[PearCircleLocation] fixlog age backstop dropped \(droppedAge) entries older than 14d")
+    }
+    let out = kept.isEmpty ? "" : kept.joined(separator: "\n") + "\n"
+    try? out.data(using: .utf8)?.write(to: fixLogURL, options: .atomic)
+  }
+
+  // JS drain entry point: age-compact, then hand back the un-drained slice
+  // ordered by ts. Does NOT truncate at the cursor -- the worklet acks that
+  // separately via ackFixBuffer once it has durably drained, so a worklet that
+  // dies mid-drain re-derives the same (idempotent) trip on the next wake.
+  @objc func flushFixBuffer(_ resolve: @escaping RCTPromiseResolveBlock,
+                            reject: @escaping RCTPromiseRejectBlock) {
+    fixLogQueue.async {
+      self.compactFixLogLocked(dropThroughTs: nil)
+      var fixes: [[String: Any]] = []
+      if let content = try? String(contentsOf: self.fixLogURL, encoding: .utf8) {
+        for line in content.split(separator: "\n") {
+          if let obj = self.parseFixLine(line) { fixes.append(obj) }
+        }
+      }
+      fixes.sort { (($0["ts"] as? Double) ?? 0) < (($1["ts"] as? Double) ?? 0) }
+      resolve(fixes)
+    }
+  }
+
+  // JS ack: the worklet drained through this ts, so drop everything at or below
+  // it (and anything now aged out).
+  @objc func ackFixBuffer(_ cursor: NSNumber,
+                          resolve: @escaping RCTPromiseResolveBlock,
+                          reject: @escaping RCTPromiseRejectBlock) {
+    fixLogQueue.async {
+      self.compactFixLogLocked(dropThroughTs: cursor.doubleValue)
+      resolve(true)
+    }
+  }
+
   private func emitLocation(_ loc: CLLocation) {
     let level = UIDevice.current.batteryLevel
     let battery: Any = level >= 0 ? Int(round(level * 100)) : NSNull()
@@ -822,6 +940,11 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       // Cold-start wake before JS attached; hold the newest fix for the
       // startObserving flush rather than dropping it.
       pendingLocation = payload
+      // AND durably append it so a whole background drive's worth of these
+      // detached wakes can be replayed into a trip later (Part B). The single
+      // pendingLocation slot only survives the next attach; this survives kills.
+      appendFixToLog(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude,
+                     ts: loc.timestamp.timeIntervalSince1970 * 1000, speed: speed, accuracy: accuracy)
       return
     }
     sendEvent(withName: PearCircleLocationModule.UPDATE_EVENT, body: payload)
