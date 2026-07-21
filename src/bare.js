@@ -58,7 +58,7 @@ const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryS
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
-const { newTripState, stepTrip, replayTrip, settleStaleTrip, polylineDistanceMeters, TRIP_MIN_DURATION_MS, TRIP_MIN_DISTANCE_M } = require('./lib/trip')
+const { newTripState, stepTrip, replayTrip, settleStaleTrip, lastActivityTs, isKnownSpeed, polylineDistanceMeters, TRIP_MIN_DURATION_MS, TRIP_MIN_DISTANCE_M } = require('./lib/trip')
 const { nextEmittedMode } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
@@ -2084,9 +2084,26 @@ const handlers = {
       if (staleSettle.completed) await finalizeCompletedTrip(staleSettle.completed)
       const prevState = _tripState
       const prevPhase = prevState.phase
+      // stepTrip ignores a fix with no measured speed or one that doesn't
+      // advance time. Say so in the trace when a trip is in flight, so a pull
+      // states why a drive stalled instead of leaving it to be inferred from
+      // spd/acc. Silent while idle: a parked phone emits these constantly.
+      const skip = !isKnownSpeed(sp)
+        ? 'speed-unknown'
+        : (() => {
+            const lastTs = lastActivityTs(_tripState)
+            return lastTs != null && stamp <= lastTs ? 'ts-stale' : null
+          })()
+      if (skip && prevPhase !== 'idle') {
+        traceTrip('fix-skip', { reason: skip, ph: prevPhase, acc: Number.isFinite(accuracy) ? Math.round(accuracy) : null }, true)
+      }
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
       _tripState = r.state
       _tripFixesSinceCheckpoint++
+      // Only a fix the machine actually acted on advances the consumed mark. A
+      // skipped one stays claimable by a later drain, which may see it in a
+      // context (ordered replay after a hydrate) where it does mean something.
+      if (!skip) noteTripFixConsumed(stamp)
       // Per-fix breadcrumb (sampled ~10s): stream density, speed, the adaptive
       // mode, and the phase each fix lands in. The raw signal that separates the
       // idle-trap (sparse low-speed fixes, trip never arms) from a durability
@@ -2500,9 +2517,24 @@ async function pruneOldTransitions () {
 // store below is device-local and never crosses the wire (T2, peer-invisible).
 const TRIP_CHECKPOINT_EVERY = 20   // also checkpoint every N appended points in a long active leg
 let _tripFixesSinceCheckpoint = 0
+// Highest fix ts the trip machine has consumed, by EITHER path (live
+// location:update or a drain of the native log). Native now records every fix,
+// including the ones the live path already handled, so this is what stops the
+// drain re-feeding the machine fixes it has already seen. Persisted as the
+// drain cursor at each checkpoint, so the pair is one consistent
+// "state as of ts" snapshot.
+let _tripConsumedThroughTs = null
+let _tripDrainCursor = null   // in-memory mirror of the persisted cursor
 
 function tripCheckpointKey () { return 'tripInFlight:' + b4a.toString(_identity.publicKey, 'hex') }
 function tripDrainCursorKey () { return 'tripDrainCursor:' + b4a.toString(_identity.publicKey, 'hex') }
+
+// Note the live path's consumption of a fix. Cheap and in-memory; it reaches
+// disk on the next checkpoint.
+function noteTripFixConsumed (ts) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return
+  if (_tripConsumedThroughTs == null || ts > _tripConsumedThroughTs) _tripConsumedThroughTs = ts
+}
 
 // Persist (or clear, when idle) the in-flight trip so a mid-drive restart can
 // resume it instead of losing the whole polyline.
@@ -2515,6 +2547,13 @@ async function persistTripCheckpoint () {
       await _localDb.put(tripCheckpointKey(), { state: _tripState, updatedAt: Date.now(), v: 1 })
     }
   } catch (e) { console.warn('[bare] trip checkpoint persist failed', e?.message) }
+  // AFTER the state, never before: if we die in between, a stale cursor just
+  // replays a few already-consumed fixes (idempotent, startTs-keyed), whereas a
+  // cursor ahead of the state would drop them and lose that stretch of road.
+  if (_tripConsumedThroughTs != null &&
+      (_tripDrainCursor == null || _tripConsumedThroughTs > _tripDrainCursor)) {
+    await setTripDrainCursor(_tripConsumedThroughTs)
+  }
 }
 
 // Rehydrate the in-flight trip on boot. If the drive clearly ended while the
@@ -2524,6 +2563,11 @@ async function persistTripCheckpoint () {
 // ready so a settled trip can persist and replicate.
 async function hydrateTripCheckpoint () {
   try {
+    // Seed the in-memory cursor mirror before anything can advance it, so the
+    // first checkpoint of this session compares against what is actually on
+    // disk rather than re-writing a cursor that is already current.
+    _tripDrainCursor = await getTripDrainCursor()
+    _tripConsumedThroughTs = _tripDrainCursor
     const rec = await _localDb.get(tripCheckpointKey())
     const saved = rec?.value?.state
     if (!saved || typeof saved.phase !== 'string' || saved.phase === 'idle') return
@@ -2539,6 +2583,8 @@ async function getTripDrainCursor () {
   try { const r = await _localDb.get(tripDrainCursorKey()); return typeof r?.value?.ts === 'number' ? r.value.ts : null } catch { return null }
 }
 async function setTripDrainCursor (ts) {
+  _tripDrainCursor = ts
+  if (_tripConsumedThroughTs == null || ts > _tripConsumedThroughTs) _tripConsumedThroughTs = ts
   try { await _localDb.put(tripDrainCursorKey(), { ts, updatedAt: Date.now() }) } catch (e) { console.warn('[bare] trip drain cursor persist failed', e?.message) }
 }
 
@@ -2581,7 +2627,15 @@ async function finalizeCompletedTrip (completed) {
 // lastSeen (LWW current position) and would fire late geofence notifications, so
 // this path deliberately does NOT touch those.
 async function drainTripFixes (fixes) {
-  const cursor = await getTripDrainCursor()
+  const persisted = await getTripDrainCursor()
+  // Native captures every fix now, including the ones this session already
+  // handled live, so gate on the higher of the persisted cursor and what the
+  // live path has consumed since the last checkpoint. Without the in-memory
+  // half, a foreground drain would re-feed the machine the fixes it just
+  // stepped and double-count the current leg.
+  const cursor = _tripConsumedThroughTs != null && (persisted == null || _tripConsumedThroughTs > persisted)
+    ? _tripConsumedThroughTs
+    : persisted
   const fresh = (Array.isArray(fixes) ? fixes : [])
     .filter((f) => f && typeof f.lat === 'number' && typeof f.lon === 'number' && typeof f.ts === 'number' &&
       (cursor == null || f.ts > cursor))

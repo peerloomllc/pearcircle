@@ -39,6 +39,13 @@ function newTripState () {
   }
 }
 
+// A speed reading we can actually act on. Rejects null/undefined (native sends
+// null when CLLocation reported its -1 unknown sentinel), non-finite values and
+// any leftover negative. "Unknown" is NOT "stopped" -- see stepTrip.
+function isKnownSpeed (speed) {
+  return typeof speed === 'number' && Number.isFinite(speed) && speed >= 0
+}
+
 // Returns the higher of the running max and a candidate speed, ignoring
 // non-finite, negative, and CLLocation's -1 unknown-speed sentinel.
 function bumpMaxSpeed (current, candidate) {
@@ -75,7 +82,20 @@ function stepTrip (state, { lat, lon, ts, speed }) {
   if (typeof lat !== 'number' || typeof lon !== 'number' || typeof ts !== 'number') {
     return { state, completed: null }
   }
-  const moving = typeof speed === 'number' && Number.isFinite(speed) && speed >= TRIP_START_THRESHOLD_MPS
+  // A fix with no usable speed carries NO information about whether the drive
+  // is still going, so it must not move the machine at all. CLLocation reports
+  // -1 for unknown, and the cached/coarse fix iOS delivers on an SLC relaunch
+  // is exactly that; the old code read it as "stopped" and reset a rehydrated
+  // arming trip on the first fix after every mid-drive kill (device trace
+  // 2026-07-21). A REAL measured stop still demotes normally.
+  if (!isKnownSpeed(speed)) return { state, completed: null }
+  // Ignore a fix that does not advance time. A cached fix carries its original
+  // (older) CLLocation timestamp, and every arming / cooldown decision below is
+  // a ts subtraction, so letting the clock run backwards silently corrupts the
+  // windows. Ordered replays (replayTrip) are unaffected.
+  const last = lastActivityTs(state)
+  if (last != null && ts <= last) return { state, completed: null }
+  const moving = speed >= TRIP_START_THRESHOLD_MPS
 
   switch (state.phase) {
     case 'idle': {
@@ -227,6 +247,7 @@ module.exports = {
   replayTrip,
   settleStaleTrip,
   lastActivityTs,
+  isKnownSpeed,
   polylineDistanceMeters,
   TRIP_START_THRESHOLD_MPS,
   TRIP_ARMING_DURATION_MS,

@@ -835,8 +835,12 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
 
   // Append one fix as a JSON line. Runs on fixLogQueue so it can't race a
   // concurrent flush/ack. Interpolated Doubles use "." regardless of locale.
-  private func appendFixToLog(lat: Double, lon: Double, ts: Double, speed: Double, accuracy: Double) {
-    let line = "{\"ts\":\(ts),\"lat\":\(lat),\"lon\":\(lon),\"speed\":\(speed),\"accuracy\":\(accuracy)}\n"
+  // `speed` is nil when CLLocation reported -1 (unknown); it is written as JSON
+  // null so a replayed fix carries the same no-information signal the live path
+  // sends, rather than a fabricated 0 that would end the trip on replay.
+  private func appendFixToLog(lat: Double, lon: Double, ts: Double, speed: Double?, accuracy: Double) {
+    let speedJSON = speed.map { "\($0)" } ?? "null"
+    let line = "{\"ts\":\(ts),\"lat\":\(lat),\"lon\":\(lon),\"speed\":\(speedJSON),\"accuracy\":\(accuracy)}\n"
     guard let data = line.data(using: .utf8) else { return }
     fixLogQueue.async {
       if let handle = try? FileHandle(forWritingTo: self.fixLogURL) {
@@ -926,25 +930,36 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // shows the bolt, matching Android's BATTERY_STATUS_FULL handling.
     let isCharging = state == .charging || state == .full
     let accuracy = loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : 0
-    let speed = loc.speed >= 0 ? loc.speed : 0
+    // CLLocation reports -1 for "speed unknown", which is exactly what the
+    // cached/coarse fix delivered on an SLC relaunch carries. Coercing that to
+    // 0 told the trip machine "the user has stopped" and reset a rehydrated
+    // arming trip on the first fix after every kill (device trace 2026-07-21).
+    // Ship unknown as null instead; motionState() and lastSeen already treat a
+    // null speed as no-information, and stepTrip now leaves the phase alone.
+    let speed = loc.speed >= 0 ? loc.speed : nil
+    let ts = loc.timestamp.timeIntervalSince1970 * 1000
     let payload: [String: Any] = [
       "lat": loc.coordinate.latitude,
       "lon": loc.coordinate.longitude,
       "accuracy": accuracy,
-      "ts": loc.timestamp.timeIntervalSince1970 * 1000,
-      "speed": speed,
+      "ts": ts,
+      "speed": speed as Any? ?? NSNull(),
       "battery": battery,
       "isCharging": isCharging,
     ]
+    // Durably record EVERY fix, attached or not (Part B). The original gate on
+    // `!hasListeners` never fired in practice: the CLLocationManager is only
+    // created when JS calls startUpdates, so on an SLC relaunch JS is always
+    // attached before the first fix arrives and fixbuffer.log was never even
+    // created (device trace 2026-07-21). The worklet de-duplicates the overlap
+    // with the live path via the drain cursor / lastLiveFixTs, so capturing
+    // unconditionally here is the only way a drive survives a mid-drive kill.
+    appendFixToLog(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude,
+                   ts: ts, speed: speed, accuracy: accuracy)
     guard hasListeners else {
       // Cold-start wake before JS attached; hold the newest fix for the
       // startObserving flush rather than dropping it.
       pendingLocation = payload
-      // AND durably append it so a whole background drive's worth of these
-      // detached wakes can be replayed into a trip later (Part B). The single
-      // pendingLocation slot only survives the next attach; this survives kills.
-      appendFixToLog(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude,
-                     ts: loc.timestamp.timeIntervalSince1970 * 1000, speed: speed, accuracy: accuracy)
       return
     }
     sendEvent(withName: PearCircleLocationModule.UPDATE_EVENT, body: payload)

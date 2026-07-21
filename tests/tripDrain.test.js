@@ -101,6 +101,75 @@ describe('replayTrip drain equivalence', () => {
   })
 })
 
+// Native now appends EVERY fix to the durable log, including the ones the live
+// path already stepped (the old `!hasListeners` gate never fired on a real SLC
+// relaunch, so the log stayed empty). That makes the cursor gate load-bearing:
+// it is the only thing keeping a drain from re-feeding the machine fixes it has
+// already consumed. This models bare.js's consumed-through mark + checkpoint
+// pair, which are written together so they always describe the same instant.
+describe('live + drain overlap (native captures every fix)', () => {
+  // Mirrors drainTripFixes' gate: max(persisted cursor, live-consumed mark).
+  function drain (state, log, consumedThroughTs) {
+    const fresh = log
+      .filter((f) => consumedThroughTs == null || f.ts > consumedThroughTs)
+      .sort((a, b) => a.ts - b.ts)
+    if (fresh.length === 0) return { state, completed: [], cursor: consumedThroughTs }
+    const r = replayTrip(state, fresh)
+    return { ...r, cursor: fresh[fresh.length - 1].ts }
+  }
+
+  test('a foreground drain over an all-live drive is a no-op', () => {
+    const fixes = makeDrive()
+    let live = newTripState()
+    let consumed = null
+    const liveTrips = []
+    for (const f of fixes) {
+      const r = stepTrip(live, f)
+      live = r.state
+      consumed = f.ts
+      if (r.completed) liveTrips.push(r.completed)
+    }
+    // App reopened: the shell hands the worklet the whole native log.
+    const after = drain(live, fixes, consumed)
+    expect(after.completed).toHaveLength(0)
+    expect(after.state).toBe(live)
+    expect(liveTrips).toHaveLength(1)
+  })
+
+  test('a kill mid-drive drains only the un-consumed tail and yields one whole trip', () => {
+    const fixes = makeDrive()
+    const whole = replayTrip(newTripState(), fixes).completed
+
+    // Live until the kill. The checkpoint lags the live state by design: it is
+    // written every N fixes, so the last few live steps are lost with the
+    // process and must come back through the drain.
+    const killAt = 14
+    const checkpointEvery = 5
+    let live = newTripState()
+    let checkpoint = newTripState()
+    let consumed = null
+    for (let i = 0; i < killAt; i++) {
+      live = stepTrip(live, fixes[i]).state
+      if (i % checkpointEvery === 0) { checkpoint = live; consumed = fixes[i].ts }
+    }
+    expect(live.phase).toBe('active')
+
+    // Reboot: hydrate the checkpoint, then drain the full native log.
+    const after = drain(checkpoint, fixes, consumed)
+    expect(after.completed).toEqual(whole)
+    expect(after.completed).toHaveLength(1)
+  })
+
+  test('a kill before the first checkpoint replays the drive from scratch', () => {
+    const fixes = makeDrive()
+    const whole = replayTrip(newTripState(), fixes).completed
+    // No checkpoint was ever written, so there is no cursor either: the drain
+    // sees the entire log and rebuilds the drive from nothing.
+    const after = drain(newTripState(), fixes, null)
+    expect(after.completed).toEqual(whole)
+  })
+})
+
 describe('settleStaleTrip', () => {
   test('finalizes an active trip abandoned mid-drive once the gap exceeds cooldown', () => {
     // Build an active trip, then never send the closing fixes.
