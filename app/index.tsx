@@ -422,20 +422,6 @@ let _pendingRegionEvents: object[] = []
 // points this at its ref on mount and clears it on unmount.
 let _webViewRef: { current: WebView | null } | null = null
 
-// WebView-freeze recovery (ported from PearGuard #230). On GrapheneOS the
-// WebView is Vanadium, whose render process the OS reaps the moment the app
-// backgrounds. On return the WebView silently reloads (NO onRenderProcessGone),
-// and the reloaded compositor exceeds its GPU tile budget ("tile memory limits
-// exceeded") and never paints - a frozen screen even though JS, React, taps and
-// haptics all still work. Only a fresh render process clears it. We detect the
-// reload-on-resume in onLoad (an unrequested load firing right after a resume)
-// and remount the <WebView> after a short settle delay, which spawns a fresh
-// render process with a fresh tile budget. The settle delay is essential: an
-// immediate remount respawns under the same memory pressure and re-freezes.
-let _resumeAt = 0            // last AppState->active time
-let _remountInFlight = false
-let _remountWebView: (() => void) | null = null
-
 // Notification setup (channels + permission). Hoisted to module scope so the
 // headless path can kick it off and the `ready` FGS-start flow can await it
 // before startUpdates, exactly as the Activity path did via a component ref.
@@ -784,9 +770,6 @@ export default function Index() {
   const webViewRef = useRef<WebView>(null)
   const [html, setHtml] = useState<string | null>(null)
   const webViewLoaded = useRef(false)
-  // Bumping this key remounts the <WebView>, spawning a fresh render process.
-  // Used to recover the GrapheneOS/Vanadium freeze (see _remountWebView below).
-  const [webViewKey, setWebViewKey] = useState(0)
   const pendingDeeplink = useRef<string | null>(null)
   const pendingNotificationFocus = useRef<{ circleId: string; pubkey: string } | null>(null)
   // QR scanner is a JS-driven modal that resolves a pending shell:scanQr
@@ -807,11 +790,6 @@ export default function Index() {
   // --android-nav-inset CSS var; the UI takes max(env(), that var). iOS
   // WKWebView reports env() correctly, so we leave the var unset there.
   const insets = useSafeAreaInsets()
-
-  // Keep the module-level remount pointer aimed at this render's setter so the
-  // onLoad freeze-recovery path can trigger a WebView remount (GrapheneOS fix).
-  _remountWebView = () => { webViewLoaded.current = false; setWebViewKey((k) => k + 1) }
-
   const injectNavInset = (bottom: number) => {
     if (Platform.OS !== 'android') return
     webViewRef.current?.injectJavaScript(
@@ -838,9 +816,6 @@ export default function Index() {
     loadUiHtml().then((h) => { shellMark('ui:html-ready'); setHtml(h) }).catch((e) => console.warn('UI bundle load failed', e))
 
     const sub = AppState.addEventListener('change', (s) => {
-      // Timestamp each resume so onLoad can tell a silent reload-on-resume (the
-      // GrapheneOS render-process reap) from a normal load (WebView-freeze fix).
-      if (s === 'active') _resumeAt = Date.now()
       sendToWorklet({ method: 'app:state', args: { state: s } })
       // Also forward to the WebView so the UI can refresh things
       // that change outside the app (e.g. the battery-optimization
@@ -1056,23 +1031,6 @@ export default function Index() {
 
   const onLoad = () => {
     shellMark('webview:loaded')
-    // A load we didn't request, firing right after a resume, is GrapheneOS
-    // silently reloading the WebView because its render process was reaped while
-    // backgrounded (no onRenderProcessGone fires). The resume-reloaded Vanadium
-    // renderer often exhausts its GPU tile budget and never paints (frozen
-    // screen). Once the app has settled, remount the <WebView> to spawn a fresh
-    // render process with a fresh tile budget. The settle delay is essential -
-    // an immediate remount respawns under the same memory pressure and re-freezes.
-    // Only fires on this reload-on-resume signature, so a normal resume (WebView
-    // still loaded, no onLoad) never remounts and never resets map state.
-    const sinceResume = _resumeAt ? (Date.now() - _resumeAt) : Infinity
-    if (!_remountInFlight && webViewLoaded.current && sinceResume < 4000) {
-      _resumeAt = 0  // don't let the remount's own onLoad re-trigger
-      _remountInFlight = true
-      setTimeout(() => { _remountWebView?.() }, 1800)
-    } else if (_remountInFlight) {
-      _remountInFlight = false
-    }
     webViewLoaded.current = true
     injectNavInset(insets.bottom)
     if (pendingDeeplink.current) {
@@ -1695,7 +1653,6 @@ export default function Index() {
     <>
       <StatusBar barStyle={statusBarStyle} translucent backgroundColor='transparent' />
       <WebView
-        key={webViewKey}
         ref={webViewRef}
         // baseUrl https://localhost/ rather than about:blank: the
         // WebView treats about:blank as a non-secure null-origin
