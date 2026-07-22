@@ -1614,12 +1614,58 @@ if [ -z "$GIT_REMOTE" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# 6b. Commit the version bumps this run made, BEFORE tagging
+# ---------------------------------------------------------------------------
+# Step 0 rewrites app.json + the Xcode project, and the seeder store steps
+# rewrite the Start9 manifest/migrations/Dockerfile pins and the Umbrel
+# manifest/compose pins. Nothing ever committed them, so the tag was cut from a
+# tree still carrying the PREVIOUS version: master permanently declared the
+# version before the one that shipped, and the tag did not contain the version
+# it names.
+#
+# Committing here (before the tag) makes the tag actually contain its version.
+#
+# Explicit allowlist, never `git add -A`. A release run leaves plenty of other
+# dirt in the tree: the .apk/.aab/.sha256 sidecars at the repo root, generated
+# release_notes.md, seeder-launcher/deno.lock. And should assets/*.bundle ever
+# stop being gitignored, `add -A` would bake a build output that can lag its own
+# source into the release commit.
+_bump_paths=(
+  app.json
+  "${XCODE_PROJECT:-ios/PearCircle.xcodeproj/project.pbxproj}"
+  seeder-launcher/start9/manifest.yaml
+  seeder-launcher/start9/Dockerfile
+  seeder-launcher/start9/scripts/procedures/migrations.ts
+  seeder-launcher/umbrel/umbrel-app.yml
+  seeder-launcher/umbrel/docker-compose.yml
+)
+_bump_existing=()
+for _p in "${_bump_paths[@]}"; do [ -e "$_p" ] && _bump_existing+=("$_p"); done
+if [ ${#_bump_existing[@]} -gt 0 ] \
+   && [ -n "$(git status --porcelain -- "${_bump_existing[@]}")" ]; then
+  echo "==> Committing version bumps for $APP_VERSION..."
+  git add -- "${_bump_existing[@]}"
+  git commit -q -m "chore(release): $APP_VERSION" \
+    && echo "    Committed $(git diff --name-only HEAD~1 HEAD | wc -l) file(s)" \
+    || echo "    WARNING: version-bump commit failed - the tag will not contain them." >&2
+else
+  echo "==> No uncommitted version bumps to record (already committed)."
+fi
+
 echo ""
 echo "    Remote : $GIT_REMOTE"
 echo "    Tag    : $RELEASE_TAG"
 echo "    Branch : $(git rev-parse --abbrev-ref HEAD)"
 echo "    Commit : $(git rev-parse --short HEAD)  $(git log -1 --format='%s')"
-_confirm "Push tag $RELEASE_TAG to $GIT_REMOTE? (This cannot be undone without a force-delete)"
+_confirm "Push branch $(git rev-parse --abbrev-ref HEAD) + tag $RELEASE_TAG to $GIT_REMOTE? (This cannot be undone without a force-delete)"
+
+# The bump commit has to reach the remote too, or the pushed tag points at a
+# commit nobody else has.
+_branch="$(git rev-parse --abbrev-ref HEAD)"
+git push "$GIT_REMOTE" "$_branch" \
+  && echo "    Pushed $_branch to $GIT_REMOTE" \
+  || echo "    WARNING: branch push failed - push $_branch manually so the tag resolves." >&2
 
 # Create the local tag here — as late as possible, only after all confirmations
 echo "==> Tagging and pushing $RELEASE_TAG..."
