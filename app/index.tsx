@@ -482,6 +482,14 @@ function ensureLocationListener() {
   emitter.addListener('PearCircleLocation:motion:changed', (data: any) => {
     sendToWorklet({ method: 'motion:changed', args: data })
   })
+  // CoreLocation pausing or resuming continuous delivery on its own (iOS only,
+  // 2026-07-21). Diagnostic: a pause is the moment the app loses its reason to
+  // stay alive in the background, so seeing one land mid-drive is what confirms
+  // that pausing is what starves the fix stream. Forwarded purely so the worklet
+  // can put it in trips.log; native already re-arms delivery itself.
+  emitter.addListener('PearCircleLocation:updates:paused', (data: any) => {
+    sendToWorklet({ method: 'location:pauseState', args: data })
+  })
   _locationListenerSet = true
 }
 

@@ -754,6 +754,17 @@ const handlers = {
     return { moving: isMoving, recentMotion: motionIsRecent() }
   },
 
+  // iOS told us CoreLocation paused or resumed continuous delivery by itself.
+  // Purely diagnostic here (native re-arms delivery on its own): a `pause` line
+  // landing mid-drive is what proves auto-pausing is what starves the fix
+  // stream, and its absence across a whole drive is what kills that theory.
+  // flushNow so it survives the app being suspended moments later, which is
+  // precisely what a pause tends to precede.
+  'location:pauseState': async ({ paused, mode } = {}) => {
+    traceTrip('loc-pause', { paused: paused === true, mode: mode ?? null, ph: _tripState.phase }, true)
+    return { ok: true }
+  },
+
   // Default-network change on the device (wifi <-> cell, vpn on/off,
   // ethernet plug). The Android side debounces the burst of native
   // callbacks during a single transition; we receive one event per real
