@@ -59,7 +59,7 @@ const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt
 const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
 const { newTripState, stepTrip, replayTrip, settleStaleTrip, lastActivityTs, isKnownSpeed, polylineDistanceMeters, TRIP_MIN_DURATION_MS, TRIP_MIN_DISTANCE_M } = require('./lib/trip')
-const { nextEmittedMode } = require('./lib/locationMode')
+const { nextEmittedMode, MODE_BOOT_GRACE_MS } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
 const { TRANSITION_RETENTION_MS, transitionIsExpired } = require('./lib/transitionRetention')
@@ -671,6 +671,7 @@ function runLocationModeDriver () {
       appForeground: _appForeground,
       recentMotion: motionIsRecent(),
       locationStarted: _locationUpdateSeen,
+      sinceBootMs: Date.now() - _bootTs,
     },
     ADAPTIVE_LOCATION_MODE_ENABLED,
   )
@@ -2664,7 +2665,29 @@ async function drainTripFixes (fixes) {
   const newCursor = fresh[fresh.length - 1].ts
   await setTripDrainCursor(newCursor)
   const trips = completed.length + (settled.completed ? 1 : 0)
-  traceTrip('drain', { fixes: fresh.length, trips, cursor: newCursor }, true)
+  // Report what was in the batch, not just how many. A drain that reports
+  // `trips: 0` is ambiguous on its own: it reads the same whether the buffered
+  // fixes were a stationary phone, a drive iOS only ever described in coarse
+  // SLC fixes, or a real drive the machine mishandled. maxSpd and the
+  // known-speed count separate those, and spanS says whether the batch even
+  // covers a meaningful stretch of time. Cost is one pass over an array we have
+  // already sorted.
+  let maxSpd = 0
+  let known = 0
+  let coarse = 0
+  for (const f of fresh) {
+    if (isKnownSpeed(f.speed)) { known++; if (f.speed > maxSpd) maxSpd = f.speed }
+    if (typeof f.accuracy === 'number' && f.accuracy > 50) coarse++
+  }
+  traceTrip('drain', {
+    fixes: fresh.length,
+    trips,
+    known,
+    coarse,
+    maxSpd: Math.round(maxSpd * 10) / 10,
+    spanS: Math.round((fresh[fresh.length - 1].ts - fresh[0].ts) / 1000),
+    cursor: newCursor,
+  }, true)
   reshipTrace()
   return { drained: fresh.length, trips, cursor: newCursor }
 }
@@ -6582,6 +6605,14 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   _activeHandlers = handlers
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
+
+  // The boot grace suppresses the idle demotion, it does not schedule the
+  // step-down that has to follow it. The driver only runs on its event inputs,
+  // and if this wake turns out to be nothing (no motion, no trip, app never
+  // opened) none of them fire again, which would leave the radio in tracking
+  // indefinitely. Re-run it once the grace lapses so a false alarm settles back
+  // to SLC-only under its own rules.
+  setTimeout(() => runLocationModeDriver(), MODE_BOOT_GRACE_MS)
 
   // Trip retention sweep. Run once on boot to claw back space from
   // anything that aged past the cutoff while the worklet was down,

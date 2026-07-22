@@ -47,11 +47,33 @@ function desiredMode ({ phase, appForeground, recentMotion } = {}) {
 // continuous delivery is up; escalations to "tracking" are always safe.
 // A missing `locationStarted` is treated as started (no gating), so
 // callers that don't track it are unaffected.
+//
+// `sinceBootMs` guards the wake-up deadlock (measured on a real drive,
+// 2026-07-22). Every escalation input is derived from in-memory state, and iOS
+// gives each background wake a brand-new process, so a freshly relaunched
+// worklet always computes phase=idle + foreground=false + recentMotion=false and
+// emits "idle" within a second of booting. That calls stopUpdatingLocation,
+// which is the very thing holding the app's background-execution assertion open,
+// so the app is suspended and terminated before it can learn anything. It is a
+// deadlock: staying awake requires a detected trip, and detecting a trip
+// requires staying awake. On a 22-minute drive it produced 4 wakes, 17 fixes,
+// all of them 40-117m SLC-grade with no usable speed, and no trip.
+//
+// So "idle" is also suppressed for the first MODE_BOOT_GRACE_MS of a worklet's
+// life: the wake itself is evidence something moved, and a bounded window of
+// real GPS is what buys CoreMotion time to report and the trip machine time to
+// arm. Cost is bounded to wakes that actually happen, and a parked phone is not
+// woken at all (SLC only fires on ~500m moves). Escalations to "tracking" are
+// unaffected, as always.
+const MODE_BOOT_GRACE_MS = 90_000
+
 function nextEmittedMode (lastMode, inputs, enabled) {
   const desired = enabled ? desiredMode(inputs) : 'tracking'
   if (desired === lastMode) return null
   if (desired === 'idle' && inputs?.locationStarted === false) return null
+  if (desired === 'idle' && typeof inputs?.sinceBootMs === 'number' &&
+      inputs.sinceBootMs < MODE_BOOT_GRACE_MS) return null
   return desired
 }
 
-module.exports = { phaseToMode, desiredMode, nextEmittedMode }
+module.exports = { phaseToMode, desiredMode, nextEmittedMode, MODE_BOOT_GRACE_MS }
