@@ -18,5 +18,13 @@ export SEEDER_NO_UPDATE_CHECK=1
 
 printf "\n [i] Starting PearCircle Seeder (data: %s) ...\n\n" "$DATA_DIR"
 
+# Populate the StartOS Properties page. compat.properties renders
+# /root/start9/stats.yaml; nothing wrote it, so that menu was empty. This poller
+# rewrites it from the seeder's own HTTP API. Backgrounded and non-fatal: if it
+# dies the seeder keeps running and Properties just stops refreshing. exec below
+# replaces this shell with tini in place, so tini inherits and reaps it.
+mkdir -p /root/start9
+node /app/start9/write-stats.js &
+
 # tini as PID 1 so the worklet's `bare` child is reaped and signals propagate.
 exec tini -- node /app/host-bundled.js --data-dir "$DATA_DIR" --no-open
