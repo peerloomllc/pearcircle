@@ -30,6 +30,10 @@ retention window (forever, 30 days, 7 days, or 24 hours) set from the dashboard.
 
 ## Notes
 
+- **Properties** shows this seeder's **public key**, its nickname, how many
+  circles it is seeding and how much encrypted data it holds. The public key is
+  what you check against the phone app when you admit the seeder, so you can
+  confirm it without opening the dashboard.
 - **No configuration** is needed. Enrollment happens entirely from the phone app.
 - **Backups** cover the seeder's identity and per-circle enrollments, so a
   restore keeps the seeder admitted without re-inviting.

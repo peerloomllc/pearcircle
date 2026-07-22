@@ -45,10 +45,10 @@ scripts/embassy.js: $(TS_FILES)
 # packer loads, tagged start9/<id>/main:<version>. Uses docker if present, else
 # podman + a RepoTags normalization (see scripts/build-image-tar.sh). The tar
 # name (x86_64 / aarch64) selects the build --platform.
-docker-images/x86_64.tar: Dockerfile docker_entrypoint.sh scripts/build-image-tar.sh
+docker-images/x86_64.tar: Dockerfile docker_entrypoint.sh write-stats.js scripts/build-image-tar.sh
 	bash scripts/build-image-tar.sh $(PKG_ID) $(PKG_VERSION) docker-images/x86_64.tar linux/amd64
 
-docker-images/aarch64.tar: Dockerfile docker_entrypoint.sh scripts/build-image-tar.sh
+docker-images/aarch64.tar: Dockerfile docker_entrypoint.sh write-stats.js scripts/build-image-tar.sh
 	bash scripts/build-image-tar.sh $(PKG_ID) $(PKG_VERSION) docker-images/aarch64.tar linux/arm64
 
 # Universal s9pk carries both arch images; the manifest's hardware-requirements
