@@ -5487,7 +5487,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
           running -- the daily open reminder, boot autostart (Android), and
           the battery exemption. The 'battery' deep-link lands here. */}
       <div ref={stayingSyncRef} />
-      <Collapsible title='Staying in sync' icon={ArrowsClockwise} open={openSection === 'stayingSync'} onToggle={() => toggleSection('stayingSync')} maxHeight='2600px'>
+      <Collapsible title='Staying in sync' icon={ArrowsClockwise} open={openSection === 'stayingSync'} onToggle={() => toggleSection('stayingSync')} maxHeight='3400px'>
         <p style={{ ...subLabel, marginTop: 0 }}>Daily reminder</p>
         <SyncReminderSection />
         <AutostartStatus />
@@ -5515,6 +5515,8 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
             {batteryError && <p style={s.error}>{batteryError}</p>}
           </div>
         )}
+        {/* Renders nothing (heading included) on a build with no relay key. */}
+        <RelaySection subLabel={subLabel} />
       </Collapsible>
 
       <Collapsible title='Display & map' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')} maxHeight='1600px'>
@@ -5946,6 +5948,44 @@ function TripNotificationsSection () {
         Notify when a circle member finishes a trip. Trips are still recorded either way.
       </span>
       <ToggleSwitch on={enabled} onChange={toggle} />
+    </div>
+  )
+}
+
+// The blind-relay privacy toggle (proposal 2026-07-23-blind-relay-adoption).
+// Default on. The worklet is the source of truth (_useRelay in src/bare.js) and
+// its swarm reads the flag live per connect, so flipping it applies to the next
+// connection attempt with no reconnect. Hidden entirely when the build has no
+// relay key baked, so we never show a switch that does nothing.
+function RelaySection ({ subLabel }) {
+  const [useRelay, setUseRelay] = useState(true)
+  const [available, setAvailable] = useState(false)
+  useEffect(() => {
+    pear.call('relay:get').then((r) => {
+      if (r && typeof r.useRelay === 'boolean') setUseRelay(r.useRelay)
+      if (r && typeof r.available === 'boolean') setAvailable(r.available)
+    }).catch(() => {})
+    pear.on('relay:changed', (data) => {
+      if (data && typeof data.useRelay === 'boolean') setUseRelay(data.useRelay)
+    })
+  }, [])
+  const toggle = useCallback(async (value) => {
+    if (value === useRelay) return
+    setUseRelay(value)   // optimistic; revert on failure
+    try { await pear.call('relay:set', { useRelay: value }) }
+    catch { setUseRelay(!value) }
+  }, [useRelay])
+  if (!available) return null
+  return (
+    <div style={{ marginTop: spacing.lg }}>
+      <p style={{ ...(subLabel || {}), marginTop: 0 }}>Connection helper</p>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base }}>
+        Some mobile networks stop two phones from reaching each other directly. When that happens, PearCircle can pass the connection through a PeerLoom relay so your circle still syncs. Everything stays locked end to end, so the relay only shuffles scrambled data along and never sees your location, and it keeps no copy. Turn this off to stay strictly phone to phone, and accept that on those networks you may not connect at all.
+      </p>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
+        <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Use the relay when a direct connection fails</span>
+        <ToggleSwitch on={useRelay} onChange={toggle} />
+      </div>
     </div>
   )
 }
