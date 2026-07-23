@@ -6021,7 +6021,7 @@ function SyncReminderSection () {
   return (
     <>
       <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base }}>
-        PearCircle has no servers — your circles sync directly between members' phones, only while the app is running. A daily reminder at the time you pick nudges you to open PearCircle so your latest location goes out and you catch up on everyone else.
+        Nothing stores your circles for you — they sync directly between members' phones, only while the app is running. A daily reminder at the time you pick nudges you to open PearCircle so your latest location goes out and you catch up on everyone else.
       </p>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
         <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Daily reminder</span>
@@ -6713,7 +6713,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
     try {
       pear.call('shell:share', {
         title: 'PearCircle',
-        text: 'Check out PearCircle - a private, peer-to-peer location-sharing app with no servers or accounts.\n\nhttps://peerloomllc.com/pearcircle/',
+        text: 'Check out PearCircle - a private, peer-to-peer location-sharing app with no accounts and no company holding your data.\n\nhttps://peerloomllc.com/pearcircle/',
       })
     } catch {}
   }
@@ -6761,7 +6761,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.xs, marginBottom: spacing.lg }}>
         <div style={{ fontSize: 20, fontWeight: 400, color: colors.text.primary, fontFamily: typography.fontFamily }}>PearCircle</div>
         <div style={{ fontSize: 12, fontWeight: 300, color: colors.text.muted, fontFamily: typography.fontFamily }}>
-          Private. Peer-to-Peer. No Servers.
+          Private. Peer-to-Peer. No Accounts.
         </div>
       </div>
 
@@ -6769,9 +6769,19 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
         <p style={body}>
           PearCircle syncs locations directly between devices using
           peer-to-peer technology powered by Hypercore Protocol. Your
-          circle's data never touches a server - it lives only on the
-          devices in your circles. No accounts. No subscriptions. No
-          data collection.
+          circle's data is never stored on a server - it lives only on
+          the devices in your circles. No accounts. No subscriptions.
+          No data collection.
+        </p>
+        <p style={body}>
+          One exception, said plainly: some networks stop two phones
+          from connecting to each other directly. When that happens
+          PearCircle can pass the connection through a relay PeerLoom
+          runs. It only carries scrambled data it has no key to unlock,
+          and it keeps no copy - though it can tell that two devices
+          are talking and how much data passes. Your phones always try
+          a direct connection first, and Settings has a switch to turn
+          the relay off entirely.
         </p>
         <button onClick={() => openURL('https://pears.com/')} style={pillBtn}>
           Learn about P2P <ArrowSquareOut size={14} weight='thin' />
@@ -6818,7 +6828,7 @@ function AboutView ({ onClose, initialExpand = null, onReplayOnboarding = null }
 
       <Collapsible title='Share the app' icon={ShareNetwork} open={openSection === 'share'} onToggle={() => toggleSection('share')}>
         <p style={body}>
-          Know someone who'd want a private, serverless way to share
+          Know someone who'd want a private, peer-to-peer way to share
           location with friends or family? Share PearCircle with them.
         </p>
         <button onClick={share} style={pillBtn}>

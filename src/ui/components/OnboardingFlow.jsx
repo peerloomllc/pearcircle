@@ -80,7 +80,7 @@ export function OnboardingFlow ({ profile, battery = { supported: null, exempt: 
               Welcome to PearCircle
             </div>
             <div style={{ ...typography.body, color: colors.text.secondary, lineHeight: 1.6, textAlign: 'center' }}>
-              Private location sharing with the people you trust. No accounts, no servers, no subscriptions - your location lives only on the devices in your circles.
+              Private location sharing with the people you trust. No accounts, no tracking, no subscriptions - your location lives only on the devices in your circles.
             </div>
             <button style={primaryBtn} onClick={() => setStep(1)}>Get started</button>
             <button style={textBtn} onClick={handleSkip}>Skip setup</button>
