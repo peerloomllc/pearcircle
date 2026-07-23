@@ -1,6 +1,6 @@
 # Blind relay adoption review
 
-**Status: implemented, verify green, on-device smoke-tested on D2. Awaiting sign-off before merge.** Proposal `proposals/2026-07-23-blind-relay-adoption.md`, branch `feature/blind-relay`, PR #170. T3 because it points PearCircle at PeerLoom-operated infrastructure that carries user traffic, not because anything on the wire changed.
+**Status: implemented, verify green, on-device verified on D2 in BOTH directions (relayed path proven against the relay node's own stats, direct-first proven to keep the relay out). Awaiting sign-off before merge.** Proposal `proposals/2026-07-23-blind-relay-adoption.md`, branch `feature/blind-relay`, PR #170. T3 because it points PearCircle at PeerLoom-operated infrastructure that carries user traffic, not because anything on the wire changed.
 
 ## What shipped
 
@@ -12,14 +12,24 @@ PearCircle's one member-mode Hyperswarm now passes `relayThrough` as a function 
 - The deployed relay answers on the baked key from this network (raw `dht.connect` smoke).
 - Debug APK installed on D1 + D2. On D2: `init:swarm-created {"relay":true}`, `init:done`, peers still connect directly in ~3.6s so the relay correctly stays out on a punchable network, the toggle flips (`relay:toggled {"useRelay":false}`) and survives a force-stop relaunch (`init:swarm-created {"relay":false}`), and flipping it back on restores the default.
 
-## Validation gap
+## The relayed path, proven (gap closed 2026-07-23)
 
-No PearCircle connection has yet been observed actually going *through* the relay - every test-network path punches fine, which is exactly why the relay stays out. Proving the relayed path for PearCircle specifically needs a 0%-punch network and, per PearTune's phase 3, must be read from the relay node's own stats (`journalctl -u peartune-relay` on the droplet: `pairings.active` / `streams.active`), because the phone-side `dht.stats.relaying` counter reads 0 even while relaying. The mechanism itself is already hardware-proven end to end by PearTune on the same relay and the same hyperswarm/hyperdht versions, so this gap is about PearCircle's specific wiring, which the direct-first smoke above exercises everywhere except the escalation branch.
+Waiting for a genuinely-0%-punch network was unnecessary: a **throwaway force-relay build** (the policy fn returns the key unconditionally, reverted immediately after and never committed) proves the wiring against the relay node's own stats, which is the ground truth per PearTune. Clean A/B on D2, relay stats read over ssh from the droplet:
+
+| | `sessions.active` | `pairings.active` | `pairings.matched` | `streams.active` |
+|---|---|---|---|---|
+| Baseline (PearTune traffic only) | 2 | 1 | 14 | 2 |
+| Force-relay PearCircle build launched | **3** | **2** | **20** | **3** |
+| Honest direct-first build relaunched | 2 | 1 | 20 (frozen) | 2 |
+
+So PearCircle's connections really do pair and carry bytes through the relay when escalation fires, and the moment the honest build is back the relay drops to baseline and stays there while the phone connects **directly** in 2.9s. Both halves of the requirement are covered: the relayed path works, and the relay stays out of a punchable network.
+
+Residual: this exercised the escalation *branch*, not the *trigger*. The `force=true` handoff after a real `HOLEPUNCH_ABORTED` is Hyperswarm's own code, unmodified and already hardware-proven by PearTune on a real cellular 0%-punch case, so what remains untested here is nothing PearCircle owns.
 
 ## Sign-off checklist
 
 - [ ] T3 tier and the "PeerLoom now runs infrastructure PearCircle touches" consequence acknowledged.
 - [ ] Default-ON toggle accepted (opt-out, not opt-in).
 - [ ] Settings copy accepted as an honest disclosure: blind and stateless, but not zero-knowledge (the relay sees which two keys talk and how many bytes).
-- [ ] Validation gap accepted, with the relay-node-stats check deferred to a real 0%-punch network.
+- [ ] The force-relay A/B accepted as sufficient proof of the relayed path (vs holding out for a real 0%-punch network).
 - [ ] Seeder-side escalation correctly deferred rather than dropped.
