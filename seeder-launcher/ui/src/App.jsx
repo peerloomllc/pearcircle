@@ -534,7 +534,7 @@ function Support () {
   const onCopy = async () => { if (await copyText(value)) { setCopied(true); setTimeout(() => setCopied(false), 1500) } }
   return (
     <div class="stack center">
-      <p class="hint center">No accounts, no servers, no subscriptions. If running this seeder is useful, a tip helps keep PearCircle free — entirely optional.</p>
+      <p class="hint center">No accounts, no tracking, no subscriptions. If running this seeder is useful, a tip helps keep PearCircle free — entirely optional.</p>
       <div class="tabs" style={{ width: '100%' }}>
         <button class={tab === 'ln' ? '' : 'ghost'} onClick={() => setTab('ln')}>⚡ Bitcoin</button>
         <button class={tab === 'bmc' ? '' : 'ghost'} onClick={() => setTab('bmc')}>💲 Card / USD</button>

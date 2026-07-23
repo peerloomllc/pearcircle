@@ -1,6 +1,6 @@
 # Blind relay adoption review
 
-**Status: implemented, verify green, on-device verified on D2 in BOTH directions (relayed path proven against the relay node's own stats, direct-first proven to keep the relay out). Awaiting sign-off before merge.** Proposal `proposals/2026-07-23-blind-relay-adoption.md`, branch `feature/blind-relay`, PR #170. T3 because it points PearCircle at PeerLoom-operated infrastructure that carries user traffic, not because anything on the wire changed.
+**Status: APPROVED + merged 2026-07-23 (Tim, in-session) via PR #170.** Verify green, on-device verified on D2 in both directions: the relayed path proven against the relay node's own stats, and direct-first proven to keep the relay out. The user-facing disclosure that follows from this decision shipped separately, see the "no servers" rewrite. Proposal `proposals/2026-07-23-blind-relay-adoption.md`, branch `feature/blind-relay`, PR #170. T3 because it points PearCircle at PeerLoom-operated infrastructure that carries user traffic, not because anything on the wire changed.
 
 ## What shipped
 
@@ -28,8 +28,10 @@ Residual: this exercised the escalation *branch*, not the *trigger*. The `force=
 
 ## Sign-off checklist
 
-- [ ] T3 tier and the "PeerLoom now runs infrastructure PearCircle touches" consequence acknowledged.
-- [ ] Default-ON toggle accepted (opt-out, not opt-in).
-- [ ] Settings copy accepted as an honest disclosure: blind and stateless, but not zero-knowledge (the relay sees which two keys talk and how many bytes).
-- [ ] The force-relay A/B accepted as sufficient proof of the relayed path (vs holding out for a real 0%-punch network).
-- [ ] Seeder-side escalation correctly deferred rather than dropped.
+- [x] T3 tier and the "PeerLoom now runs infrastructure PearCircle touches" consequence acknowledged.
+- [x] Default-ON toggle accepted (opt-out, not opt-in).
+- [x] Settings copy accepted as an honest disclosure: blind and stateless, but not zero-knowledge (the relay sees which two keys talk and how many bytes).
+- [x] The force-relay A/B accepted as sufficient proof of the relayed path (vs holding out for a real 0%-punch network).
+- [x] Seeder-side escalation correctly deferred rather than dropped.
+
+_Approved 2026-07-23 (Tim, in-session) - merged as #170 with the force-relay A/B evidence attached._
