@@ -63,6 +63,7 @@ const { nextEmittedMode, MODE_BOOT_GRACE_MS } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
 const { TRANSITION_RETENTION_MS, transitionIsExpired } = require('./lib/transitionRetention')
+const { RELAY_PUBLIC_KEY, relayThroughFor } = require('./lib/relay')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -467,6 +468,13 @@ const MEMBER_NOTIF_FRESHNESS_MS = 10 * 60 * 1000
 // User pref. Default on; off mutes peer-trip OS notifications entirely.
 // Persisted in _localDb under `tripNotifications`; loaded on init below.
 let _tripNotificationsEnabled = true
+
+// User pref. Default on; off means pure peer-to-peer - never escalate a failed
+// hole-punch through the PeerLoom blind relay (proposal 2026-07-23-blind-relay-
+// adoption). Persisted in _localDb under `relay`; loaded on init before the
+// swarm is created. The swarm's relayThrough is a FUNCTION reading this live,
+// so flipping it applies to the next connect without a reconnect.
+let _useRelay = true
 
 // In-process geofence state: every place across every circle, with the
 // most recent inside/outside classification. checkPlaceTransitions runs
@@ -1918,6 +1926,27 @@ const handlers = {
     if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean')
     const now = await setForceAutobaseLastSeen(enabled)
     return { forceAutobaseLastSeen: now }
+  },
+
+  // Relay privacy toggle (proposal 2026-07-23-blind-relay-adoption). `available`
+  // reports whether a relay key is even baked into this build, so the UI can
+  // hide the control rather than offer a switch that does nothing.
+  'relay:get': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    return { useRelay: _useRelay, available: !!RELAY_PUBLIC_KEY }
+  },
+
+  'relay:set': async ({ useRelay } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof useRelay !== 'boolean') throw new Error('useRelay must be boolean')
+    await _localDb.put('relay', { useRelay, setAt: Date.now() })
+    _useRelay = useRelay
+    // No reconnect: the swarm's relayThrough fn reads _useRelay per connect, so
+    // the next dial already honors this. Live connections are unaffected either
+    // way (turning it off does not tear down a relayed connection that works).
+    mark('relay:toggled', { useRelay })
+    send({ event: 'relay:changed', data: { useRelay } })
+    return { ok: true, useRelay }
   },
 
   'tripNotifications:get': async () => {
@@ -6388,9 +6417,29 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   }
   mark('init:identity-ready', { fresh: !stored })
 
-  _swarm = new Hyperswarm({ keyPair: _identity })
+  // Relay privacy toggle, read before the swarm exists so a user who opted out
+  // never relays even on the very first connect. Missing row = default on.
+  try {
+    const relayRow = await _localDb.get('relay')
+    if (relayRow?.value?.useRelay === false) _useRelay = false
+  } catch {}
+
+  // relayThrough is a FUNCTION, not a static key, so the toggle is read live
+  // per connect (no reconnect needed to apply it) and so we stay direct-FIRST:
+  // Hyperswarm passes force=true only after this peer's direct punch already
+  // aborted. See src/lib/relay.js and the proposal for why the seeder swarm
+  // deliberately does NOT get this.
+  _swarm = new Hyperswarm({
+    keyPair: _identity,
+    relayThrough: (force, s) => relayThroughFor({
+      force,
+      randomized: s?.dht?.randomized,
+      useRelay: _useRelay,
+      relayKey: RELAY_PUBLIC_KEY,
+    }),
+  })
   _swarm.on('connection', onSwarmConnection)
-  mark('init:swarm-created')
+  mark('init:swarm-created', { relay: _useRelay && !!RELAY_PUBLIC_KEY })
 
   // Persisted degraded flags (proposal 2026-06-03c). A circle whose
   // append/read timed out in a prior session persisted circleDegraded:{id}.
