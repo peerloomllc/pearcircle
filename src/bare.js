@@ -58,8 +58,8 @@ const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryS
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
-const { newTripState, stepTrip, polylineDistanceMeters, TRIP_MIN_DURATION_MS, TRIP_MIN_DISTANCE_M } = require('./lib/trip')
-const { nextEmittedMode } = require('./lib/locationMode')
+const { newTripState, stepTrip, replayTrip, settleStaleTrip, lastActivityTs, isKnownSpeed, polylineDistanceMeters, TRIP_MIN_DURATION_MS, TRIP_MIN_DISTANCE_M } = require('./lib/trip')
+const { nextEmittedMode, MODE_BOOT_GRACE_MS } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
 const { TRANSITION_RETENTION_MS, transitionIsExpired } = require('./lib/transitionRetention')
@@ -671,6 +671,7 @@ function runLocationModeDriver () {
       appForeground: _appForeground,
       recentMotion: motionIsRecent(),
       locationStarted: _locationUpdateSeen,
+      sinceBootMs: Date.now() - _bootTs,
     },
     ADAPTIVE_LOCATION_MODE_ENABLED,
   )
@@ -752,6 +753,17 @@ const handlers = {
     }
     runLocationModeDriver()
     return { moving: isMoving, recentMotion: motionIsRecent() }
+  },
+
+  // iOS told us CoreLocation paused or resumed continuous delivery by itself.
+  // Purely diagnostic here (native re-arms delivery on its own): a `pause` line
+  // landing mid-drive is what proves auto-pausing is what starves the fix
+  // stream, and its absence across a whole drive is what kills that theory.
+  // flushNow so it survives the app being suspended moments later, which is
+  // precisely what a pause tends to precede.
+  'location:pauseState': async ({ paused, mode } = {}) => {
+    traceTrip('loc-pause', { paused: paused === true, mode: mode ?? null, ph: _tripState.phase }, true)
+    return { ok: true }
   },
 
   // Default-network change on the device (wifi <-> cell, vpn on/off,
@@ -2075,10 +2087,35 @@ const handlers = {
       // line between a trip's arm and finalize is proof the worklet restarted
       // mid-drive and lost its in-memory _tripState.
       const sp = typeof speed === 'number' ? speed : null
+      // If the worklet was suspended (not killed) through the end of a drive,
+      // the cooldown-elapse fix never arrived; settle the stale trip before this
+      // fresh fix resumes it as one giant trip spanning the gap (proposal
+      // 2026-07-18, Part C). A no-op when the trip is still live or idle.
+      const staleSettle = settleStaleTrip(_tripState, stamp)
+      _tripState = staleSettle.state
+      if (staleSettle.completed) await finalizeCompletedTrip(staleSettle.completed)
       const prevState = _tripState
       const prevPhase = prevState.phase
+      // stepTrip ignores a fix with no measured speed or one that doesn't
+      // advance time. Say so in the trace when a trip is in flight, so a pull
+      // states why a drive stalled instead of leaving it to be inferred from
+      // spd/acc. Silent while idle: a parked phone emits these constantly.
+      const skip = !isKnownSpeed(sp)
+        ? 'speed-unknown'
+        : (() => {
+            const lastTs = lastActivityTs(_tripState)
+            return lastTs != null && stamp <= lastTs ? 'ts-stale' : null
+          })()
+      if (skip && prevPhase !== 'idle') {
+        traceTrip('fix-skip', { reason: skip, ph: prevPhase, acc: Number.isFinite(accuracy) ? Math.round(accuracy) : null }, true)
+      }
       const r = stepTrip(_tripState, { lat, lon, ts: stamp, speed: sp })
       _tripState = r.state
+      _tripFixesSinceCheckpoint++
+      // Only a fix the machine actually acted on advances the consumed mark. A
+      // skipped one stays claimable by a later drain, which may see it in a
+      // context (ordered replay after a hydrate) where it does mean something.
+      if (!skip) noteTripFixConsumed(stamp)
       // Per-fix breadcrumb (sampled ~10s): stream density, speed, the adaptive
       // mode, and the phase each fix lands in. The raw signal that separates the
       // idle-trap (sparse low-speed fixes, trip never arms) from a durability
@@ -2094,6 +2131,14 @@ const handlers = {
       }
       if (r.state.phase !== prevPhase) {
         traceTrip('phase', { from: prevPhase, to: r.state.phase, spd: sp == null ? null : Math.round(sp) }, true)
+      }
+      // Checkpoint the in-flight trip so a mid-drive restart resumes it instead
+      // of losing the polyline (proposal 2026-07-18, Part C). On every phase
+      // change, and periodically through a long active leg so a restart loses at
+      // most ~N points. Completion clears the checkpoint via finalizeCompletedTrip.
+      if (!r.completed && (r.state.phase !== prevPhase ||
+          (r.state.phase !== 'idle' && _tripFixesSinceCheckpoint >= TRIP_CHECKPOINT_EVERY))) {
+        persistTripCheckpoint().catch((e) => console.warn('[bare] trip checkpoint failed', e?.message))
       }
       // A drive that ended below the min duration/distance is discarded as a
       // silent cooldown->idle with no completed record; reconstruct it from the
@@ -2111,33 +2156,28 @@ const handlers = {
       // have changed. The foreground and motion escalations re-run the
       // driver from their own IPC handlers.
       runLocationModeDriver()
-      if (r.completed) {
-        traceTrip('finalize', {
-          durMs: r.completed.durationMs,
-          distM: Math.round(r.completed.distanceMeters),
-          maxSpd: Math.round((r.completed.maxSpeedMps ?? 0) * 10) / 10,
-          pts: r.completed.polyline.length,
-        }, true)
-        const tripKey = 'trips:' + ourKey + ':' + r.completed.startTs
-        const trip = {
-          pubkey: ourKey,
-          startTs: r.completed.startTs,
-          endTs: r.completed.endTs,
-          polyline: r.completed.polyline,
-          distanceMeters: r.completed.distanceMeters,
-          durationMs: r.completed.durationMs,
-          maxSpeedMps: r.completed.maxSpeedMps ?? 0,
-          v: 1,
-        }
-        await _localDb.put(tripKey, trip)
-        send({ event: 'trip:completed', data: trip })
-        replicateTripToOptedInCircles(ourKey, trip).catch((e) =>
-          console.warn('[bare] trip replicate failed', e?.message),
-        )
-      }
+      if (r.completed) await finalizeCompletedTrip(r.completed)
     } catch (e) { console.warn('[bare] trip step failed', e?.message) }
 
     return { ok: true, written, pubkey: ourKey }
+  },
+
+  // Drain the native durable fix log through the trip machine (proposal
+  // 2026-07-18, Part B/C). Native captures every background fix on disk even
+  // when JS is detached; on any later worklet wake (attach / foreground / SLC)
+  // the shell hands us the un-drained slice here. We replay it through the one
+  // trip machine, finalize completed trips, and return the cursor native should
+  // truncate at. Trip-only by design (see drainTripFixes). Idempotent: an
+  // un-acked cursor re-delivers a span that lands on the same startTs-keyed row.
+  'location:flushBuffer': async ({ fixes } = {}) => {
+    if (!_initialized) return { ok: false, reason: 'not_initialized' }
+    try {
+      const res = await drainTripFixes(fixes)
+      return { ok: true, ...res }
+    } catch (e) {
+      console.warn('[bare] flushBuffer drain failed', e?.message)
+      return { ok: false, reason: 'drain_failed' }
+    }
   },
 
   // CLCircularRegion enter/exit, delivered from the iOS native module
@@ -2478,6 +2518,180 @@ async function pruneOldTransitions () {
 // (this function runs at trip-completion time, never on cold-start
 // catch-up). The wire key is fixed-width zero-padded so lexicographic
 // scans across `trip:{pubkey}:` return chronological order.
+// --- Durable in-flight trip capture (proposal 2026-07-18, Part C) ---------
+// _tripState lives only in memory and is reset on every worklet start. On a
+// backgrounded iPhone the worklet is killed and SLC-relaunched repeatedly
+// mid-drive (measured ~94 restarts in 48h on the daughter's device), so a trip
+// that goes active almost never survives to finalize -- no trip is ever created.
+// We checkpoint the in-flight state to a local-only Hyperbee key on each
+// meaningful transition and rehydrate it on boot, and (Part B, native) capture
+// the background fix stream durably and drain it here on any later wake. Every
+// store below is device-local and never crosses the wire (T2, peer-invisible).
+const TRIP_CHECKPOINT_EVERY = 20   // also checkpoint every N appended points in a long active leg
+let _tripFixesSinceCheckpoint = 0
+// Highest fix ts the trip machine has consumed, by EITHER path (live
+// location:update or a drain of the native log). Native now records every fix,
+// including the ones the live path already handled, so this is what stops the
+// drain re-feeding the machine fixes it has already seen. Persisted as the
+// drain cursor at each checkpoint, so the pair is one consistent
+// "state as of ts" snapshot.
+let _tripConsumedThroughTs = null
+let _tripDrainCursor = null   // in-memory mirror of the persisted cursor
+
+function tripCheckpointKey () { return 'tripInFlight:' + b4a.toString(_identity.publicKey, 'hex') }
+function tripDrainCursorKey () { return 'tripDrainCursor:' + b4a.toString(_identity.publicKey, 'hex') }
+
+// Note the live path's consumption of a fix. Cheap and in-memory; it reaches
+// disk on the next checkpoint.
+function noteTripFixConsumed (ts) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return
+  if (_tripConsumedThroughTs == null || ts > _tripConsumedThroughTs) _tripConsumedThroughTs = ts
+}
+
+// Persist (or clear, when idle) the in-flight trip so a mid-drive restart can
+// resume it instead of losing the whole polyline.
+async function persistTripCheckpoint () {
+  _tripFixesSinceCheckpoint = 0
+  try {
+    if (_tripState.phase === 'idle') {
+      await _localDb.del(tripCheckpointKey())
+    } else {
+      await _localDb.put(tripCheckpointKey(), { state: _tripState, updatedAt: Date.now(), v: 1 })
+    }
+  } catch (e) { console.warn('[bare] trip checkpoint persist failed', e?.message) }
+  // AFTER the state, never before: if we die in between, a stale cursor just
+  // replays a few already-consumed fixes (idempotent, startTs-keyed), whereas a
+  // cursor ahead of the state would drop them and lose that stretch of road.
+  if (_tripConsumedThroughTs != null &&
+      (_tripDrainCursor == null || _tripConsumedThroughTs > _tripDrainCursor)) {
+    await setTripDrainCursor(_tripConsumedThroughTs)
+  }
+}
+
+// Rehydrate the in-flight trip on boot. If the drive clearly ended while the
+// worklet was suspended (no closing fix ever arrived), settle it now so it
+// finalizes or is discarded, rather than resuming days later as one giant trip
+// when the next fix lands. Called once during init after identity + circles are
+// ready so a settled trip can persist and replicate.
+async function hydrateTripCheckpoint () {
+  try {
+    // Seed the in-memory cursor mirror before anything can advance it, so the
+    // first checkpoint of this session compares against what is actually on
+    // disk rather than re-writing a cursor that is already current.
+    _tripDrainCursor = await getTripDrainCursor()
+    _tripConsumedThroughTs = _tripDrainCursor
+    const rec = await _localDb.get(tripCheckpointKey())
+    const saved = rec?.value?.state
+    if (!saved || typeof saved.phase !== 'string' || saved.phase === 'idle') return
+    const { state, completed } = settleStaleTrip(saved, Date.now())
+    _tripState = state
+    traceTrip('hydrate', { phase: saved.phase, to: state.phase, finalized: !!completed }, true)
+    if (completed) await finalizeCompletedTrip(completed)
+    else if (state.phase === 'idle') await _localDb.del(tripCheckpointKey()).catch(() => {})
+  } catch (e) { console.warn('[bare] trip checkpoint hydrate failed', e?.message) }
+}
+
+async function getTripDrainCursor () {
+  try { const r = await _localDb.get(tripDrainCursorKey()); return typeof r?.value?.ts === 'number' ? r.value.ts : null } catch { return null }
+}
+async function setTripDrainCursor (ts) {
+  _tripDrainCursor = ts
+  if (_tripConsumedThroughTs == null || ts > _tripConsumedThroughTs) _tripConsumedThroughTs = ts
+  try { await _localDb.put(tripDrainCursorKey(), { ts, updatedAt: Date.now() }) } catch (e) { console.warn('[bare] trip drain cursor persist failed', e?.message) }
+}
+
+// Persist + broadcast + replicate a finalized trip. Shared by the live
+// location:update path and the drain path so both produce an identical trip.
+// Keyed on startTs, so re-deriving an already-published span (an un-acked drain
+// cursor) lands on the same row -- idempotent, no duplicate. Clears the in-flight
+// checkpoint since state has returned to idle.
+async function finalizeCompletedTrip (completed) {
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  traceTrip('finalize', {
+    durMs: completed.durationMs,
+    distM: Math.round(completed.distanceMeters),
+    maxSpd: Math.round((completed.maxSpeedMps ?? 0) * 10) / 10,
+    pts: completed.polyline.length,
+  }, true)
+  const tripKey = 'trips:' + ourKey + ':' + completed.startTs
+  const trip = {
+    pubkey: ourKey,
+    startTs: completed.startTs,
+    endTs: completed.endTs,
+    polyline: completed.polyline,
+    distanceMeters: completed.distanceMeters,
+    durationMs: completed.durationMs,
+    maxSpeedMps: completed.maxSpeedMps ?? 0,
+    v: 1,
+  }
+  await _localDb.put(tripKey, trip)
+  send({ event: 'trip:completed', data: trip })
+  replicateTripToOptedInCircles(ourKey, trip).catch((e) =>
+    console.warn('[bare] trip replicate failed', e?.message),
+  )
+  await _localDb.del(tripCheckpointKey()).catch(() => {})
+}
+
+// Drain a batch of durably-captured fixes (Part B native log) through the one
+// trip machine, resuming from the persisted checkpoint. Ordered + cursor-gated
+// so a re-delivered span can't double-count. Returns the new cursor for native
+// to truncate at (via the shell's ack). Trip-only: buffered fixes are stale for
+// lastSeen (LWW current position) and would fire late geofence notifications, so
+// this path deliberately does NOT touch those.
+async function drainTripFixes (fixes) {
+  const persisted = await getTripDrainCursor()
+  // Native captures every fix now, including the ones this session already
+  // handled live, so gate on the higher of the persisted cursor and what the
+  // live path has consumed since the last checkpoint. Without the in-memory
+  // half, a foreground drain would re-feed the machine the fixes it just
+  // stepped and double-count the current leg.
+  const cursor = _tripConsumedThroughTs != null && (persisted == null || _tripConsumedThroughTs > persisted)
+    ? _tripConsumedThroughTs
+    : persisted
+  const fresh = (Array.isArray(fixes) ? fixes : [])
+    .filter((f) => f && typeof f.lat === 'number' && typeof f.lon === 'number' && typeof f.ts === 'number' &&
+      (cursor == null || f.ts > cursor))
+    .sort((a, b) => a.ts - b.ts)
+  if (fresh.length === 0) return { drained: 0, trips: 0, cursor }
+  const { state, completed } = replayTrip(_tripState, fresh)
+  _tripState = state
+  for (const c of completed) await finalizeCompletedTrip(c)
+  // The buffered span may END the drive without a trailing post-cooldown fix;
+  // settle so it finalizes on this wake instead of waiting for a coincidence.
+  const settled = settleStaleTrip(_tripState, Date.now())
+  _tripState = settled.state
+  if (settled.completed) await finalizeCompletedTrip(settled.completed)
+  await persistTripCheckpoint()
+  const newCursor = fresh[fresh.length - 1].ts
+  await setTripDrainCursor(newCursor)
+  const trips = completed.length + (settled.completed ? 1 : 0)
+  // Report what was in the batch, not just how many. A drain that reports
+  // `trips: 0` is ambiguous on its own: it reads the same whether the buffered
+  // fixes were a stationary phone, a drive iOS only ever described in coarse
+  // SLC fixes, or a real drive the machine mishandled. maxSpd and the
+  // known-speed count separate those, and spanS says whether the batch even
+  // covers a meaningful stretch of time. Cost is one pass over an array we have
+  // already sorted.
+  let maxSpd = 0
+  let known = 0
+  let coarse = 0
+  for (const f of fresh) {
+    if (isKnownSpeed(f.speed)) { known++; if (f.speed > maxSpd) maxSpd = f.speed }
+    if (typeof f.accuracy === 'number' && f.accuracy > 50) coarse++
+  }
+  traceTrip('drain', {
+    fixes: fresh.length,
+    trips,
+    known,
+    coarse,
+    maxSpd: Math.round(maxSpd * 10) / 10,
+    spanS: Math.round((fresh[fresh.length - 1].ts - fresh[0].ts) / 1000),
+    cursor: newCursor,
+  }, true)
+  reshipTrace()
+  return { drained: fresh.length, trips, cursor: newCursor }
+}
+
 async function replicateTripToOptedInCircles (ourKey, trip) {
   const signedValue = signValue({
     pubkey: ourKey,
@@ -6383,9 +6597,22 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // can apply, so the relaxed freshness window doesn't re-notify history.
   await loadTripNotifyState()
 
+  // Resume any in-flight trip left by a prior worklet lifetime, or finalize one
+  // whose drive ended while we were suspended (proposal 2026-07-18, Part C).
+  // After circles are mounted so a settled trip can replicate.
+  await hydrateTripCheckpoint()
+
   _activeHandlers = handlers
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
+
+  // The boot grace suppresses the idle demotion, it does not schedule the
+  // step-down that has to follow it. The driver only runs on its event inputs,
+  // and if this wake turns out to be nothing (no motion, no trip, app never
+  // opened) none of them fire again, which would leave the radio in tracking
+  // indefinitely. Re-run it once the grace lapses so a false alarm settles back
+  // to SLC-only under its own rules.
+  setTimeout(() => runLocationModeDriver(), MODE_BOOT_GRACE_MS)
 
   // Trip retention sweep. Run once on boot to claw back space from
   // anything that aged past the cutoff while the worklet was down,

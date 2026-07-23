@@ -20,4 +20,9 @@ RCT_EXTERN_METHOD(setMode:(NSString *)mode
                   reject:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(requestSingleFix:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(flushFixBuffer:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(ackFixBuffer:(nonnull NSNumber *)cursor
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
 @end

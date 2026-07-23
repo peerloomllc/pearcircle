@@ -26,11 +26,15 @@ Android (local):
 - `adb install -r android/app/build/outputs/apk/debug/app-debug.apk`
 
 iOS (Mac mini, dev install):
-- `./scripts/ios-dev-install.sh` — rsync, pod install, archive (Release, generic/platform=iOS), export development IPA, install + launch on the paired iPhone via `xcrun devicectl`. Uses automatic signing under team G79ALD29NA against Xcode's cached wildcard team profile; `PearCircle.entitlements` is empty by design so no Apple-portal trip is needed.
+- `./scripts/ios-dev-install.sh` - rsync, pod install, archive (Release, generic/platform=iOS), export development IPA, install + launch on the paired iPhone via `xcrun devicectl`. Uses automatic signing under team G79ALD29NA against Xcode's cached wildcard team profile; `PearCircle.entitlements` is empty by design so no Apple-portal trip is needed.
 - `SKIP_SYNC=1` / `SKIP_INSTALL=1` env vars short-circuit the corresponding stages.
-- Cold-start trace on a real device: the worklet ships its buffered `mark()` lines to the shell as a `coldstart:trace` IPC event at `init:done`; the shell writes them to `FileSystem.documentDirectory/coldstart.log`. Pull with `xcrun devicectl device copy from --device <udid> --domain-type appDataContainer --domain-identifier com.pearcircle --source Documents/coldstart.log --destination /tmp/coldstart.log`. Necessary because `log collect --device` requires root and `idevicesyslog` only sees USB-paired devices (the iPhone is paired via the CoreDevice network tunnel).
+- Cold-start trace on a real device: the worklet ships its buffered `mark()` lines to the shell as a `coldstart:trace` IPC event at `init:done`; the shell writes them to `FileSystem.documentDirectory/coldstart.log`. The trip-lifecycle trace goes to `Documents/trips.log` (append-mode, survives cold starts). Device logging is needed at all because `log collect --device` requires root and `idevicesyslog` only sees USB-paired devices.
+- Pulling those logs off the iPhone, over USB from the Linux box: `printf 'get Documents/trips.log trips.log\nquit\n' | afcclient --container com.pearcircle`. `--container` works because the build is dev-signed; `--documents` does NOT (it needs `UIFileSharingEnabled`, which the app deliberately does not set). The old `xcrun devicectl device copy from --device <udid> --domain-type appDataContainer ...` recipe on the Mac mini stopped working on 2026-07-21 - devicectl reports the iPhone `unavailable` (CoreDeviceError 1011) even though the network tunnel resolves it.
 
-Never uninstall on a paired device — wipes Hyperbee identity and forces a fresh invite.
+Simulator (Mac mini, no drive required):
+- `./scripts/ios-sim-trip-smoke.sh` - builds Release for `-sdk iphonesimulator`, plays a simulated drive through `simctl location`, terminates and relaunches the app mid-route to stand in for the iOS jetsam that kills a real trip, then asserts the trace shows `hydrate` + `drain` + `finalize`. `SKIP_BUILD` / `SKIP_SYNC` / `SKIP_XCBUILD` short-circuit stages. Does not reproduce iOS background suspension (the Simulator keeps apps running), so a real drive stays the final word.
+
+Never uninstall on a paired device - wipes Hyperbee identity and forces a fresh invite.
 
 ## Verify gate
 
@@ -113,7 +117,7 @@ Always create a branch before starting work. Never commit directly to master.
 
 ## Patching Rules
 
-Same conventions as PearCal/PearGuard — see `/home/tim/peerloomllc/p2p-wiki/wiki/concepts/PatchingRules.md`.
+Same conventions as PearCal/PearGuard - see `/home/tim/peerloomllc/p2p-wiki/wiki/concepts/PatchingRules.md`.
 
 ## TypeScript / Path Aliases
 

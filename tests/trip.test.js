@@ -160,7 +160,7 @@ describe('stepTrip state machine', () => {
     expect(r.completed.maxSpeedMps).toBe(25)
   })
 
-  test('preserves max speed when active step receives garbage speed', () => {
+  test('an unknown-speed fix during an active trip is ignored, not read as a stop', () => {
     // Get into 'active' with maxSpeedMps=15.
     let s = newTripState()
     let ts = 0
@@ -169,14 +169,53 @@ describe('stepTrip state machine', () => {
     s = stepTrip(s, pointAt(1, ts, 8)).state  // arming -> active, max stays 15
     expect(s.phase).toBe('active')
     expect(s.maxSpeedMps).toBe(15)
-    // CLLocation -1 unknown-speed sentinel during an active trip: the
-    // state machine routes it to cooldown (moving check fails) but max
-    // is preserved -- the guard inside bumpMaxSpeed never lets it
-    // overwrite a real reading even on the entry-to-cooldown step.
+    // CLLocation's -1 sentinel (and the null native now sends in its place)
+    // means "speed unknown", NOT "stopped". Routing it to cooldown is what let
+    // the coarse cached fix on an SLC relaunch end a live drive.
+    const before = s
     ts += 1000
-    s = stepTrip(s, pointAt(2, ts, -1)).state
-    expect(s.phase).toBe('cooldown')
+    for (const unknown of [-1, null, undefined, NaN]) {
+      ts += 1000
+      s = stepTrip(s, pointAt(2, ts, unknown)).state
+      expect(s.phase).toBe('active')
+      expect(s).toBe(before)   // untouched, not merely equivalent
+    }
     expect(s.maxSpeedMps).toBe(15)
+  })
+
+  test('an unknown-speed fix cannot reset an arming trip', () => {
+    // The exact device sequence from the 2026-07-21 iPhone trace: the trip
+    // rehydrates as 'arming' after a mid-drive kill, and the first fix iOS
+    // delivers on relaunch is a coarse cached one with no speed.
+    let s = newTripState()
+    let ts = 0
+    s = stepTrip(s, pointAt(0, ts, 12)).state
+    expect(s.phase).toBe('arming')
+    ts += 1000
+    s = stepTrip(s, pointAt(1, ts, null)).state
+    expect(s.phase).toBe('arming')
+    // A REAL measured stop still ends it.
+    ts += 1000
+    s = stepTrip(s, pointAt(2, ts, 0)).state
+    expect(s.phase).toBe('idle')
+  })
+
+  test('a fix that does not advance time is ignored', () => {
+    // A cached fix carries its original CLLocation timestamp, so it can arrive
+    // with a ts behind the polyline. Every arming/cooldown decision is a ts
+    // subtraction, so letting the clock run backwards corrupts the windows.
+    let s = newTripState()
+    s = stepTrip(s, pointAt(0, 10_000, 12)).state
+    expect(s.phase).toBe('arming')
+    const armed = s
+    s = stepTrip(s, pointAt(1, 9_000, 12)).state   // older than the last point
+    expect(s).toBe(armed)
+    s = stepTrip(s, pointAt(1, 10_000, 12)).state  // same ts
+    expect(s).toBe(armed)
+    // Promotion still works off the real clock once time advances again.
+    s = stepTrip(s, pointAt(1, 10_000 + TRIP_ARMING_DURATION_MS, 12)).state
+    expect(s.phase).toBe('active')
+    expect(s.startTs).toBe(10_000)
   })
 })
 

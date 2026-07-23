@@ -26,6 +26,11 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   private static let REGION_ENTER_EVENT = "PearCircleLocation:region:enter"
   private static let REGION_EXIT_EVENT = "PearCircleLocation:region:exit"
   private static let MOTION_EVENT = "PearCircleLocation:motion:changed"
+  // CoreLocation paused or resumed continuous delivery on its own. Surfaced to
+  // JS purely so it lands in trips.log: a pause is the moment the app loses its
+  // reason to keep running in the background, and until this event existed
+  // there was no signal anywhere that it had happened (2026-07-21).
+  private static let UPDATES_PAUSED_EVENT = "PearCircleLocation:updates:paused"
   private static let DEBOUNCE_SECONDS: TimeInterval = 2.0
   // CoreMotion smoothing (proposal 2026-05-21 Q4, reusing the 2026-05-03
   // isMoving decision): a raw classification must repeat this many
@@ -75,6 +80,42 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // self-region is armed yet. Keeps re-centering off the per-fix hot
   // path while the user stays put inside the circle.
   private var pendingSelfRecenter = false
+
+  // Durable background fix log (proposal 2026-07-18-background-trip-capture,
+  // Part B). A trip only materializes if the worklet processes a continuous fix
+  // stream through its whole drive, but on a backgrounded iPhone the worklet is
+  // killed and SLC-relaunched repeatedly mid-drive, so the in-memory trip is
+  // lost before it can finalize (measured: 57 trips reached active, 0 created
+  // over 48h). The single-slot pendingLocation only holds the newest fix, so
+  // intermittent background wakes can't be replayed into a trip after the fact.
+  // Here we durably append EVERY fix that arrives while JS is detached to a
+  // flat append-only file; on a later worklet wake the shell drains the slice
+  // through the one JS trip machine (stepTrip), which is ts-driven so a replay
+  // reconstructs the identical trip. Trip-only: fixes delivered while JS IS
+  // attached go through the live location:update path and are not logged here,
+  // so the drain never double-processes a fix the trip machine already saw.
+  private lazy var fixLogURL: URL = {
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    // In Documents so it is pullable with `xcrun devicectl ... copy from ...
+    // Documents/fixbuffer.log`, same as coldstart.log / trips.log.
+    return docs.appendingPathComponent("fixbuffer.log")
+  }()
+  private let fixLogQueue = DispatchQueue(label: "com.pearcircle.fixlog")
+  private var fixLogAppendsSinceCompact = 0
+  // Age backstop: a device that never drains cannot grow the file past trip
+  // retention (14d), matching the JS side's pruneOldTrips cutoff.
+  private static let FIX_LOG_MAX_AGE_MS: Double = 14 * 24 * 60 * 60 * 1000
+  // Hard line cap backstop, dropping oldest, so a pathological never-draining
+  // device is bounded even within the age window.
+  private static let FIX_LOG_MAX_LINES = 20000
+  // Floor on the encoded size of one fix line, used by fixLogMayExceedCapLocked
+  // to turn the line cap into a stat-only byte test. `{"ts":,"lat":,"lon":,
+  // "speed":,"accuracy":}` plus the newline is 48 bytes of punctuation before a
+  // single digit of data, so 64 is a safe under-estimate.
+  private static let FIX_LOG_MIN_LINE_BYTES = 64
+  // Compact (age + cap) after this many appends so append stays O(1) and the
+  // file is swept without reading it on every fix.
+  private static let FIX_LOG_COMPACT_EVERY = 500
 
   // CoreMotion activity monitoring (proposal 2026-05-21). Feeds the
   // worklet a trip-detector-independent "device started moving" signal
@@ -148,6 +189,7 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       PearCircleLocationModule.REGION_ENTER_EVENT,
       PearCircleLocationModule.REGION_EXIT_EVENT,
       PearCircleLocationModule.MOTION_EVENT,
+      PearCircleLocationModule.UPDATES_PAUSED_EVENT,
     ]
   }
 
@@ -438,6 +480,39 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     }
   }
 
+  // CoreLocation decided to stop delivering continuous updates. Until this was
+  // added (2026-07-21) the delegate did not exist at all, so a pause left no
+  // trace anywhere and nothing ever restarted delivery: the app simply went
+  // quiet and waited for the next SLC wake. Two jobs here, deliberately kept
+  // separate so the drive tells us which one mattered.
+  //
+  // 1. Say so. The event reaches trips.log via the shell, which is the only way
+  //    to confirm or kill the diagnosis that pausing is what starves the fix
+  //    stream. If this line never appears on a drive, the theory is wrong.
+  // 2. Re-arm. In tracking mode a pause is never what we want, so ask for
+  //    delivery again. Best-effort by nature: if iOS suspends us in the same
+  //    breath, this may not get to run, which is exactly why (1) is not
+  //    conditional on it.
+  func locationManagerDidPauseLocationUpdates(_ manager: CLLocationManager) {
+    NSLog("PearCircleLocation: CoreLocation paused updates (mode=%@)", currentMode)
+    if hasListeners {
+      sendEvent(withName: PearCircleLocationModule.UPDATES_PAUSED_EVENT,
+                body: ["paused": true, "mode": currentMode])
+    }
+    if currentMode == "tracking" {
+      applyModeTuning(manager)
+      manager.startUpdatingLocation()
+    }
+  }
+
+  func locationManagerDidResumeLocationUpdates(_ manager: CLLocationManager) {
+    NSLog("PearCircleLocation: CoreLocation resumed updates (mode=%@)", currentMode)
+    if hasListeners {
+      sendEvent(withName: PearCircleLocationModule.UPDATES_PAUSED_EVENT,
+                body: ["paused": false, "mode": currentMode])
+    }
+  }
+
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
     NSLog("PearCircleLocation: didFailWithError %@", error.localizedDescription)
     // If a one-shot was in flight and CoreLocation couldn't produce a fix,
@@ -534,16 +609,8 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // affects a device that is actually moving; the stationary-staleness
     // case is handled by requestSingleFix on foreground.
     m.distanceFilter = 5
-    // Let iOS pause continuous delivery when the device is stationary;
-    // it resumes automatically on detected motion. SLC stays subscribed
-    // underneath (proposal 2026-05-16 adaptive modes), so a paused
-    // device is still woken on ~500m cell-tower moves, and the
-    // swarm-connected dot -- not a periodic location republish -- now
-    // carries the "this peer is live" signal (2026-05-17
-    // swarm-live-signal change). Was previously false; that combined
-    // with Best accuracy kept the GPS chip hot 24/7 and was the
-    // dominant battery drain reported by users.
-    m.pausesLocationUpdatesAutomatically = true
+    // Pausing is now per-mode, not fixed on. See applyModeTuning.
+    applyModeTuning(m)
     // allowsBackgroundLocationUpdates needs UIBackgroundModes "location"
     // in Info.plist (set) and Always authorization at runtime; iOS
     // silently ignores the flag otherwise.
@@ -562,6 +629,40 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     m.showsBackgroundLocationIndicator = false
     manager = m
     return m
+  }
+
+  // Auto-pausing and activityType, set per adaptive mode rather than once at
+  // manager creation.
+  //
+  // Why this is per-mode now (measured 2026-07-21): with pausing on in BOTH
+  // modes, a real drive gave the app a median lifetime of 20-50 SECONDS per
+  // wake, across every build tested, and ~18 native fixes in 4.5 hours. The
+  // UIBackgroundModes "location" entitlement only keeps a process alive while
+  // updates are actually being delivered, so the moment CoreLocation pauses us
+  // we lose the reason to keep running: iOS suspends then terminates the app,
+  // and only SLC or a visit can bring it back 15-30 minutes later. A trip needs
+  // 30s of arming plus sustained motion, so it never had a chance. That is the
+  // real reason no trip has ever been created on iOS, not the in-memory trip
+  // state the 2026-07-18 proposal set out to make durable.
+  //
+  // The battery history matters here and does NOT argue against this. Pausing
+  // was turned on because it "combined with Best accuracy kept the GPS chip hot
+  // 24/7". Accuracy is now NearestTenMeters, so the expensive half of that pair
+  // is already gone, and this only disables pausing in `tracking`, which the
+  // adaptive driver enters when the device is genuinely moving. `idle` keeps the
+  // original battery posture exactly.
+  //
+  // activityType was never set at all, so it defaulted to .other, the value
+  // CoreLocation is most willing to pause on. .automotiveNavigation tells it
+  // this is a drive and makes it far more reluctant to stop delivery.
+  private func applyModeTuning(_ mgr: CLLocationManager) {
+    if currentMode == "tracking" {
+      mgr.pausesLocationUpdatesAutomatically = false
+      mgr.activityType = .automotiveNavigation
+    } else {
+      mgr.pausesLocationUpdatesAutomatically = true
+      mgr.activityType = .other
+    }
   }
 
   private func startUpdatesNow(_ mgr: CLLocationManager) {
@@ -705,6 +806,11 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
         resolve(true)
         return
       }
+      // Re-tune BEFORE starting: pausing and activityType are read by
+      // CoreLocation when delivery begins, so setting them after
+      // startUpdatingLocation would leave the first stretch of a drive on the
+      // idle-mode posture, which is the one that gets paused.
+      self.applyModeTuning(mgr)
       if m == "tracking" {
         mgr.startUpdatingLocation()
       } else {
@@ -800,6 +906,121 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     }
   }
 
+  // MARK: - Durable fix log (Part B)
+
+  // Append one fix as a JSON line. Runs on fixLogQueue so it can't race a
+  // concurrent flush/ack. Interpolated Doubles use "." regardless of locale.
+  // `speed` is nil when CLLocation reported -1 (unknown); it is written as JSON
+  // null so a replayed fix carries the same no-information signal the live path
+  // sends, rather than a fabricated 0 that would end the trip on replay.
+  private func appendFixToLog(lat: Double, lon: Double, ts: Double, speed: Double?, accuracy: Double) {
+    let speedJSON = speed.map { "\($0)" } ?? "null"
+    let line = "{\"ts\":\(ts),\"lat\":\(lat),\"lon\":\(lon),\"speed\":\(speedJSON),\"accuracy\":\(accuracy)}\n"
+    guard let data = line.data(using: .utf8) else { return }
+    fixLogQueue.async {
+      if let handle = try? FileHandle(forWritingTo: self.fixLogURL) {
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write(data)
+      } else {
+        // File doesn't exist yet.
+        try? data.write(to: self.fixLogURL, options: .atomic)
+      }
+      self.fixLogAppendsSinceCompact += 1
+      // Only rewrite the file when the line cap is actually in reach. The
+      // periodic compaction reads the whole log into a String and writes it
+      // back atomically, so doing it unconditionally every N appends is by far
+      // the most expensive thing in this path: with auto-pausing now off, a
+      // drive delivers a fix roughly every 5m (~5/s at speed), which made this
+      // a multi-megabyte rewrite every ~100 seconds for no benefit on a log
+      // that is already truncated at every drain. The age sweep still runs on
+      // flush and ack, where it costs one rewrite per wake instead of dozens.
+      if self.fixLogAppendsSinceCompact >= PearCircleLocationModule.FIX_LOG_COMPACT_EVERY {
+        self.fixLogAppendsSinceCompact = 0
+        if self.fixLogMayExceedCapLocked() {
+          self.compactFixLogLocked(dropThroughTs: nil)
+        }
+      }
+    }
+  }
+
+  // Cheap stat-only test for "the line cap might be in reach", used to decide
+  // whether the expensive full-file compaction is worth running. Every line
+  // carries five JSON keys plus their punctuation, so it cannot be shorter than
+  // FIX_LOG_MIN_LINE_BYTES; a file under cap*min bytes therefore CANNOT hold
+  // more than FIX_LOG_MAX_LINES entries. That makes this conservative in the
+  // safe direction: it can fire early and waste one rewrite, never late and let
+  // the log grow unbounded. MUST run on fixLogQueue.
+  private func fixLogMayExceedCapLocked() -> Bool {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: fixLogURL.path),
+          let size = attrs[.size] as? NSNumber else { return false }
+    let budget = PearCircleLocationModule.FIX_LOG_MAX_LINES * PearCircleLocationModule.FIX_LOG_MIN_LINE_BYTES
+    return size.intValue > budget
+  }
+
+  private func parseFixLine(_ line: Substring) -> [String: Any]? {
+    guard let data = line.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return obj
+  }
+
+  // Rewrite the log dropping entries older than the age backstop and, when
+  // given, entries at or below an acked drain cursor; then enforce the hard
+  // line cap by dropping oldest. MUST run on fixLogQueue.
+  private func compactFixLogLocked(dropThroughTs: Double?) {
+    guard let content = try? String(contentsOf: fixLogURL, encoding: .utf8) else { return }
+    let nowMs = Date().timeIntervalSince1970 * 1000
+    let minTs = nowMs - PearCircleLocationModule.FIX_LOG_MAX_AGE_MS
+    var kept: [Substring] = []
+    var droppedAge = 0
+    for line in content.split(separator: "\n") {
+      guard let obj = parseFixLine(line), let ts = obj["ts"] as? Double else { continue }
+      if ts < minTs { droppedAge += 1; continue }
+      if let cut = dropThroughTs, ts <= cut { continue }
+      kept.append(line)
+    }
+    if kept.count > PearCircleLocationModule.FIX_LOG_MAX_LINES {
+      let over = kept.count - PearCircleLocationModule.FIX_LOG_MAX_LINES
+      kept.removeFirst(over)
+      NSLog("[PearCircleLocation] fixlog line cap dropped \(over) oldest entries")
+    }
+    if droppedAge > 0 {
+      NSLog("[PearCircleLocation] fixlog age backstop dropped \(droppedAge) entries older than 14d")
+    }
+    let out = kept.isEmpty ? "" : kept.joined(separator: "\n") + "\n"
+    try? out.data(using: .utf8)?.write(to: fixLogURL, options: .atomic)
+  }
+
+  // JS drain entry point: age-compact, then hand back the un-drained slice
+  // ordered by ts. Does NOT truncate at the cursor -- the worklet acks that
+  // separately via ackFixBuffer once it has durably drained, so a worklet that
+  // dies mid-drain re-derives the same (idempotent) trip on the next wake.
+  @objc func flushFixBuffer(_ resolve: @escaping RCTPromiseResolveBlock,
+                            reject: @escaping RCTPromiseRejectBlock) {
+    fixLogQueue.async {
+      self.compactFixLogLocked(dropThroughTs: nil)
+      var fixes: [[String: Any]] = []
+      if let content = try? String(contentsOf: self.fixLogURL, encoding: .utf8) {
+        for line in content.split(separator: "\n") {
+          if let obj = self.parseFixLine(line) { fixes.append(obj) }
+        }
+      }
+      fixes.sort { (($0["ts"] as? Double) ?? 0) < (($1["ts"] as? Double) ?? 0) }
+      resolve(fixes)
+    }
+  }
+
+  // JS ack: the worklet drained through this ts, so drop everything at or below
+  // it (and anything now aged out).
+  @objc func ackFixBuffer(_ cursor: NSNumber,
+                          resolve: @escaping RCTPromiseResolveBlock,
+                          reject: @escaping RCTPromiseRejectBlock) {
+    fixLogQueue.async {
+      self.compactFixLogLocked(dropThroughTs: cursor.doubleValue)
+      resolve(true)
+    }
+  }
+
   private func emitLocation(_ loc: CLLocation) {
     let level = UIDevice.current.batteryLevel
     let battery: Any = level >= 0 ? Int(round(level * 100)) : NSNull()
@@ -808,16 +1029,32 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // shows the bolt, matching Android's BATTERY_STATUS_FULL handling.
     let isCharging = state == .charging || state == .full
     let accuracy = loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : 0
-    let speed = loc.speed >= 0 ? loc.speed : 0
+    // CLLocation reports -1 for "speed unknown", which is exactly what the
+    // cached/coarse fix delivered on an SLC relaunch carries. Coercing that to
+    // 0 told the trip machine "the user has stopped" and reset a rehydrated
+    // arming trip on the first fix after every kill (device trace 2026-07-21).
+    // Ship unknown as null instead; motionState() and lastSeen already treat a
+    // null speed as no-information, and stepTrip now leaves the phase alone.
+    let speed = loc.speed >= 0 ? loc.speed : nil
+    let ts = loc.timestamp.timeIntervalSince1970 * 1000
     let payload: [String: Any] = [
       "lat": loc.coordinate.latitude,
       "lon": loc.coordinate.longitude,
       "accuracy": accuracy,
-      "ts": loc.timestamp.timeIntervalSince1970 * 1000,
-      "speed": speed,
+      "ts": ts,
+      "speed": speed as Any? ?? NSNull(),
       "battery": battery,
       "isCharging": isCharging,
     ]
+    // Durably record EVERY fix, attached or not (Part B). The original gate on
+    // `!hasListeners` never fired in practice: the CLLocationManager is only
+    // created when JS calls startUpdates, so on an SLC relaunch JS is always
+    // attached before the first fix arrives and fixbuffer.log was never even
+    // created (device trace 2026-07-21). The worklet de-duplicates the overlap
+    // with the live path via the drain cursor / lastLiveFixTs, so capturing
+    // unconditionally here is the only way a drive survives a mid-drive kill.
+    appendFixToLog(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude,
+                   ts: ts, speed: speed, accuracy: accuracy)
     guard hasListeners else {
       // Cold-start wake before JS attached; hold the newest fix for the
       // startObserving flush rather than dropping it.

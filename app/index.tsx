@@ -496,6 +496,14 @@ function ensureLocationListener() {
   emitter.addListener('PearCircleLocation:motion:changed', (data: any) => {
     sendToWorklet({ method: 'motion:changed', args: data })
   })
+  // CoreLocation pausing or resuming continuous delivery on its own (iOS only,
+  // 2026-07-21). Diagnostic: a pause is the moment the app loses its reason to
+  // stay alive in the background, so seeing one land mid-drive is what confirms
+  // that pausing is what starves the fix stream. Forwarded purely so the worklet
+  // can put it in trips.log; native already re-arms delivery itself.
+  emitter.addListener('PearCircleLocation:updates:paused', (data: any) => {
+    sendToWorklet({ method: 'location:pauseState', args: data })
+  })
   _locationListenerSet = true
 }
 
@@ -507,6 +515,30 @@ function onEvent(event: string, fn: (data: any) => void) {
 
 function sendToWorklet(msg: object) {
   _worklet?.IPC.write(b4a.from(JSON.stringify(msg) + '\n'))
+}
+
+// Drain the native durable fix log through the worklet's trip machine
+// (proposal 2026-07-18-background-trip-capture, Part B/C). iOS-only: native
+// captures every fix that arrived while JS was detached; here we hand the
+// worklet the un-drained slice, and once it confirms the drain cursor we tell
+// native to truncate at it. If this is interrupted (worklet dies before acking)
+// the same span re-drains next wake and re-derives the same trip idempotently,
+// so the ack is best-effort, not a two-phase commit. Runs on every worklet
+// boot (each background SLC relaunch is a publish opportunity) and on
+// foreground.
+async function drainNativeFixBuffer() {
+  if (Platform.OS !== 'ios' || !PearCircleLocation?.flushFixBuffer || !_worklet) return
+  try {
+    const fixes = await PearCircleLocation.flushFixBuffer()
+    if (!Array.isArray(fixes) || fixes.length === 0) return
+    const res = await call('location:flushBuffer', { fixes })
+    const cursor = res?.cursor
+    if (typeof cursor === 'number' && PearCircleLocation.ackFixBuffer) {
+      await PearCircleLocation.ackFixBuffer(cursor)
+    }
+  } catch (e: any) {
+    console.warn('fix buffer drain failed', e?.message ?? String(e))
+  }
 }
 
 function call(method: string, args: any = {}): Promise<any> {
@@ -581,6 +613,10 @@ async function startWorklet() {
     _pendingRegionEvents = []
     for (const msg of drain) sendToWorklet(msg)
   }
+  // Drain any fixes native durably captured while this (or a prior, killed)
+  // worklet was detached, so a background drive publishes its trip on this wake
+  // without the app ever being opened (proposal 2026-07-18, Part B/C).
+  drainNativeFixBuffer().catch(() => {})
 }
 
 // The one-time FGS / location-permission bring-up, fired off the worklet's
@@ -860,6 +896,10 @@ export default function Index() {
           emitEvent('permission:status', { status })
         }).catch(() => {})
       }
+      // Foreground: drain any fixes native captured while we were backgrounded
+      // so reopening the app immediately publishes a just-finished drive's trip
+      // (proposal 2026-07-18, Part B/C).
+      if (s === 'active') drainNativeFixBuffer().catch(() => {})
       // Android-only: re-check whether the OS network-location provider is on
       // (GrapheneOS ships it off, freezing a stationary phone's position).
       // Refreshing on foreground means the banner auto-dismisses after the

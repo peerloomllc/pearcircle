@@ -1,4 +1,4 @@
-const { phaseToMode, desiredMode, nextEmittedMode } = require('../src/lib/locationMode')
+const { phaseToMode, desiredMode, nextEmittedMode, MODE_BOOT_GRACE_MS } = require('../src/lib/locationMode')
 
 describe('phaseToMode', () => {
   test('idle phase maps to idle mode', () => {
@@ -111,3 +111,51 @@ describe('nextEmittedMode cold-start idle gate', () => {
     expect(nextEmittedMode(null, preLocation, false)).toBe('tracking')
   })
 })
+
+// The wake-up deadlock (real drive, 2026-07-22). Every escalation input lives in
+// memory and iOS hands each background wake a brand-new process, so a fresh
+// worklet always computes "idle" and calls stopUpdatingLocation within a second
+// of booting -- releasing the very assertion keeping it alive. Staying awake
+// required a detected trip; detecting a trip required staying awake.
+describe('nextEmittedMode boot grace', () => {
+  const freshBoot = {
+    phase: 'idle',
+    appForeground: false,
+    recentMotion: false,
+    locationStarted: true,
+    sinceBootMs: 500,
+  }
+
+  test('suppresses the idle demotion in the first second of a wake', () => {
+    expect(nextEmittedMode(null, freshBoot, true)).toBeNull()
+  })
+
+  test('suppresses an idle step-down from tracking during the grace', () => {
+    expect(nextEmittedMode('tracking', freshBoot, true)).toBeNull()
+  })
+
+  test('suppresses right up to the grace boundary and emits after it', () => {
+    expect(nextEmittedMode(null, { ...freshBoot, sinceBootMs: MODE_BOOT_GRACE_MS - 1 }, true)).toBeNull()
+    expect(nextEmittedMode(null, { ...freshBoot, sinceBootMs: MODE_BOOT_GRACE_MS }, true)).toBe('idle')
+  })
+
+  test('escalations to tracking are never held back by the grace', () => {
+    expect(nextEmittedMode(null, { ...freshBoot, recentMotion: true }, true)).toBe('tracking')
+    expect(nextEmittedMode(null, { ...freshBoot, appForeground: true }, true)).toBe('tracking')
+    expect(nextEmittedMode(null, { ...freshBoot, phase: 'active' }, true)).toBe('tracking')
+  })
+
+  test('a hydrated in-flight trip keeps tracking through and past the grace', () => {
+    // The trip checkpoint rehydrates before the first location:update, so a
+    // wake mid-drive must not be demoted at any point.
+    const midDrive = { ...freshBoot, phase: 'active', sinceBootMs: MODE_BOOT_GRACE_MS * 10 }
+    expect(nextEmittedMode('tracking', midDrive, true)).toBeNull()
+    expect(nextEmittedMode('idle', midDrive, true)).toBe('tracking')
+  })
+
+  test('callers that do not pass sinceBootMs are unaffected', () => {
+    const { sinceBootMs, ...noBoot } = freshBoot
+    expect(nextEmittedMode(null, noBoot, true)).toBe('idle')
+  })
+})
+

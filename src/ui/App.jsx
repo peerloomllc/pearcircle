@@ -23,6 +23,11 @@ import appConfig from '../../app.json'
 const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
 import { downloadRegion, estimateTilesInBbox } from './lib/regionDownload.js'
 
+// The shell injects window.__pearPlatform ('ios' | 'android') before this
+// bundle loads (app/index.tsx head script). Read once at module load: it never
+// changes for the life of the WebView.
+const IS_IOS = typeof window !== 'undefined' && window.__pearPlatform === 'ios'
+
 // Steps for the post-onboarding spotlight tour. Anchors resolve in
 // App's main JSX via [data-tour="..."]; missing anchors fall through
 // to a centered tooltip in Tour.jsx (e.g. the welcome step has no
@@ -5460,11 +5465,21 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <LocationSharingSection active={active && openSection === 'locationSharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
       </Collapsible>
 
-      {/* Trips: sharing + notifications for trips together. */}
+      {/* Trips: sharing + notifications for trips together. Trip SHARING is
+          hidden on iOS: this device can't reliably create trips to share,
+          because iOS suspends the app within ~30s of each background wake, so
+          a drive never accumulates as one continuous fix stream (the trip
+          machine needs >=60s of sustained motion). See the background-trip
+          investigation, 2026-07. Trip NOTIFICATIONS stay: an iPhone can still
+          receive and be notified about trips shared by Android peers. */}
       <Collapsible title='Trips' icon={MapTrifold} open={openSection === 'trips'} onToggle={() => toggleSection('trips')} maxHeight='1800px'>
-        <p style={{ ...subLabel, marginTop: 0 }}>Trip sharing</p>
-        <TripsSharingSection active={active && openSection === 'trips'} />
-        <p style={{ ...subLabel, marginTop: spacing.xl }}>Trip notifications</p>
+        {!IS_IOS && (
+          <>
+            <p style={{ ...subLabel, marginTop: 0 }}>Trip sharing</p>
+            <TripsSharingSection active={active && openSection === 'trips'} />
+          </>
+        )}
+        <p style={{ ...subLabel, marginTop: IS_IOS ? 0 : spacing.xl }}>Trip notifications</p>
         <TripNotificationsSection />
       </Collapsible>
 
