@@ -489,10 +489,8 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
   // 1. Say so. The event reaches trips.log via the shell, which is the only way
   //    to confirm or kill the diagnosis that pausing is what starves the fix
   //    stream. If this line never appears on a drive, the theory is wrong.
-  // 2. Re-arm. pausesLocationUpdatesAutomatically is now off in BOTH modes
-  //    (a pause suspends us, and suspension forfeits the persistent session),
-  //    so a pause should not happen at all -- if one does, restart delivery
-  //    regardless of mode. Best-effort by nature: if iOS suspends us in the same
+  // 2. Re-arm. In tracking mode a pause is never what we want, so ask for
+  //    delivery again. Best-effort by nature: if iOS suspends us in the same
   //    breath, this may not get to run, which is exactly why (1) is not
   //    conditional on it.
   func locationManagerDidPauseLocationUpdates(_ manager: CLLocationManager) {
@@ -501,8 +499,10 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
       sendEvent(withName: PearCircleLocationModule.UPDATES_PAUSED_EVENT,
                 body: ["paused": true, "mode": currentMode])
     }
-    applyModeTuning(manager)
-    manager.startUpdatingLocation()
+    if currentMode == "tracking" {
+      applyModeTuning(manager)
+      manager.startUpdatingLocation()
+    }
   }
 
   func locationManagerDidResumeLocationUpdates(_ manager: CLLocationManager) {
@@ -599,8 +599,17 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     // a-map rendering, trip polylines, and the geofence layer (region
     // monitoring runs on its own OS-managed pipeline and is unaffected
     // by this knob).
-    // Accuracy, distance filter, pausing and activityType are all set per
-    // adaptive mode now, not fixed here. See applyModeTuning.
+    m.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+    // 5m (was 10m, foreground-refresh 2026-05-29): tightens how often a
+    // moving device republishes so the map and trip polylines refresh
+    // sooner. Still well above kCLDistanceFilterNone, which fires on
+    // every raw GPS sample and pins the radio -- the battery posture
+    // (NearestTenMeters accuracy + pausesLocationUpdatesAutomatically +
+    // SLC-backed adaptive idle) is unchanged. Note this knob only
+    // affects a device that is actually moving; the stationary-staleness
+    // case is handled by requestSingleFix on foreground.
+    m.distanceFilter = 5
+    // Pausing is now per-mode, not fixed on. See applyModeTuning.
     applyModeTuning(m)
     // allowsBackgroundLocationUpdates needs UIBackgroundModes "location"
     // in Info.plist (set) and Always authorization at runtime; iOS
@@ -622,68 +631,56 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
     return m
   }
 
-  // Per-mode tuning for a SINGLE, ALWAYS-ON continuous location session.
+  // Auto-pausing and activityType, set per adaptive mode rather than once at
+  // manager creation.
   //
-  // The history, in three measured steps (all on the paired iPhone SE):
-  //   - 2026-07-21: pausing was fixed on in both modes. A drive gave the app a
-  //     20-50s lifetime per wake and ~18 fixes in 4.5h. Turning pausing off in
-  //     tracking, plus a boot-grace against the wake-up demotion, got REAL
-  //     driving GPS through for the first time (spd 16.9, acc 5-14m) and a trip
-  //     armed and went active.
-  //   - 2026-07-22 drive: still no trip. The app was cycling a NEW PROCESS every
-  //     ~30s, and crucially with NO termination report of any kind (the phone
-  //     wrote jetsam/cpu reports for OTHER apps at the same times, so it was not
-  //     memory pressure and not a crash). That is clean iOS background
-  //     SUSPENSION, i.e. background-execution-window expiry.
+  // Why this is per-mode now (measured 2026-07-21): with pausing on in BOTH
+  // modes, a real drive gave the app a median lifetime of 20-50 SECONDS per
+  // wake, across every build tested, and ~18 native fixes in 4.5 hours. The
+  // UIBackgroundModes "location" entitlement only keeps a process alive while
+  // updates are actually being delivered, so the moment CoreLocation pauses us
+  // we lose the reason to keep running: iOS suspends then terminates the app,
+  // and only SLC or a visit can bring it back 15-30 minutes later. A trip needs
+  // 30s of arming plus sustained motion, so it never had a chance. That is the
+  // real reason no trip has ever been created on iOS, not the in-memory trip
+  // state the 2026-07-18 proposal set out to make durable.
   //
-  // The root cause that ties it together: the old adaptive `idle` mode called
-  // stopUpdatingLocation. An app that keeps a continuous location session OWNED
-  // is kept alive in the background indefinitely (the Life360 / Find My model);
-  // an app that hands the session back gets only a short (~30s) courtesy window
-  // each time SLC/motion relaunches it. Every drop to idle forfeited the
-  // session, so a drive could never accumulate the >=60s of sustained motion a
-  // trip needs before the next suspension.
+  // The battery history matters here and does NOT argue against this. Pausing
+  // was turned on because it "combined with Best accuracy kept the GPS chip hot
+  // 24/7". Accuracy is now NearestTenMeters, so the expensive half of that pair
+  // is already gone, and this only disables pausing in `tracking`, which the
+  // adaptive driver enters when the device is genuinely moving. `idle` keeps the
+  // original battery posture exactly.
   //
-  // So we NEVER stop the session now. It runs continuously; the modes differ
-  // only in accuracy and distance filter, i.e. in battery, not in liveness:
-  //   - idle:     HundredMeters accuracy + 100m filter. A stationary phone
-  //               emits almost nothing (no movement past the filter = no fix =
-  //               no GPS wake), so the parked-battery cost stays low even though
-  //               the session is nominally always armed.
-  //   - tracking: NearestTenMeters + 5m filter + .automotiveNavigation, for a
-  //               dense polyline while actually driving.
-  // pausesLocationUpdatesAutomatically stays OFF in both: a pause suspends us,
-  // and suspension is the exact thing that forfeits the persistent session.
-  // The stationary-battery case is covered by the coarse accuracy + large
-  // filter instead. The full-idle path (all circles muted) still hard-stops
-  // via stopUpdates; this only governs the sharing-on adaptive modes.
+  // activityType was never set at all, so it defaulted to .other, the value
+  // CoreLocation is most willing to pause on. .automotiveNavigation tells it
+  // this is a drive and makes it far more reluctant to stop delivery.
   private func applyModeTuning(_ mgr: CLLocationManager) {
-    mgr.pausesLocationUpdatesAutomatically = false
     if currentMode == "tracking" {
-      mgr.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
-      mgr.distanceFilter = 5
+      mgr.pausesLocationUpdatesAutomatically = false
       mgr.activityType = .automotiveNavigation
     } else {
-      mgr.desiredAccuracy = kCLLocationAccuracyHundredMeters
-      mgr.distanceFilter = 100
+      mgr.pausesLocationUpdatesAutomatically = true
       mgr.activityType = .other
     }
   }
 
   private func startUpdatesNow(_ mgr: CLLocationManager) {
-    // SLC + visits stay subscribed as the revival layer: they relaunch the app
-    // from a full force-quit / terminated state, which continuous updates alone
-    // cannot. Cheap, and belt-and-suspenders now that the continuous session is
-    // always on.
+    // SLC runs in BOTH adaptive modes (proposal 2026-05-16). It's the
+    // steady-state subscription that keeps the worklet alive on cell-
+    // tower transitions while continuous delivery is stopped. Cheap
+    // (<1% battery) and required for "idle" mode to deliver anything.
     mgr.startMonitoringSignificantLocationChanges()
+    // Visit monitoring (Tier 1 A, 2026-05-29). Very-low-power arrive/
+    // depart wakes at significant locations; like SLC and region
+    // monitoring it revives a suspended or force-quit app. It is the
+    // antidote to the stationary-staleness case: when a backgrounded
+    // phone settles somewhere, didVisit fires so we publish a fresh fix
+    // instead of letting lastSeen rot. Runs in both adaptive modes.
     mgr.startMonitoringVisits()
-    // The continuous session runs in BOTH modes now (was tracking-only). This
-    // is what keeps the app alive across a drive: an owned, never-stopped
-    // session is granted persistent background execution, whereas a session
-    // started fresh on each SLC relaunch only gets a ~30s window. applyModeTuning
-    // keeps the idle posture coarse + filtered so an always-on session is still
-    // cheap when the phone is not moving.
-    mgr.startUpdatingLocation()
+    if currentMode == "tracking" {
+      mgr.startUpdatingLocation()
+    }
     // CoreMotion activity monitoring (proposal 2026-05-21). Started
     // alongside location so a trip beginning while the worklet is in
     // "idle" mode is noticed promptly instead of ~500m in.
@@ -809,25 +806,27 @@ class PearCircleLocationModule: RCTEventEmitter, CLLocationManagerDelegate {
         resolve(true)
         return
       }
-      // Re-tune only. The continuous session is never stopped by a mode change
-      // any more: idle drops to coarse accuracy + a 100m filter (cheap while
-      // stationary) rather than calling stopUpdatingLocation, which would hand
-      // the session back and cost us the persistent-background execution that
-      // keeps the app alive across a drive. startUpdatingLocation is idempotent,
-      // so calling it here re-establishes the session if some prior full-idle
-      // stopUpdates had torn it down.
+      // Re-tune BEFORE starting: pausing and activityType are read by
+      // CoreLocation when delivery begins, so setting them after
+      // startUpdatingLocation would leave the first stretch of a drive on the
+      // idle-mode posture, which is the one that gets paused.
       self.applyModeTuning(mgr)
-      mgr.startUpdatingLocation()
+      if m == "tracking" {
+        mgr.startUpdatingLocation()
+      } else {
+        mgr.stopUpdatingLocation()
+      }
       resolve(true)
     }
   }
 
   // One-shot fresh fix, used by the shell on app-foreground
   // (foreground-refresh, 2026-05-29). The steady-state pipeline only
-  // writes lastSeen when the device moves past distanceFilter (100m in
-  // idle), so a phone that just reopened the app at a new place keeps
-  // reporting a stale "last seen" timestamp even though the peer is
-  // live. requestLocation() makes CoreLocation actively obtain
+  // writes lastSeen when the device moves past distanceFilter (or on a
+  // ~500m SLC), and pausesLocationUpdatesAutomatically shuts the GPS off
+  // while stationary -- so a phone that just reopened the app at a new
+  // place keeps reporting a stale "last seen" timestamp even though the
+  // peer is live. requestLocation() makes CoreLocation actively obtain
   // one current fix and deliver it through the normal
   // didUpdateLocations -> emitLocation path, refreshing position and
   // timestamp. iOS auto-stops after the single delivery; the SLC and any
