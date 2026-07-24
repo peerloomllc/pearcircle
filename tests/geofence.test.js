@@ -1,4 +1,4 @@
-const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES } = require('../src/lib/geofence')
+const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, clampPlaceRadius, MIN_PLACE_RADIUS_M, MAX_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES } = require('../src/lib/geofence')
 
 // Thread prev-classification + dwell through a sequence of fixes, exactly as
 // checkPlaceTransitions does. Each entry is [distance, accuracy?]; returns the
@@ -341,5 +341,34 @@ describe('MIN_PLACE_RADIUS_M (iOS region-monitoring reliability floor)', () => {
   test('flooring a small radius lifts it to the minimum, leaves a large one', () => {
     expect(Math.max(50, MIN_PLACE_RADIUS_M)).toBe(MIN_PLACE_RADIUS_M)
     expect(Math.max(400, MIN_PLACE_RADIUS_M)).toBe(400)
+  })
+})
+
+describe('clampPlaceRadius (copying legacy Places into a new circle)', () => {
+  test('lifts a pre-#139 default 100m Place to the floor', () => {
+    expect(clampPlaceRadius(100)).toBe(MIN_PLACE_RADIUS_M)
+  })
+
+  test('leaves an in-range radius untouched', () => {
+    expect(clampPlaceRadius(400)).toBe(400)
+    expect(clampPlaceRadius(MIN_PLACE_RADIUS_M)).toBe(MIN_PLACE_RADIUS_M)
+  })
+
+  test('caps an oversized radius at the maximum', () => {
+    expect(clampPlaceRadius(50000)).toBe(MAX_PLACE_RADIUS_M)
+  })
+
+  test('returns null for a non-numeric radius so the caller can skip the Place', () => {
+    expect(clampPlaceRadius(undefined)).toBeNull()
+    expect(clampPlaceRadius(NaN)).toBeNull()
+    expect(clampPlaceRadius('150')).toBeNull()
+  })
+
+  test('every clamped value is accepted by the place:create bounds', () => {
+    for (const r of [1, 10, 100, 149, 150, 9999, 10000, 1e9]) {
+      const c = clampPlaceRadius(r)
+      expect(c).toBeGreaterThanOrEqual(MIN_PLACE_RADIUS_M)
+      expect(c).toBeLessThanOrEqual(MAX_PLACE_RADIUS_M)
+    }
   })
 })

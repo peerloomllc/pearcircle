@@ -52,7 +52,7 @@ const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
 const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
-const { buildExport, validateImport } = require('./lib/circleExport')
+const { buildExport, validateImport, planPlaceCopy } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
@@ -949,7 +949,11 @@ const handlers = {
   'circle:export': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
-    return buildExport(await readCircleConfigForExport(circleId))
+    const config = await readCircleConfigForExport(circleId)
+    // Refuse rather than hand back a file that looks complete but has lost
+    // every Place because the circle's data is stuck.
+    if (config.placesUnavailable) throw new Error("Could not read this circle's Places - its data is stuck. Repair the circle and try again.")
+    return buildExport(config)
   },
 
   // Create a brand-new circle from a previously-exported config envelope.
@@ -960,7 +964,13 @@ const handlers = {
     const result = validateImport(payload)
     if (!result.ok) throw new Error('invalid import: ' + result.error)
     const created = await createCircleFromConfig(result.value)
-    return { circleId: created.circleId, name: created.name, invite: created.invite }
+    return {
+      circleId: created.circleId,
+      name: created.name,
+      invite: created.invite,
+      placesCopied: created.placesCopied,
+      placesSkipped: created.placesSkipped,
+    }
   },
 
   // In-app one-shot: recreate THIS circle on a fresh empty Autobase, keeping its
@@ -973,7 +983,8 @@ const handlers = {
     if (!sourceRec) throw new Error('unknown circle: ' + circleId)
     if (sourceRec.value.role !== 'owner') throw new Error('only the circle owner can recreate it')
 
-    const created = await createCircleFromConfig(await readCircleConfigForExport(circleId))
+    const sourceConfig = await readCircleConfigForExport(circleId)
+    const created = await createCircleFromConfig(sourceConfig)
     const recreatedAt = Date.now()
     // Local-only links: distinguish the two same-named circles in Settings and
     // back the delete-confirmation guard (proposal 2026-06-17). No wire effect.
@@ -987,11 +998,43 @@ const handlers = {
     // get a one-tap "your group moved" prompt carrying the new invite (proposal
     // 2026-06-17 slice 3). Best-effort: a supersede failure (e.g. source not yet
     // writable) must not fail the recreate, which already succeeded.
+    //
+    // It fails more often than the happy path suggests: the circles owners
+    // recreate are usually the wedged ones, and a wedged base is exactly what
+    // can't be appended to. So we REPORT the outcome instead of swallowing it -
+    // the owner has to know whether members were nudged or whether the invite
+    // is the only way they'll hear about the move.
+    let superseded = false
+    let supersedeReason = null
     try {
-      await handlers['circle:supersede']({ oldCircleId: circleId, newCircleId: created.circleId })
-    } catch (e) { console.warn('[bare] circle:supersede during recreate failed', e?.message) }
+      const r = await handlers['circle:supersede']({ oldCircleId: circleId, newCircleId: created.circleId })
+      superseded = r?.ok === true
+      if (!superseded) supersedeReason = r?.reason ?? 'failed'
+    } catch (e) {
+      supersedeReason = e?.message ?? String(e)
+      console.warn('[bare] circle:supersede during recreate failed', supersedeReason)
+    }
+    mark('circle:recreate:done', {
+      cid: created.circleId.slice(0, 8),
+      from: circleId.slice(0, 8),
+      places: created.placesCopied,
+      skipped: created.placesSkipped.length,
+      unreadable: sourceConfig.placesUnavailable === true,
+      superseded,
+      reason: supersedeReason,
+    })
 
-    return { circleId: created.circleId, name: created.name, invite: created.invite, sourceCircleId: circleId }
+    return {
+      circleId: created.circleId,
+      name: created.name,
+      invite: created.invite,
+      sourceCircleId: circleId,
+      placesCopied: created.placesCopied,
+      placesSkipped: created.placesSkipped,
+      placesUnavailable: sourceConfig.placesUnavailable === true,
+      superseded,
+      supersedeReason,
+    }
   },
 
   // Post (or re-post) the owner-signed migration nudge into the OLD circle's
@@ -1008,11 +1051,23 @@ const handlers = {
     const base = _circleBases.get(oldCircleId)
     if (!base) throw new Error('unknown circle: ' + oldCircleId)
     const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
-    const circleRow = await base.view.get('circle')
+    // Every base touch here is bounded. The circles an owner supersedes are
+    // typically the wedged ones, where an unbounded view read or append hangs
+    // forever - and the dispatcher awaits handlers serially, so that would
+    // freeze the whole worklet (proposal 2026-06-03 / 06-03c).
+    const { value: circleRow, timedOut: rowTimedOut } = await withTimeout(base.view.get('circle'), READ_TIMEOUT_MS)
+    // Ownership: prefer the replicated row, fall back to our own joined record
+    // when the view can't be read (wedged or still-rebuilding base), which
+    // would otherwise read as "not the owner" for the actual owner. The wire
+    // still enforces ownership - applyCircleNodes verifies the signature
+    // against the circle's ownerKey on every receiver - so this fallback only
+    // decides whether we bother appending.
+    const oldRec = await _localDb.get('circles:joined:' + oldCircleId)
+    const ownerKey = circleRow?.value?.ownerKey ?? (oldRec?.value?.role === 'owner' ? ourKeyHex : null)
     // Non-owner of the old circle: nothing to post (only the owner's signature
     // is accepted on the wire). Return a benign no-op rather than throwing.
-    if (circleRow?.value?.ownerKey !== ourKeyHex) return { ok: false, reason: 'not_owner' }
-    if (!base.writable) throw new Error('not yet a writer for this circle')
+    if (ownerKey !== ourKeyHex) return { ok: false, reason: rowTimedOut ? 'circle_unreadable' : 'not_owner' }
+    if (!base.writable) return { ok: false, reason: 'not_writable' }
 
     // Build the new circle's invite from its persisted joined record (same
     // fields circle:invite uses). The owner must already hold the new circle.
@@ -1031,7 +1086,12 @@ const handlers = {
       postedAt: Date.now(),
       v: 1,
     }, _identity.secretKey)
-    await base.append({ type: 'put', key: 'supersede:' + newCircleId, value })
+    const { ok, timedOut } = await raceAppend(base.append({ type: 'put', key: 'supersede:' + newCircleId, value }), APPEND_TIMEOUT_MS)
+    if (!ok) {
+      mark('circle:supersede:append-failed', { cid: oldCircleId.slice(0, 8), timedOut })
+      return { ok: false, reason: timedOut ? 'append_timeout' : 'append_failed' }
+    }
+    scheduleDurabilityFlush()
     return { ok: true }
   },
 
@@ -6105,16 +6165,29 @@ async function readCircleConfigForExport (circleId) {
   const local = await _localDb.get('circles:joined:' + circleId)
   const name = local?.value?.name
   if (typeof name !== 'string') throw new Error('circle has no local name')
-  const places = []
-  for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-    if (value && !isDeleted(value)) {
-      places.push({ name: value.name, lat: value.lat, lon: value.lon, radiusMeters: value.radiusMeters })
+  // Bounded (proposal 2026-06-03c): recreate exists to escape a wedged circle,
+  // and a wedged view stalls this stream forever. The dispatcher awaits
+  // handlers serially, so an unbounded drain here would freeze the whole
+  // worklet on exactly the circles this path is for. On a stall we report
+  // `placesUnavailable` and let the caller decide - recreate still mints the
+  // new circle (a circle with no Places beats no circle at all), export
+  // refuses rather than write a silently empty file.
+  const drain = (async () => {
+    const out = []
+    for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+      if (value && !isDeleted(value)) {
+        out.push({ name: value.name, lat: value.lat, lon: value.lon, radiusMeters: value.radiusMeters })
+      }
     }
-  }
+    return out
+  })()
+  const { value: places, timedOut } = await withTimeout(drain, READ_TIMEOUT_MS)
+  if (places === undefined) mark('circle:config:places-unreadable', { cid: circleId.slice(0, 8), timedOut })
   const tripRow = await _localDb.get('trips:sharing:' + circleId)
   return {
     name,
-    places,
+    places: places ?? [],
+    placesUnavailable: places === undefined,
     settings: {
       sharingDefault: getCircleSharing(circleId).enabled === true,
       tripSharing: tripRow?.value?.enabled === true,
@@ -6124,15 +6197,45 @@ async function readCircleConfigForExport (circleId) {
 
 // Create a brand-new circle from a validated config, reusing the live
 // circle:create + place:create + toggle handlers so the result is
-// indistinguishable from a hand-made circle. Returns the create result.
+// indistinguishable from a hand-made circle. Returns the create result plus
+// `placesCopied` / `placesSkipped`.
+//
+// Everything after circle:create is best-effort by design. Once the new circle
+// exists on disk and in the owner's list, the invite is the whole point of the
+// operation, and throwing here used to strand the owner with a half-built
+// circle and no invite (the failure Tim hit: a legacy 100m Place, created when
+// the Add Place default was 100m, rejected by the 150m floor place:create has
+// enforced since #139). Copying config is not worth losing the circle over, so
+// each step reports rather than aborts.
 async function createCircleFromConfig ({ name, places, settings }) {
   const created = await handlers['circle:create']({ name })
-  for (const p of places) {
-    await handlers['place:create']({ circleId: created.circleId, name: p.name, lat: p.lat, lon: p.lon, radiusMeters: p.radiusMeters })
+  const { copy, skipped: placesSkipped } = planPlaceCopy(places)
+  for (const s of placesSkipped) mark('circle:config:place-skipped', { cid: created.circleId.slice(0, 8), reason: s.reason })
+  let placesCopied = 0
+  for (const p of copy) {
+    try {
+      await handlers['place:create']({ circleId: created.circleId, name: p.name, lat: p.lat, lon: p.lon, radiusMeters: p.radiusMeters })
+      placesCopied++
+    } catch (e) {
+      // planPlaceCopy already guarantees the bounds, so this is an append that
+      // failed (closed / wedged base), not bad config. Still non-fatal.
+      placesSkipped.push({ name: p.name, reason: e?.message ?? String(e) })
+      mark('circle:config:place-failed', { cid: created.circleId.slice(0, 8), err: e?.message })
+    }
   }
-  await handlers['sharing:set']({ circleId: created.circleId, enabled: settings.sharingDefault === true })
-  await handlers['trips:sharing:set']({ circleId: created.circleId, enabled: settings.tripSharing === true })
-  return created
+  const settingsFailed = []
+  for (const [method, args] of [
+    ['sharing:set', { circleId: created.circleId, enabled: settings.sharingDefault === true }],
+    ['trips:sharing:set', { circleId: created.circleId, enabled: settings.tripSharing === true }],
+  ]) {
+    try {
+      await handlers[method](args)
+    } catch (e) {
+      settingsFailed.push(method)
+      mark('circle:config:setting-failed', { cid: created.circleId.slice(0, 8), method, err: e?.message })
+    }
+  }
+  return { ...created, placesCopied, placesSkipped, settingsFailed }
 }
 
 const STORE_FLUSH_INTERVAL_MS = 5 * 60 * 1000
@@ -6753,6 +6856,11 @@ _ipcRead.on('data', async (chunk) => {
       const result = await handler(msg.args ?? {})
       send({ id: msg.id, result })
     } catch (err) {
+      // Trace every handler rejection. The reply carries the message back to
+      // the UI, but the UI often renders its own generic text, so an
+      // unexplained failure left no trace anywhere - which is what made the
+      // legacy-Place recreate failure a black box on a real device.
+      mark('ipc:handler-error', { method: msg.method, err: err?.message ?? String(err) })
       send({ id: msg.id, error: err?.message ?? String(err) })
     }
   }

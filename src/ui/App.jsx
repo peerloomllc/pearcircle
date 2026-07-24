@@ -2083,6 +2083,10 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // "leave and rejoin" guidance. The staged-for-restart case is excluded (it
   // has its own "reopen the app" message). See the watchdog effect below.
   const [repairEscalated, setRepairEscalated] = useState(false)
+  // Session dismissal for the ESCALATED repair banner only. The in-progress
+  // spinner stays undismissable (it reports live work), but once escalated
+  // there is nothing left to wait for and the banner is permanent advice.
+  const [repairEscalatedDismissed, setRepairEscalatedDismissed] = useState(false)
   // Consecutive failures of the 3s home refresh. A wedged worklet makes every
   // circles:getAll throw; the catch used to swallow it silently, so the UI
   // froze on last-good data with no hint (UX audit item f). Count failures and,
@@ -2383,11 +2387,13 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // endless spinner. Resets whenever the repair clears or staging changes.
   const repairInProgress = repairingCircles.length > 0 && !repairStagedPending
   useEffect(() => {
+    setRepairEscalatedDismissed(false)
     if (!repairInProgress) { setRepairEscalated(false); return }
     setRepairEscalated(false)
     const id = setTimeout(() => setRepairEscalated(true), REPAIR_ESCALATE_MS)
     return () => clearTimeout(id)
   }, [repairInProgress])
+  const repairIsEscalated = repairEscalated || repairEscalatedByWorklet
 
   // Single top-of-map banner slot (UX audit item a). Exactly one banner renders
   // at top:0, chosen by priority so they can never stack (previously each
@@ -2397,7 +2403,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const permissionBannerEligible = permissionStatus !== 'always' && permissionStatus !== 'unknown' && permissionStatus !== 'notDetermined' && !bannerDismissed
   const batteryBannerEligible = battery.supported === true && !battery.exempt && !batteryBannerDismissed
   const networkBannerEligible = networkLocationOff && !networkBannerDismissed && (!selfSeen || (Date.now() - (selfSeen.ts ?? 0)) > NETWORK_BANNER_STALE_MS)
-  const repairingBannerEligible = repairTargets.length > 0
+  const repairingBannerEligible = repairTargets.length > 0 && !(repairIsEscalated && repairEscalatedDismissed)
   const repairBannerEligible = !repairBannerDismissed && needRepairCircles.length > 0
   const syncBannerEligible = syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed
   const topBanner = tourActive ? null
@@ -2742,8 +2748,9 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           count={repairTargets.length}
           circleName={repairTargets[0]?.circle?.name}
           needsRestart={repairStagedPending}
-          escalated={repairEscalated || repairEscalatedByWorklet}
+          escalated={repairIsEscalated}
           onResolve={() => setSheet({ name: 'settings', expand: 'circles' })}
+          onDismiss={() => setRepairEscalatedDismissed(true)}
         />
       )}
       {topBanner === 'repair' && (
@@ -4835,9 +4842,19 @@ function CirclesSection ({ active = true, onChanged }) {
     setError(null)
     try {
       const r = await pear.call('circle:recreate', { circleId: c.circleId })
+      // The bridge resolves worklet rejections as { ok: false, error }, so
+      // without this the real reason is replaced by the generic line below.
+      if (r?.ok === false && r.error) throw new Error(r.error)
       if (!r?.invite) throw new Error('Recreate did not return an invite')
       setRecreatingFor(null)
-      setRecreateResult({ name: r.name || c.name, invite: r.invite, sourceName: c.name })
+      setRecreateResult({
+        name: r.name || c.name,
+        invite: r.invite,
+        sourceName: c.name,
+        superseded: r.superseded === true,
+        placesSkipped: Array.isArray(r.placesSkipped) ? r.placesSkipped.length : 0,
+        placesUnavailable: r.placesUnavailable === true,
+      })
       onChanged?.()
       refresh()
     } catch (e) {
@@ -4889,8 +4906,14 @@ function CirclesSection ({ active = true, onChanged }) {
       try { payload = JSON.parse(picked.contents) }
       catch { throw new Error('That file is not valid JSON') }
       const r = await pear.call('circle:import', { payload })
+      if (r?.ok === false && r.error) throw new Error(r.error)
       if (!r?.invite) throw new Error('Import did not return an invite')
-      setRecreateResult({ name: r.name, invite: r.invite, imported: true })
+      setRecreateResult({
+        name: r.name,
+        invite: r.invite,
+        imported: true,
+        placesSkipped: Array.isArray(r.placesSkipped) ? r.placesSkipped.length : 0,
+      })
       onChanged?.()
       refresh()
     } catch (e) {
@@ -5177,8 +5200,23 @@ function RecreatedInviteModal ({ result, onClose }) {
       <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.md }}>
         {result.imported
           ? <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> was created from your file with the same Places. Share this invite so people can join.</>
-          : <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. Share this invite so members rejoin — anyone on the latest app also gets a one-tap "your group moved" nudge. The old circle stays until you delete it.</>}
+          : result.superseded
+            ? <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. Share this invite so members rejoin - anyone on the latest app also gets a one-tap "your group moved" nudge. The old circle stays until you delete it.</>
+            // No nudge landed. Say so plainly: the owner is the only route the
+            // members now have, and a promise of an automatic prompt that never
+            // arrives is worse than no promise. Common when the old circle is
+            // the wedged one - which is usually why it is being recreated.
+            : <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. We could not nudge the old circle's members automatically (its data is stuck), so send them this invite yourself - they will not get a prompt in the app. The old circle stays until you delete it.</>}
       </div>
+      {result.placesUnavailable ? (
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginBottom: spacing.md }}>
+          The old circle's Places could not be read, so none came across. You will need to add them again.
+        </div>
+      ) : result.placesSkipped > 0 && (
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginBottom: spacing.md }}>
+          {result.placesSkipped === 1 ? '1 Place could not be copied' : `${result.placesSkipped} Places could not be copied`} and will need adding again.
+        </div>
+      )}
       <QrImage text={result.invite} />
       <textarea style={s.inviteBox} readOnly value={result.invite} onFocus={(e) => e.target.select()} />
       <ShareButton text={result.invite} title={'Join ' + (result.name || 'my PearCircle')} />

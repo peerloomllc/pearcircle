@@ -21,6 +21,23 @@ const EARTH_RADIUS_M = 6371000
 //     be tighter than the OS layer.
 const MIN_PLACE_RADIUS_M = 150
 
+// Largest Place radius we accept, in metres. Mirrors the place:create /
+// place:update bound in bare.js and the export-envelope bound.
+const MAX_PLACE_RADIUS_M = 10000
+
+// Bring a stored radius inside [MIN_PLACE_RADIUS_M, MAX_PLACE_RADIUS_M]. Used
+// when COPYING a Place into a new circle (recreate / import), where the source
+// value may predate the floor: the Add Place default was 100m until 2026-07-01
+// (#139), so most circles created before then hold sub-floor Places. Copying
+// one verbatim would be rejected by place:create and abort the migration, so
+// we clamp up to the floor - the same treatment the OS-region push already
+// gives legacy Places. A non-finite radius has nothing to clamp and returns
+// null so the caller can skip that Place.
+function clampPlaceRadius (radiusMeters) {
+  if (!Number.isFinite(radiusMeters)) return null
+  return Math.min(Math.max(radiusMeters, MIN_PLACE_RADIUS_M), MAX_PLACE_RADIUS_M)
+}
+
 // A fix whose reported horizontal accuracy (radius of uncertainty, metres) is
 // worse than this is too blurry to drive a geofence transition and is ignored
 // by the classifier. On GrapheneOS a phone sitting still at home loses the GPS
@@ -206,4 +223,4 @@ function regionAppendDecision ({ sharing, writable } = {}) {
   return 'append'
 }
 
-module.exports = { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES }
+module.exports = { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, clampPlaceRadius, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M, MAX_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES }

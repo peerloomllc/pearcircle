@@ -9,11 +9,18 @@
 // brand-new circle). Pure functions, no worklet state, so the round-trip and
 // the validation bounds are unit-testable on their own.
 
+const { clampPlaceRadius } = require('./geofence')
+
 const EXPORT_TYPE = 'pearcircle.circle-export'
 const EXPORT_V = 1
 
-// Bounds mirror the live circle:create / place:create handlers in bare.js so an
-// imported config can never produce a row the normal write paths would reject.
+// Bounds on what an envelope may CARRY. Deliberately looser than the live
+// place:create floor (MIN_PLACE_RADIUS_M = 150 since #139): files exported from
+// circles built before that floor legitimately hold Places down to 10m, and
+// rejecting them would make old exports unimportable. The create path
+// (createCircleFromConfig in bare.js) clamps each radius up to the floor before
+// it calls place:create, so a sub-floor value here can never produce a row the
+// normal write paths would reject.
 const NAME_MAX = 64
 const PLACE_RADIUS_MIN = 10
 const PLACE_RADIUS_MAX = 10000
@@ -88,4 +95,37 @@ function validateImport (payload) {
   }
 }
 
-module.exports = { buildExport, validateImport, EXPORT_TYPE, EXPORT_V, NAME_MAX, MAX_PLACES }
+// Decide what to do with each Place before it is copied into a NEW circle
+// (recreate or import). Splits the list into `copy` (normalized, guaranteed to
+// satisfy the live place:create bounds) and `skipped` (with a reason).
+//
+// Exists because the copy used to be verbatim and all-or-nothing: one Place the
+// current place:create rejects threw, and the throw escaped AFTER the new
+// circle had already been created and persisted, leaving the owner with a
+// nameless duplicate in their list, no invite and no migration nudge for the
+// members. The dominant case is the radius floor - the Add Place default was
+// 100m until #139 raised the floor to 150m, so nearly every circle created
+// before 2026-07-01 holds Places the current handler refuses. Those are clamped
+// up rather than dropped; only a Place that is unusable on its own terms (no
+// name, no coordinates) is skipped.
+function planPlaceCopy (places = []) {
+  const copy = []
+  const skipped = []
+  for (const p of Array.isArray(places) ? places : []) {
+    const radiusMeters = clampPlaceRadius(p?.radiusMeters)
+    let reason = null
+    if (!p || typeof p !== 'object') reason = 'not an object'
+    else if (!validName(p.name)) reason = 'invalid name'
+    else if (!Number.isFinite(p.lat) || p.lat < -90 || p.lat > 90) reason = 'invalid lat'
+    else if (!Number.isFinite(p.lon) || p.lon < -180 || p.lon > 180) reason = 'invalid lon'
+    else if (radiusMeters === null) reason = 'invalid radiusMeters'
+    if (reason) {
+      skipped.push({ name: typeof p?.name === 'string' ? p.name : '', reason })
+      continue
+    }
+    copy.push({ name: p.name.trim(), lat: p.lat, lon: p.lon, radiusMeters })
+  }
+  return { copy, skipped }
+}
+
+module.exports = { buildExport, validateImport, planPlaceCopy, EXPORT_TYPE, EXPORT_V, NAME_MAX, MAX_PLACES }

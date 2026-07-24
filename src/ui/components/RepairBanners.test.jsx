@@ -63,3 +63,22 @@ describe('RepairingBanner', () => {
     expect(c.textContent).toContain('Repairing 3 circles…')
   })
 })
+
+describe('RepairingBanner dismissal', () => {
+  test('the escalated banner can be dismissed', () => {
+    // Reported 2026-07-24: an escalated repair left a permanent bar over the
+    // map that only a force-stop cleared. Nothing is running once escalated,
+    // so the advice is dismissible.
+    const onDismiss = jest.fn()
+    const c = render(<RepairingBanner count={1} circleName='Hudgins Family' escalated onDismiss={onDismiss} />)
+    const x = c.querySelector('button[aria-label="Dismiss"]')
+    expect(x).not.toBeNull()
+    act(() => { x.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(onDismiss).toHaveBeenCalled()
+  })
+
+  test('an in-progress repair stays undismissable', () => {
+    const c = render(<RepairingBanner count={1} circleName='Hudgins Family' onDismiss={jest.fn()} />)
+    expect(c.querySelector('button[aria-label="Dismiss"]')).toBeNull()
+  })
+})
