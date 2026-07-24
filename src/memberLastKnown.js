@@ -50,13 +50,34 @@ async function appendFix (core, signedValue) {
 // block is not yet replicated locally. Non-blocking ({ wait: false }) so a
 // snapshot read never hangs on an undownloaded peer core.
 async function readTip (core) {
-  await core.ready()
-  if (core.length === 0) return null
-  try {
-    const block = await core.get(core.length - 1, { wait: false })
-    if (!block) return null
-    return JSON.parse(b4a.toString(block))
-  } catch { return null }
+  return (await readTipDetailed(core)).tip
 }
 
-module.exports = { openSelfCore, openPeerCore, appendFix, readTip }
+// Same read, but says WHY it failed. `readTip` collapsed three very different
+// outcomes into one null - block absent, block present but unparseable, read
+// threw - and the caller then treated all of them as "not downloaded yet" and
+// re-requested forever. A block that is local but cannot be parsed produces an
+// infinite fetch loop that looks identical to a block that never arrives
+// (investigation 2026-07-24: three members re-fetching their tip every 5s and
+// never caching it).
+//   reason: 'empty' | 'absent' | 'unparseable' | 'error' | null (null = ok)
+async function readTipDetailed (core) {
+  await core.ready()
+  if (core.length === 0) return { tip: null, reason: 'empty' }
+  let block
+  try {
+    block = await core.get(core.length - 1, { wait: false })
+  } catch (e) {
+    return { tip: null, reason: 'error', err: e?.message }
+  }
+  if (!block) return { tip: null, reason: 'absent' }
+  try {
+    return { tip: JSON.parse(b4a.toString(block)), reason: null, bytes: block.length }
+  } catch (e) {
+    // Present on disk and undecodable: a wrong encryption key yields plausible
+    // bytes that are not JSON. Retrying cannot fix this one.
+    return { tip: null, reason: 'unparseable', bytes: block.length, err: e?.message }
+  }
+}
+
+module.exports = { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed }
