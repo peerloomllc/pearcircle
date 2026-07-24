@@ -57,6 +57,7 @@ const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require(
 const { stalledGets, writerSummary, unfetchableWriters, keyPrefix, TRACK_LIMIT } = require('./lib/appendStall')
 const { shouldAttemptAppend, nextAppendHealth } = require('./lib/appendHealth')
 const { shouldEmit, coverageSummary } = require('./lib/lastKnownDiag')
+const { shouldHealSelfTip } = require('./lib/lastKnownHeal')
 const { applyEncryptionReloadFix } = require('./lib/hypercoreEncryptionPatch')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
@@ -1119,6 +1120,19 @@ const handlers = {
     // user dismisses the "Joining…" dialog. Without it the joiner
     // sometimes sits with no peers for tens of seconds and pre-existing
     // members appear "disconnected" until an app restart kicks the DHT.
+    // Make the encryption key resolvable BEFORE the base goes live (2026-07-24).
+    // Registering the base opens this circle to the location write loop, which
+    // iterates every base in _circleBases - but the joined record carrying the
+    // key is not persisted until the end of this handler, after a DHT flush and
+    // a base.update() that take seconds. Any fix landing in that window used to
+    // resolve "no key", cache it, and create this member's last-known core
+    // UNENCRYPTED for the whole session. That is how two Hudgins members ended
+    // up publishing their positions in the clear on 2026-06-19, the day they
+    // rejoined. Priming the cache closes the window without persisting a joined
+    // record before the deleted-circle and franken-invite checks below have
+    // passed - a record written that early would survive a crash mid-join and
+    // enrol this device in a circle it never validated.
+    if (encryptionKey) _circleEncKeys.set(circleId, encryptionKey)
     _circleBases.set(circleId, base)
     const discovery = joinCircleTopic(circleId, circleKey)
     if (discovery && typeof discovery.flushed === 'function') {
@@ -1137,6 +1151,7 @@ const handlers = {
       try { await base.close() } catch {}
       _circleBases.delete(circleId)
       _circlePeers.delete(circleId)
+      _circleEncKeys.delete(circleId)
       throw new Error('this circle has been deleted by the owner')
     }
     // circleId-binding guard (proposal 2026-06-11). The founder wrote the
@@ -1152,6 +1167,7 @@ const handlers = {
       try { await base.close() } catch {}
       _circleBases.delete(circleId)
       _circlePeers.delete(circleId)
+      _circleEncKeys.delete(circleId)
       throw new Error('invite does not match this circle (malformed or stale invite)')
     }
 
@@ -5524,6 +5540,36 @@ async function pullPeerTip (circleId, pubkey, core) {
   cacheLastKnownTip(circleId, pubkey, tip)
 }
 
+// Rewrite our own last-known tip under encryption if the join-time race left it
+// in the clear (2026-07-24). Runs once per circle at boot, fire-and-forget:
+// recovery must not wait on the member happening to move, since the leak sits
+// in the data until they write again.
+async function healSelfLastKnownTip (circleId) {
+  try {
+    const encKey = await circleEncKeyHex(circleId)
+    const core = encKey ? await ensureSelfLastKnownCore(circleId) : null
+    if (!core || core.length === 0) return
+    const detail = await readTipDetailed(core)
+    const plain = detail.reason === 'unparseable'
+      ? await readTipUnencrypted(_store, b4a.toString(core.key, 'hex'))
+      : null
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    const verdict = shouldHealSelfTip({
+      hasEncryptionKey: !!encKey,
+      tipReason: detail.reason,
+      recoveredPubkey: plain?.pubkey,
+      ourPubkey: ourKey,
+    })
+    if (!verdict.heal) return
+    if (!verifyValue(plain)) return
+    // Same signed value, same ts: republished under encryption, not refreshed.
+    await appendFix(core, plain)
+    mark('lastknown:self-healed', { cid: circleId.slice(0, 8), ts: plain.ts })
+  } catch (e) {
+    mark('lastknown:self-heal-failed', { cid: circleId.slice(0, 8), err: e?.message })
+  }
+}
+
 // LWW cache write for a verified peer tip. Shared by the normal (encrypted)
 // path and the plaintext-recovery path so the freshness rule and the one-shot
 // observability mark cannot drift apart between them.
@@ -7025,6 +7071,11 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
   }
   mark('init:circles-mounted', { count: _circleBases.size })
+
+  // Heal any last-known tip this device published in the clear before the
+  // join-time race was closed (2026-07-24). Fire-and-forget per circle: a local
+  // read plus at most one append, and nothing downstream waits on it.
+  for (const circleId of _circleBases.keys()) healSelfLastKnownTip(circleId).catch(() => {})
 
   // Stale-deleted sweep (proposal amendment 2026-05-07). If a previous
   // session pulled an owner's circle.deleted tombstone but the
