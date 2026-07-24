@@ -5462,8 +5462,32 @@ const _lastKnownCoverageAt = new Map()
 // core we fire a bounded background fetch of the tip block and return; the next
 // refresh reads it. Validates the signed value (signature + pubkey match) so a
 // blind/forged block can't poison the cache, and is LWW on ts.
+// Peers whose core we have established is written in the clear. Remembering
+// them skips the doomed encrypted read on every subsequent poll, and keeps the
+// recovery mark to once per peer instead of once per 3s tick.
+const _lastKnownPlaintextPeers = new Set()
+
+async function recoverPlaintextPeerTip (circleId, pubkey, core) {
+  const seen = _lastKnownPlaintextPeers.has(circleId + ':' + pubkey)
+  const plain = await readTipUnencrypted(_store, b4a.toString(core.key, 'hex'))
+  // Verified exactly like an encrypted tip: nothing unsigned, and nothing
+  // attributed to a member who did not sign it.
+  if (!plain || plain.pubkey !== pubkey || !verifyValue(plain)) return false
+  if (!seen) {
+    _lastKnownPlaintextPeers.add(circleId + ':' + pubkey)
+    mark('lastknown:tip-plaintext-recovered', { cid: circleId.slice(0, 8), peer: pubkey.slice(0, 8), len: core.length })
+  }
+  cacheLastKnownTip(circleId, pubkey, plain)
+  return true
+}
+
 async function pullPeerTip (circleId, pubkey, core) {
   await core.ready()
+  // Known-plaintext writer: go straight to the unencrypted read rather than
+  // burning an attempt on a decrypt that cannot succeed.
+  if (_lastKnownPlaintextPeers.has(circleId + ':' + pubkey)) {
+    if (await recoverPlaintextPeerTip(circleId, pubkey, core)) return
+  }
   try { await core.update({ wait: false }) } catch {}
   if (core.length === 0) {
     // Dead end 1: we have never learned this core's length, so we cannot even
@@ -5488,12 +5512,7 @@ async function pullPeerTip (circleId, pubkey, core) {
       // leaving the member permanently stuck at their pre-cutover position.
       // Verified below exactly like an encrypted tip, so nothing unsigned gets
       // in. Re-fetching would not help, so we never fall through to it.
-      const coreKeyHex = b4a.toString(core.key, 'hex')
-      const plain = await readTipUnencrypted(_store, coreKeyHex)
-      if (plain && plain.pubkey === pubkey && verifyValue(plain)) {
-        diagLastKnown(circleId, pubkey, 'tip-plaintext-recovered', { len: core.length }, true)
-        cacheLastKnownTip(circleId, pubkey, plain)
-      }
+      await recoverPlaintextPeerTip(circleId, pubkey, core)
       return
     }
     core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
