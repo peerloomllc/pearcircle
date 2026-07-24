@@ -57,6 +57,7 @@ const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require(
 const { stalledGets, writerSummary, unfetchableWriters, keyPrefix, TRACK_LIMIT } = require('./lib/appendStall')
 const { shouldAttemptAppend, nextAppendHealth } = require('./lib/appendHealth')
 const { shouldEmit, coverageSummary } = require('./lib/lastKnownDiag')
+const { applyEncryptionReloadFix } = require('./lib/hypercoreEncryptionPatch')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
@@ -6642,6 +6643,16 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // Arm the append-stall tracer before any core exists, so the patched get is
   // the one every core inherits (investigation 2026-07-24).
   patchHypercoreGet()
+  // Repair hypercore's DefaultEncryption._reload before any core is opened.
+  // Without it, a peer core whose compat flag flips mid-open (which is every
+  // core opened by key with no manifest, once its manifest replicates) loses
+  // its block key and decrypts to noise for the rest of the session.
+  try {
+    const r = applyEncryptionReloadFix(require('hypercore'), b4a)
+    mark('hypercore:encryption-reload-fix', r)
+  } catch (e) {
+    mark('hypercore:encryption-reload-fix', { applied: false, reason: 'threw', err: e?.message })
+  }
 
   // Retry on lock errors: BareKit may restart the worklet before the prior
   // instance has released the corestore lock file.
