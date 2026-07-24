@@ -15,6 +15,7 @@ import {
   computeRingOffsets,
 } from '../lib/fanOut.js'
 import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
+import { supersedeFailureMessage } from '../lib/supersedeApply.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
 import { RepairBanner, RepairingBanner, RepairConfirmModal, REPAIR_ESCALATE_MS } from './components/RepairBanners.jsx'
@@ -4747,6 +4748,10 @@ function CirclesSection ({ active = true, onChanged }) {
   const [exportingFor, setExportingFor] = useState(null)     // circle object
   const [exportBusy, setExportBusy] = useState(false)
   const [importBusy, setImportBusy] = useState(false)
+  // Manual re-post of a migration nudge that never landed (proposal
+  // 2026-07-24). Holds the circleId being notified so only that row's button
+  // shows a busy label.
+  const [notifyingId, setNotifyingId] = useState(null)
   const [notice, setNotice] = useState(null)                 // transient success line
 
   const refresh = useCallback(async () => {
@@ -4767,6 +4772,9 @@ function CirclesSection ({ active = true, onChanged }) {
           createdAt: typeof c.createdAt === 'number' ? c.createdAt : null,
           recreatedFrom: typeof c.recreatedFrom === 'string' ? c.recreatedFrom : null,
           recreatedTo: typeof c.recreatedTo === 'string' ? c.recreatedTo : null,
+          // This circle's members still owe a "we moved" notice (proposal
+          // 2026-07-24). Drives the row's Notify members action.
+          supersedePending: c.supersedePending === true,
         }))
       setList(next)
     } catch (e) {
@@ -4861,6 +4869,31 @@ function CirclesSection ({ active = true, onChanged }) {
       setError(String(e?.message ?? e))
     } finally {
       setRecreateBusy(false)
+    }
+  }
+
+  // Re-post the "your group moved" notice into an old circle whose members
+  // never got it (proposal 2026-07-24). The worklet retries this on its own at
+  // every foreground, but a wedged circle can stay unwritable for days, so the
+  // owner gets an explicit lever and, more importantly, an honest status line
+  // telling them the notice is still outstanding.
+  const performNotify = async (c) => {
+    setNotifyingId(c.circleId)
+    setError(null)
+    setNotice(null)
+    try {
+      const r = await pear.call('circle:supersede', { oldCircleId: c.circleId, newCircleId: c.recreatedTo, manual: true })
+      if (r?.ok === false && r.error) throw new Error(r.error)
+      if (r?.ok) {
+        setNotice('Members of ' + c.name + ' will see the move prompt next time their app syncs.')
+        refresh()
+      } else {
+        setError(supersedeFailureMessage(r?.reason))
+      }
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setNotifyingId(null)
     }
   }
 
@@ -5049,6 +5082,30 @@ function CirclesSection ({ active = true, onChanged }) {
                 <div style={{ ...typography.caption, color: colors.text.secondary }}>
                   {c.createdAt ? `Created ${formatCreatedDate(c.createdAt)} · ` : ''}{c.isOwner ? 'You own this · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
                 </div>
+                {/* The move notice never landed in this circle, so its members
+                    have no idea the group moved. The app keeps retrying, but
+                    say so plainly and give the owner a lever - a wedged circle
+                    can stay unwritable for days (proposal 2026-07-24). */}
+                {c.supersedePending && beingReplaced && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginTop: spacing.xs, flexWrap: 'wrap' }}>
+                    <span style={{ ...typography.caption, color: colors.warn }}>
+                      Members not told about the move yet
+                    </span>
+                    <button
+                      onClick={() => performNotify(c)}
+                      disabled={notifyingId === c.circleId}
+                      style={{
+                        padding: '4px 10px', borderRadius: radius.sm,
+                        background: 'transparent', color: colors.text.primary,
+                        border: `1px solid ${colors.border}`,
+                        cursor: notifyingId === c.circleId ? 'default' : 'pointer',
+                        fontFamily: typography.fontFamily, fontSize: 12, fontWeight: 400,
+                        whiteSpace: 'nowrap',
+                      }}>
+                      {notifyingId === c.circleId ? 'Trying...' : 'Notify members'}
+                    </button>
+                  </div>
+                )}
               </div>
               {c.isOwner && (
                 <button
@@ -5202,11 +5259,13 @@ function RecreatedInviteModal ({ result, onClose }) {
           ? <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> was created from your file with the same Places. Share this invite so people can join.</>
           : result.superseded
             ? <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. Share this invite so members rejoin - anyone on the latest app also gets a one-tap "your group moved" nudge. The old circle stays until you delete it.</>
-            // No nudge landed. Say so plainly: the owner is the only route the
-            // members now have, and a promise of an automatic prompt that never
-            // arrives is worse than no promise. Common when the old circle is
-            // the wedged one - which is usually why it is being recreated.
-            : <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. We could not nudge the old circle's members automatically (its data is stuck), so send them this invite yourself - they will not get a prompt in the app. The old circle stays until you delete it.</>}
+            // No nudge landed. Say so plainly: the invite is the only route the
+            // members have right now, and a promise of an automatic prompt that
+            // may never arrive is worse than no promise. Common when the old
+            // circle is the wedged one - which is usually why it is being
+            // recreated. We do keep retrying in the background (proposal
+            // 2026-07-24), so say that too, without leaning on it.
+            : <><strong style={{ color: colors.text.primary, fontWeight: 400 }}>{result.name}</strong> is rebuilt on a clean slate with the same Places. We could not nudge the old circle's members automatically (its data is stuck) - we will keep trying, but send them this invite yourself rather than wait. The old circle stays until you delete it.</>}
       </div>
       {result.placesUnavailable ? (
         <div style={{ ...typography.caption, color: colors.text.secondary, marginBottom: spacing.md }}>

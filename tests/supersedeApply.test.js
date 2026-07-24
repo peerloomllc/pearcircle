@@ -1,4 +1,4 @@
-const { shouldAcceptSupersede } = require('../src/lib/supersedeApply')
+const { shouldAcceptSupersede, shouldRetrySupersede, supersedePendingNext, supersedeFailureMessage, SUPERSEDE_RETRYABLE, SUPERSEDE_MAX_ATTEMPTS } = require('../src/lib/supersedeApply')
 const { signValue, verifyValueWithSigner } = require('../src/lib/sign')
 const { generateKeypair } = require('../src/identity')
 const b4a = require('b4a')
@@ -81,5 +81,102 @@ describe('shouldAcceptSupersede', () => {
     expect(accept(row, { existing: { postedAt: now } })).toBe(false)        // equal
     expect(accept(row, { existing: { postedAt: now + 1 } })).toBe(false)    // older
     expect(accept(row, { existing: { postedAt: now - 1 } })).toBe(true)     // newer
+  })
+})
+
+describe('shouldRetrySupersede', () => {
+  test('retries the failures a wedged circle produces', () => {
+    // These are the whole reason the retry exists: the circles an owner
+    // recreates are the wedged ones, and a wedged base refuses the append the
+    // migration nudge needs. A repair or a writer re-admission fixes it.
+    for (const reason of ['not_writable', 'append_timeout', 'append_failed', 'circle_unreadable']) {
+      expect(shouldRetrySupersede(reason, 0)).toBe(true)
+    }
+  })
+
+  test('does not retry a failure that waiting cannot change', () => {
+    expect(shouldRetrySupersede('not_owner', 0)).toBe(false)
+    expect(shouldRetrySupersede('unknown_new_circle', 0)).toBe(false)
+    expect(shouldRetrySupersede('unknown_old_circle', 0)).toBe(false)
+    expect(shouldRetrySupersede(undefined, 0)).toBe(false)
+    expect(shouldRetrySupersede('failed', 0)).toBe(false)
+  })
+
+  test('gives up once the attempt cap is reached', () => {
+    expect(shouldRetrySupersede('not_writable', SUPERSEDE_MAX_ATTEMPTS - 1)).toBe(true)
+    expect(shouldRetrySupersede('not_writable', SUPERSEDE_MAX_ATTEMPTS)).toBe(false)
+    expect(shouldRetrySupersede('not_writable', SUPERSEDE_MAX_ATTEMPTS + 100)).toBe(false)
+  })
+
+  test('every retryable reason has user-facing copy that points at the invite', () => {
+    for (const reason of SUPERSEDE_RETRYABLE) {
+      expect(supersedeFailureMessage(reason)).toMatch(/invite/)
+    }
+  })
+})
+
+describe('supersedeFailureMessage', () => {
+  test('explains a stuck circle without jargon', () => {
+    const m = supersedeFailureMessage('not_writable')
+    expect(m).toContain('stuck')
+    expect(m).not.toMatch(/append|autobase|writable|timeout/i)
+  })
+
+  test('names the owner as the only one who can post it', () => {
+    expect(supersedeFailureMessage('not_owner')).toContain('owner')
+  })
+
+  test('falls back to a sane line for an unknown reason', () => {
+    expect(supersedeFailureMessage(undefined)).toMatch(/invite/)
+    expect(supersedeFailureMessage('something-new')).toMatch(/invite/)
+  })
+})
+
+describe('supersedePendingNext (retry bookkeeping)', () => {
+  const NEW = 'b'.repeat(64)
+  const NOW = 1_750_000_000_000
+
+  test('a first failure on a wedged circle starts the tally', () => {
+    const r = supersedePendingNext({ prev: null, newCircleId: NEW, result: { ok: false, reason: 'not_writable' }, now: NOW })
+    expect(r.action).toBe('keep')
+    expect(r.row).toEqual({ newCircleId: NEW, attempts: 1, reason: 'not_writable', since: NOW, v: 1 })
+  })
+
+  test('each further failure bumps the tally and keeps the original since', () => {
+    const prev = { newCircleId: NEW, attempts: 1, reason: 'not_writable', since: NOW, v: 1 }
+    const r = supersedePendingNext({ prev, newCircleId: NEW, result: { ok: false, reason: 'append_timeout' }, now: NOW + 90_000 })
+    expect(r.row.attempts).toBe(2)
+    expect(r.row.since).toBe(NOW)
+    expect(r.row.reason).toBe('append_timeout')
+  })
+
+  test('success clears a pending row', () => {
+    const prev = { newCircleId: NEW, attempts: 4, since: NOW, v: 1 }
+    expect(supersedePendingNext({ prev, newCircleId: NEW, result: { ok: true } }).action).toBe('clear')
+  })
+
+  test('success with nothing pending is a no-op, not a write', () => {
+    // The happy-path recreate: the nudge posted first time, so there is no row
+    // to clear and no row to create.
+    expect(supersedePendingNext({ prev: null, newCircleId: NEW, result: { ok: true } }).action).toBe('none')
+  })
+
+  test('a terminal failure clears rather than spinning forever', () => {
+    const prev = { newCircleId: NEW, attempts: 3, since: NOW, v: 1 }
+    expect(supersedePendingNext({ prev, newCircleId: NEW, result: { ok: false, reason: 'not_owner' } }).action).toBe('clear')
+    expect(supersedePendingNext({ prev, newCircleId: NEW, result: { ok: false, reason: 'unknown_new_circle' } }).action).toBe('clear')
+  })
+
+  test('hitting the cap clears the row so the sweep stops', () => {
+    const prev = { newCircleId: NEW, attempts: SUPERSEDE_MAX_ATTEMPTS - 1, since: NOW, v: 1 }
+    expect(supersedePendingNext({ prev, newCircleId: NEW, result: { ok: false, reason: 'not_writable' } }).action).toBe('clear')
+  })
+
+  test('a manual tap resets the tally, buying another run of auto retries', () => {
+    const prev = { newCircleId: NEW, attempts: SUPERSEDE_MAX_ATTEMPTS - 1, since: NOW, v: 1 }
+    const r = supersedePendingNext({ prev, newCircleId: NEW, result: { ok: false, reason: 'not_writable' }, manual: true, now: NOW })
+    expect(r.action).toBe('keep')
+    expect(r.row.attempts).toBe(0)
+    expect(r.row.since).toBe(NOW)
   })
 })
