@@ -74,10 +74,40 @@ async function readTipDetailed (core) {
   try {
     return { tip: JSON.parse(b4a.toString(block)), reason: null, bytes: block.length }
   } catch (e) {
-    // Present on disk and undecodable: a wrong encryption key yields plausible
-    // bytes that are not JSON. Retrying cannot fix this one.
+    // Present and undecodable. The known benign cause is a writer that
+    // published this block in the CLEAR (see circleEncKeyHex - a swallowed read
+    // error used to downgrade a member's core to plaintext for a whole
+    // session). It is NOT recoverable from this buffer: the cipher already
+    // XOR'd the body using a nonce built from padding hypercore has since
+    // stripped. The caller re-reads it through readTipUnencrypted instead.
     return { tip: null, reason: 'unparseable', bytes: block.length, err: e?.message }
   }
 }
 
-module.exports = { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed }
+// Read a tip from a core whose blocks were never encrypted, by opening a second
+// session on the same key with no encryption key at all - the only way to see
+// the stored bytes once an encrypted session has mangled them. Used as the
+// fallback for 'unparseable', and proven against the live Hudgins circle on
+// 2026-07-24, where two members' tips turned out to be plain JSON.
+//
+// The caller must still verify the signature and pubkey on whatever comes back:
+// this admits nothing an attacker could not already have signed, and only
+// recovers positions that are, unfortunately, already public.
+async function readTipUnencrypted (store, coreKeyHex) {
+  let core = null
+  try {
+    core = store.get({ key: b4a.from(coreKeyHex, 'hex') })
+    await core.ready()
+    if (core.length === 0) return null
+    const block = await core.get(core.length - 1, { wait: false })
+    if (!block) return null
+    const parsed = JSON.parse(b4a.toString(block))
+    return (parsed && typeof parsed === 'object') ? parsed : null
+  } catch {
+    return null
+  } finally {
+    if (core) { try { await core.close() } catch {} }
+  }
+}
+
+module.exports = { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed, readTipUnencrypted }

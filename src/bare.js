@@ -35,7 +35,7 @@ const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const { setupSeederPairChannel } = require('./seederPair')
 const { setupLiveChannel, LIVE_PROTOCOL } = require('./liveLocation')
 const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
-const { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed } = require('./memberLastKnown')
+const { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed, readTipUnencrypted } = require('./memberLastKnown')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('./lib/seederApply')
@@ -5297,11 +5297,29 @@ function broadcastLive (circleId, value) {
 // Resolve a circle's enc key hex, caching it. Falls back to the local
 // circles:joined record so callers don't have to thread it from the mount site
 // (legacy unencrypted circles resolve to null, which openSelf/PeerCore handle).
+// Never negative-cache (2026-07-24). This used to store whatever it resolved,
+// including the null produced by a missing record or by the .catch below
+// swallowing a transient read error - and that null was then returned for the
+// rest of the process. Every consumer downstream treats "no key" as "this
+// circle is unencrypted", so one swallowed error silently downgraded a member's
+// last-known core to PLAINTEXT for the whole session, and the resulting blocks
+// are readable by anyone who replicates them, including the blind seeder that
+// is specifically designed not to read content. Two Hudgins members were found
+// writing plaintext positions this way on 2026-06-19.
+//
+// A real key is cached; anything else is re-read next time, which costs one
+// local get on a store that caches it anyway.
 async function circleEncKeyHex (circleId) {
   if (_circleEncKeys.has(circleId)) return _circleEncKeys.get(circleId)
-  const rec = await _localDb.get('circles:joined:' + circleId).catch(() => null)
+  let rec = null
+  try {
+    rec = await _localDb.get('circles:joined:' + circleId)
+  } catch (e) {
+    mark('circle:enckey-read-failed', { cid: circleId.slice(0, 8), err: e?.message })
+    return null
+  }
   const k = rec?.value?.encryptionKey || null
-  _circleEncKeys.set(circleId, k)
+  if (k) _circleEncKeys.set(circleId, k)
   return k
 }
 
@@ -5310,9 +5328,36 @@ async function ensureSelfLastKnownCore (circleId) {
   let core = _lastKnownSelfCores.get(circleId)
   if (core) return core
   const encKey = await circleEncKeyHex(circleId)
+  // Refuse to write positions in the clear. If this circle is encrypted (its
+  // joined record carries an encryptionKey) but we could not resolve one, the
+  // right move is to write nothing this round rather than publish coordinates
+  // a blind seeder could read. The caller retries on the next fix, by which
+  // time the key normally resolves. A genuinely legacy unencrypted circle has
+  // no `encrypted` flag and proceeds as before.
+  if (!encKey && await circleIsEncrypted(circleId)) {
+    mark('lastknown:refused-plaintext', { cid: circleId.slice(0, 8) })
+    return null
+  }
   core = openSelfCore(_store, circleId, encKey)
   _lastKnownSelfCores.set(circleId, core)
   return core
+}
+
+// Does this circle expect encryption? Read from the replicated circle row,
+// which carries `encrypted: true` for every circle created since the
+// blind-seeder proposal, with the local joined record as the fallback.
+async function circleIsEncrypted (circleId) {
+  try {
+    const rec = await _localDb.get('circles:joined:' + circleId)
+    if (rec?.value?.encryptionKey) return true
+    const base = _circleBases.get(circleId)
+    const row = base ? await base.view.get('circle') : null
+    return row?.value?.encrypted === true
+  } catch {
+    // Unknown: assume encrypted. Withholding one position update is a far
+    // smaller harm than publishing coordinates in the clear.
+    return true
+  }
 }
 
 // Persist the latest signed fix to our per-member core (append + clear earlier
@@ -5321,6 +5366,7 @@ async function ensureSelfLastKnownCore (circleId) {
 // writability: the core is single-writer and entirely ours.
 async function appendSelfLastKnown (circleId, value) {
   const core = await ensureSelfLastKnownCore(circleId)
+  if (!core) return // refused rather than write in the clear; retried next fix
   await appendFix(core, value)
   if (!_firstLastKnownWriteMarked.has(circleId)) {
     _firstLastKnownWriteMarked.add(circleId)
@@ -5437,8 +5483,17 @@ async function pullPeerTip (circleId, pubkey, core) {
     // and never cached.
     diagLastKnown(circleId, pubkey, 'tip-remote', { len: core.length, reason: detail.reason, bytes: detail.bytes ?? null, err: detail.err ?? null })
     if (detail.reason === 'unparseable') {
-      // Retrying cannot help. Report it once per throttle window and stop
-      // burning a fetch on every poll.
+      // The writer published this block in the clear (proven on the Hudgins
+      // circle 2026-07-24). Re-read it with encryption bypassed rather than
+      // leaving the member permanently stuck at their pre-cutover position.
+      // Verified below exactly like an encrypted tip, so nothing unsigned gets
+      // in. Re-fetching would not help, so we never fall through to it.
+      const coreKeyHex = b4a.toString(core.key, 'hex')
+      const plain = await readTipUnencrypted(_store, coreKeyHex)
+      if (plain && plain.pubkey === pubkey && verifyValue(plain)) {
+        diagLastKnown(circleId, pubkey, 'tip-plaintext-recovered', { len: core.length }, true)
+        cacheLastKnownTip(circleId, pubkey, plain)
+      }
       return
     }
     core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
@@ -5447,14 +5502,22 @@ async function pullPeerTip (circleId, pubkey, core) {
     return
   }
   if (tip.pubkey !== pubkey || !verifyValue(tip)) return
+  cacheLastKnownTip(circleId, pubkey, tip)
+}
+
+// LWW cache write for a verified peer tip. Shared by the normal (encrypted)
+// path and the plaintext-recovery path so the freshness rule and the one-shot
+// observability mark cannot drift apart between them.
+function cacheLastKnownTip (circleId, pubkey, tip) {
   const cache = _lastKnownCache.get(circleId)
   if (!cache) return
   const cur = cache.get(pubkey)
   if (cur && typeof cur.ts === 'number' && typeof tip.ts === 'number' && tip.ts <= cur.ts) return
   cache.set(pubkey, tip)
   // One-shot observability: the first peer tip we replicate + decrypt + cache
-  // for a circle confirms the full last-known read path (announce → open core →
-  // download tip → verify → cache), the slice-2a payoff (proposal 2026-06-04).
+  // for a circle confirms the full last-known read path (announce -> open core
+  // -> download tip -> verify -> cache), the slice-2a payoff (proposal
+  // 2026-06-04).
   if (!_firstPeerLastKnownMarked.has(circleId)) {
     _firstPeerLastKnownMarked.add(circleId)
     mark('lastknown:peer-tip:first', { circleId: circleId.slice(0, 8), from: pubkey.slice(0, 8) })
