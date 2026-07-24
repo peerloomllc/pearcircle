@@ -58,6 +58,7 @@ const { stalledGets, writerSummary, unfetchableWriters, keyPrefix, TRACK_LIMIT }
 const { shouldAttemptAppend, nextAppendHealth } = require('./lib/appendHealth')
 const { shouldEmit, coverageSummary } = require('./lib/lastKnownDiag')
 const { shouldHealSelfTip } = require('./lib/lastKnownHeal')
+const { blindnessVerdict } = require('./lib/blindnessCheck')
 const { applyEncryptionReloadFix } = require('./lib/hypercoreEncryptionPatch')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
@@ -179,6 +180,9 @@ const _firstLiveRecvMarked = new Set()        // circleIds where we first receiv
 const _firstLastKnownWriteMarked = new Set()  // circleIds where we first appended our last-known core fix (proposal 2026-06-04 slice 2a)
 const _firstPeerLastKnownMarked = new Set()   // circleIds where we first cached a peer's last-known core tip
 const _seederLastknownTipMarked = new Set()   // coreKeyHex of peer last-known cores whose tip the seeder has replicated (slice 2b)
+// Cores this seeder has already warned about for readable (unencrypted) content.
+// Cleared when the member heals, so a regression warns again.
+const _seederBlindnessWarned = new Set()
 
 let _store = null
 let _localDb = null
@@ -5017,12 +5021,40 @@ async function refreshSeederLastknownTip (core, circleId, pubkey) {
   await core.ready()
   try { await core.update({ wait: false }) } catch {}
   if (core.length === 0) return
+  let tipBlock = null
   try {
-    await core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
+    tipBlock = await core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
   } catch { return } // tip not served yet; the 'append'/next push retries
   // One-shot observability: the seeder replicated a member's (encrypted) tip,
   // so it can now serve offline last-known (proposal 2026-06-04 slice 2b).
   const coreKeyHex = b4a.toString(core.key, 'hex')
+  // Blindness canary (2026-07-24). This seeder is supposed to be unable to read
+  // what it mirrors. If the tip parses as JSON it was never encrypted, and that
+  // promise is broken for this member - which went unnoticed for five weeks.
+  // Warn only: peers recover these positions from us (PR #176), and the block
+  // is replaced automatically by the clear below once the member heals.
+  const verdict = blindnessVerdict({
+    block: tipBlock,
+    alreadyWarned: _seederBlindnessWarned.has(coreKeyHex),
+    toString: (b) => b4a.toString(b),
+  })
+  if (verdict.warn) {
+    _seederBlindnessWarned.add(coreKeyHex)
+    mark('seeder:blindness-broken', {
+      circleId,
+      pubkey: (pubkey || '').slice(0, 8),
+      core: coreKeyHex.slice(0, 8),
+      detail: 'member is publishing last-known positions UNENCRYPTED; this seeder can read them',
+    })
+    console.warn('[seeder] BLINDNESS BROKEN: circle ' + String(circleId).slice(0, 8) +
+      ' member ' + (pubkey || '').slice(0, 8) +
+      ' is publishing last-known positions unencrypted. Their app needs the 2026-07-24 fix; this seeder can read their location.')
+  } else if (!verdict.readable && _seederBlindnessWarned.has(coreKeyHex)) {
+    // Healed: the member now writes ciphertext, and the clear below drops the
+    // last readable copy we were holding.
+    _seederBlindnessWarned.delete(coreKeyHex)
+    mark('seeder:blindness-restored', { circleId, pubkey: (pubkey || '').slice(0, 8) })
+  }
   if (!_seederLastknownTipMarked.has(coreKeyHex)) {
     _seederLastknownTipMarked.add(coreKeyHex)
     mark('seeder:lastknown-tip', { circleId, pubkey: (pubkey || '').slice(0, 8), length: core.length })
