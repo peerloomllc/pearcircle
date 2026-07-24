@@ -35,7 +35,7 @@ const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const { setupSeederPairChannel } = require('./seederPair')
 const { setupLiveChannel, LIVE_PROTOCOL } = require('./liveLocation')
 const { mergeLiveLastSeen } = require('./lib/liveLastSeen')
-const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLastKnown')
+const { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed } = require('./memberLastKnown')
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('./lib/seederApply')
@@ -56,6 +56,7 @@ const { buildExport, validateImport, planPlaceCopy } = require('./lib/circleExpo
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
 const { stalledGets, writerSummary, unfetchableWriters, keyPrefix, TRACK_LIMIT } = require('./lib/appendStall')
 const { shouldAttemptAppend, nextAppendHealth } = require('./lib/appendHealth')
+const { shouldEmit, coverageSummary } = require('./lib/lastKnownDiag')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
@@ -5352,6 +5353,19 @@ async function announceLastKnownCore (circleId) {
 // Read peers' announced core keys from the view, open their cores (cached), and
 // pull each tip into _lastKnownCache. Non-blocking with respect to snapshot: a
 // not-yet-downloaded tip triggers a background fetch and lands on a later poll.
+// Throttled per member+event tracing for the last-known fetch. This runs off
+// the ~3s snapshot poll, so unthrottled marks would flood logcat; `force`
+// bypasses it for one-shot outcomes (a fetch resolving or failing) that are
+// rare and always worth seeing.
+const _lastKnownDiagAt = new Map() // `${cid}:${pubkey}:${event}` -> ts
+function diagLastKnown (circleId, pubkey, event, extra = {}, force = false) {
+  const k = circleId + ':' + pubkey + ':' + event
+  const now = Date.now()
+  if (!force && !shouldEmit(_lastKnownDiagAt.get(k), now)) return
+  _lastKnownDiagAt.set(k, now)
+  mark('lastknown:' + event, { cid: circleId.slice(0, 8), peer: pubkey.slice(0, 8), ...extra })
+}
+
 async function refreshPeerLastKnown (circleId) {
   const base = _circleBases.get(circleId)
   if (!base) return
@@ -5360,19 +5374,42 @@ async function refreshPeerLastKnown (circleId) {
   let peerCores = _lastKnownPeerCores.get(circleId)
   if (!peerCores) { peerCores = new Map(); _lastKnownPeerCores.set(circleId, peerCores) }
   if (!_lastKnownCache.has(circleId)) _lastKnownCache.set(circleId, new Map())
+  // Announced rows we could not use at all. A member whose row is missing or
+  // fails verification never even gets a core opened, which looks identical
+  // downstream to a fetch that failed.
+  let announced = 0
+  let unusable = 0
+  const entries = []
   for await (const { key, value } of base.view.createReadStream({ gt: 'lastknownCore:', lt: 'lastknownCore:~' })) {
     const pubkey = key.slice('lastknownCore:'.length)
     if (pubkey === ourKey) continue
-    if (!value || typeof value.coreKey !== 'string') continue
-    if (value.pubkey !== pubkey || !verifyValue(value)) continue
+    announced++
+    if (!value || typeof value.coreKey !== 'string') { unusable++; continue }
+    if (value.pubkey !== pubkey || !verifyValue(value)) { unusable++; continue }
     let core = peerCores.get(pubkey)
     if (!core) {
       core = openPeerCore(_store, value.coreKey, encKey)
       peerCores.set(pubkey, core)
     }
+    entries.push({ pubkey, core })
     pullPeerTip(circleId, pubkey, core).catch(() => {})
   }
+  // One coverage line per circle per throttle window: says at a glance whether
+  // this is one stuck member or the whole path failing.
+  if (shouldEmit(_lastKnownCoverageAt.get(circleId))) {
+    _lastKnownCoverageAt.set(circleId, Date.now())
+    const cache = _lastKnownCache.get(circleId)
+    const summary = coverageSummary(entries.map(({ pubkey, core }) => ({
+      pubkey,
+      length: core?.length ?? 0,
+      // contiguousLength >= length means the tip block is on disk here.
+      tipLocal: (core?.contiguousLength ?? 0) >= (core?.length ?? 0) && (core?.length ?? 0) > 0,
+      cachedTs: cache?.get(pubkey)?.ts,
+    })))
+    mark('lastknown:coverage', { cid: circleId.slice(0, 8), announced, unusable, ...summary })
+  }
 }
+const _lastKnownCoverageAt = new Map()
 
 // Download + cache a peer core's tip. readTip is non-blocking, so on a cold
 // core we fire a bounded background fetch of the tip block and return; the next
@@ -5381,11 +5418,31 @@ async function refreshPeerLastKnown (circleId) {
 async function pullPeerTip (circleId, pubkey, core) {
   await core.ready()
   try { await core.update({ wait: false }) } catch {}
-  if (core.length === 0) return
-  const tip = await readTip(core)
+  if (core.length === 0) {
+    // Dead end 1: we have never learned this core's length, so we cannot even
+    // name a block to ask for. Nothing here retries beyond the next poll, and
+    // until 2026-07-24 it was completely silent (investigation: a peer stuck at
+    // its pre-cutover position with no way to tell which step failed).
+    diagLastKnown(circleId, pubkey, 'no-length', {})
+    return
+  }
+  const detail = await readTipDetailed(core)
+  const tip = detail.tip
   if (!tip) {
-    // Tip not local yet: request it in the background (bounded), cache later.
-    core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS }).catch(() => {})
+    // Dead end 2, now split by reason. 'absent' means the block genuinely is
+    // not here and fetching is the right response. 'unparseable' means it IS
+    // here and re-fetching is pointless - that is the infinite 5-second loop
+    // observed on 2026-07-24, where three members' tips were "fetched" forever
+    // and never cached.
+    diagLastKnown(circleId, pubkey, 'tip-remote', { len: core.length, reason: detail.reason, bytes: detail.bytes ?? null, err: detail.err ?? null })
+    if (detail.reason === 'unparseable') {
+      // Retrying cannot help. Report it once per throttle window and stop
+      // burning a fetch on every poll.
+      return
+    }
+    core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
+      .then((block) => diagLastKnown(circleId, pubkey, 'tip-fetched', { len: core.length, bytes: block ? block.length : 0 }, true))
+      .catch((e) => diagLastKnown(circleId, pubkey, 'tip-fetch-failed', { len: core.length, err: e?.message }, true))
     return
   }
   if (tip.pubkey !== pubkey || !verifyValue(tip)) return
