@@ -54,6 +54,8 @@ const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
 const { buildExport, validateImport, planPlaceCopy } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
+const { stalledGets, writerSummary, unfetchableWriters, keyPrefix, TRACK_LIMIT } = require('./lib/appendStall')
+const { shouldAttemptAppend, nextAppendHealth } = require('./lib/appendHealth')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
@@ -3292,16 +3294,166 @@ async function retryStagedRepairs () {
 // false. A normal rejection (base closed mid-flight) returns false WITHOUT
 // degrading. Returns true iff the row was appended. Proposal
 // 2026-06-03-autobase-append-hang.
+// Per-circle append health (proposal 2026-07-24). All in-memory: a fresh mount
+// starts with a clean slate, which is the point - the first append after one is
+// slow by design and must not condemn the circle.
+const _appendFailStreak = new Map()   // cid -> consecutive timeouts
+const _firstAppendDone = new Set()    // cids that have attempted an append since mount
+const _lastDegradedProbe = new Map()  // cid -> ts of the last probe while degraded
+
+// Called when a circle's base is (re)mounted, so the next append is treated as
+// the cold first one again.
+function resetAppendHealth (circleId) {
+  if (!circleId) return
+  _appendFailStreak.delete(circleId)
+  _firstAppendDone.delete(circleId)
+  _lastDegradedProbe.delete(circleId)
+}
+
 async function safeAppend (base, op, label) {
   const cid = circleIdForBase(base)
-  if (cid && _degradedCircles.has(cid)) return false
+  const degraded = !!(cid && _degradedCircles.has(cid))
+  if (cid) {
+    // Degraded no longer hard-blocks: it throttles. Recovery has to be
+    // reachable, and it cannot be if the flag suppresses every append that
+    // would demonstrate it (proposal 2026-07-24).
+    const { attempt, probe } = shouldAttemptAppend({ degraded, lastProbeAt: _lastDegradedProbe.get(cid) ?? 0 })
+    if (!attempt) return false
+    if (probe) {
+      _lastDegradedProbe.set(cid, Date.now())
+      mark('circle:degraded-probe', { cid: cid.slice(0, 8), label: label || null })
+    }
+  }
   // Rewind guard (proposal 2026-06-27 item 3): never append past a truncated
   // writer tip while the network still holds the original blocks, or we fork.
   if (writerRewindBlocked(base, cid)) return false
+  const firstAttemptDone = !cid || _firstAppendDone.has(cid)
+  if (cid) _firstAppendDone.add(cid)
+  beginAppendTrace()
   const { ok, timedOut } = await raceAppend(base.append(op), APPEND_TIMEOUT_MS)
-  if (timedOut) flagDegraded(cid, 'append:' + (label || ''))
-  else if (ok) scheduleDurabilityFlush() // item 4: bound the WAL-loss window after a writer append
+  // Report BEFORE ending the trace: the reads that were outstanding when the
+  // append gave up are the evidence, and endAppendTrace drops them.
+  if (timedOut) dumpAppendStall(base, cid, label)
+  endAppendTrace()
+
+  const health = nextAppendHealth({
+    ok,
+    timedOut,
+    degraded,
+    streak: cid ? (_appendFailStreak.get(cid) ?? 0) : 0,
+    firstAttemptDone,
+  })
+  if (cid) {
+    _appendFailStreak.set(cid, health.streak)
+    if (health.firstSlow) {
+      // Expected: the discovery gate makes the first append after a mount slow.
+      // The append promise is still running, so this write may yet land.
+      mark('append:first-slow', { cid: cid.slice(0, 8), label: label || null })
+    }
+    if (health.degrade) flagDegraded(cid, 'append:' + (label || ''))
+    else if (timedOut && !health.firstSlow) {
+      mark('append:timeout', { cid: cid.slice(0, 8), label: label || null, streak: health.streak })
+    }
+    if (health.clearDegrade) {
+      clearDegraded(cid)
+      mark('circle:degraded-cleared', { cid: cid.slice(0, 8), label: label || null })
+      send({ event: 'circle:degraded', data: { circleId: cid, degraded: false } })
+    }
+  }
+  if (ok) scheduleDurabilityFlush() // item 4: bound the WAL-loss window after a writer append
   return ok
+}
+
+// --- Append-stall tracing (investigation 2026-07-24) ------------------------
+// Records Hypercore reads while a writer append is in flight so a timeout can
+// say what the append was waiting on. See src/lib/appendStall.js for why this
+// has to run on a real device.
+//
+// Cost in the healthy case is one integer comparison per read: tracking only
+// engages while an append is actually in flight, and a healthy append settles
+// in milliseconds. Only the wedged case, where the window stretches to the full
+// APPEND_TIMEOUT_MS, records anything worth the name.
+let _appendTraceDepth = 0
+let _inflightGets = new Map()
+let _getSeq = 0
+let _getPatched = false
+
+function patchHypercoreGet () {
+  if (_getPatched) return
+  _getPatched = true
+  try {
+    const Hypercore = require('hypercore')
+    const orig = Hypercore.prototype.get
+    Hypercore.prototype.get = function (index, ...rest) {
+      if (_appendTraceDepth === 0 || _inflightGets.size >= TRACK_LIMIT) return orig.call(this, index, ...rest)
+      const id = ++_getSeq
+      _inflightGets.set(id, {
+        core: this.key ? keyPrefix(b4a.toString(this.key, 'hex')) : '?',
+        index,
+        ts: Date.now(),
+        coreLength: this.length,
+      })
+      let p
+      try {
+        p = orig.call(this, index, ...rest)
+      } catch (e) {
+        _inflightGets.delete(id)
+        throw e
+      }
+      return Promise.resolve(p).finally(() => _inflightGets.delete(id))
+    }
+    mark('append-trace:armed')
+  } catch (e) {
+    // A worklet that can't patch still works; it just can't explain a stall.
+    mark('append-trace:arm-failed', { err: e?.message })
+  }
+}
+
+function beginAppendTrace () {
+  _appendTraceDepth++
+}
+
+function endAppendTrace () {
+  _appendTraceDepth = Math.max(0, _appendTraceDepth - 1)
+  // An append that timed out never settles, so its reads never resolve and
+  // would otherwise sit in the map forever. Nothing reads them after the dump.
+  if (_appendTraceDepth === 0 && _inflightGets.size) _inflightGets = new Map()
+}
+
+// Emit what the timed-out append was blocked on. Three shapes, so a log line
+// stays readable: the summary, the writers whose history this device cannot
+// fetch, and the individual stuck reads.
+function dumpAppendStall (base, cid, label) {
+  try {
+    const now = Date.now()
+    const stuck = stalledGets(_inflightGets.values(), now)
+    const writers = writerSummary(base?.activeWriters ? [...base.activeWriters] : [])
+    const gaps = unfetchableWriters(writers)
+    mark('append:stall', {
+      cid: cid ? cid.slice(0, 8) : null,
+      label: label || null,
+      writable: !!base?.writable,
+      writers: writers.length,
+      // Zero stuck reads is the informative negative: the append is blocked on
+      // something other than fetching a block.
+      stuckGets: stuck.length,
+      tracked: _inflightGets.size,
+      unfetchable: gaps.count,
+      worstGap: gaps.worst,
+      sysLen: base?.system?.core?.length ?? null,
+      localLen: base?.local?.length ?? null,
+    })
+    for (const g of stuck) {
+      mark('append:stall:get', { core: g.core, index: g.index, coreLen: g.coreLength, pendingMs: g.pendingMs })
+    }
+    for (const w of writers) {
+      if (typeof w.length === 'number' && typeof w.contig === 'number' && w.contig < w.length) {
+        mark('append:stall:writer', { core: w.core, len: w.length, contig: w.contig })
+      }
+    }
+  } catch (e) {
+    mark('append:stall:dump-failed', { err: e?.message })
+  }
 }
 
 // Synchronous, never-throws check on the writer-append hot path. Returns true
@@ -4454,6 +4606,10 @@ async function buildCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, re
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
   attachConflictListeners(base, circleId)
+  // Fresh mount, fresh append health: the first append against it has to wait
+  // on the discovery gate and must not count against the circle (proposal
+  // 2026-07-24).
+  resetAppendHealth(circleId)
   return base
 }
 
@@ -6426,6 +6582,9 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     throw new Error('init requires { dataDir: string }')
   }
   mark('init:start', { attempt, mode: mode ?? 'member' })
+  // Arm the append-stall tracer before any core exists, so the patched get is
+  // the one every core inherits (investigation 2026-07-24).
+  patchHypercoreGet()
 
   // Retry on lock errors: BareKit may restart the worklet before the prior
   // instance has released the corestore lock file.
