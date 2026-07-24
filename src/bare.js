@@ -706,7 +706,14 @@ const handlers = {
   // user's own; backgrounding hands control back to the trip-phase and
   // motion escalations.
   'app:state': async ({ state } = {}) => {
+    const wasForeground = _appForeground
     _appForeground = state === 'active'
+    // Trace it. A great deal hangs off this flag (staged-repair retry, the
+    // pending migration nudge, the stale-socket probe, the queued-transition
+    // flush, the location mode driver), and when the shell stopped delivering
+    // 'active' after an Activity recreate, every one of them went quiet with
+    // nothing in the log to say why (2026-07-24).
+    if (wasForeground !== _appForeground) mark('app:state', { state, foreground: _appForeground })
     // Reset the lastSeen movement gate on foreground so the next fix
     // (typically the foreground one-shot, #63) always publishes a current
     // position even when the user is stationary (storage-growth
