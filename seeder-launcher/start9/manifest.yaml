@@ -10,7 +10,7 @@ id: pearcircle-seeder
 title: "PearCircle Seeder"
 # emver: up to four dot-separated numbers; the fourth (if present) is the
 # StartOS packaging revision. Kept in lockstep with the seeder image tag.
-version: 1.0.24
+version: 1.0.25
 release-notes: |
   First StartOS release of the PearCircle blind-seeder. Runs the seed-mode
   worklet as an always-on service with a dashboard for enrolling circles and
