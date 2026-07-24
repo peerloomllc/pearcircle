@@ -1,4 +1,5 @@
-const { buildExport, validateImport, EXPORT_TYPE, MAX_PLACES } = require('../src/lib/circleExport')
+const { buildExport, validateImport, planPlaceCopy, EXPORT_TYPE, MAX_PLACES } = require('../src/lib/circleExport')
+const { MIN_PLACE_RADIUS_M } = require('../src/lib/geofence')
 
 const goodConfig = {
   name: 'Family',
@@ -87,5 +88,69 @@ describe('validateImport', () => {
     expect(r.ok).toBe(true)
     expect(r.value.name).toBe('Trip')
     expect(r.value.places[0].name).toBe('Gym')
+  })
+})
+
+describe('planPlaceCopy (copying Places into a freshly created circle)', () => {
+  test('lifts a legacy sub-floor radius to the live floor instead of failing', () => {
+    // The regression: circles created before #139 hold 100m Places (the old
+    // Add Place default), which place:create now rejects. Recreating one used
+    // to abort after the new circle had already been created, so the owner got
+    // a duplicate circle, no invite and no migration nudge.
+    const { copy, skipped } = planPlaceCopy([{ name: 'Home', lat: 1, lon: 2, radiusMeters: 100 }])
+    expect(skipped).toEqual([])
+    expect(copy).toEqual([{ name: 'Home', lat: 1, lon: 2, radiusMeters: MIN_PLACE_RADIUS_M }])
+  })
+
+  test('passes an in-range Place through untouched, minus its extra fields', () => {
+    const { copy } = planPlaceCopy([
+      { id: 'p1', name: 'Work', lat: 3, lon: 4, radiusMeters: 400, createdBy: 'abc', createdAt: 9 },
+    ])
+    expect(copy).toEqual([{ name: 'Work', lat: 3, lon: 4, radiusMeters: 400 }])
+  })
+
+  test('skips only the unusable Place and keeps the rest', () => {
+    const { copy, skipped } = planPlaceCopy([
+      { name: 'Home', lat: 1, lon: 2, radiusMeters: 100 },
+      { name: '', lat: 1, lon: 2, radiusMeters: 200 },
+      { name: 'Broken', lat: 'x', lon: 2, radiusMeters: 200 },
+      { name: 'NoRadius', lat: 1, lon: 2 },
+      { name: 'School', lat: 5, lon: 6, radiusMeters: 300 },
+    ])
+    expect(copy.map((p) => p.name)).toEqual(['Home', 'School'])
+    expect(skipped.map((s) => s.reason)).toEqual(['invalid name', 'invalid lat', 'invalid radiusMeters'])
+  })
+
+  test('caps an oversized radius rather than dropping the Place', () => {
+    const { copy, skipped } = planPlaceCopy([{ name: 'Big', lat: 0, lon: 0, radiusMeters: 99999 }])
+    expect(skipped).toEqual([])
+    expect(copy[0].radiusMeters).toBe(10000)
+  })
+
+  test('trims names and tolerates a missing/!array list', () => {
+    expect(planPlaceCopy([{ name: ' Gym ', lat: 1, lon: 2, radiusMeters: 200 }]).copy[0].name).toBe('Gym')
+    expect(planPlaceCopy().copy).toEqual([])
+    expect(planPlaceCopy('nope').copy).toEqual([])
+  })
+
+  test('every planned Place satisfies the live place:create bounds', () => {
+    const { copy } = planPlaceCopy([
+      { name: 'A', lat: -90, lon: -180, radiusMeters: 1 },
+      { name: 'B', lat: 90, lon: 180, radiusMeters: 1e9 },
+      { name: 'C', lat: 0, lon: 0, radiusMeters: 149 },
+    ])
+    expect(copy).toHaveLength(3)
+    for (const p of copy) {
+      expect(p.radiusMeters).toBeGreaterThanOrEqual(MIN_PLACE_RADIUS_M)
+      expect(p.radiusMeters).toBeLessThanOrEqual(10000)
+      expect(Number.isFinite(p.lat) && Number.isFinite(p.lon)).toBe(true)
+    }
+  })
+
+  test('a legacy export file round-trips into a copyable plan', () => {
+    const legacy = buildExport({ name: 'Family', places: [{ name: 'Home', lat: 1, lon: 2, radiusMeters: 100 }] })
+    const validated = validateImport(legacy)
+    expect(validated.ok).toBe(true) // the envelope keeps the historical value
+    expect(planPlaceCopy(validated.value.places).copy[0].radiusMeters).toBe(MIN_PLACE_RADIUS_M)
   })
 })

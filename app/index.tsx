@@ -930,6 +930,23 @@ export default function Index() {
       }
     })
 
+    // Re-seed the worklet's foreground state on every mount, not just the
+    // first (2026-07-24). This effect re-runs whenever the Activity is
+    // destroyed and recreated -- which is what a swipe-away and reopen does on
+    // Android -- and the listener above only fires on a CHANGE. By the time
+    // React remounts and re-registers it, AppState is already 'active', so no
+    // change event ever arrives and the worklet stays stuck on the 'background'
+    // it was told just before the swipe. Everything gated on foreground then
+    // silently stops: the staged-repair retry (which exists precisely for the
+    // swipe-away-and-reopen flow), the pending migration nudge, the stale-socket
+    // probe, the queued-transition flush and the OS region re-push.
+    //
+    // The 'ready' handler seeds this too, but only when the worklet starts, and
+    // ensureBackendStarted is idempotent -- a remount does not re-fire it. Safe
+    // to call before the worklet exists: sendToWorklet no-ops on a null worklet
+    // and the ready seed covers that case.
+    sendToWorklet({ method: 'app:state', args: { state: AppState.currentState } })
+
     // WebView/UI-forwarding handlers ONLY. The native-action side of these
     // events (FGS toggle, OS notifications, region/mode native calls, the
     // ready app:state seed + pubkey capture) is registered by

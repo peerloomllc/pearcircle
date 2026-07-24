@@ -65,7 +65,7 @@ export const REPAIR_ESCALATE_MS = 75_000
 // until the rebuilt base is functional again. While it's progressing there's
 // no action; once escalated we tell the user some wedges can't be repaired and
 // point them at leave + rejoin.
-export function RepairingBanner ({ count, circleName, needsRestart = false, escalated = false, onResolve }) {
+export function RepairingBanner ({ count, circleName, needsRestart = false, escalated = false, onResolve, onDismiss }) {
   const target = count > 1 ? `${count} circles` : (circleName || 'circle')
   const bannerStyle = {
     position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
@@ -79,9 +79,28 @@ export function RepairingBanner ({ count, circleName, needsRestart = false, esca
   // too (proposal 2026-07-16): "reopen the app" is only a real path while the
   // retry might still land, and once the worklet has given up it is a dead end
   // — which is what stranded a user behind an undismissable banner.
+  // Dismissible, unlike the in-progress state: once we've escalated, nothing is
+  // running any more and the banner is advice, not a progress indicator. An
+  // owner who has already acted on it (recreated the circle, or decided to live
+  // with it) was otherwise stuck with a permanent bar over the map that only a
+  // force-stop cleared. Session-scoped, same as the needs-repair nudge: the
+  // persisted flag brings it back next launch if the circle is still wedged.
   if (escalated) {
     return (
       <div style={bannerStyle}>
+        {onDismiss && (
+          <button
+            onClick={onDismiss}
+            aria-label='Dismiss'
+            style={{
+              position: 'absolute',
+              top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+              right: spacing.sm,
+              background: 'transparent', border: 'none', color: colors.text.secondary,
+              fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+            }}
+          >×</button>
+        )}
         <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
           <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>
             Repair is taking longer than usual

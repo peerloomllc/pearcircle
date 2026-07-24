@@ -39,7 +39,7 @@ const { openSelfCore, openPeerCore, appendFix, readTip } = require('./memberLast
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('./lib/seederApply')
-const { shouldAcceptSupersede } = require('./lib/supersedeApply')
+const { shouldAcceptSupersede, supersedePendingNext } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
@@ -52,8 +52,10 @@ const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
 const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
-const { buildExport, validateImport } = require('./lib/circleExport')
+const { buildExport, validateImport, planPlaceCopy } = require('./lib/circleExport')
 const { raceAppend, withTimeout, APPEND_TIMEOUT_MS, READ_TIMEOUT_MS } = require('./lib/appendTimeout')
+const { stalledGets, writerSummary, unfetchableWriters, keyPrefix, TRACK_LIMIT } = require('./lib/appendStall')
+const { shouldAttemptAppend, nextAppendHealth } = require('./lib/appendHealth')
 const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
@@ -706,7 +708,14 @@ const handlers = {
   // user's own; backgrounding hands control back to the trip-phase and
   // motion escalations.
   'app:state': async ({ state } = {}) => {
+    const wasForeground = _appForeground
     _appForeground = state === 'active'
+    // Trace it. A great deal hangs off this flag (staged-repair retry, the
+    // pending migration nudge, the stale-socket probe, the queued-transition
+    // flush, the location mode driver), and when the shell stopped delivering
+    // 'active' after an Activity recreate, every one of them went quiet with
+    // nothing in the log to say why (2026-07-24).
+    if (wasForeground !== _appForeground) mark('app:state', { state, foreground: _appForeground })
     // Reset the lastSeen movement gate on foreground so the next fix
     // (typically the foreground one-shot, #63) always publishes a current
     // position even when the user is stationary (storage-growth
@@ -734,6 +743,11 @@ const handlers = {
     // here instead (proposal 2026-07-16). Fire-and-forget: the mount race can
     // run REPAIR_MOUNT_TIMEOUT_MS and must not block this handler's response.
     if (_appForeground && _repairStaged.size) retryStagedRepairs().catch(() => {})
+    // Same shape for the migration nudge an owner still owes a wedged old
+    // circle (proposal 2026-07-24): foreground is when a stuck base has most
+    // plausibly become writable again, and the owner may never open Settings to
+    // press the manual button. Fire-and-forget for the same reason.
+    if (_appForeground) retryPendingSupersedes('foreground').catch(() => {})
     runLocationModeDriver()
     return { state, appForeground: _appForeground }
   },
@@ -949,7 +963,11 @@ const handlers = {
   'circle:export': async ({ circleId } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
-    return buildExport(await readCircleConfigForExport(circleId))
+    const config = await readCircleConfigForExport(circleId)
+    // Refuse rather than hand back a file that looks complete but has lost
+    // every Place because the circle's data is stuck.
+    if (config.placesUnavailable) throw new Error("Could not read this circle's Places - its data is stuck. Repair the circle and try again.")
+    return buildExport(config)
   },
 
   // Create a brand-new circle from a previously-exported config envelope.
@@ -960,7 +978,13 @@ const handlers = {
     const result = validateImport(payload)
     if (!result.ok) throw new Error('invalid import: ' + result.error)
     const created = await createCircleFromConfig(result.value)
-    return { circleId: created.circleId, name: created.name, invite: created.invite }
+    return {
+      circleId: created.circleId,
+      name: created.name,
+      invite: created.invite,
+      placesCopied: created.placesCopied,
+      placesSkipped: created.placesSkipped,
+    }
   },
 
   // In-app one-shot: recreate THIS circle on a fresh empty Autobase, keeping its
@@ -973,7 +997,8 @@ const handlers = {
     if (!sourceRec) throw new Error('unknown circle: ' + circleId)
     if (sourceRec.value.role !== 'owner') throw new Error('only the circle owner can recreate it')
 
-    const created = await createCircleFromConfig(await readCircleConfigForExport(circleId))
+    const sourceConfig = await readCircleConfigForExport(circleId)
+    const created = await createCircleFromConfig(sourceConfig)
     const recreatedAt = Date.now()
     // Local-only links: distinguish the two same-named circles in Settings and
     // back the delete-confirmation guard (proposal 2026-06-17). No wire effect.
@@ -987,11 +1012,43 @@ const handlers = {
     // get a one-tap "your group moved" prompt carrying the new invite (proposal
     // 2026-06-17 slice 3). Best-effort: a supersede failure (e.g. source not yet
     // writable) must not fail the recreate, which already succeeded.
+    //
+    // It fails more often than the happy path suggests: the circles owners
+    // recreate are usually the wedged ones, and a wedged base is exactly what
+    // can't be appended to. So we REPORT the outcome instead of swallowing it -
+    // the owner has to know whether members were nudged or whether the invite
+    // is the only way they'll hear about the move.
+    let superseded = false
+    let supersedeReason = null
     try {
-      await handlers['circle:supersede']({ oldCircleId: circleId, newCircleId: created.circleId })
-    } catch (e) { console.warn('[bare] circle:supersede during recreate failed', e?.message) }
+      const r = await handlers['circle:supersede']({ oldCircleId: circleId, newCircleId: created.circleId })
+      superseded = r?.ok === true
+      if (!superseded) supersedeReason = r?.reason ?? 'failed'
+    } catch (e) {
+      supersedeReason = e?.message ?? String(e)
+      console.warn('[bare] circle:supersede during recreate failed', supersedeReason)
+    }
+    mark('circle:recreate:done', {
+      cid: created.circleId.slice(0, 8),
+      from: circleId.slice(0, 8),
+      places: created.placesCopied,
+      skipped: created.placesSkipped.length,
+      unreadable: sourceConfig.placesUnavailable === true,
+      superseded,
+      reason: supersedeReason,
+    })
 
-    return { circleId: created.circleId, name: created.name, invite: created.invite, sourceCircleId: circleId }
+    return {
+      circleId: created.circleId,
+      name: created.name,
+      invite: created.invite,
+      sourceCircleId: circleId,
+      placesCopied: created.placesCopied,
+      placesSkipped: created.placesSkipped,
+      placesUnavailable: sourceConfig.placesUnavailable === true,
+      superseded,
+      supersedeReason,
+    }
   },
 
   // Post (or re-post) the owner-signed migration nudge into the OLD circle's
@@ -1001,38 +1058,20 @@ const handlers = {
   // applyCircleNodes accepts it only when its signature verifies against the
   // circle's ownerKey, so no other writer can forge a "we moved" notice. A
   // no-op for a non-owner of the old circle. Proposal 2026-06-17 slice 3.
-  'circle:supersede': async ({ oldCircleId, newCircleId } = {}) => {
+  //
+  // Owns the retry bookkeeping for its own outcome (proposal 2026-07-24): a
+  // retryable failure leaves a `supersede:pending:` row that the foreground
+  // sweep and the owner's "Notify members" button both re-drive, and any
+  // success clears it. Keeping that here rather than in the callers means the
+  // automatic and manual paths can never disagree about the state.
+  'circle:supersede': async ({ oldCircleId, newCircleId, manual = false } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof oldCircleId !== 'string') throw new Error('oldCircleId must be a string')
     if (typeof newCircleId !== 'string') throw new Error('newCircleId must be a string')
-    const base = _circleBases.get(oldCircleId)
-    if (!base) throw new Error('unknown circle: ' + oldCircleId)
-    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
-    const circleRow = await base.view.get('circle')
-    // Non-owner of the old circle: nothing to post (only the owner's signature
-    // is accepted on the wire). Return a benign no-op rather than throwing.
-    if (circleRow?.value?.ownerKey !== ourKeyHex) return { ok: false, reason: 'not_owner' }
-    if (!base.writable) throw new Error('not yet a writer for this circle')
-
-    // Build the new circle's invite from its persisted joined record (same
-    // fields circle:invite uses). The owner must already hold the new circle.
-    const newRec = await _localDb.get('circles:joined:' + newCircleId)
-    if (!newRec?.value) throw new Error('unknown new circle: ' + newCircleId)
-    const { circleKey, bootstrap, encryptionKey, name } = newRec.value
-    const invite = buildInvite({ circleId: newCircleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey: ourKeyHex })
-
-    // ownerKey is the signer field (verifyValueWithSigner against 'ownerKey'),
-    // and the apply branch cross-checks it equals the circle row's ownerKey.
-    const value = signValue({
-      newCircleId,
-      name,
-      invite,
-      ownerKey: ourKeyHex,
-      postedAt: Date.now(),
-      v: 1,
-    }, _identity.secretKey)
-    await base.append({ type: 'put', key: 'supersede:' + newCircleId, value })
-    return { ok: true }
+    if (!_circleBases.has(oldCircleId)) throw new Error('unknown circle: ' + oldCircleId)
+    const result = await postSupersede(oldCircleId, newCircleId)
+    await recordSupersedeOutcome(oldCircleId, newCircleId, result, manual === true)
+    return result
   },
 
   'circle:join': async ({ invite } = {}) => {
@@ -1182,6 +1221,9 @@ const handlers = {
           recreatedFrom: lv.recreatedFrom || null,
           recreatedTo: lv.recreatedTo || null,
           recreatedAt: typeof lv.recreatedAt === 'number' ? lv.recreatedAt : null,
+          // The migration nudge this circle still owes its members (proposal
+          // 2026-07-24). In-memory read, so it costs the poll nothing.
+          supersedePending: _supersedePending.has(circleId),
         })
         // A repairing circle is "done enough" once its rebuilt base is
         // writable again (re-admitted as a writer == functional). Historical
@@ -3113,6 +3155,10 @@ function clearRepairing (circleId) {
   _repairEscalated.delete(circleId)
   _localDb.del('circleRepairing:' + circleId).catch(() => {})
   mark('circle:repair:settled', { circleId: circleId.slice(0, 8) })
+  // A repair settling is the other moment a base that refused the migration
+  // nudge becomes writable, and it can happen with the app already open, so
+  // waiting for the next foreground would leave the notice unposted for hours.
+  if (_supersedePending.has(circleId)) retryPendingSupersedes('repair-settled').catch(() => {})
   send({ event: 'circle:repairing', data: { circleId, repairing: false } })
 }
 
@@ -3248,16 +3294,166 @@ async function retryStagedRepairs () {
 // false. A normal rejection (base closed mid-flight) returns false WITHOUT
 // degrading. Returns true iff the row was appended. Proposal
 // 2026-06-03-autobase-append-hang.
+// Per-circle append health (proposal 2026-07-24). All in-memory: a fresh mount
+// starts with a clean slate, which is the point - the first append after one is
+// slow by design and must not condemn the circle.
+const _appendFailStreak = new Map()   // cid -> consecutive timeouts
+const _firstAppendDone = new Set()    // cids that have attempted an append since mount
+const _lastDegradedProbe = new Map()  // cid -> ts of the last probe while degraded
+
+// Called when a circle's base is (re)mounted, so the next append is treated as
+// the cold first one again.
+function resetAppendHealth (circleId) {
+  if (!circleId) return
+  _appendFailStreak.delete(circleId)
+  _firstAppendDone.delete(circleId)
+  _lastDegradedProbe.delete(circleId)
+}
+
 async function safeAppend (base, op, label) {
   const cid = circleIdForBase(base)
-  if (cid && _degradedCircles.has(cid)) return false
+  const degraded = !!(cid && _degradedCircles.has(cid))
+  if (cid) {
+    // Degraded no longer hard-blocks: it throttles. Recovery has to be
+    // reachable, and it cannot be if the flag suppresses every append that
+    // would demonstrate it (proposal 2026-07-24).
+    const { attempt, probe } = shouldAttemptAppend({ degraded, lastProbeAt: _lastDegradedProbe.get(cid) ?? 0 })
+    if (!attempt) return false
+    if (probe) {
+      _lastDegradedProbe.set(cid, Date.now())
+      mark('circle:degraded-probe', { cid: cid.slice(0, 8), label: label || null })
+    }
+  }
   // Rewind guard (proposal 2026-06-27 item 3): never append past a truncated
   // writer tip while the network still holds the original blocks, or we fork.
   if (writerRewindBlocked(base, cid)) return false
+  const firstAttemptDone = !cid || _firstAppendDone.has(cid)
+  if (cid) _firstAppendDone.add(cid)
+  beginAppendTrace()
   const { ok, timedOut } = await raceAppend(base.append(op), APPEND_TIMEOUT_MS)
-  if (timedOut) flagDegraded(cid, 'append:' + (label || ''))
-  else if (ok) scheduleDurabilityFlush() // item 4: bound the WAL-loss window after a writer append
+  // Report BEFORE ending the trace: the reads that were outstanding when the
+  // append gave up are the evidence, and endAppendTrace drops them.
+  if (timedOut) dumpAppendStall(base, cid, label)
+  endAppendTrace()
+
+  const health = nextAppendHealth({
+    ok,
+    timedOut,
+    degraded,
+    streak: cid ? (_appendFailStreak.get(cid) ?? 0) : 0,
+    firstAttemptDone,
+  })
+  if (cid) {
+    _appendFailStreak.set(cid, health.streak)
+    if (health.firstSlow) {
+      // Expected: the discovery gate makes the first append after a mount slow.
+      // The append promise is still running, so this write may yet land.
+      mark('append:first-slow', { cid: cid.slice(0, 8), label: label || null })
+    }
+    if (health.degrade) flagDegraded(cid, 'append:' + (label || ''))
+    else if (timedOut && !health.firstSlow) {
+      mark('append:timeout', { cid: cid.slice(0, 8), label: label || null, streak: health.streak })
+    }
+    if (health.clearDegrade) {
+      clearDegraded(cid)
+      mark('circle:degraded-cleared', { cid: cid.slice(0, 8), label: label || null })
+      send({ event: 'circle:degraded', data: { circleId: cid, degraded: false } })
+    }
+  }
+  if (ok) scheduleDurabilityFlush() // item 4: bound the WAL-loss window after a writer append
   return ok
+}
+
+// --- Append-stall tracing (investigation 2026-07-24) ------------------------
+// Records Hypercore reads while a writer append is in flight so a timeout can
+// say what the append was waiting on. See src/lib/appendStall.js for why this
+// has to run on a real device.
+//
+// Cost in the healthy case is one integer comparison per read: tracking only
+// engages while an append is actually in flight, and a healthy append settles
+// in milliseconds. Only the wedged case, where the window stretches to the full
+// APPEND_TIMEOUT_MS, records anything worth the name.
+let _appendTraceDepth = 0
+let _inflightGets = new Map()
+let _getSeq = 0
+let _getPatched = false
+
+function patchHypercoreGet () {
+  if (_getPatched) return
+  _getPatched = true
+  try {
+    const Hypercore = require('hypercore')
+    const orig = Hypercore.prototype.get
+    Hypercore.prototype.get = function (index, ...rest) {
+      if (_appendTraceDepth === 0 || _inflightGets.size >= TRACK_LIMIT) return orig.call(this, index, ...rest)
+      const id = ++_getSeq
+      _inflightGets.set(id, {
+        core: this.key ? keyPrefix(b4a.toString(this.key, 'hex')) : '?',
+        index,
+        ts: Date.now(),
+        coreLength: this.length,
+      })
+      let p
+      try {
+        p = orig.call(this, index, ...rest)
+      } catch (e) {
+        _inflightGets.delete(id)
+        throw e
+      }
+      return Promise.resolve(p).finally(() => _inflightGets.delete(id))
+    }
+    mark('append-trace:armed')
+  } catch (e) {
+    // A worklet that can't patch still works; it just can't explain a stall.
+    mark('append-trace:arm-failed', { err: e?.message })
+  }
+}
+
+function beginAppendTrace () {
+  _appendTraceDepth++
+}
+
+function endAppendTrace () {
+  _appendTraceDepth = Math.max(0, _appendTraceDepth - 1)
+  // An append that timed out never settles, so its reads never resolve and
+  // would otherwise sit in the map forever. Nothing reads them after the dump.
+  if (_appendTraceDepth === 0 && _inflightGets.size) _inflightGets = new Map()
+}
+
+// Emit what the timed-out append was blocked on. Three shapes, so a log line
+// stays readable: the summary, the writers whose history this device cannot
+// fetch, and the individual stuck reads.
+function dumpAppendStall (base, cid, label) {
+  try {
+    const now = Date.now()
+    const stuck = stalledGets(_inflightGets.values(), now)
+    const writers = writerSummary(base?.activeWriters ? [...base.activeWriters] : [])
+    const gaps = unfetchableWriters(writers)
+    mark('append:stall', {
+      cid: cid ? cid.slice(0, 8) : null,
+      label: label || null,
+      writable: !!base?.writable,
+      writers: writers.length,
+      // Zero stuck reads is the informative negative: the append is blocked on
+      // something other than fetching a block.
+      stuckGets: stuck.length,
+      tracked: _inflightGets.size,
+      unfetchable: gaps.count,
+      worstGap: gaps.worst,
+      sysLen: base?.system?.core?.length ?? null,
+      localLen: base?.local?.length ?? null,
+    })
+    for (const g of stuck) {
+      mark('append:stall:get', { core: g.core, index: g.index, coreLen: g.coreLength, pendingMs: g.pendingMs })
+    }
+    for (const w of writers) {
+      if (typeof w.length === 'number' && typeof w.contig === 'number' && w.contig < w.length) {
+        mark('append:stall:writer', { core: w.core, len: w.length, contig: w.contig })
+      }
+    }
+  } catch (e) {
+    mark('append:stall:dump-failed', { err: e?.message })
+  }
 }
 
 // Synchronous, never-throws check on the writer-append hot path. Returns true
@@ -4410,6 +4606,10 @@ async function buildCircleAutobase (circleId, bootstrapHex, encryptionKeyHex, re
   const base = new Autobase(ns, b4a.from(bootstrapHex, 'hex'), baseOpts)
   await base.ready()
   attachConflictListeners(base, circleId)
+  // Fresh mount, fresh append health: the first append against it has to wait
+  // on the discovery gate and must not count against the circle (proposal
+  // 2026-07-24).
+  resetAppendHealth(circleId)
   return base
 }
 
@@ -6095,6 +6295,137 @@ async function onSwarmConnection (conn, info) {
 // ~zero. This is the canonical lever -- Corestore.suspend() flushes via the
 // same `storage.db.flush()` call. Belt to the lastSeen-ephemeral fix's braces:
 // this bounds the damage from any high-frequency write path, present or future.
+// --- Migration nudge: post + retry (proposals 2026-06-17, 2026-07-24) -------
+// Append the owner-signed `supersede:{newCircleId}` record to the OLD circle.
+// Every base touch is bounded: the circles an owner supersedes are typically
+// the wedged ones, where an unbounded view read or append hangs forever - and
+// the dispatcher awaits handlers serially, so that would freeze the whole
+// worklet (proposal 2026-06-03 / 06-03c). Returns { ok } or { ok: false,
+// reason }; the reason drives both the retry rules and the user-facing copy.
+async function postSupersede (oldCircleId, newCircleId) {
+  const base = _circleBases.get(oldCircleId)
+  if (!base) return { ok: false, reason: 'unknown_old_circle' }
+  const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+  const { value: circleRow, timedOut: rowTimedOut } = await withTimeout(base.view.get('circle'), READ_TIMEOUT_MS)
+  // Ownership: prefer the replicated row, fall back to our own joined record
+  // when the view can't be read (wedged or still-rebuilding base), which would
+  // otherwise read as "not the owner" for the actual owner. The wire still
+  // enforces ownership - applyCircleNodes verifies the signature against the
+  // circle's ownerKey on every receiver - so this fallback only decides
+  // whether we bother appending.
+  const oldRec = await _localDb.get('circles:joined:' + oldCircleId)
+  const ownerKey = circleRow?.value?.ownerKey ?? (oldRec?.value?.role === 'owner' ? ourKeyHex : null)
+  // Non-owner of the old circle: nothing to post (only the owner's signature is
+  // accepted on the wire). A benign no-op rather than an error.
+  if (ownerKey !== ourKeyHex) return { ok: false, reason: rowTimedOut ? 'circle_unreadable' : 'not_owner' }
+  if (!base.writable) return { ok: false, reason: 'not_writable' }
+
+  // Build the new circle's invite from its persisted joined record (same fields
+  // circle:invite uses). The owner must already hold the new circle.
+  const newRec = await _localDb.get('circles:joined:' + newCircleId)
+  if (!newRec?.value) return { ok: false, reason: 'unknown_new_circle' }
+  const { circleKey, bootstrap, encryptionKey, name } = newRec.value
+  const invite = buildInvite({ circleId: newCircleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey: ourKeyHex })
+
+  // ownerKey is the signer field (verifyValueWithSigner against 'ownerKey'),
+  // and the apply branch cross-checks it equals the circle row's ownerKey.
+  const value = signValue({
+    newCircleId,
+    name,
+    invite,
+    ownerKey: ourKeyHex,
+    postedAt: Date.now(),
+    v: 1,
+  }, _identity.secretKey)
+  const { ok, timedOut } = await raceAppend(base.append({ type: 'put', key: 'supersede:' + newCircleId, value }), APPEND_TIMEOUT_MS)
+  if (!ok) {
+    mark('circle:supersede:append-failed', { cid: oldCircleId.slice(0, 8), timedOut })
+    return { ok: false, reason: timedOut ? 'append_timeout' : 'append_failed' }
+  }
+  scheduleDurabilityFlush()
+  return { ok: true }
+}
+
+// Local-only pending row (never replicated) recording that an owner's migration
+// nudge still owes the old circle a successful post. Keyed by the OLD circle,
+// which is where the record has to land and is also the circle the UI badges.
+const SUPERSEDE_PENDING_PREFIX = 'supersede:pending:'
+// Mirrors the pending set in memory so circles:getAll can badge a row without a
+// per-poll DB read. Rebuilt from disk at init.
+const _supersedePending = new Map() // oldCircleId -> { newCircleId, attempts }
+
+// Fold the outcome of one post into the pending state. A success clears it, a
+// terminal failure drops it (waiting cannot change the answer), a retryable one
+// keeps it with the attempt tally bumped. `manual` resets the tally, so an
+// owner's explicit tap always buys a fresh run of automatic attempts.
+async function recordSupersedeOutcome (oldCircleId, newCircleId, result, manual = false) {
+  const key = SUPERSEDE_PENDING_PREFIX + oldCircleId
+  const prev = _supersedePending.get(oldCircleId) ?? null
+  const next = supersedePendingNext({ prev, newCircleId, result, manual })
+  if (next.action === 'none') return
+  if (next.action === 'clear') {
+    mark(result?.ok ? 'circle:supersede:posted' : 'circle:supersede:retry-abandoned',
+      { cid: oldCircleId.slice(0, 8), attempts: prev?.attempts ?? 0, reason: result?.reason })
+    _supersedePending.delete(oldCircleId)
+    await _localDb.del(key).catch(() => {})
+    return
+  }
+  _supersedePending.set(oldCircleId, next.row)
+  await _localDb.put(key, next.row).catch(() => {})
+}
+
+async function loadSupersedePending () {
+  try {
+    for await (const { key, value } of _localDb.createReadStream({ gt: SUPERSEDE_PENDING_PREFIX, lt: SUPERSEDE_PENDING_PREFIX + '~' })) {
+      const oldCircleId = key.slice(SUPERSEDE_PENDING_PREFIX.length)
+      if (value && typeof value.newCircleId === 'string') {
+        _supersedePending.set(oldCircleId, { ...value, attempts: typeof value.attempts === 'number' ? value.attempts : 0 })
+      }
+    }
+  } catch (e) {
+    mark('circle:supersede:pending-load-failed', { err: e?.message })
+  }
+  if (_supersedePending.size) mark('circle:supersede:pending-loaded', { count: _supersedePending.size })
+}
+
+// Re-drive every pending nudge. Fire-and-forget from the foreground hook and
+// from a settled repair (the two moments a wedged base plausibly became
+// writable). Serial, because each attempt can sit out its bounds and there is
+// no value in racing them. Self-heals stale rows: if either half of the pair is
+// gone (the owner deleted one), the pending row goes with it.
+let _supersedeSweeping = false
+async function retryPendingSupersedes (trigger) {
+  if (_supersedePending.size === 0 || _supersedeSweeping) return
+  // One sweep at a time: a foreground can land while a repair-settled sweep is
+  // still sitting out its bounds, and two concurrent passes would both post and
+  // both bump the tally for the same row.
+  _supersedeSweeping = true
+  try {
+    await sweepPendingSupersedes(trigger)
+  } finally {
+    _supersedeSweeping = false
+  }
+}
+
+async function sweepPendingSupersedes (trigger) {
+  for (const [oldCircleId, row] of Array.from(_supersedePending)) {
+    const gone = !_circleBases.has(oldCircleId) || !(await _localDb.get('circles:joined:' + row.newCircleId).catch(() => null))
+    if (gone) {
+      _supersedePending.delete(oldCircleId)
+      await _localDb.del(SUPERSEDE_PENDING_PREFIX + oldCircleId).catch(() => {})
+      mark('circle:supersede:pending-dropped', { cid: oldCircleId.slice(0, 8) })
+      continue
+    }
+    mark('circle:supersede:retry', { cid: oldCircleId.slice(0, 8), attempts: row.attempts, trigger })
+    try {
+      const result = await postSupersede(oldCircleId, row.newCircleId)
+      await recordSupersedeOutcome(oldCircleId, row.newCircleId, result)
+    } catch (e) {
+      mark('circle:supersede:retry-failed', { cid: oldCircleId.slice(0, 8), err: e?.message })
+    }
+  }
+}
+
 // --- Circle config export / recreate (proposal 2026-06-17) ------------------
 // Read a circle's curated config (name + Places + per-circle toggles) for
 // export or recreate. Reads the on-disk view directly (no base.update(), same
@@ -6105,16 +6436,29 @@ async function readCircleConfigForExport (circleId) {
   const local = await _localDb.get('circles:joined:' + circleId)
   const name = local?.value?.name
   if (typeof name !== 'string') throw new Error('circle has no local name')
-  const places = []
-  for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
-    if (value && !isDeleted(value)) {
-      places.push({ name: value.name, lat: value.lat, lon: value.lon, radiusMeters: value.radiusMeters })
+  // Bounded (proposal 2026-06-03c): recreate exists to escape a wedged circle,
+  // and a wedged view stalls this stream forever. The dispatcher awaits
+  // handlers serially, so an unbounded drain here would freeze the whole
+  // worklet on exactly the circles this path is for. On a stall we report
+  // `placesUnavailable` and let the caller decide - recreate still mints the
+  // new circle (a circle with no Places beats no circle at all), export
+  // refuses rather than write a silently empty file.
+  const drain = (async () => {
+    const out = []
+    for await (const { value } of base.view.createReadStream({ gt: 'place:', lt: 'place:~' })) {
+      if (value && !isDeleted(value)) {
+        out.push({ name: value.name, lat: value.lat, lon: value.lon, radiusMeters: value.radiusMeters })
+      }
     }
-  }
+    return out
+  })()
+  const { value: places, timedOut } = await withTimeout(drain, READ_TIMEOUT_MS)
+  if (places === undefined) mark('circle:config:places-unreadable', { cid: circleId.slice(0, 8), timedOut })
   const tripRow = await _localDb.get('trips:sharing:' + circleId)
   return {
     name,
-    places,
+    places: places ?? [],
+    placesUnavailable: places === undefined,
     settings: {
       sharingDefault: getCircleSharing(circleId).enabled === true,
       tripSharing: tripRow?.value?.enabled === true,
@@ -6124,15 +6468,45 @@ async function readCircleConfigForExport (circleId) {
 
 // Create a brand-new circle from a validated config, reusing the live
 // circle:create + place:create + toggle handlers so the result is
-// indistinguishable from a hand-made circle. Returns the create result.
+// indistinguishable from a hand-made circle. Returns the create result plus
+// `placesCopied` / `placesSkipped`.
+//
+// Everything after circle:create is best-effort by design. Once the new circle
+// exists on disk and in the owner's list, the invite is the whole point of the
+// operation, and throwing here used to strand the owner with a half-built
+// circle and no invite (the failure Tim hit: a legacy 100m Place, created when
+// the Add Place default was 100m, rejected by the 150m floor place:create has
+// enforced since #139). Copying config is not worth losing the circle over, so
+// each step reports rather than aborts.
 async function createCircleFromConfig ({ name, places, settings }) {
   const created = await handlers['circle:create']({ name })
-  for (const p of places) {
-    await handlers['place:create']({ circleId: created.circleId, name: p.name, lat: p.lat, lon: p.lon, radiusMeters: p.radiusMeters })
+  const { copy, skipped: placesSkipped } = planPlaceCopy(places)
+  for (const s of placesSkipped) mark('circle:config:place-skipped', { cid: created.circleId.slice(0, 8), reason: s.reason })
+  let placesCopied = 0
+  for (const p of copy) {
+    try {
+      await handlers['place:create']({ circleId: created.circleId, name: p.name, lat: p.lat, lon: p.lon, radiusMeters: p.radiusMeters })
+      placesCopied++
+    } catch (e) {
+      // planPlaceCopy already guarantees the bounds, so this is an append that
+      // failed (closed / wedged base), not bad config. Still non-fatal.
+      placesSkipped.push({ name: p.name, reason: e?.message ?? String(e) })
+      mark('circle:config:place-failed', { cid: created.circleId.slice(0, 8), err: e?.message })
+    }
   }
-  await handlers['sharing:set']({ circleId: created.circleId, enabled: settings.sharingDefault === true })
-  await handlers['trips:sharing:set']({ circleId: created.circleId, enabled: settings.tripSharing === true })
-  return created
+  const settingsFailed = []
+  for (const [method, args] of [
+    ['sharing:set', { circleId: created.circleId, enabled: settings.sharingDefault === true }],
+    ['trips:sharing:set', { circleId: created.circleId, enabled: settings.tripSharing === true }],
+  ]) {
+    try {
+      await handlers[method](args)
+    } catch (e) {
+      settingsFailed.push(method)
+      mark('circle:config:setting-failed', { cid: created.circleId.slice(0, 8), method, err: e?.message })
+    }
+  }
+  return { ...created, placesCopied, placesSkipped, settingsFailed }
 }
 
 const STORE_FLUSH_INTERVAL_MS = 5 * 60 * 1000
@@ -6208,6 +6582,9 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     throw new Error('init requires { dataDir: string }')
   }
   mark('init:start', { attempt, mode: mode ?? 'member' })
+  // Arm the append-stall tracer before any core exists, so the patched get is
+  // the one every core inherits (investigation 2026-07-24).
+  patchHypercoreGet()
 
   // Retry on lock errors: BareKit may restart the worklet before the prior
   // instance has released the corestore lock file.
@@ -6471,6 +6848,11 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     if (repairValueEscalated(value)) _repairEscalated.add(circleId)
   }
   if (_repairingCircles.size) mark('circle:repairing-persisted', { count: _repairingCircles.size, escalated: _repairEscalated.size })
+
+  // Migration nudges an owner still owes an old circle (proposal 2026-07-24).
+  // Restored before the bases mount so circles:getAll can badge the row on the
+  // very first poll; the retry itself waits for the foreground hook.
+  await loadSupersedePending()
 
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced
@@ -6753,6 +7135,11 @@ _ipcRead.on('data', async (chunk) => {
       const result = await handler(msg.args ?? {})
       send({ id: msg.id, result })
     } catch (err) {
+      // Trace every handler rejection. The reply carries the message back to
+      // the UI, but the UI often renders its own generic text, so an
+      // unexplained failure left no trace anywhere - which is what made the
+      // legacy-Place recreate failure a black box on a real device.
+      mark('ipc:handler-error', { method: msg.method, err: err?.message ?? String(err) })
       send({ id: msg.id, error: err?.message ?? String(err) })
     }
   }
