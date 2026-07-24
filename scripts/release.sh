@@ -71,6 +71,21 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   set -a; source "$SCRIPT_DIR/.env"; set +a
 fi
 
+# Required app.conf keys, checked once, up front.
+#
+# Each of these used to carry a hard-coded default copied from whichever
+# sibling app the script was forked from. That is how PearGuard came to
+# announce itself as PearCal on Nostr, PearPetal as PearList, and how
+# PearPetal would have named its APK pearlist-*.apk had app.conf ever lost a
+# key. Dormant wrong defaults are still wrong defaults: fail here, where it
+# costs nothing, instead of mid-release or after the announcement is public.
+for _k in APP_NAME ARTIFACT_PREFIX XCODE_PROJECT; do
+  if [ -z "${!_k:-}" ]; then
+    echo "error: $_k is not set — check $SCRIPT_DIR/app.conf" >&2
+    exit 1
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # Helper: derive "owner/repo" from the git remote URL without gh CLI
 # ---------------------------------------------------------------------------
@@ -1123,16 +1138,25 @@ echo "    iOS build   : $(node -p "require('./app.json').expo.ios.buildNumber")"
 _confirm "app.json version looks correct — proceed with bundle builds?"
 
 # ---------------------------------------------------------------------------
-# 1. Build UI bundle
+# 1. Canonical verify gate (tests + all bundles)
+#
+# Constitution §5 gate: the unit tests run first and a red suite aborts the
+# release via set -e, then every bundle the release ships is rebuilt.
+#
+# The bundle commands are inlined rather than delegated to `npm run verify`
+# because package.json's build:bare passes `--defer fs --defer path` and its
+# build:bare:ios uses `--preset ios` where the release uses `--host ios-arm64
+# --linked`. Those produce different bundles, so calling verify here would
+# change what ships. Reconciling package.json is tracked separately.
 # ---------------------------------------------------------------------------
+echo "==> Running unit tests..."
+npm test
+
 echo "==> Building UI bundle..."
 npx esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic \
   --loader:.js=jsx --loader:.css=text --loader:.png=dataurl \
   --define:process.env.NODE_ENV=\"production\" --outfile=assets/app-ui.bundle
 
-# ---------------------------------------------------------------------------
-# 2. Build Bare bundle
-# ---------------------------------------------------------------------------
 echo "==> Building Bare bundle..."
 node_modules/.bin/bare-pack --linked src/bare.js -o assets/bare-universal.bundle
 
@@ -1140,6 +1164,18 @@ if $PUBLISH_APP_STORE; then
   echo "==> Building iOS Bare bundle..."
   node_modules/.bin/bare-pack --host ios-arm64 --linked src/bare.js -o assets/bare-ios.bundle
 fi
+
+# ---------------------------------------------------------------------------
+# 2. Native project preparation
+#
+# android/ is checked into this repo, so there is nothing to regenerate here.
+# The step holds the slot: PearList and PearPetal gitignore android/ and run
+# `expo prebuild --clean` at this point to apply the release-signing config
+# plugin. Keeping the number reserved is what lets the pipeline checker tell
+# "this app has no prebuild" apart from "this app runs prebuild in the wrong
+# place". See RELEASE-PIPELINE.md §2.
+# ---------------------------------------------------------------------------
+echo "==> Native project: android/ is checked in, no prebuild needed."
 
 # ---------------------------------------------------------------------------
 # 3. Build signed release APK (and AAB if publishing to Google Play)
@@ -1196,7 +1232,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4c. Generate .sha256 sidecars for every release artifact
+# 4e. Generate .sha256 sidecars for the mobile artifacts
 # ---------------------------------------------------------------------------
 for _artifact in "$APK_NAME" "$AAB_NAME"; do
   [ -z "$_artifact" ] && continue
@@ -1584,7 +1620,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Push tag and create GitHub release
+# 5e. Generate .sha256 sidecars for the desktop artifacts, then the final gate
+#
+# The desktop, Umbrel and Start9 builds above are slow and best-effort, so
+# their checksums and the last look at the full asset list happen here rather
+# than at step 4e. This is the last confirm before anything irreversible: step
+# 6 commits and step 6b pushes the tag. See RELEASE-PIPELINE.md §2.
+# ---------------------------------------------------------------------------
+for _artifact in "${DESKTOP_ARTIFACTS[@]:-}"; do
+  [ -z "$_artifact" ] && continue
+  [ -f "$_artifact" ] || continue
+  case "$_artifact" in
+    *.sha256|*.yml|*.yaml) continue ;;   # sidecars and update manifests
+  esac
+  [ -f "${_artifact}.sha256" ] && continue          # the builder already made one
+  ( cd "$(dirname "$_artifact")" && sha256sum "$(basename "$_artifact")" > "$(basename "$_artifact").sha256" )
+  echo "    sha256  $(cut -d' ' -f1 < "${_artifact}.sha256")  $(basename "$_artifact")"
+done
+
+echo ""
+_RELEASE_SUMMARY=""
+[ -n "${APK_NAME:-}" ] && _RELEASE_SUMMARY="APK (${APK_SIZE:-?})"
+if $PUBLISH_PLAY && [ -n "${AAB_NAME:-}" ]; then
+  _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }AAB (${AAB_SIZE:-?})"
+fi
+if [ "${#DESKTOP_ARTIFACTS[@]}" -gt 0 ]; then
+  _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }${#DESKTOP_ARTIFACTS[@]} desktop artifact(s)"
+fi
+[ -n "${START9_S9PK:-}" ] && _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }Start9 .s9pk"
+[ -z "$_RELEASE_SUMMARY" ] && _RELEASE_SUMMARY="no artifacts"
+_confirm "$_RELEASE_SUMMARY ready to publish?"
+
+# ---------------------------------------------------------------------------
+# Phase D — publishing starts here. Nothing below this line is undoable.
 # ---------------------------------------------------------------------------
 # Precheck: if every build platform was skipped, there's nothing to upload.
 # Disable the GitHub step (and thus the tag push) rather than push a tag
@@ -1615,7 +1683,7 @@ if [ -z "$GIT_REMOTE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6b. Commit the version bumps this run made, BEFORE tagging
+# 6. Commit the version bumps this run made, BEFORE tagging
 # ---------------------------------------------------------------------------
 # Step 0 rewrites app.json + the Xcode project, and the seeder store steps
 # rewrite the Start9 manifest/migrations/Dockerfile pins and the Umbrel
@@ -1653,6 +1721,9 @@ else
   echo "==> No uncommitted version bumps to record (already committed)."
 fi
 
+# ---------------------------------------------------------------------------
+# 6b. Push branch and tag
+# ---------------------------------------------------------------------------
 echo ""
 echo "    Remote : $GIT_REMOTE"
 echo "    Tag    : $RELEASE_TAG"
@@ -2173,12 +2244,36 @@ else
           echo "    APK uploaded (versionCode: $VERSION_CODE)"
 
           # --- Step 3: Assign AAB to track with release notes ---
-          # Truncate release notes to 500 chars (Play Store limit)
+          # Fit the release notes into Play's 500-char limit on a LINE
+          # boundary. `head -c 500` cut mid-word and could leave a dangling
+          # markdown heading as the last thing a Play user reads.
+          # See RELEASE-PIPELINE.md §3.
           PLAY_NOTES_TEXT=""
+          _play_notes_src=""
           if [ -f "${ZSP_NOTES_FILE:-}" ]; then
-            PLAY_NOTES_TEXT=$(head -c 500 "$ZSP_NOTES_FILE")
+            _play_notes_src="$ZSP_NOTES_FILE"
           elif [ -f release_notes.md ]; then
-            PLAY_NOTES_TEXT=$(head -c 500 release_notes.md)
+            _play_notes_src="release_notes.md"
+          fi
+          if [ -n "$_play_notes_src" ]; then
+            PLAY_NOTES_TEXT=$(NOTES_SRC="$_play_notes_src" python3 -c '
+import os, sys
+
+LIMIT = 500
+out, used = [], 0
+with open(os.environ["NOTES_SRC"], encoding="utf-8", errors="replace") as fh:
+    for raw in fh:
+        line = raw.rstrip("\n")
+        cost = len(line) + 1
+        if used + cost > LIMIT:
+            break
+        out.append(line)
+        used += cost
+# Drop a heading left dangling at the end with nothing under it
+while out and out[-1].lstrip().startswith("#"):
+    out.pop()
+sys.stdout.write("\n".join(out).strip())
+')
           fi
 
           TRACK_BODY=$(python3 -c "
@@ -2623,7 +2718,15 @@ else
     ZAPSTORE_HEX="78ce6faa72264387284e647ba6938995735ec8c7d5c5a65737e55130f026307d"
     ZAPSTORE_NPUB="npub10r8xl2njyepcw2zwv3a6dyufj4e4ajx86hz6v4ehu4gnpupxxp7stjt2p8"
 
-    # Extract first 3 PR title bullets from release notes (strips markdown bold markers)
+    # Build the "what's new" body from the release notes, PRESERVING the
+    # section grouping (Improvements / Bug Fixes / Other) and filling up to a
+    # character budget.
+    #
+    # This replaces the old `head -3`, which took the first three bullets in
+    # file order, threw the headings away, and so announced a twelve-PR release
+    # as three uncategorised lines while the GitHub release told the full story.
+    # See RELEASE-PIPELINE.md §4.
+    NOSTR_NOTE_BUDGET="${NOSTR_NOTE_BUDGET:-900}"
     BULLETS=""
     NOTES_SRC=""
     if [ -n "${ZSP_NOTES_FILE:-}" ] && [ -f "${ZSP_NOTES_FILE:-}" ]; then
@@ -2632,16 +2735,67 @@ else
       NOTES_SRC="release_notes.md"
     fi
     if [ -n "$NOTES_SRC" ]; then
-      # Extract first 3 bullet items from release notes (handles both '- **bold**' and plain '- item',
-      # and tolerates leading whitespace from hand-edited nested bullets).
-      while IFS= read -r _bline; do
-        [ -z "$_bline" ] && continue
-        _bline=$(printf '%s' "$_bline" | sed 's/^[[:space:]]*//; s/^- \*\*//; s/\*\*[: ]*.*//; s/^- //')
-        BULLETS="${BULLETS:+${BULLETS}$'\n'}• ${_bline}"
-      done < <(grep -E '^[[:space:]]*- ' "$NOTES_SRC" | head -3)
+      BULLETS=$(NOTES_SRC="$NOTES_SRC" BUDGET="$NOSTR_NOTE_BUDGET" python3 -c '
+import os, re, sys
+
+BULLET = "• "
+ELLIPSIS = "…"
+ITEM_MAX = 120          # a single overlong bullet is trimmed, not dropped
+
+src = os.environ["NOTES_SRC"]
+budget = int(os.environ["BUDGET"])
+
+# Parse the notes into [(heading, [items])] in file order. Headings keep their
+# emoji so the Nostr note reads the same as the GitHub release.
+groups = []
+with open(src, encoding="utf-8", errors="replace") as fh:
+    for raw in fh:
+        line = raw.rstrip("\n")
+        m = re.match(r"^#{2,4}\s+(.*)$", line)
+        if m:
+            title = m.group(1).strip()
+            # The document title line is not a section heading
+            if title.lower().startswith("what"):
+                continue
+            groups.append((title, []))
+            continue
+        m = re.match(r"^\s*[-*]\s+(.+)$", line)
+        if m:
+            item = m.group(1).replace("**", "").strip()
+            if not item:
+                continue
+            if len(item) > ITEM_MAX:
+                cut = item[:ITEM_MAX].rsplit(" ", 1)[0].rstrip(",.;:")
+                item = cut + ELLIPSIS
+            if not groups:
+                groups.append((None, []))
+            groups[-1][1].append(item)
+
+out, used, dropped = [], 0, 0
+for heading, items in groups:
+    kept = []
+    for item in items:
+        cost = len(BULLET) + len(item) + 1
+        if dropped == 0 and used + cost <= budget:
+            kept.append(BULLET + item)
+            used += cost
+        else:
+            dropped += 1
+    if not kept:
+        continue          # never emit a heading with nothing under it
+    if heading:
+        out.append(heading)
+        used += len(heading) + 1
+    out.extend(kept)
+
+if dropped:
+    out.append("%s%sand %d more" % (BULLET, ELLIPSIS, dropped))
+
+sys.stdout.write("\n".join(out))
+')
     fi
 
-    NOTE_CONTENT="${APP_NAME:-PearCircle} ${RELEASE_TAG} is out!"$'\n\n'"${APP_TAGLINE:-}"
+    NOTE_CONTENT="${APP_NAME} ${RELEASE_TAG} is out!"$'\n\n'"${APP_TAGLINE:-}"
 
     if [ -n "$BULLETS" ]; then
       NOTE_CONTENT+=$'\n\n'"What's new:"$'\n'"${BULLETS}"
@@ -2682,7 +2836,30 @@ else
 fi # end PUBLISH_NOSTR
 
 # ---------------------------------------------------------------------------
-# 13. Deferred-action reminders
+# 13. Close-out summary and deferred-action reminders
+#
+# Every publish step is best-effort past the tag push: a Zapstore outage sets
+# PUBLISH_FAILED rather than aborting, so an already-created GitHub release is
+# never stranded. That makes a final ledger worth printing, because a partial
+# release otherwise scrolls past unnoticed. See RELEASE-PIPELINE.md §2.
+# ---------------------------------------------------------------------------
+echo ""
+echo "==> $APP_NAME $RELEASE_TAG"
+_report() { printf '    %-14s %s\n' "$1" "$2"; }
+$PUBLISH_GITHUB    && _report "GitHub"    "published" || _report "GitHub"    "skipped"
+$PUBLISH_ZAPSTORE  && _report "Zapstore"  "published" || _report "Zapstore"  "skipped"
+$PUBLISH_PLAY      && _report "Google Play" "published" || _report "Google Play" "skipped"
+$PUBLISH_APP_STORE && _report "App Store" "uploaded"  || _report "App Store" "skipped"
+$PUBLISH_NOSTR     && _report "Nostr"     "announced" || _report "Nostr"     "skipped"
+
+if $PUBLISH_FAILED; then
+  echo ""
+  echo "    WARNING: at least one publish step failed. Scroll up for which."
+  echo "    Re-run with --retag to redo the release in place once fixed."
+fi
+
+# ---------------------------------------------------------------------------
+# 13b. Deferred-action reminders
 #
 # Surfaces anything the script couldn't auto-complete but isn't actually a
 # failure. Today that's the App Store review submission when Apple is still
