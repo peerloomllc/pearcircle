@@ -103,6 +103,9 @@ export function App () {
   const [update, setUpdate] = useState(null)
   const [applyState, setApplyState] = useState(null)
   const [pairResult, setPairResult] = useState(null)
+  // Live beat from the worklet while a phone is pairing (issue #179): 'connected'
+  // when the phone reaches us, 'enrolling' while its circles are being added.
+  const [pairProgress, setPairProgress] = useState(null)
   const [modal, setModal] = useState(null) // 'add' | 'maintenance' | 'support' | null
   const [theme, toggleTheme] = useTheme()
 
@@ -110,8 +113,19 @@ export function App () {
     const ws = openWs({
       onMessage: (msg) => {
         setWsConnected(true)
+        if (msg.type === 'event' && msg.name === 'seeder:pair:progress') {
+          setPairProgress(msg.data || null); return
+        }
         if (msg.type === 'event' && msg.name === 'seeder:pair:result') {
-          setPairResult(msg.data || { enrolled: 0, names: [] }); return
+          const r = msg.data || { enrolled: 0, names: [] }
+          setPairProgress(null)
+          setPairResult(r)
+          // A real pairing is done, so get out of the operator's way: close the
+          // Add-circles dialog and confirm on the main screen instead. An
+          // enrolled-nothing ack is NOT success, so that one stays in the dialog
+          // where the retry button is.
+          if (r.enrolled > 0) setModal(null)
+          return
         }
         if (msg.type === 'snapshot') {
           if (msg.status && !msg.status.error) { setStatus(msg.status); setError(null) }
@@ -131,6 +145,16 @@ export function App () {
   const refresh = () => api.circles().then((c) => setCircles(c.circles ?? [])).catch(() => {})
   const liveCount = circles.filter((c) => !c.revoked).length
 
+  // A successful pair closes the dialog (above), which unmounts PairPhone before
+  // its own effects can run - so the list refresh and the auto-dismiss of the
+  // confirmation both live here.
+  useEffect(() => {
+    if (!pairResult || !(pairResult.enrolled > 0)) return
+    refresh()
+    const t = setTimeout(() => setPairResult(null), 15000)
+    return () => clearTimeout(t)
+  }, [pairResult])
+
   return (
     <div class="app">
       <TopBar
@@ -140,6 +164,15 @@ export function App () {
 
       {update && update.updateAvailable && (
         <UpdateBar update={update} applyState={applyState} setApplyState={setApplyState} />
+      )}
+      {pairResult && pairResult.enrolled > 0 && (
+        <div class="toast good" style={{ flex: '0 0 auto' }}>
+          <span class="grow">
+            Pairing successful. Now seeding {pairResult.enrolled} {pairResult.enrolled === 1 ? 'circle' : 'circles'}
+            {Array.isArray(pairResult.names) && pairResult.names.length ? ` (${pairResult.names.join(', ')})` : ''}.
+          </span>
+          <button class="ghost" onClick={() => setPairResult(null)}>Dismiss</button>
+        </div>
       )}
       {error && <div class="toast error" style={{ flex: '0 0 auto' }}>{error}</div>}
 
@@ -187,7 +220,11 @@ export function App () {
 
       {modal === 'add' && (
         <Modal title="Add circles" onClose={() => setModal(null)}>
-          <AddCircles pairResult={pairResult} clearPairResult={() => setPairResult(null)} onAdded={refresh} setError={setError} />
+          <AddCircles
+            pairResult={pairResult} pairProgress={pairProgress}
+            clearPairResult={() => { setPairResult(null); setPairProgress(null) }}
+            onAdded={refresh} setError={setError}
+          />
         </Modal>
       )}
       {modal === 'maintenance' && (
@@ -377,7 +414,7 @@ function Modal ({ title, onClose, children }) {
 }
 
 /* ---- add circles (pair / paste) ------------------------------------------- */
-function AddCircles ({ pairResult, clearPairResult, onAdded, setError }) {
+function AddCircles ({ pairResult, pairProgress, clearPairResult, onAdded, setError }) {
   const [tab, setTab] = useState('pair')
   return (
     <div>
@@ -386,13 +423,18 @@ function AddCircles ({ pairResult, clearPairResult, onAdded, setError }) {
         <button class={tab === 'paste' ? '' : 'ghost'} onClick={() => setTab('paste')}>Paste invite</button>
       </div>
       {tab === 'pair'
-        ? <PairPhone pairResult={pairResult} clearPairResult={clearPairResult} onPaired={onAdded} setError={setError} />
+        ? (
+          <PairPhone
+            pairResult={pairResult} pairProgress={pairProgress}
+            clearPairResult={clearPairResult} onPaired={onAdded} setError={setError}
+          />
+        )
         : <Enroll onEnrolled={onAdded} setError={setError} />}
     </div>
   )
 }
 
-function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
+function PairPhone ({ pairResult, pairProgress, clearPairResult, onPaired, setError }) {
   const [link, setLink] = useState(null)
   const [qr, setQr] = useState(null)
   const [remaining, setRemaining] = useState(0)
@@ -407,6 +449,9 @@ function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
       setLink(r.link); setRemaining(Math.round((r.ttlMs || 300000) / 1000))
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
+  // Leaving this view (dialog closed, tab switched) retires the rendezvous
+  // rather than leaving it live for the rest of its 5-minute TTL.
+  useEffect(() => () => { api.pairClose().catch(() => {}) }, [])
   useEffect(() => {
     if (!link) { setQr(null); return }
     let cancelled = false
@@ -427,14 +472,18 @@ function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
     if (typeof onPaired === 'function') onPaired()
   }, [pairResult])
 
-  if (pairResult) {
+  // A phone reached us but nothing was added - not a success, so it stays here
+  // next to the retry rather than turning into a green "paired" message. The
+  // successful case closes this dialog and confirms on the main screen.
+  if (pairResult && !(pairResult.enrolled > 0)) {
     return (
       <div class="stack center">
-        <div class="msg-good center">
-          Paired — now seeding {pairResult.enrolled} circle{pairResult.enrolled === 1 ? '' : 's'}
-          {Array.isArray(pairResult.names) && pairResult.names.length ? ` (${pairResult.names.join(', ')})` : ''}.
+        <div class="msg-warn center">
+          A phone connected, but no circles were added. Its circles may already be
+          seeded here, or it has no encrypted circle to share yet.
         </div>
-        <button class="ghost" onClick={clearPairResult}>Done</button>
+        <button onClick={open} disabled={busy}>{busy ? 'Starting…' : 'Try again'}</button>
+        <button class="ghost" onClick={clearPairResult}>Close</button>
       </div>
     )
   }
@@ -446,11 +495,28 @@ function PairPhone ({ pairResult, clearPairResult, onPaired, setError }) {
       </div>
     )
   }
+  // Once a phone is on the wire the countdown stops being the story, so the
+  // beat replaces it: something is happening and the operator can see it.
+  const stage = pairProgress?.stage
   return (
     <div class="stack center">
       {qr ? <img class="qr" src={qr} alt="pairing QR code" /> : <div class="empty">generating…</div>}
-      <div class="hint center">Scan with the PearCircle app. Expires in {remaining}s.</div>
-      <div class="hint center" style={{ opacity: 0.85 }}>Won't connect? Turn off the phone's WiFi so it pairs over cellular — a seeder on a home server often can't be found over the same WiFi.</div>
+      {stage === 'enrolling' || stage === 'connected'
+        ? (
+          <div class="beat msg-good">
+            <span class="spinner" />
+            {stage === 'enrolling'
+              ? `Phone connected. Adding ${pairProgress.count === 1 ? 'its circle' : (pairProgress.count > 1 ? `its ${pairProgress.count} circles` : 'its circles')}…`
+              : 'Phone connected. Receiving its circles…'}
+          </div>
+        )
+        : (
+          <div class="beat hint">
+            <span class="spinner" />
+            Waiting for a phone to scan. Expires in {remaining}s.
+          </div>
+        )}
+      <div class="hint center" style={{ opacity: 0.85 }}>Won't connect? Turn off the phone's WiFi so it pairs over cellular - a seeder on a home server often can't be found over the same WiFi.</div>
       <button class="ghost" onClick={close}>Cancel</button>
     </div>
   )
