@@ -1622,7 +1622,7 @@ else
   set +e
   bash "$REPO_ROOT/seeder-launcher/scripts/build-start9-s9pk.sh" "${RELEASE_TAG#v}" 2>&1 \
     | tee /tmp/pearcircle-build-start9.log \
-    | grep --line-buffered -E '^==>|STEP [0-9]+/|Copying (blob|config)|save \+ normalize|packing |verify|s9pk ready|WARNING|[Ee]rror' \
+    | grep --line-buffered -E '^==>|^\s*!!|STEP [0-9]+/|Copying (blob|config)|save \+ normalize|packing |verify|s9pk ready|WARNING|[Ee]rror' \
     | awk '{ print "      " $0; fflush() }'
   _start9_status=${PIPESTATUS[0]}
   set -e
@@ -1794,6 +1794,16 @@ done
 if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ]; then
   RELEASE_ASSETS+=("$START9_S9PK")
   [ -f "${START9_S9PK}.sha256" ] && RELEASE_ASSETS+=("${START9_S9PK}.sha256")
+  # The v2 package for StartOS 0.4.0+, converted from the v1 above by the same
+  # build script. 0.4.0's web UI refuses a v1 s9pk on a magic-byte check, so
+  # without this asset a 0.4.0 user has to fall back to the CLI to sideload.
+  # Absent when the build machine lacks the 0.4.x start-cli or a packaging
+  # workspace, which that script says loudly.
+  _s9pk_v2="${START9_S9PK%.s9pk}-v2.s9pk"
+  if [ -f "$_s9pk_v2" ]; then
+    RELEASE_ASSETS+=("$_s9pk_v2")
+    [ -f "${_s9pk_v2}.sha256" ] && RELEASE_ASSETS+=("${_s9pk_v2}.sha256")
+  fi
 fi
 echo ""
 echo "    Repo   : ${REPO_SLUG:-unknown}"
