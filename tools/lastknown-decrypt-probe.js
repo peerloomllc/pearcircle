@@ -89,10 +89,25 @@ async function main () {
     valueEncoding: 'json',
     encryptionKey: encKeyBuf,
     open: (viewStore) => new Hyperbee(viewStore.get('view'), { keyEncoding: 'utf-8', valueEncoding: 'json', extension: false }),
-    apply: async (nodes, view) => {
+    // Replay enough of the app's apply to build a readable view. addWriter
+    // MUST be handled: without it the other writers are never admitted, their
+    // nodes never linearize, and the probe reports an EMPTY circle - which on a
+    // freshly recreated circle looks exactly like "nobody has joined yet"
+    // rather than like a broken tool. It only went unnoticed because a
+    // long-lived circle lets the probe fast-forward to a peer's view snapshot.
+    // Diagnostic replay only: this does NOT enforce the ownership and signature
+    // rules applyCircleNodes does, so never read this view to decide who was
+    // ALLOWED to write something. It is here to find cores, nothing more.
+    apply: async (nodes, view, host) => {
       for (const n of nodes) {
         const op = n.value
-        if (op && op.type === 'put' && typeof op.key === 'string') await view.put(op.key, op.value)
+        if (!op || typeof op.type !== 'string') continue
+        if (op.type === 'addWriter' && typeof op.pubkey === 'string') {
+          await host.addWriter(b4a.from(op.pubkey, 'hex'))
+          continue
+        }
+        if (op.type === 'put' && typeof op.key === 'string') await view.put(op.key, op.value)
+        else if (op.type === 'del' && typeof op.key === 'string') await view.del(op.key)
       }
     },
   })
