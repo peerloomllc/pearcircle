@@ -103,6 +103,14 @@ async function main () {
 
   // Each member announces their last-known core key in the (encrypted) view,
   // which we can read because we hold the circle key.
+  // Map pubkey -> display name so the report names PEOPLE, not hex. Chasing
+  // "who is 080fbd90" by hand is the slow part of acting on this.
+  const names = new Map()
+  for await (const { key, value } of base.view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+    const pubkey = key.slice('member:'.length)
+    if (value && typeof value.displayName === 'string') names.set(pubkey, value.displayName)
+  }
+
   const announced = []
   for await (const { key, value } of base.view.createReadStream({ gt: 'lastknownCore:', lt: 'lastknownCore:~' })) {
     const pubkey = key.slice('lastknownCore:'.length)
@@ -115,7 +123,7 @@ async function main () {
     const core = store.get({ key: b4a.from(coreKey, 'hex') })
     await core.ready()
     try { await core.update({ wait: true }) } catch {}
-    const label = `member ${pubkey.slice(0, 8)} core ${coreKey.slice(0, 8)}`
+    const label = `${(names.get(pubkey) || '(unknown)').padEnd(10)} ${pubkey.slice(0, 8)} core ${coreKey.slice(0, 8)}`
     if (core.length === 0) { console.log(`${label}: core empty / never synced`); continue }
     let raw
     try {
