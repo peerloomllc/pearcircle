@@ -36,10 +36,16 @@ dependencies: []
 repo: https://github.com/peerloomllc/pearcircle
 support: https://github.com/peerloomllc/pearcircle/issues
 gallery: []
-releaseNotes: >-
-  First release of the PearCircle seeder for Umbrel. Runs the blind-seeder
-  worklet as an always-on service with a dashboard for enrolling circles and
-  watching replication.
+releaseNotes: |
+  Improvements
+
+  - The seeder now warns you if it can read any of the data it is storing. It is meant to be blind, so this is your alarm that a member's app needs updating.
+  - Clearer reporting when a member's saved position cannot be read, instead of retrying it forever in the background.
+
+  Bug Fixes
+
+  - Circles that looked like they needed repairing usually did not. That false alarm is gone, along with the bugs behind the Recreate button.
+  - Members' saved positions are stored encrypted again, and any that were saved unprotected are repaired automatically.
 path: ""
 defaultUsername: ""
 defaultPassword: ""

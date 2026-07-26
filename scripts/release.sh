@@ -1428,6 +1428,23 @@ if [ -d "$REPO_ROOT/metadata/ios/en-US" ]; then
   echo "    Updated metadata/ios/en-US/release_notes.txt"
 fi
 
+# Same notes into the two app-store manifests. Both were fossilised on their
+# first-release text while this script faithfully bumped their VERSION every
+# time, so anyone updating from either store was told they were installing the
+# first release. Start9's registry republishes the field, so it was served, not
+# just stored. Both files are already in _bump_paths, so the rewrite rides the
+# existing release commit.
+#
+# A hard failure, deliberately: it runs before the tag, the build and any
+# publish, so aborting here costs nothing, and a warning that scrolls past in a
+# long release log is exactly how this class of bug keeps happening.
+echo "==> Writing release notes into the app-store manifests..."
+if ! node "$REPO_ROOT/seeder-launcher/scripts/write-store-release-notes.js" release_notes.md; then
+  echo "ERROR: could not write the store release notes - fix this before releasing," >&2
+  echo "       or the stores will advertise the previous version's notes again." >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # 5b. Build the desktop seeder-launcher installers
 #
