@@ -6119,9 +6119,17 @@ function setupSeederPairChannelFor (conn) {
     conn,
     role: 'seed',
     rv: _pairSession.rv,
+    // Progress beats for the dashboard (issue #179): "a phone is talking to me"
+    // and "I am adding its circles now". Best-effort - a dropped beat only costs
+    // the operator a nicer label, never the pairing itself.
+    onPeer: () => {
+      mark('seeder:pair:peer')
+      try { send({ event: 'seeder:pair:progress', data: { stage: 'connected' } }) } catch {}
+    },
     onBundle: async ({ invites }) => {
       const names = []
       let enrolled = 0
+      try { send({ event: 'seeder:pair:progress', data: { stage: 'enrolling', count: invites.length } }) } catch {}
       for (const invite of invites) {
         try {
           const r = await enrollSeedInvite({ invite, localDb: _localDb, mountCircle: mountSeederCircle })

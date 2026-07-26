@@ -1508,6 +1508,9 @@ function ToggleSwitch ({ on, onChange, disabled = false }) {
   )
 }
 
+// Kept in step with SEEDER_PAIR_SCAN_TIMEOUT_MS in src/bare.js (60s).
+const SEEDER_PAIR_SCAN_SECONDS = 60
+
 // Top-level seeder management. Proposal amendment 2026-05-19 (global
 // seeder setup): one section, not a per-circle thing. "Set up a seeder
 // device" mints seed invites for every encrypted circle at once (no
@@ -1532,6 +1535,9 @@ function SeedersSection ({ active = true }) {
   // push our circles to it over P2P, no copy-paste.
   const [pairing, setPairing] = useState(false)
   const [pairResult, setPairResult] = useState(null)
+  // Seconds left before the worklet gives up on the scan. Shown so the wait has
+  // a visible end instead of an indefinite "Pairing..." (issue #179).
+  const [pairSecs, setPairSecs] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
@@ -1573,6 +1579,16 @@ function SeedersSection ({ active = true }) {
     const id = setInterval(refresh, 5000)
     return () => clearInterval(id)
   }, [active, refresh])
+
+  // Countdown while a scan is in flight. Mirrors SEEDER_PAIR_SCAN_TIMEOUT_MS in
+  // the worklet, which stays the authority: this only labels the wait, so a
+  // little drift is harmless and the worklet's own timer still ends it.
+  useEffect(() => {
+    if (!pairing) { setPairSecs(0); return }
+    setPairSecs(SEEDER_PAIR_SCAN_SECONDS)
+    const id = setInterval(() => setPairSecs((n) => (n > 0 ? n - 1 : 0)), 1000)
+    return () => clearInterval(id)
+  }, [pairing])
 
   // Fetch the latest published seeder version once per open of the section.
   useEffect(() => {
@@ -1725,11 +1741,24 @@ function SeedersSection ({ active = true }) {
       ) : (
         <>
           <button onClick={scanSeeder} disabled={pairing} style={s.primaryBtn}>
-            {pairing ? 'Pairing...' : 'Scan seeder QR'}
+            {pairing ? (
+              <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm }}>
+                <span
+                  data-testid='pair-spinner'
+                  style={{
+                    width: 14, height: 14, borderRadius: '50%', flexShrink: 0, display: 'inline-block',
+                    border: '2px solid rgba(0, 0, 0, 0.22)', borderTopColor: colors.text.onPrimary,
+                    animation: 'pearcircle-focus-spin 0.8s linear infinite',
+                  }}
+                />
+                Pairing{pairSecs > 0 ? ` (${pairSecs}s)` : ''}
+              </span>
+            ) : 'Scan seeder QR'}
           </button>
           <p style={{ ...s.muted, textAlign: 'center', marginTop: spacing.sm, marginBottom: 0 }}>
-            On the seeder's dashboard, tap "Pair a phone" and scan the code. Tip:
-            if it won't connect, turn off WiFi so your phone pairs over cellular.
+            {pairing
+              ? 'Talking to the seeder. Keep this screen open. If it gives up, turn off WiFi and try again so your phone pairs over cellular.'
+              : 'On the seeder\'s dashboard, tap "Pair a phone" and scan the code. Tip: if it won\'t connect, turn off WiFi so your phone pairs over cellular.'}
           </p>
         </>
       )}

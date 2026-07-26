@@ -24,7 +24,7 @@ const b4a = require('b4a')
 const SEEDER_PAIR_PROTOCOL = 'pearcircle/seeder-pair/1'
 const RV_B64URL_43 = /^[A-Za-z0-9_-]{43}$/
 
-function setupSeederPairChannel ({ conn, role, rv, getBundle, onBundle, onAck, mark }) {
+function setupSeederPairChannel ({ conn, role, rv, getBundle, onBundle, onAck, onPeer, mark }) {
   if (role !== 'member' && role !== 'seed') {
     throw new Error('role must be "member" or "seed"')
   }
@@ -67,6 +67,12 @@ function setupSeederPairChannel ({ conn, role, rv, getBundle, onBundle, onAck, m
     onopen () {
       trace('seederpair:onopen')
       if (role === 'member') sendBundle()
+      // Seed side: the scanning phone is now on the wire. The dashboard shows
+      // this so a pairing that is genuinely progressing does not look dead
+      // while the bundle transfers (issue #179).
+      if (role === 'seed' && typeof onPeer === 'function') {
+        try { onPeer() } catch (e) { trace('seederpair:onpeer-failed', { err: e?.message ?? String(e) }) }
+      }
     },
     onclose () { trace('seederpair:onclose') },
   })
