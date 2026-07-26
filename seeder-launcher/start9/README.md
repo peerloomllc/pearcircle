@@ -46,6 +46,37 @@ cd seeder-launcher/start9
 make            # build + verify a universal pearcircle-seeder.s9pk (x86_64 + aarch64)
 ```
 
+`../scripts/build-start9-s9pk.sh` wraps that for a release: it pins the version
+and image digest first, then emits a **second** artifact,
+`pearcircle-seeder-v2.s9pk`, for StartOS 0.4.0+.
+
+### Why two artifacts
+
+StartOS 0.4.0's web UI refuses a v1 package outright - it sniffs the magic bytes
+(`3b 3b 01` vs `3b 3b 02`) and reports the format as deprecated. The OS still
+installs v1 through `start-cli package install --sideload`, so 0.3.5 boxes are
+unaffected and v1 remains the source of truth, but a 0.4.0 operator expects to
+drag the file into the browser.
+
+We do not hand-author a second package for that. StartOS ships a converter, and
+that is how Start9 migrated its own catalogue; a converted package keeps these
+0.3.5-era procedures and gains " (Legacy)" on its title. Porting to the 0.4.x
+TypeScript SDK properly is the follow-up that removes both.
+
+The conversion needs machine setup the repo cannot carry, since it involves a
+private signing key:
+
+- **A 0.4.x `start-cli`** (the 0.3.5 SDK's `start-cli` cannot convert). Download
+  it from the `start-cli/v*` releases of `Start9Labs/start-technologies`. The
+  build script finds `start-cli-1.1.0` or any `start-cli` reporting a 1.x
+  version; override with `START_CLI_V2`.
+- **A packaging workspace**, holding the build key the converted package is
+  signed with: `start-cli s9pk init-workspace ~/.start9-workspace`. Override the
+  location with `START9_WORKSPACE`. Also needs `tar2sqfs` (`squashfs-tools-ng`)
+  and podman able to resolve short image names.
+
+Without both, the build prints a loud `!!` block and ships v1 only.
+
 ## Install on a server
 
 Point the SDK at your server, then install:
@@ -57,7 +88,11 @@ Point the SDK at your server, then install:
 make install    # or: start-cli package install pearcircle-seeder.s9pk
 ```
 
-Or upload the `.s9pk` through the StartOS UI (System > Sideload Service).
+Or upload the `.s9pk` through the StartOS UI (System > Sideload Service). On
+**0.4.0+ the UI only accepts `pearcircle-seeder-v2.s9pk`**; the v1 file installs
+there too, but only via `start-cli package install --sideload <file>`. Note
+0.4.0 also moved CLI auth to per-device signing keys, so a 0.3.5-era `start-cli`
+fails against it with `missing field __Auth_signer`.
 
 ## Status
 

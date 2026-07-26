@@ -82,7 +82,76 @@ S9PK="$START9_DIR/pearcircle-seeder.s9pk"
 ( cd "$START9_DIR" && sha256sum "pearcircle-seeder.s9pk" > "pearcircle-seeder.s9pk.sha256" )
 echo "==> s9pk ready: $S9PK ($(du -h "$S9PK" | cut -f1))"
 
+# --- also emit a v2 s9pk for StartOS 0.4.0+ --------------------------------
+# 0.4.0's web UI refuses a v1 package outright: sideload.utils.ts sniffs the
+# magic bytes (3b 3b 01 vs 3b 3b 02) and tells the operator the format is
+# deprecated. The OS still installs v1 through `start-cli package install
+# --sideload`, so v1 is not dead - but "sideload from the browser" is how a
+# StartOS user expects to install a package we do not list in a marketplace.
+#
+# We do NOT hand-author a second package for that. StartOS ships a converter
+# (`start-cli s9pk convert`, backed by S9pk::from_v1), which is how Start9
+# migrated its own catalogue; a converted package keeps its 0.3.5-era
+# procedures and gains " (Legacy)" on its title. So the v1 above stays the
+# single source of truth and the v2 is derived from it.
+#
+# Needs the 0.4.x-era start-cli (the 0.3.5 SDK's `start-cli` cannot do this)
+# and a packaging workspace, which holds the build signing key the converted
+# package is signed with. Both are machine setup, not repo state - the key must
+# never be committed. Create one with `start-cli s9pk init-workspace`.
+V2_S9PK="$START9_DIR/pearcircle-seeder-v2.s9pk"
+START9_WORKSPACE="${START9_WORKSPACE:-$HOME/.start9-workspace}"
+
+# Resolve a start-cli that can convert. `start-cli --version` prints "StartOS
+# CLI 0.3.5.1" for the old SDK and "start-cli 1.1.0" for the new one, so the
+# leading token tells them apart without comparing version numbers.
+_v2_cli=""
+for _cand in "${START_CLI_V2:-}" start-cli-1.1.0 start-cli; do
+  [ -n "$_cand" ] || continue
+  command -v "$_cand" >/dev/null 2>&1 || continue
+  if "$_cand" --version 2>/dev/null | grep -qE '^start-cli [1-9]'; then _v2_cli="$_cand"; break; fi
+done
+
+if [ -z "$_v2_cli" ] || [ ! -f "$START9_WORKSPACE/.startos/config.yaml" ]; then
+  echo ""
+  echo "  !! SKIPPING the v2 s9pk - StartOS 0.4.0 users will not be able to" >&2
+  echo "  !! sideload this release from the web UI (CLI still works)." >&2
+  # if/fi, not `[ ] && echo`: under `set -e` a false test would exit the script,
+  # turning a skipped optional artifact into a failed release build.
+  if [ -z "$_v2_cli" ]; then
+    echo "  !!   missing: a 0.4.x start-cli (set START_CLI_V2, or install start-cli 1.x)" >&2
+  fi
+  if [ ! -f "$START9_WORKSPACE/.startos/config.yaml" ]; then
+    echo "  !!   missing: a packaging workspace at $START9_WORKSPACE" >&2
+  fi
+  echo "  !!   fix: start-cli s9pk init-workspace $START9_WORKSPACE" >&2
+  echo ""
+else
+  echo "==> converting to a v2 s9pk for StartOS 0.4.0+ ($_v2_cli) ..."
+  # convert rewrites IN PLACE, so it operates on a copy - losing the v1 here
+  # would strand every 0.3.5 box.
+  cp -f "$S9PK" "$V2_S9PK"
+  # Run from inside the workspace: the converter walks up from the CWD looking
+  # for .startos, and signs with that workspace's build key.
+  if ( cd "$START9_WORKSPACE" && "$_v2_cli" s9pk convert "$V2_S9PK" ); then
+    # Trust the bytes, not the exit code: a v2 package starts 3b 3b 02.
+    if [ "$(head -c 3 "$V2_S9PK" | od -An -tx1 | tr -d ' \n')" = "3b3b02" ]; then
+      ( cd "$START9_DIR" && sha256sum "pearcircle-seeder-v2.s9pk" > "pearcircle-seeder-v2.s9pk.sha256" )
+      echo "==> v2 s9pk ready: $V2_S9PK ($(du -h "$V2_S9PK" | cut -f1))"
+    else
+      rm -f "$V2_S9PK"
+      echo "build-start9-s9pk: conversion reported success but the output is not a v2 s9pk" >&2
+      exit 1
+    fi
+  else
+    rm -f "$V2_S9PK"
+    echo "build-start9-s9pk: v2 conversion failed" >&2
+    exit 1
+  fi
+fi
+
 echo ""
 echo "==> Done. Review + commit the pinned start9/ files with the release:"
 echo "      $START9_DIR/{manifest.yaml,Dockerfile,scripts/procedures/migrations.ts}"
 echo "S9PK=$S9PK"
+if [ -f "$V2_S9PK" ]; then echo "S9PK_V2=$V2_S9PK"; fi
