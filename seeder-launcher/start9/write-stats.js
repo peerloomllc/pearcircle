@@ -79,6 +79,12 @@ async function getJson (pathname) {
   return res.json()
 }
 
+// One failure is logged, then the rest stay quiet: a fully silent catch made
+// two of PearCal's four Properties bugs undiagnosable from outside the
+// container (pearcal-native PRs #244-#249), while logging every tick would spam
+// the journal for the whole time a seeder is down.
+let _loggedFailure = false
+
 async function tick () {
   try {
     // Both endpoints are unauthenticated here (SEEDER_NO_AUTH=1). A failure on
@@ -92,21 +98,43 @@ async function tick () {
     const tmp = STATS_FILE + '.tmp'
     fs.writeFileSync(tmp, render(status, circles))
     fs.renameSync(tmp, STATS_FILE)
-  } catch {
+    return true
+  } catch (e) {
     // The seeder may not be listening yet, or may be mid-restart. Properties
     // keeps showing the previous snapshot rather than going blank, so a failed
-    // poll is not worth logging on every tick.
+    // poll is not fatal - but the first one says so.
+    if (!_loggedFailure) {
+      _loggedFailure = true
+      console.error('[start9-stats] first poll failed:', e?.message ?? String(e))
+    }
+    return false
   }
+}
+
+// Boot cadence: retry fast until the first successful write, then settle into the
+// slow refresh. The first tick runs before the seeder API is listening, so a
+// single attempt followed by the 60s interval leaves Properties empty for the
+// first minute after every boot - which reads as "this page does nothing".
+const BOOT_RETRY_MS = Number(process.env.START9_STATS_BOOT_RETRY_MS || 3000)
+
+function startPolling ({ setTimeoutFn = setTimeout, setIntervalFn = setInterval } = {}) {
+  const settle = () => setIntervalFn(tick, INTERVAL_MS)
+  const attempt = async () => {
+    const ok = await tick()
+    if (ok) settle()
+    else setTimeoutFn(attempt, BOOT_RETRY_MS)
+  }
+  attempt()
 }
 
 // Only poll when run as the entrypoint's background process; requiring this
 // file (the render test does) must not start a timer.
 if (require.main === module) {
-  tick()
-  // Deliberately NOT unref'd: this runs as its own process next to the seeder,
-  // so an unref'd timer would let it exit after the first tick and freeze
-  // Properties on the boot-time snapshot, taken before the API is listening.
-  setInterval(tick, INTERVAL_MS)
+  // Deliberately NOT unref'd anywhere below: this runs as its own process next
+  // to the seeder, so an unref'd timer would let it exit after the first tick
+  // and freeze Properties on the boot-time snapshot, taken before the API is
+  // listening.
+  startPolling()
 }
 
-module.exports = { render, tick, STATS_FILE }
+module.exports = { render, tick, startPolling, STATS_FILE, BOOT_RETRY_MS }

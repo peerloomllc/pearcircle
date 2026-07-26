@@ -80,7 +80,13 @@ config: ~
 # Populated at runtime: the entrypoint writes /root/start9/stats.yaml (compat
 # format) so Properties shows the seeder public key, nickname and enrollment
 # counts. Without that file this page renders empty.
-properties: ~
+#
+# MUST be the object form. `properties: ~` serialises to an empty value and
+# StartOS reads that as "this package has no properties procedure", so it never
+# invokes properties.ts however correct stats.yaml is. That was the root cause
+# of PearCal's three failed attempts at this page (pearcal-native PR #249).
+properties:
+  type: script
 volumes:
   main:
     type: data
