@@ -71,3 +71,60 @@ describe('start9 write-stats render', () => {
     expect(out).not.toMatch(/token/i)
   })
 })
+
+// The boot cadence is the difference between a Properties page that is populated
+// a few seconds after a restart and one that is empty for the first minute -
+// PearCal shipped the latter three times (pearcal-native PRs #244-#249).
+describe('start9 write-stats boot cadence', () => {
+  const { startPolling } = require('../seeder-launcher/start9/write-stats')
+
+  // Stand-in for a seeder API that is not listening yet: tick() fails until the
+  // Nth call. tick() is exercised through fetch, which write-stats calls.
+  const fakeTimers = () => {
+    const timeouts = []
+    const intervals = []
+    return {
+      timeouts,
+      intervals,
+      opts: {
+        setTimeoutFn: (fn, ms) => { timeouts.push({ fn, ms }); return timeouts.length },
+        setIntervalFn: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length },
+      },
+    }
+  }
+
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  let realFetch
+
+  beforeEach(() => {
+    realFetch = global.fetch
+    // The first-failure line is deliberate behaviour here, not test noise.
+    jest.spyOn(console, 'error').mockImplementation(() => {})
+  })
+  afterEach(() => { global.fetch = realFetch; jest.restoreAllMocks() })
+
+  test('retries on the fast boot interval until the first write succeeds', async () => {
+    global.fetch = jest.fn(async () => { throw new Error('ECONNREFUSED') })
+    const t = fakeTimers()
+    startPolling(t.opts)
+    await flush()
+    expect(t.intervals).toHaveLength(0)       // has not settled into the slow refresh
+    expect(t.timeouts).toHaveLength(1)
+    expect(t.timeouts[0].ms).toBe(3000)       // and retries fast, not in 60s
+  })
+
+  test('settles into the slow refresh once a write lands', async () => {
+    global.fetch = jest.fn(async () => ({ ok: true, json: async () => ({}) }))
+    const t = fakeTimers()
+    const fs = require('fs')
+    jest.spyOn(fs, 'mkdirSync').mockImplementation(() => {})
+    jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {})
+    jest.spyOn(fs, 'renameSync').mockImplementation(() => {})
+    startPolling(t.opts)
+    await flush()
+    expect(t.timeouts).toHaveLength(0)        // no further boot retry
+    expect(t.intervals).toHaveLength(1)
+    expect(t.intervals[0].ms).toBe(60000)
+    jest.restoreAllMocks()
+  })
+})
