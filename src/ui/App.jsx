@@ -16,6 +16,7 @@ import {
 } from '../lib/fanOut.js'
 import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
 import { supersedeFailureMessage } from '../lib/supersedeApply.js'
+import { summarizeSeederCircles } from '../lib/seederContact.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { Tour } from './components/Tour.jsx'
 import { RepairBanner, RepairingBanner, RepairConfirmModal, REPAIR_ESCALATE_MS } from './components/RepairBanners.jsx'
@@ -1699,12 +1700,22 @@ function SeedersSection ({ active = true }) {
   // fully-revoked device stays in the list so the user can re-admit it —
   // durable revocation (proposal 2026-05-21 amendment) makes re-admission
   // an explicit action, so the row must remain reachable.
+  // A circle counts as actually held only once the seeder has checked in for
+  // it. The admission row on its own proves nothing: it is written locally for
+  // every followed seeder when a circle is created, so a switched-off machine
+  // would otherwise read as covering the circle. See lib/seederContact.js.
   const seederRows = seeders
-    .map((sd) => ({
-      ...sd,
-      liveCircles: (sd.circles ?? []).filter((c) => !c.revoked),
-      revokedCircles: (sd.circles ?? []).filter((c) => c.revoked),
-    }))
+    .map((sd) => {
+      const s = summarizeSeederCircles(sd.circles)
+      return {
+        ...sd,
+        liveCircles: s.live,
+        heldCircles: s.held,
+        unconfirmedCircles: s.unconfirmed,
+        revokedCircles: s.revoked,
+        lastSeenAt: s.lastSeenAt,
+      }
+    })
     .filter((sd) => sd.liveCircles.length + sd.revokedCircles.length > 0)
 
   return (
@@ -1823,7 +1834,8 @@ function SeedersSection ({ active = true }) {
           {seederRows.map((seeder) => {
             const isPending = pending === seeder.pubkey
             const labelLine = seeder.label || ('Seeder ' + seeder.pubkey.slice(0, 8))
-            const liveNames = seeder.liveCircles.map((c) => c.name).join(', ')
+            const heldNames = seeder.heldCircles.map((c) => c.name).join(', ')
+            const unconfirmedNames = seeder.unconfirmedCircles.map((c) => c.name).join(', ')
             const revokedNames = seeder.revokedCircles.map((c) => c.name).join(', ')
             return (
               <li key={seeder.pubkey} style={{
@@ -1835,9 +1847,25 @@ function SeedersSection ({ active = true }) {
                     <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {labelLine}
                     </div>
-                    {seeder.liveCircles.length > 0 && (
+                    {seeder.heldCircles.length > 0 && (
                       <div style={{ ...typography.caption, color: colors.text.secondary }}>
-                        Seeding {seeder.liveCircles.length} {seeder.liveCircles.length === 1 ? 'circle' : 'circles'}: {liveNames}
+                        Seeding {seeder.heldCircles.length} {seeder.heldCircles.length === 1 ? 'circle' : 'circles'}: {heldNames}
+                      </div>
+                    )}
+                    {/* Admitted but never heard from for these circles, so we
+                        cannot claim it is holding them. Showing this separately
+                        is the point of the row: a switched-off seeder used to
+                        render identically to a working one. */}
+                    {seeder.unconfirmedCircles.length > 0 && (
+                      <div style={{ ...typography.caption, color: colors.warn }}>
+                        Not confirmed for {seeder.unconfirmedCircles.length} {seeder.unconfirmedCircles.length === 1 ? 'circle' : 'circles'}: {unconfirmedNames}
+                      </div>
+                    )}
+                    {seeder.liveCircles.length > 0 && (
+                      <div style={{ ...typography.caption, color: seeder.lastSeenAt === null ? colors.warn : colors.text.secondary }}>
+                        {seeder.lastSeenAt === null
+                          ? 'Never checked in with this phone'
+                          : 'Last checked in ' + ageLabel(seeder.lastSeenAt)}
                       </div>
                     )}
                     {seeder.revokedCircles.length > 0 && (
