@@ -518,6 +518,34 @@ _android_package_name() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: the versionName baked into an APK, or "" if it cannot be read.
+#
+# Exists so a publish can assert the artifact really is the version being
+# announced. Prefers aapt (same tool _android_package_name already relies on),
+# falls back to the newest aapt2 in the Android SDK, and gives up quietly
+# rather than guessing — callers treat "" as "unknown", not as a mismatch.
+# ---------------------------------------------------------------------------
+_apk_version_name() {
+  local apk="$1"
+  [ -f "$apk" ] || return 0
+
+  local badging=""
+  if command -v aapt &>/dev/null; then
+    badging=$(aapt dump badging "$apk" 2>/dev/null || true)
+  fi
+  if [ -z "$badging" ]; then
+    local aapt2
+    aapt2=$(ls -1 "${ANDROID_HOME:-$HOME/Android/Sdk}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+    [ -n "$aapt2" ] && badging=$("$aapt2" dump badging "$apk" 2>/dev/null || true)
+  fi
+  [ -z "$badging" ] && return 0
+
+  printf '%s' "$badging" \
+    | grep -m1 "^package:" \
+    | sed -E "s/.*versionName='([^']*)'.*/\1/"
+}
+
+# ---------------------------------------------------------------------------
 # Helper: compare two X.Y.Z version strings.
 # Prints "gt" / "lt" / "eq"
 # ---------------------------------------------------------------------------
@@ -791,7 +819,13 @@ if [ -n "${EXPLICIT_TAG:-}" ]; then
 
   elif ! $GH_HAS_VERSION; then
     echo ""
-    echo "    $RELEASE_TAG does not exist on GitHub yet — running full build."
+    # Deliberately not "running full build": this branch cannot promise that.
+    # Destination selection recomputes NEEDS_BUILD afterwards, and the old
+    # wording asserted an outcome decided later — which is what made the
+    # skipped build silent in the v1.1.0 run. The build is now forced for an
+    # unpublished version (see the NEEDS_BUILD block), so the two agree, but
+    # the message still only states what is known at this point.
+    echo "    $RELEASE_TAG does not exist on GitHub yet — a build will be required."
   fi
 
 else
@@ -1088,6 +1122,27 @@ if ! $CHECK_VERSIONS_ONLY; then
   # build regardless of ZAPSTORE_ONLY hint.
   if $PUBLISH_GITHUB || $PUBLISH_PLAY || $PUBLISH_APP_STORE; then
     NEEDS_BUILD=true
+  fi
+
+  # ...but the Zapstore shortcut is only valid when republishing a version that
+  # ALREADY exists on GitHub. A version GitHub has never seen has never been
+  # built, so there is no artifact for any destination to publish.
+  #
+  # Without this, declining GitHub/Play/App Store left NEEDS_BUILD=false and
+  # skipped the entire build phase INCLUDING the app.json version bump — after
+  # the script had already printed "$RELEASE_TAG does not exist on GitHub yet".
+  # Zapstore then fell back to whatever stale APK was on disk and published it:
+  # the run that intended v1.1.0 shipped v1.0.25 to the relay (2026-07-24).
+  #
+  # Compared against $GH_VERSION directly rather than $GH_HAS_VERSION, which is
+  # only assigned on the explicit-tag path. An empty $GH_VERSION (the GitHub
+  # query failed) also forces a build, which is the safe direction: build
+  # needlessly rather than publish something stale.
+  if [ "${GH_VERSION:-}" != "$APP_VERSION" ] && ! $NEEDS_BUILD; then
+    NEEDS_BUILD=true
+    echo ""
+    echo "    Note: $RELEASE_TAG is not published on GitHub, so there is no"
+    echo "    existing artifact to republish — building it."
   fi
 
   # Google Play requires an AAB — warn if Play is selected alongside APK targets
@@ -2089,6 +2144,39 @@ printf '%s' "$ZSP_NOTES" > "$ZSP_NOTES_FILE"
 echo ""
 echo "    Version : $ZSP_VERSION"
 echo "    Notes   : $(head -3 "$ZSP_NOTES_FILE" | tr '\n' ' ')..."
+
+# Refuse to publish an artifact that is not the version being announced.
+# zsp will happily upload whatever APK it is pointed at and label it with
+# $ZSP_VERSION, which is exactly how v1.0.25 went to the relay as v1.1.0.
+# The APK's own versionName is the ground truth, so check it before the
+# confirm rather than trusting the filename or the intent of the run.
+_ZSP_APK=""
+if [ -f "$REPO_ROOT/${APK_NAME:-}" ]; then
+  _ZSP_APK="$REPO_ROOT/${APK_NAME}"
+elif [ -f "$REPO_ROOT/android/app/build/outputs/apk/release/app-release.apk" ]; then
+  _ZSP_APK="$REPO_ROOT/android/app/build/outputs/apk/release/app-release.apk"
+fi
+if [ -n "$_ZSP_APK" ]; then
+  _ZSP_APK_VERSION=$(_apk_version_name "$_ZSP_APK")
+  if [ -z "$_ZSP_APK_VERSION" ]; then
+    echo "    Warning: could not read the APK's versionName (no aapt/aapt2) —"
+    echo "             publishing $(basename "$_ZSP_APK") unverified."
+  elif [ "$_ZSP_APK_VERSION" != "$ZSP_VERSION" ]; then
+    echo ""
+    echo "ERROR: artifact/version mismatch — refusing to publish."
+    echo "    About to announce : $ZSP_VERSION"
+    echo "    APK actually is   : $_ZSP_APK_VERSION"
+    echo "    APK               : $_ZSP_APK"
+    echo ""
+    echo "    This is the v1.0.25-published-as-v1.1.0 failure. The APK on disk is"
+    echo "    stale, which means the build phase did not run for this version."
+    echo "    Re-run and accept the build, or delete the stale APK."
+    exit 1
+  else
+    echo "    Artifact : $(basename "$_ZSP_APK") (versionName $_ZSP_APK_VERSION ✓)"
+  fi
+fi
+
 _confirm "Publish $RELEASE_TAG to Zapstore?"
 
 # Always patch zapstore.yaml to inject local release notes so the Nostr
