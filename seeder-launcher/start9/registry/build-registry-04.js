@@ -15,20 +15,22 @@
 // 2026-07-27:
 //   - `commitment` is MANDATORY. Omitting it fails deserialization outright.
 //     Its value comes from the s9pk itself, so we can generate it.
-//   - `signatures` may be an empty object. This is what makes a static
-//     registry possible at all; without it we would need Start9's publishing
-//     pipeline.
 //   - `icon` must be a real base64 data URL. `null` is rejected.
+//   - `signatures` may be empty ONLY to browse. An unsigned entry lists fine
+//     and then fails install with "Invalid Signature Signer(s) not accepted".
+//     Self-signing is enough - see signCommitment below for why, and for what
+//     exactly gets signed.
 //
 // Usage:
 //   build-registry-04.js <path-to-v2.s9pk> --url <public-s9pk-url> \
-//     [--icon <png>] [--out <file>] [--registry-name <name>]
+//     [--icon <png>] [--out <file>] [--registry-name <name>] [--signing-key <pem>]
 //
 // Env: START_CLI overrides the start-cli binary. It must be the 0.4-era one
 // (1.x); the 0.3.5 SDK's start-cli has no `s9pk inspect` and will fail.
 
 const { execFileSync } = require('child_process')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 
 function arg (flag, fallback = null) {
@@ -56,6 +58,9 @@ const START_CLI = process.env.START_CLI || 'start-cli'
 const ICON = arg('--icon', path.join(path.dirname(S9PK), 'icon.png'))
 const OUT = arg('--out', path.join(path.dirname(S9PK), 'registry-04.json'))
 const REGISTRY_NAME = arg('--registry-name', 'PeerLoom Registry')
+// The key the entry is self-signed with. Defaults to the same developer key
+// that signs the s9pk itself, so the registry and the package share an identity.
+const SIGNING_KEY = arg('--signing-key', process.env.START9_SIGNING_KEY || `${process.env.HOME}/.embassy/developer.key.pem`)
 
 // Categories are the registry's own vocabulary; package entries reference
 // these keys. Kept in step with the 0.3.5 tree so a package does not appear
@@ -80,6 +85,71 @@ function inspect (sub) {
 // en_US is claimed: asserting a translation we do not have would be worse
 // than offering one language.
 const loc = (v) => (typeof v === 'string' && v.length > 0 ? { en_US: v } : { en_US: '' })
+
+// Sign the commitment so the entry can actually be INSTALLED, not just browsed.
+//
+// An unsigned entry lists fine and then fails install with "Invalid Signature
+// Signer(s) not accepted". StartOS derives its accept-policy from the asset's
+// OWN signatures - RegistryAsset::all_signers() returns
+// AcceptSigners::All(signatures.keys()), and install/mod.rs calls
+// `asset.validate(SIG_CONTEXT, asset.all_signers())`. So self-signing is
+// sufficient: any key is accepted provided its signature verifies. With no
+// signatures the policy is All([]), which never becomes Accepted - hence the
+// error, permanently, whatever the key.
+//
+// What gets signed (sign/commitment/merkle_archive.rs): SHA-512 over the raw
+// root_sighash bytes followed by root_maxsize as a big-endian u64. Signed with
+// Ed25519ph - the PREHASHED variant - under context "s9pk" (s9pk/v2/mod.rs).
+//
+// openssl does this correctly and is used rather than a JS library because
+// neither Node's crypto nor Python's cryptography exposes Ed25519ph with a
+// context; both would silently produce a plain-Ed25519 signature that looks
+// right and fails verification. Validated against the RFC 8032 section 7.3
+// Ed25519ph test vector, which this openssl reproduces byte for byte.
+function signCommitment (c) {
+  const msg = Buffer.concat([
+    Buffer.from(c.rootSighash, 'base64url'),
+    (() => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(c.rootMaxsize)); return b })(),
+  ])
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 's9sig-'))
+  const msgFile = path.join(tmp, 'msg.bin')
+  const sigFile = path.join(tmp, 'sig.bin')
+  const pubFile = path.join(tmp, 'pub.pem')
+  const ph = ['-pkeyopt', 'instance:ed25519ph', '-pkeyopt', 'context-string:s9pk']
+
+  try {
+    fs.writeFileSync(msgFile, msg)
+
+    execFileSync('openssl', ['pkey', '-in', SIGNING_KEY, '-pubout', '-out', pubFile],
+      { stdio: ['ignore', 'ignore', 'pipe'] })
+    execFileSync('openssl',
+      ['pkeyutl', '-sign', '-inkey', SIGNING_KEY, '-rawin', '-in', msgFile, ...ph, '-out', sigFile],
+      { stdio: ['ignore', 'ignore', 'pipe'] })
+
+    // Fail closed. An entry whose signature does not verify would list happily
+    // and then refuse to install, which is worse than not publishing at all.
+    execFileSync('openssl',
+      ['pkeyutl', '-verify', '-pubin', '-inkey', pubFile, '-rawin', '-in', msgFile,
+        '-sigfile', sigFile, ...ph],
+      { stdio: ['ignore', 'ignore', 'pipe'] })
+
+    // Registry format, matching registry.start9.com: the key is a standard SPKI
+    // PEM, and the value is the 64-byte signature DER-wrapped with the Ed25519
+    // algorithm identifier (SEQUENCE { AlgorithmIdentifier, OCTET STRING }) in a
+    // PEM block labelled SIGNATURE.
+    const rawSig = fs.readFileSync(sigFile)
+    if (rawSig.length !== 64) throw new Error(`expected a 64-byte signature, got ${rawSig.length}`)
+    const der = Buffer.concat([Buffer.from('3049300506032b65700440', 'hex'), rawSig])
+    const sigPem = '-----BEGIN SIGNATURE-----\n' +
+      (der.toString('base64').match(/.{1,64}/g) ?? []).join('\n') +
+      '\n-----END SIGNATURE-----\n'
+
+    return { [fs.readFileSync(pubFile, 'utf8')]: sigPem }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
 
 console.error(`==> inspecting ${path.basename(S9PK)} (this reads the whole package, give it a minute)`)
 const manifest = inspect('manifest')
@@ -124,14 +194,13 @@ const versionEntry = {
   dependencyMetadata: {},
   sourceVersion: null,
   // One entry: a hardware predicate paired with where to get the file.
-  // `signatures: {}` is deliberate and load-bearing - see the header.
   s9pks: [[
     { device: [], ram: null, arch: arches },
     {
       publishedAt: new Date().toISOString().replace('Z', '000000Z'),
       urls: [S9PK_URL],
       commitment,
-      signatures: {},
+      signatures: signCommitment(commitment),
     },
   ]],
 }
