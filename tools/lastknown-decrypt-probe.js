@@ -129,7 +129,13 @@ async function main () {
     try {
       raw = await core.get(core.length - 1, { wait: true, timeout: TIP_TIMEOUT_MS })
     } catch (e) {
-      console.log(`${label}: tip fetch failed (${e.message})`)
+      // Report the length even on a failed fetch. Whether the core ADVANCED is
+      // the whole diagnosis when a tip goes unfetchable: a length past the one
+      // seen on an earlier run means the writer appended a fresh (healed) tip
+      // that nobody is serving yet, while an unchanged length means the same
+      // old block simply has no seeder online. Without this, both print the
+      // same line.
+      console.log(`${label}: tip fetch failed (${e.message})  len=${core.length}`)
       continue
     }
     if (!raw) { console.log(`${label}: tip unavailable`); continue }
