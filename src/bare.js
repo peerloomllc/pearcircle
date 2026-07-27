@@ -43,6 +43,7 @@ const { shouldAcceptSupersede, supersedePendingNext } = require('./lib/supersede
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
+const { seederSeenKey, shouldPersistSeederContact } = require('./lib/seederContact')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
@@ -211,6 +212,47 @@ let _seederNickname = null
 // from the admission announce. Advisory + in-memory; surfaced by
 // circle:seeders:list so the mobile app can flag out-of-date seeders.
 const _seederVersions = new Map()
+// Member-side: `${circleId}:${seederPubkey}` → ms timestamp of the last
+// admission announce received from that seeder FOR that circle. An announce is
+// the only signal that proves a seeder actually has the circle: the admission
+// row alone is written locally at circle:create for every followed seeder
+// (admitFollowedSeedersToCircle), so it records intent, not fact. Persisted
+// under `seederseen:` and rehydrated at boot so "last contact" survives a
+// restart, which is the whole point of the field.
+const _seederLastSeen = new Map()
+const SEEDER_SEEN_PREFIX = 'seederseen:'
+// Don't write a row on every announce - they arrive on each channel open, so a
+// busy seeder would churn the local DB for no extra information.
+const SEEDER_SEEN_PERSIST_MS = 60000
+
+// Record that `pubkey` announced itself as a seeder for `circleId` just now.
+// In-memory always, persisted at most once per SEEDER_SEEN_PERSIST_MS.
+function recordSeederContact (circleId, pubkey) {
+  if (typeof circleId !== 'string' || typeof pubkey !== 'string' || pubkey.length !== 64) return
+  const k = seederSeenKey(circleId, pubkey)
+  const now = Date.now()
+  const prev = _seederLastSeen.get(k)
+  _seederLastSeen.set(k, now)
+  if (!shouldPersistSeederContact(prev, now, SEEDER_SEEN_PERSIST_MS)) return
+  _localDb.put(SEEDER_SEEN_PREFIX + k, { circleId, pubkey, at: now })
+    .catch((e) => console.warn('[bare] seeder contact persist failed', e?.message))
+}
+
+// Rehydrate `_seederLastSeen` from the local DB at boot.
+async function hydrateSeederLastSeen () {
+  try {
+    for await (const { value } of _localDb.createReadStream({
+      gt: SEEDER_SEEN_PREFIX,
+      lt: SEEDER_SEEN_PREFIX + '~',
+    })) {
+      if (!value || typeof value.at !== 'number') continue
+      if (typeof value.circleId !== 'string' || typeof value.pubkey !== 'string') continue
+      _seederLastSeen.set(seederSeenKey(value.circleId, value.pubkey), value.at)
+    }
+  } catch (e) {
+    console.warn('[bare] seeder last-seen hydrate failed', e?.message)
+  }
+}
 
 const _circlePeers = new Map()    // circleId → Set<remotePublicKeyHex>
 const _topicToCircle = new Map()  // topicHex → circleId
@@ -1502,6 +1544,12 @@ const handlers = {
         // 2026-06-05-seeder-update slice 1). undefined → never connected this
         // session; null → connected but pre-version (old) seeder.
         version: _seederVersions.has(value.pubkey) ? _seederVersions.get(value.pubkey) : undefined,
+        // ms of the last admission announce from this seeder for this circle,
+        // or null if it has never announced here. The admission row alone does
+        // not imply coverage - it is written locally for every followed seeder
+        // at circle:create - so this is the field that says whether the seeder
+        // really has the circle.
+        lastSeenAt: _seederLastSeen.get(seederSeenKey(circleId, value.pubkey)) ?? null,
       })
     }
     return { seeders }
@@ -1556,7 +1604,17 @@ const handlers = {
             byPubkey.set(value.pubkey, entry)
           }
           if (!entry.label && typeof value.label === 'string') entry.label = value.label
-          entry.circles.push({ circleId, name: circleName, revoked: value.revoked === true })
+          // lastSeenAt distinguishes a seeder that has actually announced for
+          // this circle from one merely admitted at circle:create. null = never
+          // heard from for this circle, i.e. it is NOT known to hold it. The
+          // held/unconfirmed split is derived from this by summarizeSeederCircles
+          // so there is exactly one source of truth.
+          entry.circles.push({
+            circleId,
+            name: circleName,
+            revoked: value.revoked === true,
+            lastSeenAt: _seederLastSeen.get(seederSeenKey(circleId, value.pubkey)) ?? null,
+          })
           // Build version learned from this seeder's admission announce (proposal
           // 2026-06-05-seeder-update slice 1). undefined = not connected this
           // session; null = connected but pre-version (out-of-date) seeder.
@@ -5969,6 +6027,10 @@ async function handleSeederAnnounce (circleId, base, { pubkey, label, version },
   if (typeof pubkey === 'string') {
     if (typeof version === 'string' && version.length > 0) _seederVersions.set(pubkey, version)
     else if (!_seederVersions.has(pubkey)) _seederVersions.set(pubkey, null)
+    // An announce is proof this seeder actually holds this circle, so stamp the
+    // contact before any admission branching - a revoked or already-admitted
+    // seeder is still a seeder we just heard from.
+    recordSeederContact(circleId, pubkey)
   }
   const existingNode = await base.view.get('seeder:' + pubkey).catch(() => null)
   const existing = existingNode?.value ?? null
@@ -7273,6 +7335,10 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // whose drive ended while we were suspended (proposal 2026-07-18, Part C).
   // After circles are mounted so a settled trip can replicate.
   await hydrateTripCheckpoint()
+
+  // Seeder last-contact stamps, so the Seeders list can report real coverage
+  // from the first render instead of waiting for this session's first announce.
+  await hydrateSeederLastSeen()
 
   _activeHandlers = handlers
   _initialized = true
