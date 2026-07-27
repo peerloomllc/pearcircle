@@ -6,7 +6,7 @@ id: peerloom-pearcircle-seeder
 name: PearCircle Seeder
 tagline: Keep your PearCircle circles online 24/7
 category: networking
-version: "1.0.25"
+version: "1.1.0"
 port: 8730
 description: >-
   Run a blind seeder for your PearCircle circles on your Umbrel so their
@@ -37,15 +37,26 @@ repo: https://github.com/peerloomllc/pearcircle
 support: https://github.com/peerloomllc/pearcircle/issues
 gallery: []
 releaseNotes: |
+  What's New in 1.1.0
+
   Improvements
 
-  - The seeder now warns you if it can read any of the data it is storing. It is meant to be blind, so this is your alarm that a member's app needs updating.
-  - Clearer reporting when a member's saved position cannot be read, instead of retrying it forever in the background.
+    - **You can now see which computers are really protecting your circle.** The Seeders screen used to list every computer you had ever approved, whether or not it was actually doing anything. It now separates the ones genuinely holding your circle from the ones that have never checked in, and shows when each was last heard from. A switched-off computer no longer looks like a working one.
+
+    - **Linking a computer to your circles shows its progress.** Pairing used to sit silently and look like it had frozen. Now each step is reported as it happens, so you can tell it is working.
+
+    - **Start9 owners can install the seeder from the browser again.** Newer Start9 systems refused the older package format. The seeder now ships in a format they accept, so you can add it by drag and drop instead of using the command line.
 
   Bug Fixes
+    
+    - **The seeder's details page on Start9 was blank.** It now shows the information it was meant to.
 
-  - Circles that looked like they needed repairing usually did not. That false alarm is gone, along with the bugs behind the Recreate button.
-  - Members' saved positions are stored encrypted again, and any that were saved unprotected are repaired automatically.
+    - **App store listings showed the wrong "what's new" text.** Every update was described as a first release. Each version's real notes now appear.
+
+  Security
+
+    - **Your location is always encrypted before it leaves your phone.** A timing problem when you first joined a circle could leave one early position  
+    unprotected. That was fixed in 1.0.25, so if you are updating from an older version you are getting that fix here too.
 path: ""
 defaultUsername: ""
 defaultPassword: ""
