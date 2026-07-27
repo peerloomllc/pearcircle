@@ -1638,7 +1638,7 @@ else
   if [ "$_umbrel_status" -eq 0 ]; then
     echo "    Umbrel image OK ($(grep -oE 'digest=sha256:[0-9a-f]+' /tmp/pearcircle-build-umbrel.log | tail -1)). Log: /tmp/pearcircle-build-umbrel.log"
     echo "    In-repo umbrel manifest bumped — review + commit it with the release."
-    [ -n "${UMBREL_STORE_DIR:-}" ] && echo "    Community store at $UMBREL_STORE_DIR bumped — commit + push that repo to publish."
+    [ -n "${UMBREL_STORE_DIR:-}" ] && echo "    Community store at $UMBREL_STORE_DIR bumped — commit + push that repo to publish (checked again at the end)."
     if [ -n "${UMBREL_OFFICIAL_DIR:-}" ]; then
       if [ "${UMBREL_OFFICIAL_PR:-}" = 1 ]; then
         echo "    Official store: update PR pushed/refreshed — see $(grep -oE 'https://github.com/getumbrel/umbrel-apps/pull/[0-9]+' /tmp/pearcircle-build-umbrel.log | tail -1) (or the log)."
@@ -2995,4 +2995,68 @@ if $APP_STORE_DEFERRED; then
   echo "      asc review submissions-create --app $ASC_APP_ID --platform IOS"
   echo "      asc review items-add --submission <SID> --item-type appStoreVersions --item-id <VID>"
   echo "      asc review submissions-submit --id <SID> --confirm"
+fi
+# ---------------------------------------------------------------------------
+# 13c. Community app store gate
+#
+# The PeerLoom community store served 1.0.19 for SEVEN releases. Not because
+# anything failed - because step 5c bumps the manifests in $UMBREL_STORE_DIR
+# and then prints "commit + push that repo to publish", and that line scrolls
+# past in a long release log. Every release since 1.0.19 missed it, so anyone
+# installing the seeder from that store got a build weeks old.
+#
+# This is the third silent-manual-step in this pipeline (missing seeder build
+# scripts #113, the Umbrel publish env gate 2026-06-30, this), so the fix is
+# aimed at the shape rather than the instance: a release that leaves the store
+# unpublished now EXITS NON-ZERO. An instruction can be walked past; a failed
+# release cannot.
+#
+# Deliberately last, and deliberately not fatal earlier: everything above has
+# already succeeded and must not be rolled back. This only refuses to call the
+# run clean.
+#
+# Two distinct traps are checked, because both have actually happened:
+#   1. uncommitted bumps  - the manifests were edited but never committed
+#   2. wrong branch       - the clone was sitting on a feature branch
+#                           (`add-peartune`), so even committing in place would
+#                           not publish; the store serves its default branch
+# ---------------------------------------------------------------------------
+if [ -n "${UMBREL_STORE_DIR:-}" ] && [ -d "${UMBREL_STORE_DIR}/.git" ]; then
+  _store_dirty=$(git -C "$UMBREL_STORE_DIR" status --porcelain -- '*pearcircle-seeder*' 2>/dev/null)
+  _store_branch=$(git -C "$UMBREL_STORE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  # The branch the store actually serves, straight from the remote rather than
+  # assumed to be "master" - it differs between forks.
+  _store_default=$(git -C "$UMBREL_STORE_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+  _store_default="${_store_default:-master}"
+
+  if [ -n "$_store_dirty" ]; then
+    echo ""
+    echo "=========================================================================="
+    echo "  RELEASE INCOMPLETE: the community app store was NOT published"
+    echo "=========================================================================="
+    echo ""
+    echo "  $UMBREL_STORE_DIR has uncommitted PearCircle seeder changes, so the"
+    echo "  store still serves the PREVIOUS version. Users installing from it will"
+    echo "  not get $RELEASE_TAG."
+    echo ""
+    echo "$_store_dirty" | sed 's/^/      /'
+    echo ""
+    if [ "$_store_branch" != "$_store_default" ]; then
+      echo "  Also: that clone is on branch '$_store_branch', but the store serves"
+      echo "  '$_store_default'. Committing in place would still not publish."
+      echo "  Move the seeder changes onto a branch cut from origin/$_store_default."
+      echo ""
+    fi
+    echo "  Everything else in this release succeeded and is live. Publish the"
+    echo "  store, then this is done."
+    echo ""
+    exit 1
+  fi
+
+  if [ "$_store_branch" != "$_store_default" ]; then
+    echo ""
+    echo "    NOTE: $UMBREL_STORE_DIR is on '$_store_branch', not the store's"
+    echo "    '$_store_default'. Nothing uncommitted, so this release is fine, but"
+    echo "    a future bump made on this branch would not publish."
+  fi
 fi
