@@ -10,13 +10,27 @@ no registry service, no signing keyring (the s9pk is self-signed by `start-sdk
 pack`; StartOS only checks the signature is internally valid). `build-registry.sh`
 generates that tree from the built `.s9pk`.
 
+StartOS 0.4 reads none of that. It speaks JSON-RPC over `POST /rpc/v0`, answered
+on the website by `worker.js` from a single generated payload that
+`build-registry-04.js` produces from the **v2** s9pk.
+
 **Combined (multi-package) registry:** PeerLoom serves one registry
 (`peerloomllc.com`) that lists several seeders (pearcircle-seeder, pearcal-seeder,
 …). `build-registry.sh` is **merge-aware** — it upserts *this* package into
 whatever tree already exists at `OUT_DIR` and leaves the others untouched (only
-`index`/`latest`/`info` are merged; the per-id files are namespaced by id). Every
-app publishing into the shared tree must use merge-aware tooling like this; a
-legacy `rm -rf package`-style generator would drop the other packages.
+`index`/`latest`/`info` are merged; the per-id files are namespaced by id).
+
+`build-registry-04.js` upserts the same way, and there it matters more: 0.4
+serves every package from a **single** document, so writing that file wholesale
+delists every other app in one line. It originally did exactly that, which is
+why pearcal-seeder was invisible on 0.4 until 2026-07-27 while browsing looked
+perfectly healthy on 0.3.5. It now replaces only this id's entry under
+`packageIndex.packages`, unions the categories and leaves the registry name
+alone. Keep this file in step with the sibling copies in the other PeerLoom
+repos — they are deliberately near-identical.
+
+> Every app publishing into the shared registry must use merge-aware tooling
+> like this; a legacy `rm -rf package`-style generator would drop the others.
 
 ## Generate
 

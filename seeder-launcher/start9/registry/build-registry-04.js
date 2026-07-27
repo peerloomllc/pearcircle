@@ -10,6 +10,19 @@
 // verbatim by a tiny Worker. That keeps the request path dumb: no s9pk
 // inspection, no crypto, no start-cli at the edge.
 //
+// COMBINED registry: like build-registry.sh for the 0.3.5 tree, this UPSERTS
+// this package into whatever payload already exists at --out — it does NOT
+// write the file wholesale. peerloomllc.com is one registry listing several
+// PeerLoom seeders (pearcal-seeder, pearcircle-seeder, ...), and 0.4 serves
+// them from a SINGLE generated document, so a generator that overwrote it
+// would silently delist every other app. Only this id's entry under
+// packageIndex.packages is replaced; categories are unioned and the registry
+// name is left alone.
+//
+// NOTE: every app publishing into the shared payload must use merge-aware
+// tooling like this. Keep this file in step with the sibling copies in the
+// other PeerLoom repos — they are deliberately near-identical.
+//
 // What 0.4 actually demands, established by driving a real 0.4 client
 // (`start-cli -r <url> registry package index`) against a stub registry on
 // 2026-07-27:
@@ -169,6 +182,30 @@ if (!version) {
 
 const arches = manifest.hardwareRequirements?.arch ?? ['x86_64', 'aarch64']
 
+// --- read whatever is already published ------------------------------------
+// Missing or unreadable is normal (first run). Anything else present is another
+// package's entry and must survive.
+let prior = null
+try {
+  prior = JSON.parse(fs.readFileSync(OUT, 'utf8'))
+} catch {
+  prior = null
+}
+const priorPackages = prior?.packageIndex?.packages ?? {}
+
+// Re-stamping publishedAt on every run would churn the payload even when
+// nothing about the package changed, and publish-start9-registry.sh decides
+// whether there is anything to publish by diffing the working tree. So carry
+// the previous timestamp forward when this exact package is already published
+// at the same version and commitment, and stamp fresh otherwise.
+const priorAsset = priorPackages[manifest.id]?.versions?.[version]?.s9pks?.[0]?.[1]
+const unchanged = priorAsset &&
+  priorAsset.commitment?.rootSighash === commitment.rootSighash &&
+  String(priorAsset.commitment?.rootMaxsize) === String(commitment.rootMaxsize) &&
+  Array.isArray(priorAsset.urls) && priorAsset.urls[0] === S9PK_URL
+const publishedAt = arg('--published-at',
+  unchanged ? priorAsset.publishedAt : new Date().toISOString().replace('Z', '000000Z'))
+
 const versionEntry = {
   title: manifest.title,
   description: {
@@ -197,7 +234,7 @@ const versionEntry = {
   s9pks: [[
     { device: [], ram: null, arch: arches },
     {
-      publishedAt: new Date().toISOString().replace('Z', '000000Z'),
+      publishedAt,
       urls: [S9PK_URL],
       commitment,
       signatures: signCommitment(commitment),
@@ -205,20 +242,35 @@ const versionEntry = {
   ]],
 }
 
+// --- UPSERT this package, preserving every other one -----------------------
+// We publish a single version per package, so this id's versions map is
+// replaced rather than accumulated; other ids are copied through untouched.
+const packages = { ...priorPackages }
+packages[manifest.id] = {
+  authorized: {},
+  categories: PACKAGE_CATEGORIES,
+  versions: { [version]: versionEntry },
+}
+// Stable order by id so re-runs produce a deterministic diff.
+const orderedPackages = Object.fromEntries(
+  Object.entries(packages).sort(([a], [b]) => a.localeCompare(b)),
+)
+
+// Categories are unioned: another package may list under headings we do not.
+const categories = { ...(prior?.packageIndex?.categories ?? {}), ...(prior?.info?.categories ?? {}), ...CATEGORIES }
+
 const payload = {
-  info: { name: REGISTRY_NAME, icon: null, categories: CATEGORIES },
+  // The registry name belongs to the registry, not to any one package, so an
+  // existing one wins - otherwise two apps with different defaults would flip
+  // it back and forth on alternate releases.
+  info: { name: prior?.info?.name ?? REGISTRY_NAME, icon: prior?.info?.icon ?? null, categories },
   packageIndex: {
-    categories: CATEGORIES,
-    packages: {
-      [manifest.id]: {
-        authorized: {},
-        categories: PACKAGE_CATEGORIES,
-        versions: { [version]: versionEntry },
-      },
-    },
+    categories,
+    packages: orderedPackages,
   },
 }
 
 fs.writeFileSync(OUT, JSON.stringify(payload, null, 2))
 console.error(`==> wrote ${OUT}`)
 console.error(`    ${manifest.id} ${version} | arch ${arches.join(',')} | rootSighash ${commitment.rootSighash}`)
+console.error(`    payload lists ${Object.keys(orderedPackages).length} package(s): ${Object.keys(orderedPackages).join(', ')}`)
