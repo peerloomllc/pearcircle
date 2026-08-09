@@ -37,26 +37,13 @@ repo: https://github.com/peerloomllc/pearcircle
 support: https://github.com/peerloomllc/pearcircle/issues
 gallery: []
 releaseNotes: |
-  What's New in 1.1.0
+  New Features
+
+    - **Low battery alerts.** Get a heads-up when someone in your circles is running low, while there is still time to reach them. A phone that dies stops sharing its location, so this is usually the last warning before their dot goes stale. Turn it on in Settings under "Low battery alerts" and slide to pick how low they have to get, anywhere from 5% to 50%. It tells you about your circle members' phones, not your own, and you get one alert per person each time their battery runs down, which resets once they charge back up.
 
   Improvements
-
-    - **You can now see which computers are really protecting your circle.** The Seeders screen used to list every computer you had ever approved, whether or not it was actually doing anything. It now separates the ones genuinely holding your circle from the ones that have never checked in, and shows when each was last heard from. A switched-off computer no longer looks like a working one.
-
-    - **Linking a computer to your circles shows its progress.** Pairing used to sit silently and look like it had frozen. Now each step is reported as it happens, so you can tell it is working.
-
-    - **Start9 owners can install the seeder from the browser again.** Newer Start9 systems refused the older package format. The seeder now ships in a format they accept, so you can add it by drag and drop instead of using the command line.
-
-  Bug Fixes
     
-    - **The seeder's details page on Start9 was blank.** It now shows the information it was meant to.
-
-    - **App store listings showed the wrong "what's new" text.** Every update was described as a first release. Each version's real notes now appear.
-
-  Security
-
-    - **Your location is always encrypted before it leaves your phone.** A timing problem when you first joined a circle could leave one early position  
-    unprotected. That was fixed in 1.0.25, so if you are updating from an older version you are getting that fix here too.
+    - **Start9 owners can add the PearCircle seeder from the built-in store.** Newer Start9 systems can now find and install the seeder the normal way, instead of needing a file downloaded and dragged in by hand.
 path: ""
 defaultUsername: ""
 defaultPassword: ""
