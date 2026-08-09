@@ -11,9 +11,24 @@
 // set mutation and the IPC emit. Kept pure and separate from src/bare.js so the
 // gate ordering is testable without a worklet, an Autobase or a swarm.
 
-// Offered in the Settings picker, high to low.
-const BATTERY_ALERT_THRESHOLDS = [50, 25, 20, 15, 10, 5]
+// The Settings slider's range. Stepped in 5s: a 1% slider implies a precision
+// the readings don't have (both platforms report whole percents that jump
+// several points at a time) and makes the control fiddly on a phone.
+// Floor at 5 because below that a phone is minutes from dead, ceiling at 50
+// because alerting on a half-full battery is noise.
+const BATTERY_ALERT_MIN_THRESHOLD = 5
+const BATTERY_ALERT_MAX_THRESHOLD = 50
+const BATTERY_ALERT_THRESHOLD_STEP = 5
 const BATTERY_ALERT_DEFAULT_THRESHOLD = 15
+
+// True for a value the slider could actually have produced. The worklet
+// validates with this rather than trusting the UI, so a stale bundle or a
+// hand-made IPC call can't persist a threshold the slider can never show back.
+function isValidBatteryThreshold (t) {
+  return typeof t === 'number' && Number.isInteger(t) &&
+    t >= BATTERY_ALERT_MIN_THRESHOLD && t <= BATTERY_ALERT_MAX_THRESHOLD &&
+    t % BATTERY_ALERT_THRESHOLD_STEP === 0
+}
 
 // How far a phone must recover ABOVE the threshold before it re-arms. Without
 // the margin, a phone hovering at exactly the threshold would re-fire on every
@@ -69,7 +84,10 @@ function batteryAlertDecision (value, opts = {}) {
 
 module.exports = {
   batteryAlertDecision,
-  BATTERY_ALERT_THRESHOLDS,
+  isValidBatteryThreshold,
+  BATTERY_ALERT_MIN_THRESHOLD,
+  BATTERY_ALERT_MAX_THRESHOLD,
+  BATTERY_ALERT_THRESHOLD_STEP,
   BATTERY_ALERT_DEFAULT_THRESHOLD,
   BATTERY_ALERT_REARM_MARGIN,
   BATTERY_ALERT_FRESHNESS_MS,

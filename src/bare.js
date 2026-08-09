@@ -52,7 +52,10 @@ const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const {
   batteryAlertDecision,
-  BATTERY_ALERT_THRESHOLDS,
+  isValidBatteryThreshold,
+  BATTERY_ALERT_MIN_THRESHOLD,
+  BATTERY_ALERT_MAX_THRESHOLD,
+  BATTERY_ALERT_THRESHOLD_STEP,
   BATTERY_ALERT_DEFAULT_THRESHOLD,
 } = require('./lib/batteryAlert')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
@@ -2108,7 +2111,9 @@ const handlers = {
     return {
       enabled: _batteryAlertsEnabled,
       threshold: _batteryAlertThreshold,
-      thresholds: BATTERY_ALERT_THRESHOLDS,
+      min: BATTERY_ALERT_MIN_THRESHOLD,
+      max: BATTERY_ALERT_MAX_THRESHOLD,
+      step: BATTERY_ALERT_THRESHOLD_STEP,
     }
   },
 
@@ -2119,8 +2124,8 @@ const handlers = {
   'batteryAlerts:set': async ({ enabled, threshold } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (enabled !== undefined && typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
-    if (threshold !== undefined && !BATTERY_ALERT_THRESHOLDS.includes(threshold)) {
-      throw new Error('threshold must be one of ' + BATTERY_ALERT_THRESHOLDS.join(', '))
+    if (threshold !== undefined && !isValidBatteryThreshold(threshold)) {
+      throw new Error(`threshold must be a multiple of ${BATTERY_ALERT_THRESHOLD_STEP} between ${BATTERY_ALERT_MIN_THRESHOLD} and ${BATTERY_ALERT_MAX_THRESHOLD}`)
     }
     if (typeof enabled === 'boolean') _batteryAlertsEnabled = enabled
     if (threshold !== undefined && threshold !== _batteryAlertThreshold) {
@@ -3031,7 +3036,7 @@ async function loadBatteryAlertState () {
   try {
     const row = await _localDb.get('batteryAlerts')
     if (row?.value?.enabled === false) _batteryAlertsEnabled = false
-    if (BATTERY_ALERT_THRESHOLDS.includes(row?.value?.threshold)) {
+    if (isValidBatteryThreshold(row?.value?.threshold)) {
       _batteryAlertThreshold = row.value.threshold
     }
   } catch (e) { console.warn('[bare] load batteryAlerts failed', e?.message) }

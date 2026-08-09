@@ -1,6 +1,9 @@
 const {
   batteryAlertDecision,
-  BATTERY_ALERT_THRESHOLDS,
+  isValidBatteryThreshold,
+  BATTERY_ALERT_MIN_THRESHOLD,
+  BATTERY_ALERT_MAX_THRESHOLD,
+  BATTERY_ALERT_THRESHOLD_STEP,
   BATTERY_ALERT_DEFAULT_THRESHOLD,
   BATTERY_ALERT_REARM_MARGIN,
   BATTERY_ALERT_FRESHNESS_MS,
@@ -74,13 +77,34 @@ describe('batteryAlertDecision', () => {
     expect(decide(reading({ battery: 30 }), { threshold: 25 })).toBe('ignore')
   })
 
-  test('every offered threshold is a usable number', () => {
-    for (const t of BATTERY_ALERT_THRESHOLDS) {
-      expect(typeof t).toBe('number')
-      expect(t).toBeGreaterThan(0)
-      expect(t).toBeLessThanOrEqual(100)
-    }
-    expect(BATTERY_ALERT_THRESHOLDS).toContain(BATTERY_ALERT_DEFAULT_THRESHOLD)
+  describe('isValidBatteryThreshold', () => {
+    test('accepts every stop the slider can land on', () => {
+      for (let t = BATTERY_ALERT_MIN_THRESHOLD; t <= BATTERY_ALERT_MAX_THRESHOLD; t += BATTERY_ALERT_THRESHOLD_STEP) {
+        expect(isValidBatteryThreshold(t)).toBe(true)
+      }
+    })
+
+    test('the default is a valid stop', () => {
+      expect(isValidBatteryThreshold(BATTERY_ALERT_DEFAULT_THRESHOLD)).toBe(true)
+    })
+
+    test('rejects values outside the range', () => {
+      expect(isValidBatteryThreshold(BATTERY_ALERT_MIN_THRESHOLD - BATTERY_ALERT_THRESHOLD_STEP)).toBe(false)
+      expect(isValidBatteryThreshold(BATTERY_ALERT_MAX_THRESHOLD + BATTERY_ALERT_THRESHOLD_STEP)).toBe(false)
+      expect(isValidBatteryThreshold(0)).toBe(false)
+      expect(isValidBatteryThreshold(100)).toBe(false)
+    })
+
+    test('rejects values off the step grid', () => {
+      expect(isValidBatteryThreshold(17)).toBe(false)
+      expect(isValidBatteryThreshold(12.5)).toBe(false)
+    })
+
+    test('rejects non-numbers', () => {
+      for (const t of [undefined, null, NaN, '15', {}, Infinity]) {
+        expect(isValidBatteryThreshold(t)).toBe(false)
+      }
+    })
   })
 
   describe('once per discharge cycle', () => {

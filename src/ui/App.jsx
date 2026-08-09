@@ -6122,12 +6122,18 @@ function TripNotificationsSection () {
 function BatteryAlertsSection () {
   const [enabled, setEnabled] = useState(true)
   const [threshold, setThreshold] = useState(15)
-  const [thresholds, setThresholds] = useState([50, 25, 20, 15, 10, 5])
+  const [range, setRange] = useState({ min: 5, max: 50, step: 5 })
+  // Slider position while a drag is in flight. The worklet only hears the
+  // final value on release, so a drag across the track is one IPC round-trip
+  // and one fired-set clear, not one per step.
+  const [dragging, setDragging] = useState(null)
   useEffect(() => {
     pear.call('batteryAlerts:get').then((r) => {
       if (r && typeof r.enabled === 'boolean') setEnabled(r.enabled)
       if (r && typeof r.threshold === 'number') setThreshold(r.threshold)
-      if (r && Array.isArray(r.thresholds) && r.thresholds.length) setThresholds(r.thresholds)
+      if (r && typeof r.min === 'number' && typeof r.max === 'number' && typeof r.step === 'number') {
+        setRange({ min: r.min, max: r.max, step: r.step })
+      }
     }).catch(() => {})
     pear.on('batteryAlerts:changed', (data) => {
       if (data && typeof data.enabled === 'boolean') setEnabled(data.enabled)
@@ -6140,48 +6146,42 @@ function BatteryAlertsSection () {
     try { await pear.call('batteryAlerts:set', { enabled: value }) }
     catch { setEnabled(!value) }
   }, [enabled])
-  const pick = useCallback(async (value) => {
+  const commit = useCallback(async (value) => {
+    setDragging(null)
     if (value === threshold) return
     const prev = threshold
     setThreshold(value)
     try { await pear.call('batteryAlerts:set', { threshold: value }) }
     catch { setThreshold(prev) }
   }, [threshold])
+  const shown = dragging ?? threshold
   return (
     <>
-      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base }}>
-        Get a heads-up when someone in your circles is running low, while there's still time to reach them. A phone that dies stops sharing its location, so this is usually the last warning before their dot goes stale.
-      </p>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
         <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Low battery alerts</span>
         <ToggleSwitch on={enabled} onChange={toggle} />
       </div>
       {enabled && (
         <div style={{ marginTop: spacing.lg }}>
-          <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>
-            Alert me when a member drops below
-          </p>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: spacing.sm }}>
-            {thresholds.map((t) => (
-              <button
-                key={t}
-                onClick={() => pick(t)}
-                style={{
-                  flex: '1 1 auto', minWidth: 62, padding: '10px 0',
-                  borderRadius: radius.sm, cursor: 'pointer',
-                  background: t === threshold ? colors.primary : 'transparent',
-                  color: t === threshold ? colors.text.onPrimary : colors.text.primary,
-                  border: `1px solid ${t === threshold ? colors.primary : colors.border}`,
-                  fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
-                }}
-              >
-                {t}%
-              </button>
-            ))}
+          <div style={{
+            ...typography.caption, color: colors.text.secondary,
+            marginBottom: spacing.sm, fontVariantNumeric: 'tabular-nums',
+          }}>
+            Alert me below <span style={{ color: colors.text.primary }}>{shown}%</span>
           </div>
-          <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.sm, marginBottom: 0 }}>
-            One alert per person each time their battery runs down. It resets once they charge back up.
-          </p>
+          <input
+            type='range'
+            min={range.min} max={range.max} step={range.step}
+            value={shown}
+            aria-label='Low battery alert threshold'
+            // onChange tracks the drag locally; onPointerUp / onKeyUp commit.
+            // onBlur catches a drag that ends off the control.
+            onChange={(e) => setDragging(parseInt(e.target.value, 10))}
+            onPointerUp={(e) => commit(parseInt(e.currentTarget.value, 10))}
+            onKeyUp={(e) => commit(parseInt(e.currentTarget.value, 10))}
+            onBlur={(e) => { if (dragging != null) commit(parseInt(e.currentTarget.value, 10)) }}
+            style={{ width: '100%', accentColor: colorsRaw.primary }}
+          />
         </div>
       )}
     </>
