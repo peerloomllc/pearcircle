@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -5637,6 +5637,14 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TripNotificationsSection />
       </Collapsible>
 
+      {/* Deliberately its own section rather than a row under "Staying in
+          sync": that section's battery block is Android's Doze exemption, which
+          is about THIS phone staying awake. This is about OTHER people's phones
+          dying, and filing them together reads as one setting. */}
+      <Collapsible title='Low battery alerts' icon={BatteryWarning} open={openSection === 'batteryAlerts'} onToggle={() => toggleSection('batteryAlerts')} maxHeight='1200px'>
+        <BatteryAlertsSection />
+      </Collapsible>
+
       {/* Staying in sync: everything that keeps the no-server P2P backend
           running -- the daily open reminder, boot autostart (Android), and
           the battery exemption. The 'battery' deep-link lands here. */}
@@ -6103,6 +6111,86 @@ function TripNotificationsSection () {
       </span>
       <ToggleSwitch on={enabled} onChange={toggle} />
     </div>
+  )
+}
+
+// Low-battery alerts for circle members. The worklet is the source of truth
+// (_batteryAlertsEnabled / _batteryAlertThreshold in src/bare.js) and gates the
+// IPC emit, so flipping the toggle applies immediately whether or not the
+// WebView stays open. The threshold list comes back from the worklet rather
+// than being duplicated here, so the two can't disagree about what's valid.
+function BatteryAlertsSection () {
+  const [enabled, setEnabled] = useState(true)
+  const [threshold, setThreshold] = useState(15)
+  const [range, setRange] = useState({ min: 5, max: 50, step: 5 })
+  // Slider position while a drag is in flight. The worklet only hears the
+  // final value on release, so a drag across the track is one IPC round-trip
+  // and one fired-set clear, not one per step.
+  const [dragging, setDragging] = useState(null)
+  useEffect(() => {
+    pear.call('batteryAlerts:get').then((r) => {
+      if (r && typeof r.enabled === 'boolean') setEnabled(r.enabled)
+      if (r && typeof r.threshold === 'number') setThreshold(r.threshold)
+      if (r && typeof r.min === 'number' && typeof r.max === 'number' && typeof r.step === 'number') {
+        setRange({ min: r.min, max: r.max, step: r.step })
+      }
+    }).catch(() => {})
+    pear.on('batteryAlerts:changed', (data) => {
+      if (data && typeof data.enabled === 'boolean') setEnabled(data.enabled)
+      if (data && typeof data.threshold === 'number') setThreshold(data.threshold)
+    })
+  }, [])
+  const toggle = useCallback(async (value) => {
+    if (value === enabled) return
+    setEnabled(value)   // optimistic; revert on failure
+    try { await pear.call('batteryAlerts:set', { enabled: value }) }
+    catch { setEnabled(!value) }
+  }, [enabled])
+  const commit = useCallback(async (value) => {
+    setDragging(null)
+    if (value === threshold) return
+    const prev = threshold
+    setThreshold(value)
+    try { await pear.call('batteryAlerts:set', { threshold: value }) }
+    catch { setThreshold(prev) }
+  }, [threshold])
+  const shown = dragging ?? threshold
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
+        <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Low battery alerts</span>
+        <ToggleSwitch on={enabled} onChange={toggle} />
+      </div>
+      {/* The one thing the control itself can't convey: this is about OTHER
+          people's phones. Without it "Alert me below 15%" reads as a warning
+          about your own battery, which is the opposite of what it does. */}
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.xs, marginBottom: 0 }}>
+        About your circle members' phones, not your own.
+      </p>
+      {enabled && (
+        <div style={{ marginTop: spacing.lg }}>
+          <div style={{
+            ...typography.caption, color: colors.text.secondary,
+            marginBottom: spacing.sm, fontVariantNumeric: 'tabular-nums',
+          }}>
+            Alert me below <span style={{ color: colors.text.primary }}>{shown}%</span>
+          </div>
+          <input
+            type='range'
+            min={range.min} max={range.max} step={range.step}
+            value={shown}
+            aria-label='Low battery alert threshold'
+            // onChange tracks the drag locally; onPointerUp / onKeyUp commit.
+            // onBlur catches a drag that ends off the control.
+            onChange={(e) => setDragging(parseInt(e.target.value, 10))}
+            onPointerUp={(e) => commit(parseInt(e.currentTarget.value, 10))}
+            onKeyUp={(e) => commit(parseInt(e.currentTarget.value, 10))}
+            onBlur={(e) => { if (dragging != null) commit(parseInt(e.currentTarget.value, 10)) }}
+            style={{ width: '100%', accentColor: colorsRaw.primary }}
+          />
+        </div>
+      )}
+    </>
   )
 }
 
