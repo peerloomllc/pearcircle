@@ -6161,6 +6161,12 @@ function BatteryAlertsSection () {
         <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Low battery alerts</span>
         <ToggleSwitch on={enabled} onChange={toggle} />
       </div>
+      {/* The one thing the control itself can't convey: this is about OTHER
+          people's phones. Without it "Alert me below 15%" reads as a warning
+          about your own battery, which is the opposite of what it does. */}
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.xs, marginBottom: 0 }}>
+        About your circle members' phones, not your own.
+      </p>
       {enabled && (
         <div style={{ marginTop: spacing.lg }}>
           <div style={{
