@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -5637,6 +5637,14 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <TripNotificationsSection />
       </Collapsible>
 
+      {/* Deliberately its own section rather than a row under "Staying in
+          sync": that section's battery block is Android's Doze exemption, which
+          is about THIS phone staying awake. This is about OTHER people's phones
+          dying, and filing them together reads as one setting. */}
+      <Collapsible title='Low battery alerts' icon={BatteryWarning} open={openSection === 'batteryAlerts'} onToggle={() => toggleSection('batteryAlerts')} maxHeight='1200px'>
+        <BatteryAlertsSection />
+      </Collapsible>
+
       {/* Staying in sync: everything that keeps the no-server P2P backend
           running -- the daily open reminder, boot autostart (Android), and
           the battery exemption. The 'battery' deep-link lands here. */}
@@ -6103,6 +6111,80 @@ function TripNotificationsSection () {
       </span>
       <ToggleSwitch on={enabled} onChange={toggle} />
     </div>
+  )
+}
+
+// Low-battery alerts for circle members. The worklet is the source of truth
+// (_batteryAlertsEnabled / _batteryAlertThreshold in src/bare.js) and gates the
+// IPC emit, so flipping the toggle applies immediately whether or not the
+// WebView stays open. The threshold list comes back from the worklet rather
+// than being duplicated here, so the two can't disagree about what's valid.
+function BatteryAlertsSection () {
+  const [enabled, setEnabled] = useState(true)
+  const [threshold, setThreshold] = useState(15)
+  const [thresholds, setThresholds] = useState([50, 25, 20, 15, 10, 5])
+  useEffect(() => {
+    pear.call('batteryAlerts:get').then((r) => {
+      if (r && typeof r.enabled === 'boolean') setEnabled(r.enabled)
+      if (r && typeof r.threshold === 'number') setThreshold(r.threshold)
+      if (r && Array.isArray(r.thresholds) && r.thresholds.length) setThresholds(r.thresholds)
+    }).catch(() => {})
+    pear.on('batteryAlerts:changed', (data) => {
+      if (data && typeof data.enabled === 'boolean') setEnabled(data.enabled)
+      if (data && typeof data.threshold === 'number') setThreshold(data.threshold)
+    })
+  }, [])
+  const toggle = useCallback(async (value) => {
+    if (value === enabled) return
+    setEnabled(value)   // optimistic; revert on failure
+    try { await pear.call('batteryAlerts:set', { enabled: value }) }
+    catch { setEnabled(!value) }
+  }, [enabled])
+  const pick = useCallback(async (value) => {
+    if (value === threshold) return
+    const prev = threshold
+    setThreshold(value)
+    try { await pear.call('batteryAlerts:set', { threshold: value }) }
+    catch { setThreshold(prev) }
+  }, [threshold])
+  return (
+    <>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base }}>
+        Get a heads-up when someone in your circles is running low, while there's still time to reach them. A phone that dies stops sharing its location, so this is usually the last warning before their dot goes stale.
+      </p>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
+        <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Low battery alerts</span>
+        <ToggleSwitch on={enabled} onChange={toggle} />
+      </div>
+      {enabled && (
+        <div style={{ marginTop: spacing.lg }}>
+          <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.sm, fontWeight: 400 }}>
+            Alert me when a member drops below
+          </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: spacing.sm }}>
+            {thresholds.map((t) => (
+              <button
+                key={t}
+                onClick={() => pick(t)}
+                style={{
+                  flex: '1 1 auto', minWidth: 62, padding: '10px 0',
+                  borderRadius: radius.sm, cursor: 'pointer',
+                  background: t === threshold ? colors.primary : 'transparent',
+                  color: t === threshold ? colors.text.onPrimary : colors.text.primary,
+                  border: `1px solid ${t === threshold ? colors.primary : colors.border}`,
+                  fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+                }}
+              >
+                {t}%
+              </button>
+            ))}
+          </div>
+          <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: spacing.sm, marginBottom: 0 }}>
+            One alert per person each time their battery runs down. It resets once they charge back up.
+          </p>
+        </div>
+      )}
+    </>
   )
 }
 

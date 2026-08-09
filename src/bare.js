@@ -50,6 +50,11 @@ const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAccept
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
+const {
+  batteryAlertDecision,
+  BATTERY_ALERT_THRESHOLDS,
+  BATTERY_ALERT_DEFAULT_THRESHOLD,
+} = require('./lib/batteryAlert')
 const { allMembersAnnouncedCore } = require('./lib/lastSeenCutover')
 const { resolveCircleName } = require('./lib/circleName')
 const { createStoreFlusher, createStoreCompactor } = require('./lib/storeFlush')
@@ -519,6 +524,19 @@ const MEMBER_NOTIF_FRESHNESS_MS = 10 * 60 * 1000
 // User pref. Default on; off mutes peer-trip OS notifications entirely.
 // Persisted in _localDb under `tripNotifications`; loaded on init below.
 let _tripNotificationsEnabled = true
+
+// Low-battery alerts for circle MEMBERS ("Jane's phone is at 12%"). Decision
+// rules live in src/lib/batteryAlert.js; this owns the pref, the durable
+// already-alerted set and the emit.
+//
+// One alert per member per discharge cycle. _batteryAlertFired marks a member
+// as already-alerted; the mark clears when their phone recovers above the
+// threshold, or starts charging. Keyed by pubkey alone rather than
+// circleId:pubkey, because the same person in two circles is one phone with one
+// battery and one alert is the right number.
+let _batteryAlertsEnabled = true
+let _batteryAlertThreshold = BATTERY_ALERT_DEFAULT_THRESHOLD
+const _batteryAlertFired = new Set()
 
 // User pref. Default on; off means pure peer-to-peer - never escalate a failed
 // hole-punch through the PeerLoom blind relay (proposal 2026-07-23-blind-relay-
@@ -2085,6 +2103,70 @@ const handlers = {
     return { ok: true, enabled }
   },
 
+  'batteryAlerts:get': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    return {
+      enabled: _batteryAlertsEnabled,
+      threshold: _batteryAlertThreshold,
+      thresholds: BATTERY_ALERT_THRESHOLDS,
+    }
+  },
+
+  // Either field may be set independently, so the UI can flip the toggle
+  // without restating the threshold and vice versa. Changing the threshold
+  // clears the already-alerted set: lowering it to 10% should still alert for a
+  // member sitting at 8% who was passed over by the old 25% rule.
+  'batteryAlerts:set': async ({ enabled, threshold } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (enabled !== undefined && typeof enabled !== 'boolean') throw new Error('enabled must be boolean')
+    if (threshold !== undefined && !BATTERY_ALERT_THRESHOLDS.includes(threshold)) {
+      throw new Error('threshold must be one of ' + BATTERY_ALERT_THRESHOLDS.join(', '))
+    }
+    if (typeof enabled === 'boolean') _batteryAlertsEnabled = enabled
+    if (threshold !== undefined && threshold !== _batteryAlertThreshold) {
+      _batteryAlertThreshold = threshold
+      _batteryAlertFired.clear()
+      await persistBatteryAlertFired()
+    }
+    await _localDb.put('batteryAlerts', {
+      enabled: _batteryAlertsEnabled,
+      threshold: _batteryAlertThreshold,
+      setAt: Date.now(),
+    })
+    const state = { enabled: _batteryAlertsEnabled, threshold: _batteryAlertThreshold }
+    send({ event: 'batteryAlerts:changed', data: state })
+    return { ok: true, ...state }
+  },
+
+  // Debug-only, same purpose as trip:debugComplete: synthesize a peer battery
+  // reading and push it through the real observePeerBattery path, so the whole
+  // chain (decision -> fired-set persist -> IPC emit -> OS notification) can be
+  // exercised on a device without waiting for someone's phone to actually run
+  // down. Defaults to the first non-self member of the first circle, so the
+  // displayName lookup resolves against a real member row. Writes nothing to
+  // any circle -- alerts are a local read of data peers already sent.
+  'batteryAlert:debugFire': async ({ pubkey = null, level = 5, isCharging = false } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    const ourKey = b4a.toString(_identity.publicKey, 'hex')
+    let targetCircle = null
+    let target = pubkey
+    for (const [circleId, base] of _circleBases) {
+      targetCircle = targetCircle ?? circleId
+      if (target) { if (circleId === targetCircle) break; else continue }
+      for await (const { key } of base.view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
+        const k = key.slice('member:'.length)
+        if (k !== ourKey) { target = k; targetCircle = circleId; break }
+      }
+      if (target) break
+    }
+    if (!targetCircle) throw new Error('no circles to fire against')
+    if (!target) throw new Error('no non-self member to fire against')
+    await observePeerBattery(targetCircle, {
+      pubkey: target, battery: level, isCharging, ts: Date.now(),
+    })
+    return { ok: true, circleId: targetCircle, pubkey: target, level, isCharging }
+  },
+
   'sharing:set': async ({ circleId, enabled, expiresAt = null } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
@@ -2940,6 +3022,73 @@ async function markTripNotified (key) {
     if (keys.length > _PERSISTED_TRIP_SEEN_MAX) keys = keys.slice(keys.length - _PERSISTED_TRIP_SEEN_MAX)
     await _localDb.put('tripNotify:seen', { keys })
   } catch (e) { console.warn('[bare] persist tripNotify:seen failed', e?.message) }
+}
+
+// Restore the low-battery pref and the already-alerted set. Missing rows leave
+// the defaults (on, at BATTERY_ALERT_DEFAULT_THRESHOLD) in place; only an
+// explicit persisted false opts out.
+async function loadBatteryAlertState () {
+  try {
+    const row = await _localDb.get('batteryAlerts')
+    if (row?.value?.enabled === false) _batteryAlertsEnabled = false
+    if (BATTERY_ALERT_THRESHOLDS.includes(row?.value?.threshold)) {
+      _batteryAlertThreshold = row.value.threshold
+    }
+  } catch (e) { console.warn('[bare] load batteryAlerts failed', e?.message) }
+  try {
+    const row = await _localDb.get('batteryAlert:fired')
+    if (Array.isArray(row?.value?.keys)) {
+      for (const k of row.value.keys) if (typeof k === 'string') _batteryAlertFired.add(k)
+    }
+  } catch (e) { console.warn('[bare] load batteryAlert:fired failed', e?.message) }
+}
+
+// The already-alerted set survives a worklet restart, so a phone that reboots
+// while Jane sits at 9% doesn't alert about her all over again. Written only on
+// an actual fire or re-arm, so a handful of writes per day at most.
+async function persistBatteryAlertFired () {
+  try {
+    await _localDb.put('batteryAlert:fired', { keys: Array.from(_batteryAlertFired) })
+  } catch (e) { console.warn('[bare] persist batteryAlert:fired failed', e?.message) }
+}
+
+// Single chokepoint for every peer battery reading, whichever transport carried
+// it: the ephemeral live channel, a per-member last-known core tip, or a
+// durable lastSeen apply. All three deliver the same signed value shape, and a
+// member's reading routinely arrives by more than one of them, so the
+// already-alerted set is what keeps that from being three notifications.
+async function observePeerBattery (circleId, value) {
+  const ourKey = _identity && b4a.toString(_identity.publicKey, 'hex')
+  if (!ourKey) return
+  const decision = batteryAlertDecision(value, {
+    enabled: _batteryAlertsEnabled,
+    threshold: _batteryAlertThreshold,
+    ourPubkey: ourKey,
+    fired: _batteryAlertFired,
+  })
+  if (decision === 'ignore') return
+  if (decision === 'rearm') {
+    _batteryAlertFired.delete(value.pubkey)
+    await persistBatteryAlertFired()
+    return
+  }
+  _batteryAlertFired.add(value.pubkey)
+  await persistBatteryAlertFired()
+  let displayName = value.pubkey.slice(0, 8)
+  try {
+    const base = _circleBases.get(circleId)
+    const memberRow = base && await base.view.get('member:' + value.pubkey)
+    if (memberRow?.value?.displayName) displayName = memberRow.value.displayName
+  } catch (e) { console.warn('[bare] batteryAlert name lookup failed', e?.message) }
+  mark('battery:alert', { peer: value.pubkey.slice(0, 8), level: value.battery, threshold: _batteryAlertThreshold })
+  send({ event: 'batteryAlert:low', data: {
+    circleId,
+    pubkey: value.pubkey,
+    displayName,
+    level: value.battery,
+    threshold: _batteryAlertThreshold,
+    ts: value.ts,
+  }})
 }
 
 async function writePresenceToCircle (circleId, state, expiresAt = null) {
@@ -4319,6 +4468,7 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         const keyPubkey = op.key.slice('lastSeen:'.length)
         if (keyPubkey !== incoming.pubkey) continue
         await view.put(op.key, incoming)
+        if (circleId) observePeerBattery(circleId, incoming).catch(() => {})
         if (circleId && !_firstLastSeenRemoteMarked.has(circleId)) {
           const ourKeyHex = _identity && b4a.toString(_identity.publicKey, 'hex')
           if (ourKeyHex && keyPubkey !== ourKeyHex) {
@@ -5366,6 +5516,7 @@ async function handleLivePosition (circleId, value) {
   const cur = perCircle.get(value.pubkey)
   if (cur && typeof cur.ts === 'number' && typeof value.ts === 'number' && value.ts <= cur.ts) return
   perCircle.set(value.pubkey, value)
+  observePeerBattery(circleId, value).catch(() => {})
   // One-shot observability: the first live fix received per circle confirms the
   // ephemeral receive path works (proposal 2026-06-04 phase 1). Bounded to once
   // per circle, then re-ship the trace so it lands in coldstart.log.
@@ -5669,6 +5820,7 @@ function cacheLastKnownTip (circleId, pubkey, tip) {
   const cur = cache.get(pubkey)
   if (cur && typeof cur.ts === 'number' && typeof tip.ts === 'number' && tip.ts <= cur.ts) return
   cache.set(pubkey, tip)
+  observePeerBattery(circleId, tip).catch(() => {})
   // One-shot observability: the first peer tip we replicate + decrypt + cache
   // for a circle confirms the full last-known read path (announce -> open core
   // -> download tip -> verify -> cache), the slice-2a payoff (proposal
@@ -7151,6 +7303,12 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   // Restored before the bases mount so circles:getAll can badge the row on the
   // very first poll; the retry itself waits for the foreground hook.
   await loadSupersedePending()
+
+  // Low-battery alert pref + the durable already-alerted set. Loaded BEFORE the
+  // circles mount and their topics rejoin: the moment a peer connects, a live
+  // fix or a replayed lastSeen can reach observePeerBattery, and it would judge
+  // that reading against a default threshold and an empty fired set.
+  await loadBatteryAlertState()
 
   // Rejoin all known circle topics and mount their Autobases. Pre-existing
   // local records (from prior launches) need their swarm topics re-announced

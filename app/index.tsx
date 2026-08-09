@@ -195,6 +195,15 @@ async function ensureNotifications() {
       description: 'Notifications when members join or leave a circle',
       lightColor: '#0E413A',
     })
+    // A circle member's phone running low. HIGH importance: the point is to
+    // reach you while there's still time to call them, and the worklet already
+    // caps it at one alert per member per discharge cycle so it can't nag.
+    await Notifications.setNotificationChannelAsync('battery', {
+      name: 'Low battery alerts',
+      importance: Notifications.AndroidImportance.HIGH,
+      description: "Notifications when a circle member's phone battery gets low",
+      lightColor: '#0E413A',
+    })
     // The daily "open to sync" reminder. Its own channel so users can mute it
     // from system settings independently of the geofence/trip/membership ones.
     await Notifications.setNotificationChannelAsync('reminders', {
@@ -387,6 +396,46 @@ async function fireMembershipNotification(payload: any, kind: 'memberJoined' | '
     })
   } catch (e: any) {
     console.warn('fire membership notification failed: ' + e?.message)
+  }
+}
+
+// A circle member's phone crossed the user's low-battery threshold. Every gate
+// that matters (enabled, threshold, self, freshness, once-per-discharge-cycle)
+// lives in the worklet, which owns the pref and sees the readings from all
+// three transports; the shell just formats and posts. The short-TTL dedup is
+// belt-and-braces against the same reading arriving over two transports within
+// the same tick, before the worklet's fired-set write lands.
+async function fireBatteryAlertNotification(payload: any) {
+  if (!payload) return
+  const { circleId, pubkey, displayName, level } = payload
+  if (typeof pubkey !== 'string') return
+  if (typeof level !== 'number' || !Number.isFinite(level)) return
+  // Defense in depth: the worklet drops self, but never tell the user about
+  // their own battery if an old worklet build lets it through.
+  if (_ourPubkey && pubkey === _ourPubkey) return
+  const name = (typeof displayName === 'string' && displayName.length > 0) ? displayName : pubkey.slice(0, 8)
+  const dedupKey = 'battery:' + pubkey
+  const lastTs = _recentNotifications.get(dedupKey)
+  const now = Date.now()
+  if (lastTs != null && now - lastTs < NOTIF_DEDUP_TTL_MS) return
+  _recentNotifications.set(dedupKey, now)
+  const cutoff = now - NOTIF_DEDUP_TTL_MS
+  for (const [k, ts] of _recentNotifications) {
+    if (ts < cutoff) _recentNotifications.delete(k)
+  }
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'PearCircle',
+        // "X's battery", not "X's phone", because a member's display name is
+        // often the device itself ("iPhone's phone is at 7%" reads as a typo).
+        body: `${name}'s battery is at ${Math.round(level)}%`,
+        data: { kind: 'batteryLow', circleId: circleId ?? null, pubkey },
+      },
+      trigger: Platform.OS === 'android' ? { channelId: 'battery' } : null,
+    })
+  } catch (e: any) {
+    console.warn('fire battery alert notification failed: ' + e?.message)
   }
 }
 
@@ -713,6 +762,7 @@ function registerNativeActionHandlers() {
   onEvent('peerTrip:completed', (data) => { firePeerTripNotification(data) })
   onEvent('member:joined', (data) => { fireMembershipNotification(data, 'memberJoined') })
   onEvent('member:left', (data) => { fireMembershipNotification(data, 'memberLeft') })
+  onEvent('batteryAlert:low', (data) => { fireBatteryAlertNotification(data) })
   // Keep the local trip-notification-enabled cache fresh so headless trip
   // notifications respect the toggle. The UI forwarding is separate in Index.
   onEvent('tripNotifications:changed', (data) => {
@@ -1038,6 +1088,7 @@ export default function Index() {
     // Same UI path as circle:deleted -- one-time notice, then cleanup.
     onEvent('circle:removed-self', (data) => emitEvent('circle:removed-self', data))
     onEvent('tripNotifications:changed', (data) => emitEvent('tripNotifications:changed', data))
+    onEvent('batteryAlerts:changed', (data) => emitEvent('batteryAlerts:changed', data))
 
     // Deep links: pear://pearcircle/join?... and https equivalent.
     Linking.getInitialURL().then((url) => {
@@ -1057,6 +1108,7 @@ export default function Index() {
     //   - peerTrip:     { kind: 'peerTrip', circleId, authorPubkey } from trip-completion
     //   - memberJoined: { kind: 'memberJoined', circleId, pubkey } from a circle join
     //   - memberLeft:   { kind: 'memberLeft', circleId, pubkey } from a circle leave/remove
+    //   - batteryLow:   { kind: 'batteryLow', circleId, pubkey } from a member's low battery
     // All resolve to the same WebView event so the UI can switch circle
     // filter and focus the member uniformly.
     const routeNotificationData = (data: any) => {
@@ -1065,7 +1117,7 @@ export default function Index() {
         deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
       } else if (data.kind === 'peerTrip' && typeof data.circleId === 'string' && typeof data.authorPubkey === 'string') {
         deliverNotificationFocus({ circleId: data.circleId, pubkey: data.authorPubkey })
-      } else if ((data.kind === 'memberJoined' || data.kind === 'memberLeft') &&
+      } else if ((data.kind === 'memberJoined' || data.kind === 'memberLeft' || data.kind === 'batteryLow') &&
                  typeof data.circleId === 'string' && typeof data.pubkey === 'string') {
         deliverNotificationFocus({ circleId: data.circleId, pubkey: data.pubkey })
       }
