@@ -7,7 +7,7 @@ PearCircle circles sync peer-to-peer, so a circle's history is only reachable wh
 ## What it does
 
 - Runs the seed-mode worklet as a long-lived background service.
-- Serves a small monitoring UI at `http://127.0.0.1:8730` for enrolling circles and watching replication.
+- Serves a small monitoring UI at `http://127.0.0.1:8730` for enrolling circles and watching replication. Loopback-only by default; set `SEEDER_HOST=0.0.0.0` (or `--host 0.0.0.0`) to reach it from elsewhere on the LAN, which is what a headless install wants.
 - Stores the seeder identity and per-circle enrollments in a local on-disk database.
 - Starts automatically at login.
 
