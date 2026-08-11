@@ -7,6 +7,7 @@ const { resolveDataDir, ensureDir } = require('./dataDir')
 const { loadOrCreateToken } = require('./auth')
 const { Worklet } = require('./worklet')
 const { createServer } = require('./server')
+const { dashboardUrls } = require('./dashboardUrl')
 const { SEEDER_VERSION } = require('./version')
 const { UpdateChecker } = require('./updateCheck')
 const { UpdateApplier } = require('./updateApply')
@@ -58,8 +59,10 @@ function printHelp () {
     '  --ui <dir>          Override the static UI directory',
     '  --data-dir <path>   Override the OS-default data directory',
     '  --port <n>          Bind port (default 8730, env SEEDER_PORT)',
-    '  --host <addr>       Bind address (default 127.0.0.1, env SEEDER_HOST;',
-    '                      use 0.0.0.0 behind a reverse proxy / in a container)',
+    '  --host <addr>       Bind address (default 127.0.0.1, env SEEDER_HOST).',
+    '                      Use 0.0.0.0 to reach the dashboard from elsewhere on',
+    '                      the LAN (headless box) or through a reverse proxy /',
+    '                      container. The auth token is still required.',
     '  --no-auth           Skip the bearer-token check (env SEEDER_NO_AUTH=1);',
     '                      only for when a front proxy already gates access',
     '  --no-update-check   Disable the in-app update checker/banner (env',
@@ -214,12 +217,13 @@ async function main () {
   })
   startPolling()
 
-  // Loopback URL carries the token for the auto-opened browser; a non-loopback
-  // bind (container) is reached through the proxy, so just log host:port.
   const onLoopback = opts.host === '127.0.0.1' || opts.host === 'localhost'
-  const url = onLoopback ? `http://127.0.0.1:${opts.port}/?t=${token}` : `http://${opts.host}:${opts.port}/`
-  log('host', `UI at ${url}`)
-  if (!opts.noOpen && onLoopback && process.stdout.isTTY) tryOpenBrowser(url)
+  const urls = dashboardUrls(opts.host, opts.port, token, opts.noAuth)
+  log('host', `UI at ${urls[0]}`)
+  for (const extra of urls.slice(1)) log('host', `UI also at ${extra}`)
+  // Only auto-open on a loopback bind: a wildcard/LAN bind is either headless
+  // or proxied, where there is no local browser worth launching.
+  if (!opts.noOpen && onLoopback && process.stdout.isTTY) tryOpenBrowser(urls[0])
 
   const shutdown = async (sig) => {
     log('host', `received ${sig}, shutting down`)

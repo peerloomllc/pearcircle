@@ -69,6 +69,40 @@ systemctl --user status pearcircle-seeder
 journalctl --user -u pearcircle-seeder -f
 ```
 
+## Reach the dashboard from another machine on your LAN
+
+By default the dashboard binds to loopback only, so it is reachable from the
+seeder box itself and nowhere else. That is the right default for a desktop
+install and the wrong one for a headless box, where there is no browser to
+open it with. Bind to all interfaces instead:
+
+```bash
+systemctl --user edit pearcircle-seeder
+```
+
+Add this to the drop-in the editor opens, save, then restart the service with
+`systemctl --user restart pearcircle-seeder`:
+
+```ini
+[Service]
+Environment=SEEDER_HOST=0.0.0.0
+```
+
+The startup log then lists the box's LAN addresses, token included, so
+`grep 'UI at' ~/.local/share/pearcircle-seeder/seeder.log` gives you a URL you
+can paste into a browser on another machine. Running in the foreground,
+`pearcircle-seeder --host 0.0.0.0` does the same thing.
+
+Two things to keep in mind:
+
+- **The token is the only gate.** Anything that can reach port 8730 can reach
+  the dashboard with that token. On a home LAN that is normally fine. Bind to
+  one address (`SEEDER_HOST=192.168.1.50`) to narrow it.
+- **Do not expose the port to the internet** directly. Put it behind a reverse
+  proxy or a tunnel (Tailscale, Cloudflare Tunnel, WireGuard) that does its own
+  authentication. Seeding itself does not need any inbound port forwarded - the
+  P2P side holepunches.
+
 ## Update
 
 The seeder checks GitHub Releases hourly and surfaces a newer version in the
