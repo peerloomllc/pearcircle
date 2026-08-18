@@ -80,11 +80,22 @@ if [ -n "$USER_UID" ]; then
 fi
 rm -f "$LEGACY_AGENT"
 
+# Booting a job out can leave a `disabled` override on its LABEL in
+# /var/db/com.apple.xpc.launchd/disabled.*.plist, and that override outlives the
+# uninstall. A later install of the same label then silently refuses to start
+# (`load` no-ops, `bootstrap` fails "5: Input/output error"). Clear both domains
+# so a reinstall is a clean slate. Seen on the mac-mini 2026-08-18.
+launchctl enable system/com.pearcircle.seeder 2>/dev/null || true
+if [ -n "$USER_UID" ]; then
+  launchctl asuser "$USER_UID" launchctl enable "gui/$USER_UID/com.pearcircle.seeder" 2>/dev/null || true
+fi
+
 # 2. Root updater LaunchDaemon: bootout of the system domain, then remove.
 DAEMON="/Library/LaunchDaemons/com.pearcircle.seeder.updater.plist"
 launchctl bootout system/com.pearcircle.seeder.updater 2>/dev/null \
   || launchctl unload "$DAEMON" 2>/dev/null || true
 rm -f "$DAEMON"
+launchctl enable system/com.pearcircle.seeder.updater 2>/dev/null || true
 
 # 3. Root updates scratch dir (verified-pkg requests + updater.log).
 rm -rf "/Library/Application Support/PearCircle Seeder"
