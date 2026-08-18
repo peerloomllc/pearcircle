@@ -1,10 +1,11 @@
 #!/bin/bash
-# Runs as root under macOS installer's postinstall context. Resolves the
-# actual console user (whose login session needs the LaunchAgent), writes
-# the templated plist into their LaunchAgents directory, chowns it, loads
-# it in the user's session, waits for the UI URL to appear in the log,
-# opens the URL in the user's default browser, and prompts (via osascript)
-# whether to drop a .webloc shortcut on the Desktop.
+# Runs as root under macOS installer's postinstall context. Resolves the actual
+# console user (whose account the seeder runs under and whose home holds the
+# store), templates the plist into /Library/LaunchDaemons, bootstraps it into the
+# SYSTEM domain so it outlives the login session, retires the login-bound
+# LaunchAgent this used to be, waits for the UI URL to appear in the log, opens
+# the URL in the user's default browser, and prompts (via osascript) whether to
+# drop a .webloc shortcut on the Desktop.
 set -euo pipefail
 
 # Resolve the console user, not $USER (which is root during install).
@@ -16,28 +17,52 @@ if [ -z "$USER_HOME" ]; then USER_HOME="/Users/$USER_NAME"; fi
 DATA_DIR="$USER_HOME/Library/Application Support/PearCircle Seeder"
 LOG_PATH="$DATA_DIR/launchd.log"
 PLIST_SRC="/usr/local/lib/pearcircle-seeder/installer/com.pearcircle.seeder.plist"
-PLIST_DST="$USER_HOME/Library/LaunchAgents/com.pearcircle.seeder.plist"
+PLIST_DST="/Library/LaunchDaemons/com.pearcircle.seeder.plist"
+# Where this used to live. Every install before 2026-08-17 has one, and it must be
+# torn down or we end up running two seeders against one store.
+LEGACY_AGENT="$USER_HOME/Library/LaunchAgents/com.pearcircle.seeder.plist"
 
-# Update vs fresh install: if the LaunchAgent already exists this is a
-# re-install / one-click auto-update, so skip the first-run UI (open browser,
-# Desktop-shortcut prompt) — an auto-update must not pop dialogs.
+# Update vs fresh install: if either the daemon or the legacy agent already
+# exists this is a re-install / one-click auto-update, so skip the first-run UI
+# (open browser, Desktop-shortcut prompt) — an auto-update must not pop dialogs.
 # Proposal 2026-06-05-seeder-update slice 3b.
 IS_UPDATE=0
-[ -f "$PLIST_DST" ] && IS_UPDATE=1
+{ [ -f "$PLIST_DST" ] || [ -f "$LEGACY_AGENT" ]; } && IS_UPDATE=1
 
 mkdir -p "$DATA_DIR"
-mkdir -p "$USER_HOME/Library/LaunchAgents"
-chown "$USER_NAME" "$DATA_DIR" "$USER_HOME/Library/LaunchAgents"
+chown "$USER_NAME" "$DATA_DIR"
 
-# Substitute the log path into the template.
-sed "s|__LOG_PATH__|$LOG_PATH|g" "$PLIST_SRC" > "$PLIST_DST"
-chown "$USER_NAME" "$PLIST_DST"
+# --- Retire the login-bound LaunchAgent --------------------------------------
+# This job used to be an agent in ~/Library/LaunchAgents, whose own comment
+# claimed it "survives logout via KeepAlive". It does not: agents there load into
+# gui/501, a `type = login` domain that loginwindow tears down at logout, and
+# KeepAlive does not exempt a job from its domain's teardown. Measured on the
+# mac-mini 2026-07-31 across one real logout/login - the job was killed and a
+# DIFFERENT pid appeared only at the next login. Boot it out before bootstrapping
+# the daemon, or both run at once against the same store.
+if [ -f "$LEGACY_AGENT" ]; then
+  launchctl asuser "$USER_UID" launchctl unload "$LEGACY_AGENT" 2>/dev/null || true
+  launchctl bootout "gui/$USER_UID/com.pearcircle.seeder" 2>/dev/null || true
+  rm -f "$LEGACY_AGENT"
+fi
+
+# Substitute the log path, the credentials to run under and the data dir (see the
+# template's own note on why the data dir is passed explicitly).
+sed -e "s|__LOG_PATH__|$LOG_PATH|g" \
+    -e "s|__USER__|$USER_NAME|g" \
+    -e "s|__GROUP__|staff|g" \
+    -e "s|__USER_HOME__|$USER_HOME|g" \
+    -e "s|__DATA_DIR__|$DATA_DIR|g" \
+    "$PLIST_SRC" > "$PLIST_DST"
+chown root:wheel "$PLIST_DST"
 chmod 0644 "$PLIST_DST"
 
-# Reload if already present (post-update install path). Run in the user's
-# session so the daemon lives there, not in the root session.
-launchctl asuser "$USER_UID" launchctl unload "$PLIST_DST" 2>/dev/null || true
-launchctl asuser "$USER_UID" launchctl load "$PLIST_DST"
+# Reload if already present (post-update install path). A system daemon so it
+# outlives the login session; UserName in the plist keeps it running as the user,
+# so the store's ownership is untouched.
+launchctl bootout "system/com.pearcircle.seeder" 2>/dev/null || true
+launchctl bootstrap system "$PLIST_DST" 2>/dev/null \
+  || launchctl load "$PLIST_DST" 2>/dev/null || true
 
 # --- Privileged updater LaunchDaemon (proposal 2026-06-05-seeder-update 3b) ---
 # Installs the root auto-updater that applies one-click updates without sudo.
@@ -91,10 +116,10 @@ fi
 
 # On an auto-update / re-install, the seeder is already set up and the operator
 # isn't watching — skip the browser-open + shortcut prompt entirely so the
-# update stays silent (slice 3b). The LaunchAgent reload above already brought
-# the new version up.
+# update stays silent (slice 3b). The daemon reload above already brought the new
+# version up.
 if [ "$IS_UPDATE" = "1" ]; then
-  echo "PearCircle Seeder updated; LaunchAgent reloaded (silent update)."
+  echo "PearCircle Seeder updated; LaunchDaemon reloaded (silent update)."
   exit 0
 fi
 
@@ -160,7 +185,7 @@ cat > "$APP/Contents/MacOS/open-ui" <<'LAUNCH'
 DATA="$HOME/Library/Application Support/PearCircle Seeder"
 TOKEN=$(cat "$DATA/auth.token" 2>/dev/null | tr -d '\n')
 if [ -z "$TOKEN" ]; then
-  /usr/bin/osascript -e 'display dialog "PearCircle Seeder is not running. Open Activity Monitor or check ~/Library/LaunchAgents/com.pearcircle.seeder.plist." with title "PearCircle Seeder" buttons {"OK"} default button "OK" with icon caution'
+  /usr/bin/osascript -e 'display dialog "PearCircle Seeder is not running. Open Activity Monitor or check /Library/LaunchDaemons/com.pearcircle.seeder.plist." with title "PearCircle Seeder" buttons {"OK"} default button "OK" with icon caution'
   exit 1
 fi
 exec /usr/bin/open "http://127.0.0.1:8730/?t=$TOKEN"

@@ -6,7 +6,9 @@
    [releases page](https://github.com/peerloomllc/pearcircle/releases).
 2. Double-click it and follow the installer.
 
-The package is signed and notarized by Apple, so Gatekeeper allows it with no extra steps. The installer places the seeder under `/usr/local/lib/pearcircle-seeder`, adds a LaunchAgent at `~/Library/LaunchAgents/com.pearcircle.seeder.plist`, and starts the background service in your login session right away.
+The package is signed and notarized by Apple, so Gatekeeper allows it with no extra steps. The installer places the seeder under `/usr/local/lib/pearcircle-seeder`, adds a LaunchDaemon at `/Library/LaunchDaemons/com.pearcircle.seeder.plist`, and starts the background service right away.
+
+It is a system LaunchDaemon rather than a per-user LaunchAgent so that seeding **keeps running when you log out**, which is the whole point of a seeder. It still runs under your own account (`UserName` in the plist), so its identity and circle enrollments stay in your `~/Library/Application Support` exactly as before. Installs made before 2026-08-17 used a LaunchAgent, which was killed at logout; upgrading removes that agent automatically.
 
 ## Open the monitoring UI
 
@@ -35,7 +37,8 @@ sudo bash /usr/local/lib/pearcircle-seeder/uninstall.sh          # keeps identit
 sudo bash /usr/local/lib/pearcircle-seeder/uninstall.sh --purge  # also wipes identity
 ```
 
-Either path removes the user LaunchAgent, the program files under
+Either path removes the seeder LaunchDaemon (and the legacy user LaunchAgent, if
+this machine predates 2026-08-17), the program files under
 `/usr/local/lib/pearcircle-seeder`, the root auto-updater LaunchDaemon
 (`/Library/LaunchDaemons/com.pearcircle.seeder.updater.plist`) and its scratch
 dir (`/Library/Application Support/PearCircle Seeder`), the `/Applications`
@@ -46,9 +49,11 @@ you choose to remove them, so a reinstall stays the same seeder.
 If the program files are already gone, remove the leftovers by hand:
 
 ```bash
+sudo launchctl bootout system/com.pearcircle.seeder 2>/dev/null
 sudo launchctl bootout system/com.pearcircle.seeder.updater 2>/dev/null
-launchctl bootout gui/$(id -u)/com.pearcircle.seeder 2>/dev/null
-rm -f ~/Library/LaunchAgents/com.pearcircle.seeder.plist
+launchctl bootout gui/$(id -u)/com.pearcircle.seeder 2>/dev/null   # pre-2026-08-17 installs
+rm -f ~/Library/LaunchAgents/com.pearcircle.seeder.plist           # pre-2026-08-17 installs
+sudo rm -f /Library/LaunchDaemons/com.pearcircle.seeder.plist
 sudo rm -f /Library/LaunchDaemons/com.pearcircle.seeder.updater.plist
 sudo rm -rf /usr/local/lib/pearcircle-seeder "/Library/Application Support/PearCircle Seeder"
 rm -rf "/Applications/Uninstall PearCircle Seeder.app" "$HOME/Desktop/PearCircle Seeder.app"

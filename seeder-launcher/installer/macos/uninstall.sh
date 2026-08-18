@@ -5,7 +5,8 @@
 # (proposal 2026-06-05-seeder-update slice 3b) that is FIVE things, three of
 # which the old hand-written README steps missed entirely:
 #
-#   user LaunchAgent   ~/Library/LaunchAgents/com.pearcircle.seeder.plist
+#   seeder daemon      /Library/LaunchDaemons/com.pearcircle.seeder.plist
+#                      (plus the legacy ~/Library/LaunchAgents agent, pre-2026-08-17)
 #   payload            /usr/local/lib/pearcircle-seeder
 #   root LaunchDaemon  /Library/LaunchDaemons/com.pearcircle.seeder.updater.plist   (missed)
 #   root updates dir   /Library/Application Support/PearCircle Seeder               (missed)
@@ -63,13 +64,21 @@ IDENTITY_DIR="$USER_HOME/Library/Application Support/PearCircle Seeder"
 
 echo "Uninstalling PearCircle Seeder (user: $USER_NAME)..."
 
-# 1. User LaunchAgent: stop in the user's GUI session, then remove the plist.
-AGENT="$USER_HOME/Library/LaunchAgents/com.pearcircle.seeder.plist"
+# 1. The seeder itself: a system LaunchDaemon since 2026-08-17. Bootout of the
+# system domain, then remove. The old login-bound LaunchAgent is cleaned up too -
+# an install that predates the daemon still has one, and a machine that has been
+# through both has both.
+SEEDER_DAEMON="/Library/LaunchDaemons/com.pearcircle.seeder.plist"
+launchctl bootout system/com.pearcircle.seeder 2>/dev/null \
+  || launchctl unload "$SEEDER_DAEMON" 2>/dev/null || true
+rm -f "$SEEDER_DAEMON"
+
+LEGACY_AGENT="$USER_HOME/Library/LaunchAgents/com.pearcircle.seeder.plist"
 if [ -n "$USER_UID" ]; then
   launchctl asuser "$USER_UID" launchctl bootout "gui/$USER_UID/com.pearcircle.seeder" 2>/dev/null \
-    || launchctl asuser "$USER_UID" launchctl unload "$AGENT" 2>/dev/null || true
+    || launchctl asuser "$USER_UID" launchctl unload "$LEGACY_AGENT" 2>/dev/null || true
 fi
-rm -f "$AGENT"
+rm -f "$LEGACY_AGENT"
 
 # 2. Root updater LaunchDaemon: bootout of the system domain, then remove.
 DAEMON="/Library/LaunchDaemons/com.pearcircle.seeder.updater.plist"
