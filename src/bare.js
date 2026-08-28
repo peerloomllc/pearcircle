@@ -30,6 +30,7 @@ const { generateKeypair } = require('./identity')
 const { generateCircleId, generateRendezvousKey, generateCircleKey, generateEncryptionKey, generatePlaceId } = require('./circle')
 const { buildInvite, parseInvite, buildSeedInvite, buildSeederPairLink, parseSeederPairLink, inviteCircleIdMismatch } = require('./invite')
 const { detectSeedMode, loadOrCreateSeederIdentity, createSeederHandlers, enrollSeedInvite } = require('./seeder')
+const { isDeviceFileModifiedError, healCorestoreDeviceFiles } = require('./lib/deviceFileHeal.js')
 const { topicForCircleKey, seederPairTopic } = require('./swarm')
 const { setupPairChannel, PAIR_PROTOCOL } = require('./pair')
 const { setupSeederPairChannel } = require('./seederPair')
@@ -6998,6 +6999,18 @@ function scheduleDurabilityFlush () {
 const STORE_COMPACT_INTERVAL_MS = 24 * 60 * 60 * 1000
 const STORE_COMPACT_BOOT_DELAY_MS = 90 * 1000
 let _storeCompactTimer = null
+let _deviceFileHealed = false
+
+function deviceHealDisabled () {
+  // Bare has no `Bare.env`; its environment is the bare-env module (what
+  // bare-process's process.env wraps). Node has process.env.
+  let env = {}
+  try {
+    env = typeof Bare !== 'undefined' ? require('bare-env')
+      : (typeof process !== 'undefined' && process.env) ? process.env : {}
+  } catch (e) { env = {} }
+  return env.PEARCIRCLE_SEED_NO_DEVICE_HEAL === '1'
+}
 
 const compactStore = createStoreCompactor({
   getStore: () => _store,
@@ -7047,6 +7060,33 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     _store = new Corestore(dataDir + '/pearcircle/store')
     await _store.ready()
   } catch (e) {
+    // Seed-mode self-heal (ported from PearCal PR #325). hypercore-storage's
+    // device-file guard refuses a store whose CORESTORE marker no longer
+    // matches the file's inode or birth time, which is what a host-side copy
+    // of the data folder produces: StartOS 0.4.0.1 clones every package volume
+    // into a btrfs subvolume on first boot and deletes the original, and this
+    // seeder crash-looped on the Start9 on 2026-08-28 until the marker was
+    // rewritten by hand. The seeder is blind and never writes a member's
+    // cores, only its own local bee, so a stale marker on the single surviving
+    // copy is a false alarm worth healing. MEMBER MODE IS DELIBERATELY NOT
+    // HEALED: a phone writes, and a copied data folder is exactly what the
+    // guard must catch there. Only the exact "was modified" case is healed;
+    // "was moved unsafely" and "different platform" still fail as before.
+    // PEARCIRCLE_SEED_NO_DEVICE_HEAL=1 disables it.
+    if (detectSeedMode({ mode }) && isDeviceFileModifiedError(e) && !deviceHealDisabled() && !_deviceFileHealed) {
+      _deviceFileHealed = true
+      // Close the failed instance first: device-file holds an fd lock on the
+      // marker and that lock conflicts in-process, so a retry against a
+      // half-open store can never succeed.
+      await _store.close().catch(() => {})
+      const fs = typeof Bare !== 'undefined' ? require('bare-fs') : require('fs')
+      const healed = healCorestoreDeviceFiles(fs, [dataDir + '/pearcircle/store'])
+      console.error('[seed] device-file guard tripped (' + e.message + '). The host copied our data folder;',
+        'this is what StartOS 0.4.0.1 does on first boot. Re-stamped', healed.length,
+        'CORESTORE marker(s) in place and retrying once:', JSON.stringify(healed.map((h) => h.file)))
+      mark('init:device-file-healed', { healed: healed.length })
+      if (healed.length > 0) return init({ dataDir, mode, version }, attempt)
+    }
     if (e?.message?.includes('lock') && attempt < 20) {
       await new Promise(r => setTimeout(r, 1000))
       return init({ dataDir, mode }, attempt + 1)
