@@ -1213,11 +1213,11 @@ npx esbuild src/ui/main.jsx --bundle --format=iife --jsx=automatic \
   --define:process.env.NODE_ENV=\"production\" --outfile=assets/app-ui.bundle
 
 echo "==> Building Bare bundle..."
-node_modules/.bin/bare-pack --linked src/bare.js -o assets/bare-universal.bundle
+node_modules/.bin/bare-pack --linked --defer fs --defer path src/bare.js -o assets/bare-universal.bundle
 
 if $PUBLISH_APP_STORE; then
   echo "==> Building iOS Bare bundle..."
-  node_modules/.bin/bare-pack --host ios-arm64 --linked src/bare.js -o assets/bare-ios.bundle
+  node_modules/.bin/bare-pack --host ios-arm64 --linked --defer fs --defer path src/bare.js -o assets/bare-ios.bundle
 fi
 
 # ---------------------------------------------------------------------------
