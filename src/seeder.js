@@ -174,7 +174,7 @@ async function enrollSeedInvite ({ invite, localDb, mountCircle }) {
  *   Called by seeder:leave before the persistence rows are deleted so the host can
  *   close the core and leave the topic without racing the persistence write.
  */
-function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps, openPairSession, closePairSession, getNickname, setNickname }) {
+function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version = null, mountCircle, leaveCircle, getReplicatedBytes, runRetentionSweeps, openPairSession, closePairSession, getNickname, setNickname, getCoverage }) {
   const pubkeyHex = b4a.toString(identity.publicKey, 'hex')
 
   return {
@@ -217,14 +217,20 @@ function createSeederHandlers ({ localDb, identity, bootTs = Date.now(), version
       for (const value of enrolled) {
         const revokedNode = await localDb.get('seeder:revoked:' + value.circleId)
         const revoked = revokedNode?.value ?? null
-        circles.push({
+        const circle = {
           circleId: value.circleId,
           name: value.name ?? '',
           inviter: value.inviter ?? null,
           enrolledAt: value.enrolledAt ?? null,
           revoked: !!revoked,
           revokedAt: revoked && typeof revoked.revokedAt === 'number' ? revoked.revokedAt : null,
-        })
+        }
+        // What this seeder actually holds for the circle (src/lib/seederCoverage.js).
+        // Only present when the host wires it; null for a circle not mounted.
+        if (typeof getCoverage === 'function') {
+          circle.coverage = await Promise.resolve(getCoverage(value.circleId)).catch(() => null)
+        }
+        circles.push(circle)
       }
       return { circles }
     },
