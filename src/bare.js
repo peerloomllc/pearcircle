@@ -45,7 +45,8 @@ const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
 const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { seederSeenKey, shouldPersistSeederContact } = require('./lib/seederContact')
-const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
+const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForCircle, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
+const { planSeederLeavePurge } = require('./lib/seederLeavePurge')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
@@ -5175,49 +5176,82 @@ async function leaveSeederCircle (circleId) {
     if (h && h.sendLeft()) leftSent++
   }
   if (leftSent > 0) mark('seeder:left-notice-pushed', { circleId, sent: leftSent })
+  // Decide which stored cores to wipe before anything is torn down. The
+  // enrolled row for this circle is still present here (seeder:leave deletes it
+  // after this returns), so every reference is visible.
+  const plan = planSeederLeavePurge({
+    circleId,
+    enrolled: await readSeederRows('seeder:enrolled:', (v) => ({ circleId: v?.circleId, bootstrap: v?.bootstrap })),
+    writers: await readSeederRows('seeder:writerCore:', (v) => ({ circleId: v?.circleId, coreKey: v?.coreKey })),
+    lastknown: await readSeederRows('seeder:lastknownCore:', (v) => ({ circleId: v?.circleId, coreKey: v?.coreKey })),
+  })
   const entry = _seederCircles.get(circleId)
-  if (!entry) return
-  try {
-    const topic = b4a.from(entry.topicHex, 'hex')
-    await _swarm.leave(topic).catch(() => {})
-  } catch {}
-  _topicToCircle.delete(entry.topicHex)
-  if (entry.onDownload && entry.core) {
-    try { entry.core.off('download', entry.onDownload) } catch {}
-  }
-  try { await entry.core.close() } catch {}
-  // Close + forget this circle's last-known cores and their persisted keys (2b).
-  if (entry.lastknownCores) {
-    for (const c of entry.lastknownCores.values()) { try { await c.close() } catch {} }
-    entry.lastknownCores.clear()
-  }
-  for await (const { key } of _localDb.createReadStream({
-    gt: 'seeder:lastknownCore:' + circleId + ':', lt: 'seeder:lastknownCore:' + circleId + ':~',
-  })) {
-    await _localDb.del(key).catch(() => {})
-  }
-  // Close + forget this circle's writer cores and their persisted keys (slice 3d).
-  if (entry.writerCores) {
-    for (const [coreKey, c] of entry.writerCores) {
+  // Open cores for this circle, by key, so a mounted circle reuses its sessions.
+  const openByKey = new Map()
+  if (entry) {
+    try {
+      const topic = b4a.from(entry.topicHex, 'hex')
+      await _swarm.leave(topic).catch(() => {})
+    } catch {}
+    _topicToCircle.delete(entry.topicHex)
+    if (entry.onDownload && entry.core) {
+      try { entry.core.off('download', entry.onDownload) } catch {}
+    }
+    if (entry.core) openByKey.set(b4a.toString(entry.core.key, 'hex'), entry.core)
+    for (const c of entry.lastknownCores?.values() ?? []) openByKey.set(b4a.toString(c.key, 'hex'), c)
+    for (const [coreKey, c] of entry.writerCores ?? []) {
       const fn = entry.writerOnDownload?.get(coreKey)
       if (fn) { try { c.off('download', fn) } catch {} }
-      try { await c.close() } catch {}
+      openByKey.set(coreKey, c)
     }
-    entry.writerCores.clear()
   }
-  if (entry.writerOnDownload) entry.writerOnDownload.clear()
-  for await (const { key } of _localDb.createReadStream({
-    gt: 'seeder:writerCore:' + circleId + ':', lt: 'seeder:writerCore:' + circleId + ':~',
-  })) {
-    await _localDb.del(key).catch(() => {})
+  // Wipe the blocks of every core only this circle used. clear() deletes the
+  // stored block data (the ciphertext positions and view entries); only the
+  // small tree metadata stays. Hypercore.purge() is not usable here: in
+  // hypercore 11.29 it calls a core method that does not exist.
+  let cleared = 0
+  for (const key of plan.clear) {
+    try {
+      const core = openByKey.get(key) ?? openPeerCore(_store, key, null)
+      await core.ready()
+      if (core.length > 0) await core.clear(0, core.length)
+      openByKey.delete(key)
+      await core.close().catch(() => {})
+      cleared++
+    } catch (e) {
+      mark('seeder:leave-clear-failed', { circleId, coreKey: key.slice(0, 8), err: e?.message })
+    }
   }
-  // Drop per-block writer retention tracking rows for this circle (storage
-  // audit 2026-06-22) so they don't orphan after a leave.
-  for await (const { key } of _localDb.createReadStream(rangeForWriterCircle(circleId))) {
-    await _localDb.del(key).catch(() => {})
+  // Anything still open (a shared core, or one whose clear failed) is closed
+  // but left intact.
+  for (const c of openByKey.values()) { try { await c.close() } catch {} }
+  if (entry) {
+    entry.lastknownCores?.clear()
+    entry.writerCores?.clear()
+    entry.writerOnDownload?.clear()
+  }
+  // Forget this circle's persisted rows whether or not it was mounted: core
+  // keys (2b, slice 3d) and the per-block retention tracking for the bootstrap
+  // and writer cores (storage audit 2026-06-22).
+  for (const range of [
+    { gt: 'seeder:lastknownCore:' + circleId + ':', lt: 'seeder:lastknownCore:' + circleId + ':~' },
+    { gt: 'seeder:writerCore:' + circleId + ':', lt: 'seeder:writerCore:' + circleId + ':~' },
+    rangeForWriterCircle(circleId),
+    rangeForCircle(circleId),
+  ]) {
+    for await (const { key } of _localDb.createReadStream(range)) {
+      await _localDb.del(key).catch(() => {})
+    }
   }
   _seederCircles.delete(circleId)
-  mark('seeder:left', { circleId })
+  mark('seeder:left', { circleId, mounted: !!entry, cleared, shared: plan.shared.length })
+}
+
+// Read every row under a seeder: prefix, mapped to the fields the leave plan needs.
+async function readSeederRows (prefix, pick) {
+  const out = []
+  for await (const { value } of _localDb.createReadStream({ gt: prefix, lt: prefix + '~' })) out.push(pick(value))
+  return out
 }
 
 // Seed-mode handler for a member's last-known core-key list. The blind seeder

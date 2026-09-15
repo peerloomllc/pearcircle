@@ -210,6 +210,7 @@ async function runSeederWriterRetentionSweep ({ localDb, writerCores, getRetenti
 
 module.exports = {
   blockTimeKey,
+  rangeForCircle,
   recordBlockReceived,
   removeBlockTracking,
   pickStaleBlocks,
