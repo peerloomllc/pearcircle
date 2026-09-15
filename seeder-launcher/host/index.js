@@ -5,6 +5,7 @@ const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { resolveDataDir, ensureDir } = require('./dataDir')
 const { loadOrCreateToken } = require('./auth')
+const { loadHostSettings, resolveBind } = require('./settings')
 const { Worklet } = require('./worklet')
 const { createServer } = require('./server')
 const { dashboardUrls } = require('./dashboardUrl')
@@ -21,8 +22,10 @@ function parseArgs (argv) {
   // set these without editing the CMD; explicit flags still win.
   const out = {
     dev: false,
-    port: process.env.SEEDER_PORT ? Number(process.env.SEEDER_PORT) : 8730,
-    host: process.env.SEEDER_HOST || '127.0.0.1',
+    // null = not set by flag or env, so <dataDir>/settings.json may supply it
+    // (see settings.js). Defaults are applied in resolveBind.
+    port: process.env.SEEDER_PORT ? Number(process.env.SEEDER_PORT) : null,
+    host: process.env.SEEDER_HOST || null,
     noAuth: process.env.SEEDER_NO_AUTH === '1' || process.env.SEEDER_NO_AUTH === 'true',
     noUpdateCheck: process.env.SEEDER_NO_UPDATE_CHECK === '1' || process.env.SEEDER_NO_UPDATE_CHECK === 'true',
   }
@@ -58,8 +61,9 @@ function printHelp () {
     '  --bundle <path>     Override the worklet entry file',
     '  --ui <dir>          Override the static UI directory',
     '  --data-dir <path>   Override the OS-default data directory',
-    '  --port <n>          Bind port (default 8730, env SEEDER_PORT)',
-    '  --host <addr>       Bind address (default 127.0.0.1, env SEEDER_HOST).',
+    '  --port <n>          Bind port (default 8730, env SEEDER_PORT, or "port" in settings.json)',
+    '  --host <addr>       Bind address (default 127.0.0.1, env SEEDER_HOST,',
+    '                      or "host" in <data dir>/settings.json).',
     '                      Use 0.0.0.0 to reach the dashboard from elsewhere on',
     '                      the LAN (headless box) or through a reverse proxy /',
     '                      container. The auth token is still required.',
@@ -140,6 +144,13 @@ async function main () {
   log('host', `launcher starting v${SEEDER_VERSION} (dev=${opts.dev}, dataDir=${dataDir})`)
   log('host', `bare=${paths.barePath} bundle=${paths.bundleEntry}`)
   if (freshToken) log('host', `generated fresh auth token at ${path.join(dataDir, 'auth.token')}`)
+
+  const { settings: fileSettings, errors: settingsErrors } = loadHostSettings(dataDir)
+  for (const msg of settingsErrors) log('host', `settings: ${msg} (ignored)`)
+  const bind = resolveBind({ host: opts.host, port: opts.port }, fileSettings)
+  opts.host = bind.host
+  opts.port = bind.port
+  log('host', `bind ${bind.host} (${bind.hostSource}) port ${bind.port} (${bind.portSource})`)
 
   const worklet = new Worklet({
     barePath: paths.barePath,
