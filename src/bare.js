@@ -48,7 +48,7 @@ const { seederSeenKey, shouldPersistSeederContact } = require('./lib/seederConta
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
-const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M } = require('./lib/geofence')
+const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
 const {
@@ -696,11 +696,11 @@ function pushRegionsToShell () {
     id: state.circleId + '|' + state.placeId,
     lat: state.lat,
     lon: state.lon,
-    // Floor the OS-region radius at the iOS reliability minimum. New Places
-    // can't be created below it, but a legacy Place stored before that gate
-    // still needs its OS geofence widened or iOS may never fire the wake.
+    // Floor the OS-region radius at the iOS reliability minimum. A Place can
+    // be smaller (MIN_PLACE_RADIUS_M), but its OS geofence still needs
+    // widening or iOS may never fire the wake.
     // The JS classifier keeps state.radiusMeters unchanged (see checkPlaceTransitions).
-    radius: Math.max(state.radiusMeters, MIN_PLACE_RADIUS_M),
+    radius: Math.max(state.radiusMeters, OS_REGION_MIN_RADIUS_M),
   }))
   _lastRegionRankPos = _lastDevicePos
   send({ event: 'regions:set', data: { regions } })
@@ -6921,8 +6921,8 @@ async function readCircleConfigForExport (circleId) {
 // exists on disk and in the owner's list, the invite is the whole point of the
 // operation, and throwing here used to strand the owner with a half-built
 // circle and no invite (the failure Tim hit: a legacy 100m Place, created when
-// the Add Place default was 100m, rejected by the 150m floor place:create has
-// enforced since #139). Copying config is not worth losing the circle over, so
+// the Add Place default was 100m, rejected by the 150m floor place:create
+// enforced from #139 until #199 lowered it to 50m). Copying config is not worth losing the circle over, so
 // each step reports rather than aborts.
 async function createCircleFromConfig ({ name, places, settings }) {
   const created = await handlers['circle:create']({ name })

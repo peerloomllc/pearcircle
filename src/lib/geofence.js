@@ -8,18 +8,22 @@
 
 const EARTH_RADIUS_M = 6371000
 
-// Minimum Place radius, in metres. iOS OS-level region monitoring geofences
-// off cell towers and wifi rather than the GPS chip, so a CLCircularRegion
-// much below ~100-150m is unreliable: didEnterRegion / didExitRegion often
-// never fire, especially on a device moving through by car. 150m is the
-// practical floor. This serves two roles:
-//   - the minimum we accept in place:create / place:update (and the UI),
-//     so no NEW Place is ever defined below the reliable floor.
-//   - the value we clamp the OS-region copy up to for LEGACY Places already
-//     stored below it (pushRegionsToShell). The JS classifier keeps each
-//     Place's precise radiusMeters -- it runs against real GPS fixes and can
-//     be tighter than the OS layer.
-const MIN_PLACE_RADIUS_M = 150
+// Smallest radius the OS-level region monitor gets, in metres. iOS region
+// monitoring geofences off cell towers and wifi rather than the GPS chip, so a
+// CLCircularRegion much below ~100-150m is unreliable: didEnterRegion /
+// didExitRegion often never fire, especially on a device moving through by
+// car. pushRegionsToShell widens every Place's OS-region copy to at least this.
+// It is also the Add Place default and the size below which the form warns.
+const OS_REGION_MIN_RADIUS_M = 150
+
+// Smallest Place radius we accept in place:create / place:update (and the UI),
+// in metres. Below OS_REGION_MIN_RADIUS_M the JS classifier still uses the
+// Place's exact radiusMeters against real GPS fixes, and its uncertainty
+// circle stops a poor fix from reading as a crossing. Only the background OS
+// region is widened, so on iOS a background arrival or departure for a small
+// Place fires at the 150m edge. 50m is about the smallest radius a phone
+// indoors (20-40m accuracy) can still confirm it is inside (#199).
+const MIN_PLACE_RADIUS_M = 50
 
 // Largest Place radius we accept, in metres. Mirrors the place:create /
 // place:update bound in bare.js and the export-envelope bound.
@@ -27,11 +31,9 @@ const MAX_PLACE_RADIUS_M = 10000
 
 // Bring a stored radius inside [MIN_PLACE_RADIUS_M, MAX_PLACE_RADIUS_M]. Used
 // when COPYING a Place into a new circle (recreate / import), where the source
-// value may predate the floor: the Add Place default was 100m until 2026-07-01
-// (#139), so most circles created before then hold sub-floor Places. Copying
-// one verbatim would be rejected by place:create and abort the migration, so
-// we clamp up to the floor - the same treatment the OS-region push already
-// gives legacy Places. A non-finite radius has nothing to clamp and returns
+// value may predate the floor: circles exported before it could hold Places
+// down to 10m. Copying one verbatim would be rejected by place:create, so we
+// clamp up to the floor. A non-finite radius has nothing to clamp and returns
 // null so the caller can skip that Place.
 function clampPlaceRadius (radiusMeters) {
   if (!Number.isFinite(radiusMeters)) return null
@@ -223,4 +225,4 @@ function regionAppendDecision ({ sharing, writable } = {}) {
   return 'append'
 }
 
-module.exports = { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, clampPlaceRadius, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M, MAX_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES }
+module.exports = { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, clampPlaceRadius, EARTH_RADIUS_M, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M, MAX_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES }

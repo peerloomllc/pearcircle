@@ -6,7 +6,7 @@ import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
 import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
-import { MIN_PLACE_RADIUS_M } from '../lib/geofence.js'
+import { MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import {
@@ -3365,6 +3365,19 @@ function currentPlaceFor (seen, places) {
   return best
 }
 
+// Shown under the radius field for a Place smaller than the background OS
+// geofence (#199). The Place is still saved at its exact size, but phones can
+// misread a small area and iOS wakes the app at the 150m edge.
+function SmallPlaceWarning ({ radius }) {
+  const r = parseFloat(radius)
+  if (!Number.isFinite(r) || r < MIN_PLACE_RADIUS_M || r >= OS_REGION_MIN_RADIUS_M) return null
+  return (
+    <p data-testid='small-place-warning' style={s.warn}>
+      Places under {OS_REGION_MIN_RADIUS_M}m can miss arrivals or report someone leaving when they have not, especially indoors. With the app in the background, iPhones notice arrivals and departures at {OS_REGION_MIN_RADIUS_M}m.
+    </p>
+  )
+}
+
 function EditPlaceForm ({ initial, onCancel, onSaved }) {
   const [name, setName] = useState(initial?.name ?? '')
   const [radius, setRadius] = useState(initial?.radiusMeters != null ? String(initial.radiusMeters) : '')
@@ -3399,7 +3412,8 @@ function EditPlaceForm ({ initial, onCancel, onSaved }) {
       <label style={s.label}>Name</label>
       <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
-      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='150' />
+      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder={String(OS_REGION_MIN_RADIUS_M)} />
+      <SmallPlaceWarning radius={radius} />
       <button style={s.primaryBtn} disabled={submitting} onClick={submit}>
         {submitting ? 'Saving...' : 'Save changes'}
       </button>
@@ -3429,7 +3443,7 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
     circles.length === 1 ? circles[0].circleId : null,
   )
   const [name, setName] = useState('')
-  const [radius, setRadius] = useState(String(MIN_PLACE_RADIUS_M))
+  const [radius, setRadius] = useState(String(OS_REGION_MIN_RADIUS_M))
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
 
@@ -3512,7 +3526,8 @@ function AddPlaceForm ({ circles, myLastSeen, initialCoords, onCancel, onAdded }
       </div>
       <input style={s.input} value={name} onChange={(e) => setName(e.target.value)} placeholder='Home' maxLength={64} autoFocus />
       <label style={s.label}>Radius (metres)</label>
-      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder='150' />
+      <input style={s.input} value={radius} onChange={(e) => setRadius(e.target.value)} inputMode='numeric' placeholder={String(OS_REGION_MIN_RADIUS_M)} />
+      <SmallPlaceWarning radius={radius} />
       <button style={s.primaryBtn} disabled={submitting || !coords || !targetCircleId} onClick={submit}>
         {submitting ? 'Saving...' : 'Save place'}
       </button>
@@ -8602,6 +8617,7 @@ const s = {
   inviteBox: { width: '100%', padding: spacing.md, background: colors.surface.card, color: colors.accent, border: `1px solid ${colors.border}`, borderRadius: radius.md, fontSize: typography.micro.fontSize, fontFamily: typography.monoFamily, resize: 'vertical', marginBottom: spacing.md, minHeight: 80, boxSizing: 'border-box' },
   muted: { color: colors.text.muted, fontSize: typography.body.fontSize },
   error: { color: colors.error, marginTop: spacing.sm, fontSize: typography.body.fontSize },
+  warn: { color: colors.warn, margin: `0 0 ${spacing.sm}px 0`, fontSize: typography.caption.fontSize, lineHeight: 1.4 },
   section: { background: colors.surface.card, padding: spacing.md, borderRadius: radius.lg, marginBottom: spacing.md },
   row: { display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: typography.body.fontSize },
   memberList: { listStyle: 'none', padding: 0, margin: 0 },

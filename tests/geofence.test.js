@@ -1,4 +1,4 @@
-const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, clampPlaceRadius, MIN_PLACE_RADIUS_M, MAX_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES } = require('../src/lib/geofence')
+const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, clampPlaceRadius, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M, MAX_PLACE_RADIUS_M, ACCURACY_CEILING_M, DWELL_FIXES } = require('../src/lib/geofence')
 
 // Thread prev-classification + dwell through a sequence of fixes, exactly as
 // checkPlaceTransitions does. Each entry is [distance, accuracy?]; returns the
@@ -333,20 +333,36 @@ describe('regionAppendDecision (no-resurrection guard for the native region path
   })
 })
 
-describe('MIN_PLACE_RADIUS_M (iOS region-monitoring reliability floor)', () => {
-  test('is at least 100m, the practical iOS floor', () => {
-    expect(MIN_PLACE_RADIUS_M).toBeGreaterThanOrEqual(100)
+describe('Place radius floors (#199)', () => {
+  test('the OS region floor stays at least 100m, the practical iOS floor', () => {
+    expect(OS_REGION_MIN_RADIUS_M).toBeGreaterThanOrEqual(100)
   })
 
-  test('flooring a small radius lifts it to the minimum, leaves a large one', () => {
-    expect(Math.max(50, MIN_PLACE_RADIUS_M)).toBe(MIN_PLACE_RADIUS_M)
-    expect(Math.max(400, MIN_PLACE_RADIUS_M)).toBe(400)
+  test('a Place may be smaller than its OS region', () => {
+    expect(MIN_PLACE_RADIUS_M).toBe(50)
+    expect(MIN_PLACE_RADIUS_M).toBeLessThan(OS_REGION_MIN_RADIUS_M)
+  })
+
+  test('flooring a small radius lifts the OS region copy, leaves a large one', () => {
+    expect(Math.max(MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M)).toBe(OS_REGION_MIN_RADIUS_M)
+    expect(Math.max(400, OS_REGION_MIN_RADIUS_M)).toBe(400)
+  })
+
+  test('the classifier uses the exact small radius, not the OS floor', () => {
+    // 80m from the centre of a 50m Place with a 10m fix is outside, even
+    // though it is inside the 150m OS region.
+    expect(classify(80, MIN_PLACE_RADIUS_M, null, 10, null).classification).toBe('outside')
+    expect(classify(30, MIN_PLACE_RADIUS_M, null, 10, null).classification).toBe('inside')
   })
 })
 
 describe('clampPlaceRadius (copying legacy Places into a new circle)', () => {
-  test('lifts a pre-#139 default 100m Place to the floor', () => {
-    expect(clampPlaceRadius(100)).toBe(MIN_PLACE_RADIUS_M)
+  test('lifts a sub-floor Place to the floor', () => {
+    expect(clampPlaceRadius(10)).toBe(MIN_PLACE_RADIUS_M)
+  })
+
+  test('keeps a pre-#139 default 100m Place at its size now the floor is 50m', () => {
+    expect(clampPlaceRadius(100)).toBe(100)
   })
 
   test('leaves an in-range radius untouched', () => {

@@ -97,7 +97,8 @@ describe('planPlaceCopy (copying Places into a freshly created circle)', () => {
     // Add Place default), which place:create now rejects. Recreating one used
     // to abort after the new circle had already been created, so the owner got
     // a duplicate circle, no invite and no migration nudge.
-    const { copy, skipped } = planPlaceCopy([{ name: 'Home', lat: 1, lon: 2, radiusMeters: 100 }])
+    // #199 lowered the floor to 50m, so a sub-floor 20m Place stands in here.
+    const { copy, skipped } = planPlaceCopy([{ name: 'Home', lat: 1, lon: 2, radiusMeters: 20 }])
     expect(skipped).toEqual([])
     expect(copy).toEqual([{ name: 'Home', lat: 1, lon: 2, radiusMeters: MIN_PLACE_RADIUS_M }])
   })
@@ -148,7 +149,7 @@ describe('planPlaceCopy (copying Places into a freshly created circle)', () => {
   })
 
   test('a legacy export file round-trips into a copyable plan', () => {
-    const legacy = buildExport({ name: 'Family', places: [{ name: 'Home', lat: 1, lon: 2, radiusMeters: 100 }] })
+    const legacy = buildExport({ name: 'Family', places: [{ name: 'Home', lat: 1, lon: 2, radiusMeters: 20 }] })
     const validated = validateImport(legacy)
     expect(validated.ok).toBe(true) // the envelope keeps the historical value
     expect(planPlaceCopy(validated.value.places).copy[0].radiusMeters).toBe(MIN_PLACE_RADIUS_M)
