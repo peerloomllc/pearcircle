@@ -56,13 +56,16 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /payload /app
 
-# Containerized defaults (overridable): bind all interfaces so Umbrel's
-# app_proxy on the Docker network can reach the UI, and skip the in-app bearer
-# token because the proxy already gates access behind the Umbrel login. The
-# seeder identity + per-circle enrollments + logs persist under /data.
+# Containerized defaults (overridable): bind all interfaces so a proxy on the
+# container network (Umbrel's app_proxy, StartOS's interface) can reach the UI.
+# The in-app bearer token stays ON here. It used to be switched off in this
+# image, which left anyone running it with --network host serving an
+# unauthenticated dashboard to their LAN. Packagers whose proxy already gates
+# access switch it off themselves: umbrel/docker-compose.yml and
+# start9/docker_entrypoint.sh both set SEEDER_NO_AUTH=1. The seeder identity +
+# per-circle enrollments + logs persist under /data.
 ENV SEEDER_HOST=0.0.0.0 \
-    SEEDER_PORT=8730 \
-    SEEDER_NO_AUTH=1
+    SEEDER_PORT=8730
 VOLUME /data
 EXPOSE 8730
 

@@ -71,8 +71,8 @@ container directly on the Umbrel host:
 ssh umbrel@umbrel.local \
   'docker run -d --name pcseeder -p 8730:8730 -v ~/pcseeder-data:/data \
      ghcr.io/peerloomllc/pearcircle-seeder:0.1.0'
-# dashboard at http://umbrel.local:8730 - no token, since the image defaults to
-# SEEDER_NO_AUTH=1. Stop the container when done; it is open to the whole LAN.
+# dashboard at http://umbrel.local:8730/?t=<token from ~/pcseeder-data/auth.token>
+# (images up to 1.1.1 skip the token and are open to the whole LAN; stop it when done)
 ```
 
 ## Install as an Umbrel app
@@ -108,4 +108,5 @@ container networking does not: under rootless Podman (slirp4netns or pasta)
 connections form but no hole-punched traffic flows, and the seeder churns forever
 without replicating. Outside Umbrel, run the image with host networking - see
 "Run the Docker image yourself" in [../README.md](../README.md), which also covers
-turning the dashboard token back on (this image defaults to `SEEDER_NO_AUTH=1`).
+the dashboard token (images up to 1.1.1 default to `SEEDER_NO_AUTH=1`; the app's
+`docker-compose.yml` sets it explicitly, because `app_proxy` already gates access).

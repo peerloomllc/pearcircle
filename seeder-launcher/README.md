@@ -63,10 +63,11 @@ docker run -d --name pearcircle-seeder --restart unless-stopped --network host -
   dashboard still works through the port map and hides the problem. Umbrel's
   rootful Docker bridge does carry it, which is why the Umbrel app does not use
   host networking. Anywhere else, use `--network host` rather than `-p`.
-- **The token.** The image is built for Umbrel, where the Umbrel login guards the
-  dashboard, so it defaults to `SEEDER_NO_AUTH=1` and binds `0.0.0.0`. With host
-  networking that puts an unauthenticated dashboard on your LAN. `-e
-  SEEDER_NO_AUTH=0` requires the token again; it is in `auth.token` in the data
+- **The token.** Images up to 1.1.1 turn the dashboard token off by default
+  (built for Umbrel, where the Umbrel login guards the dashboard) and bind
+  `0.0.0.0`, so with host networking they put an unauthenticated dashboard on your
+  LAN. Later images require the token by default; `-e SEEDER_NO_AUTH=0` makes
+  either one require it. The token is in `auth.token` in the data
   folder (`sudo cat ~/pearcircle-seeder-data/auth.token`, or `podman unshare cat`
   for rootless Podman), and you open the dashboard at `http://<host>:8730/?t=<token>`.
 - **Local only.** Add `-e SEEDER_HOST=127.0.0.1` to keep the dashboard off the
