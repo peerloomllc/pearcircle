@@ -70,7 +70,7 @@ const { shouldEmit, coverageSummary } = require('./lib/lastKnownDiag')
 const { shouldHealSelfTip } = require('./lib/lastKnownHeal')
 const { blindnessVerdict } = require('./lib/blindnessCheck')
 const { applyEncryptionReloadFix } = require('./lib/hypercoreEncryptionPatch')
-const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair } = require('./lib/repairRetry')
+const { repairEscalated: repairValueEscalated, recordRepairFailure, shouldRetryStagedRepair, shouldArmStagedRepairTimer, STAGED_REPAIR_RETRY_MS } = require('./lib/repairRetry')
 const { shouldSwallowFault, parseConflictLog } = require('./lib/conflictSeatbelt')
 const { writerRewindStatus } = require('./lib/rewindGuard')
 const { handleNetworkChange } = require('./lib/networkChange')
@@ -814,6 +814,11 @@ const handlers = {
     // here instead (proposal 2026-07-16). Fire-and-forget: the mount race can
     // run REPAIR_MOUNT_TIMEOUT_MS and must not block this handler's response.
     if (_appForeground && _repairStaged.size) retryStagedRepairs().catch(() => {})
+    // ...and keep retrying on a timer while the app stays open, since a user
+    // watching the banner never produces another foreground. Backgrounding
+    // cancels it; the next foreground retries directly.
+    if (_appForeground) scheduleStagedRepairRetry()
+    else cancelStagedRepairRetry()
     // Same shape for the migration nudge an owner still owes a wedged old
     // circle (proposal 2026-07-24): foreground is when a stuck base has most
     // plausibly become writable again, and the owner may never open Settings to
@@ -3480,6 +3485,7 @@ async function runRepairMount (circleId, { bootstrap, encryptionKey, newGen } = 
     mark('circle:repair:escalated', { circleId: circleId.slice(0, 8), newGen, attempts: next.attempts })
   }
   await _localDb.put('circleRepairing:' + circleId, next).catch(() => {})
+  scheduleStagedRepairRetry()
   send({ event: 'circle:repaired', data: { circleId, restartRequired: true, escalated: next.escalated } })
   return { ok: true, staged: true, restartRequired: true, escalated: next.escalated }
 }
@@ -3520,6 +3526,27 @@ async function retryStagedRepairs () {
       mark('circle:repair:retry-failed', { circleId: circleId.slice(0, 8), err: e?.message })
     }
   }
+}
+
+// Foreground retry timer for staged rebuilds. One timer for all circles; it
+// re-arms after each round while the app is open and a non-escalated circle is
+// still staged. Each failed round counts toward REPAIR_MAX_ATTEMPTS inside
+// attemptRepairMount, so this cannot spin forever.
+let _stagedRepairTimer = null
+
+function scheduleStagedRepairRetry () {
+  if (_stagedRepairTimer) return
+  if (!shouldArmStagedRepairTimer({ foreground: _appForeground, staged: _repairStaged, escalated: _repairEscalated })) return
+  _stagedRepairTimer = setTimeout(() => {
+    _stagedRepairTimer = null
+    if (!_appForeground) return
+    mark('circle:repair:timer-retry', { staged: _repairStaged.size })
+    retryStagedRepairs().catch(() => {}).finally(() => scheduleStagedRepairRetry())
+  }, STAGED_REPAIR_RETRY_MS)
+}
+
+function cancelStagedRepairRetry () {
+  if (_stagedRepairTimer) { clearTimeout(_stagedRepairTimer); _stagedRepairTimer = null }
 }
 
 // Drop-in for `await base.append(op)` on the automatic/background write paths.

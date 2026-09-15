@@ -4,6 +4,8 @@ const {
   repairEscalated,
   recordRepairFailure,
   shouldRetryStagedRepair,
+  shouldArmStagedRepairTimer,
+  STAGED_REPAIR_RETRY_MS,
 } = require('../src/lib/repairRetry')
 
 describe('repairAttempts', () => {
@@ -102,5 +104,38 @@ describe('shouldRetryStagedRepair', () => {
   test('fails closed on missing input', () => {
     expect(shouldRetryStagedRepair()).toBe(false)
     expect(shouldRetryStagedRepair({})).toBe(false)
+  })
+})
+
+describe('shouldArmStagedRepairTimer', () => {
+  test('arms while the app is open and a circle is staged', () => {
+    expect(shouldArmStagedRepairTimer({ foreground: true, staged: new Set(['a']), escalated: new Set() })).toBe(true)
+  })
+
+  test('does not arm in the background', () => {
+    expect(shouldArmStagedRepairTimer({ foreground: false, staged: new Set(['a']), escalated: new Set() })).toBe(false)
+  })
+
+  test('does not arm with nothing staged', () => {
+    expect(shouldArmStagedRepairTimer({ foreground: true, staged: new Set(), escalated: new Set() })).toBe(false)
+  })
+
+  test('does not spin on circles that have all escalated', () => {
+    expect(shouldArmStagedRepairTimer({ foreground: true, staged: new Set(['a', 'b']), escalated: new Set(['a', 'b']) })).toBe(false)
+  })
+
+  test('arms if any staged circle is still retryable', () => {
+    expect(shouldArmStagedRepairTimer({ foreground: true, staged: new Set(['a', 'b']), escalated: new Set(['a']) })).toBe(true)
+  })
+
+  test('fails closed on missing input', () => {
+    expect(shouldArmStagedRepairTimer()).toBe(false)
+    expect(shouldArmStagedRepairTimer({ foreground: true })).toBe(false)
+  })
+
+  test('retries every 15 seconds', () => {
+    // The wait is measured from the end of the previous round, so it can be
+    // shorter than the 18s mount race without rounds overlapping.
+    expect(STAGED_REPAIR_RETRY_MS).toBe(15000)
   })
 })

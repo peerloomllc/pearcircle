@@ -129,7 +129,7 @@ export function RepairingBanner ({ count, circleName, needsRestart = false, esca
     ? `Finishing repair of ${target}`
     : (count > 1 ? `Repairing ${count} circles…` : `Repairing ${circleName || 'circle'}…`)
   const sub = needsRestart
-    ? 'Reopen the app to finish repairing.'
+    ? 'Still working on it. It retries automatically while the app is open.'
     : 'This can take a while. Your circle will catch up in the background.'
   return (
     <div style={bannerStyle}>
