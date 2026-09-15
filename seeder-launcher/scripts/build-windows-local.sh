@@ -16,8 +16,8 @@
 # Requires locally: bash, node + npm, makensis (NSIS 3.x), curl, tar, unzip/bsdtar.
 # Requires in the repo node_modules: bare-pack, and bare-runtime-win32-x64 (an
 #   optional npm dep gated to os=win32, so a plain `npm install` on Linux SKIPS
-#   it). Force it in once with:
-#     npm install bare-runtime-win32-x64@<ver> --os=win32 --cpu=x64 --force --no-save
+#   it). The preflight below prints the exact install command, pinned to the
+#   version in package-lock.json.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -44,10 +44,20 @@ step "Preflight"
 [ -x "$LAUNCHER/node_modules/.bin/esbuild" ] || fail "seeder-launcher node_modules missing esbuild - run \`npm install\` in $LAUNCHER"
 command -v makensis >/dev/null || fail "makensis not found - install NSIS (Fedora: dnf install mingw32-nsis)"
 BARE_EXE="$REPO/node_modules/bare-runtime-win32-x64/bin/bare.exe"
-[ -f "$BARE_EXE" ] || fail "bare.exe missing - run: npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 --force --no-save (in $REPO)"
+# The Windows runtime must be the version package-lock.json pins. A forced
+# `npm install bare-runtime-win32-x64` without a version pulls the newest one,
+# and a newer runtime cannot load a worklet packed against the locked bare-module:
+# the installer builds fine and then crash-loops at boot with
+# "CANNOT_READ ... worklet/src/bare.js" (hit 2026-09-15 with 1.33.1 vs 1.28.5).
+BARE_WANT="$(cd "$REPO" && node -p "require('./package-lock.json').packages['node_modules/bare-runtime-win32-x64']?.version || ''" 2>/dev/null)"
+[ -n "$BARE_WANT" ] || fail "package-lock.json has no bare-runtime-win32-x64 entry - cannot tell which runtime to bundle"
+BARE_HAVE="$(cd "$REPO" && node -p "require('./node_modules/bare-runtime-win32-x64/package.json').version" 2>/dev/null || true)"
+BARE_INSTALL="npm install bare-runtime-win32-x64@$BARE_WANT --os=win32 --cpu=x64 --force --no-save"
+[ -f "$BARE_EXE" ] || fail "bare.exe missing - run in $REPO: $BARE_INSTALL"
+[ "$BARE_HAVE" = "$BARE_WANT" ] || fail "bare-runtime-win32-x64 is $BARE_HAVE but package-lock.json pins $BARE_WANT - run in $REPO: $BARE_INSTALL"
 echo "    version   : $VERSION"
 echo "    makensis  : $(command -v makensis) ($(makensis -VERSION 2>/dev/null))"
-echo "    bare.exe  : $BARE_EXE"
+echo "    bare.exe  : $BARE_EXE ($BARE_HAVE)"
 
 # --- 1. UI bundle ------------------------------------------------------------
 step "Build UI bundle"
