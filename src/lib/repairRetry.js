@@ -54,8 +54,28 @@ function shouldRetryStagedRepair ({ staged, escalated, inFlight } = {}) {
   return staged === true && escalated !== true && inFlight !== true
 }
 
+// How long to wait, while the app stays in the foreground, before re-driving a
+// staged mount. Foreground transitions alone never fire for a user who opens the
+// app and watches the banner, which left "Reopen the app" on screen with nothing
+// retrying (observed 2026-07-24). The timer shares the REPAIR_MAX_ATTEMPTS tally,
+// so a circle that won't converge still escalates after a few minutes.
+const STAGED_REPAIR_RETRY_MS = 45000
+
+// Whether to arm the foreground retry timer: the app is on screen and at least
+// one staged circle has not escalated. Escalated circles are left alone, so the
+// timer never spins on a mount that has been given up on.
+function shouldArmStagedRepairTimer ({ foreground, staged, escalated } = {}) {
+  if (foreground !== true || !staged) return false
+  for (const circleId of staged) {
+    if (!escalated || !escalated.has(circleId)) return true
+  }
+  return false
+}
+
 module.exports = {
   REPAIR_MAX_ATTEMPTS,
+  STAGED_REPAIR_RETRY_MS,
+  shouldArmStagedRepairTimer,
   repairAttempts,
   repairEscalated,
   recordRepairFailure,
