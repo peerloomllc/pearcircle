@@ -133,8 +133,9 @@ describe('shouldArmStagedRepairTimer', () => {
     expect(shouldArmStagedRepairTimer({ foreground: true })).toBe(false)
   })
 
-  test('waits long enough for the previous mount race to finish', () => {
-    // attemptRepairMount can sit in the race for REPAIR_MOUNT_TIMEOUT_MS (18s).
-    expect(STAGED_REPAIR_RETRY_MS).toBeGreaterThan(18000)
+  test('retries every 15 seconds', () => {
+    // The wait is measured from the end of the previous round, so it can be
+    // shorter than the 18s mount race without rounds overlapping.
+    expect(STAGED_REPAIR_RETRY_MS).toBe(15000)
   })
 })
