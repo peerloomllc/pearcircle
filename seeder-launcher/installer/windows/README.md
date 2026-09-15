@@ -13,6 +13,39 @@ The installer places the files under `C:\Program Files\PearCircle Seeder`, regis
 
 Open **PearCircle Seeder** from the Start Menu. It opens the monitoring UI (`http://127.0.0.1:8730`) in your browser with the API token filled in - use it to enroll circles and watch replication.
 
+## Reach the dashboard from another machine on your LAN
+
+Needs a seeder newer than 1.1.1.
+
+By default the dashboard only answers on this PC itself. To open it from another computer on your network, run these in an **administrator** PowerShell. First create a settings file in the seeder's data folder:
+
+```powershell
+Set-Content -Encoding ascii -Path "$env:ProgramData\PearCircle Seeder\settings.json" -Value '{ "host": "0.0.0.0" }'
+```
+
+Windows Firewall blocks incoming connections to a service without asking, so allow the dashboard port on private networks:
+
+```powershell
+New-NetFirewallRule -DisplayName "PearCircle Seeder dashboard" -Direction Inbound -Protocol TCP -LocalPort 8730 -Action Allow -Profile Private
+```
+
+Then restart the service:
+
+```powershell
+Restart-Service PearCircleSeeder
+```
+
+The startup log then lists the PC's LAN addresses with the token included, so `Select-String -Path "$env:ProgramData\PearCircle Seeder\seeder.log" -Pattern 'UI at'` gives you a URL to paste into a browser on the other machine. The Start Menu shortcut keeps working on this PC.
+
+Use `settings.json` rather than adding an environment variable to the service. Every update, including **Update now**, removes and re-registers the service, which would silently undo a change made there. The data folder is left alone by updates.
+
+Things to keep in mind:
+
+- **The token is the only gate.** Anything that can reach port 8730 can reach the dashboard with that token. On a home LAN that is normally fine. Use one address (`{ "host": "192.168.1.50" }`) to narrow it.
+- **Do not expose the port to the internet** directly. Put it behind a reverse proxy or a tunnel (Tailscale, Cloudflare Tunnel, WireGuard) that does its own authentication. Seeding itself does not need any inbound port forwarded - the P2P side holepunches.
+- The firewall rule uses the Private profile. If Windows lists your network as Public, change it to Private in Settings > Network & internet rather than opening the port on public networks.
+- To go back to this-PC-only, delete `settings.json`, restart the service and remove the rule with `Remove-NetFirewallRule -DisplayName "PearCircle Seeder dashboard"`.
+
 ## Update
 
 The seeder checks GitHub Releases hourly and surfaces a newer version in the monitoring dashboard (and in the mobile app's seeder list). Click **Update now** to apply it one-click: the LocalSystem service (already privileged) downloads the new `Setup.exe`, verifies its SHA-256 against the release's `.sha256` sidecar, and runs it silently (`/S`). The installer stops the old service, overwrites the files - silent mode shows no UI and never launches the browser - re-registers the service, and starts it again. It is launched detached (via WMI) so the service stop the installer itself triggers can't reap it mid-swap. The integrity boundary is HTTPS to GitHub plus the release `.sha256` (Windows artifacts are unsigned).

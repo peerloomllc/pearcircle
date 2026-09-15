@@ -20,6 +20,33 @@ grep 'UI at' "$HOME/Library/Application Support/PearCircle Seeder/seeder.log"
 
 Open that URL in a browser to enroll circles and watch replication.
 
+## Reach the dashboard from another machine on your LAN
+
+Needs a seeder newer than 1.1.1.
+
+By default the dashboard only answers on this Mac itself. To open it from another computer on your network, create a settings file in the seeder's data folder:
+
+```bash
+printf '{ "host": "0.0.0.0" }\n' > "$HOME/Library/Application Support/PearCircle Seeder/settings.json"
+```
+
+Then restart the seeder:
+
+```bash
+sudo launchctl kickstart -k system/com.pearcircle.seeder
+```
+
+The startup log then lists the Mac's LAN addresses with the token included, so `grep 'UI at' "$HOME/Library/Application Support/PearCircle Seeder/seeder.log"` gives you a URL to paste into a browser on the other machine.
+
+Use `settings.json` rather than editing the LaunchDaemon plist. Every update, including **Update now**, rewrites the plist from the installer's template, which would silently undo a change made there. The data folder is left alone by updates.
+
+Things to keep in mind:
+
+- **The token is the only gate.** Anything that can reach port 8730 can reach the dashboard with that token. On a home LAN that is normally fine. Use one address (`{ "host": "192.168.1.50" }`) to narrow it.
+- **Do not expose the port to the internet** directly. Put it behind a reverse proxy or a tunnel (Tailscale, Cloudflare Tunnel, WireGuard) that does its own authentication. Seeding itself does not need any inbound port forwarded - the P2P side holepunches.
+- If you turned on the macOS firewall, allow incoming connections for `pearcircle-seeder` in System Settings > Network > Firewall > Options.
+- To go back to this-Mac-only, delete `settings.json` and restart the seeder.
+
 ## Update
 
 Download the newer `.pkg` and double-click it. The installer reloads the background service automatically. The seeder identity and circle enrollments under `~/Library/Application Support/PearCircle Seeder` are preserved.

@@ -93,6 +93,11 @@ The startup log then lists the box's LAN addresses, token included, so
 can paste into a browser on another machine. Running in the foreground,
 `pearcircle-seeder --host 0.0.0.0` does the same thing.
 
+A seeder newer than 1.1.1 also reads the bind address from
+`~/.local/share/pearcircle-seeder/settings.json`, for example
+`{ "host": "0.0.0.0" }`, if you would rather not use a systemd drop-in. An
+environment variable or `--host` flag wins over the file.
+
 Two things to keep in mind:
 
 - **The token is the only gate.** Anything that can reach port 8730 can reach
