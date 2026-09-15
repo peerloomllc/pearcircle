@@ -69,7 +69,8 @@ PearCircle works without it.
 
 Note it needs host networking. Under a NAT'd container bridge the swarm cannot
 hole-punch, so run it with `--network=host` if you are running the image outside
-Umbrel.
+Umbrel, and turn the dashboard token back on with `-e SEEDER_NO_AUTH=0`. See
+[Run the Docker image yourself](seeder-launcher/README.md#run-the-docker-image-yourself).
 
 ### Pairing
 You pair into a circle via a one-time invite link or QR code. The link encodes the cryptographic address of the circle - there's no server involved. After joining, every device in the circle remembers every other one and can sync directly.
