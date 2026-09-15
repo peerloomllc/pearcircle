@@ -15,8 +15,8 @@ const EXPORT_TYPE = 'pearcircle.circle-export'
 const EXPORT_V = 1
 
 // Bounds on what an envelope may CARRY. Deliberately looser than the live
-// place:create floor (MIN_PLACE_RADIUS_M = 150 since #139): files exported from
-// circles built before that floor legitimately hold Places down to 10m, and
+// place:create floor (MIN_PLACE_RADIUS_M, 50m since #199): files exported from
+// circles built before any floor legitimately hold Places down to 10m, and
 // rejecting them would make old exports unimportable. The create path
 // (createCircleFromConfig in bare.js) clamps each radius up to the floor before
 // it calls place:create, so a sub-floor value here can never produce a row the
