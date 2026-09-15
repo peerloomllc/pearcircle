@@ -80,11 +80,17 @@ Prereqs:
 
 One-time: the `bare-runtime-win32-x64` package is an optional npm dep gated to
 `os=win32`, so a normal `npm install` on a non-Windows host *skips* it. Force it
-into the repo `node_modules` once:
+into the repo `node_modules` at the version `package-lock.json` pins:
 
 ```bash
-npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 --force --no-save
+npm install "bare-runtime-win32-x64@$(node -p "require('./package-lock.json').packages['node_modules/bare-runtime-win32-x64'].version")" --os=win32 --cpu=x64 --force --no-save
 ```
+
+Leave off the version and npm installs the newest runtime, which cannot load the
+worklet: the installer builds, then the service crash-loops at boot with
+`CANNOT_READ ... worklet/src/bare.js`. `build-windows-local.sh` refuses to build
+against a mismatched runtime and prints the right command. Any later `npm install
+--no-save` (for example of the Linux runtime) removes it again.
 
 Then build:
 
