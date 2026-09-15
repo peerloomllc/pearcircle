@@ -10,15 +10,8 @@ id: pearcircle-seeder
 title: "PearCircle Seeder"
 # emver: up to four dot-separated numbers; the fourth (if present) is the
 # StartOS packaging revision. Kept in lockstep with the seeder image tag.
-version: 1.1.0
-release-notes: |
-  New Features
-
-    - **Low battery alerts.** Get a heads-up when someone in your circles is running low, while there is still time to reach them. A phone that dies stops sharing its location, so this is usually the last warning before their dot goes stale. Turn it on in Settings under "Low battery alerts" and slide to pick how low they have to get, anywhere from 5% to 50%. It tells you about your circle members' phones, not your own, and you get one alert per person each time their battery runs down, which resets once they charge back up.
-
-  Improvements
-    
-    - **Start9 owners can add the PearCircle seeder from the built-in store.** Newer Start9 systems can now find and install the seeder the normal way, instead of needing a file downloaded and dragged in by hand.
+version: 1.1.2
+release-notes: "New Features\n  \n    - **Smaller Places.** Places can now be as small as 50 meters, down from 150. Handy when two Places sit close together, like neighbors or a school next to a park. When you pick a size under 150 meters, the app shows a short warning: a small Place can miss arrivals or report someone leaving when they have not, especially indoors, and iPhones running in the background still notice arrivals and departures at 150 meters.\n    - **See what your seeder is holding.** The seeder dashboard now shows, for each circle, whose latest location it is keeping for them while their phone is offline. A line turns amber when someone is missing, and a details list shows when each person's location was last stored.\n\nImprovements\n\n    - **Repairs finish on their own.** If a circle repair has to wait, the app now keeps retrying every few seconds while it is open, instead of asking you to close and reopen it.\n    - **Open the seeder dashboard from another computer.** Mac and Windows seeders can now be reached from other devices on your home network, with step-by-step instructions in the install guides. The setting stays in place when the seeder updates.\n    - **Start9 updates show up.** Seeders installed from the Start9 store on newer Start9 systems now see new versions as they are released.\n\nBug Fixes\n\n    - **Mac seeder keeps running after you log out.** It used to stop when you logged out of your Mac, which defeated the point of a seeder. It now keeps going with nobody logged in.\n    - **Mac seeder starts after a reinstall.** Fixed a case where reinstalling left the seeder quietly switched off.\n    - **Seeder survives a Start9 system upgrade.** Upgrading a Start9 box could leave the seeder stuck restarting over and over. It now recovers on its own.\n    - **Working dashboard link for network installs.** A seeder set up to be reachable from other computers now shows a link you can actually open, with its access code included.\n"
 license: MIT
 wrapper-repo: "https://github.com/peerloomllc/pearcircle"
 upstream-repo: "https://github.com/peerloomllc/pearcircle"
