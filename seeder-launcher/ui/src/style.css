@@ -221,6 +221,16 @@ a { color: var(--primary-strong); }
 .circle-name .id { color: var(--subtle); font-size: 11.5px; font-weight: 400; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .circle-state { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
 .circle-state.rev { color: var(--warn); }
+.coverage { margin-top: 4px; font-size: 12px; color: var(--muted); }
+.coverage.muted { color: var(--subtle); }
+.coverage-line { all: unset; cursor: pointer; display: inline; line-height: 1.5; }
+.coverage-line.warn { color: var(--warn); }
+.coverage-line:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.coverage-toggle { margin-left: 8px; color: var(--accent); }
+.coverage-list { list-style: none; margin: 6px 0 2px; padding: 0; display: grid; gap: 3px; }
+.coverage-list li { display: flex; gap: 8px; flex-wrap: wrap; }
+.coverage-list li.warn { color: var(--warn); }
+.coverage-list .id { color: var(--subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .badge { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 7px; border-radius: 999px; }
 .badge.revoked { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .circle-controls { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }

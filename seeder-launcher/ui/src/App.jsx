@@ -373,6 +373,7 @@ function CircleRow ({ circle, wsConnected, onChanged, setError }) {
         <div class={'circle-state' + (revoked ? ' rev' : '')}>
           {revoked ? 'A member removed this seeder — leave to clear it' : (wsConnected ? 'Seeding' : 'Waiting for connection')}
         </div>
+        {!revoked && circle.coverage && <Coverage coverage={circle.coverage} />}
       </div>
       <div class="circle-controls">
         {!revoked && (
@@ -389,6 +390,52 @@ function CircleRow ({ circle, wsConnected, onChanged, setError }) {
         )}
         <button class="ghost small danger" onClick={leave}>Leave</button>
       </div>
+    </div>
+  )
+}
+
+/* ---- coverage: what this seeder actually holds for a circle ---------------- */
+// The seeder cannot read positions, so "held" means it has the member's newest
+// encrypted position block and can hand it to a phone while that member is
+// offline. Members are shown by key prefix; a blind seeder never learns names.
+function agoText (ms) {
+  if (ms == null) return null
+  const m = Math.floor(ms / 60000)
+  if (m < 1) return 'just now'
+  if (m < 60) return `${m} min ago`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h} h ago`
+  return `${Math.floor(h / 24)} days ago`
+}
+
+function Coverage ({ coverage }) {
+  const [open, setOpen] = useState(false)
+  const { membersAnnounced, tipsHeld, newestTipAgoMs, writersTotal, writersComplete, members = [] } = coverage
+  if (!membersAnnounced && !writersTotal) {
+    return <div class="coverage muted">No members have shared their data keys with this seeder yet</div>
+  }
+  const missing = membersAnnounced - tipsHeld
+  const newest = agoText(newestTipAgoMs)
+  return (
+    <div class="coverage">
+      <button class={'coverage-line' + (missing > 0 ? ' warn' : '')} onClick={() => setOpen(!open)} aria-expanded={open}>
+        Positions held for {tipsHeld} of {membersAnnounced} {membersAnnounced === 1 ? 'member' : 'members'}
+        {newest ? ` · latest stored ${newest}` : ''}
+        {writersTotal > 0 ? ` · full history for ${writersComplete} of ${writersTotal}` : ''}
+        <span class="coverage-toggle">{open ? 'Hide' : 'Details'}</span>
+      </button>
+      {open && (
+        <ul class="coverage-list">
+          {members.map((m) => (
+            <li key={m.pubkey} class={m.tipHeld ? '' : 'warn'}>
+              <span class="id">{m.pubkey.slice(0, 8)}</span>
+              {m.tipHeld
+                ? (m.tipAgoMs == null ? 'position held (stored before the last restart)' : `position held · stored ${agoText(m.tipAgoMs)}`)
+                : 'no position held yet'}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }

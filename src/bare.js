@@ -47,6 +47,7 @@ const { classifySeederConnection } = require('./lib/seederPeerFilter')
 const { seederSeenKey, shouldPersistSeederContact } = require('./lib/seederContact')
 const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, rangeForCircle, rangeForWriterCircle, recordWriterBlockReceived, removeWriterBlockTracking, runSeederWriterRetentionSweep } = require('./lib/seederRetention')
 const { planSeederLeavePurge } = require('./lib/seederLeavePurge')
+const { summarizeSeederCoverage } = require('./lib/seederCoverage')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
@@ -5243,6 +5244,7 @@ async function leaveSeederCircle (circleId) {
       await _localDb.del(key).catch(() => {})
     }
   }
+  for (const k of [..._seederTipAt.keys()]) if (k.startsWith(circleId + ':')) _seederTipAt.delete(k)
   _seederCircles.delete(circleId)
   mark('seeder:left', { circleId, mounted: !!entry, cleared, shared: plan.shared.length })
 }
@@ -5292,6 +5294,28 @@ async function openSeederLastknownCore (entry, circleId, pubkey, coreKey) {
 // Download a seeder-held last-known core's tip block, then clear earlier blocks
 // so storage stays bounded to the latest fix (we never decrypt — the seeder
 // only stores + serves ciphertext). Best-effort throughout.
+// `${circleId}:${pubkey}` -> when this seeder last stored that member's newest
+// last-known block. In memory only: after a restart the dashboard still shows
+// whether the block is held, just not when it arrived.
+const _seederTipAt = new Map()
+
+// Coverage for one mounted circle, for the dashboard (seeder:enrolled:list).
+async function seederCoverage (circleId) {
+  const entry = _seederCircles.get(circleId)
+  if (!entry) return null
+  const members = []
+  for (const [pubkey, core] of entry.lastknownCores ?? []) {
+    const length = core.length
+    let tipHeld = false
+    try { tipHeld = length > 0 && await core.has(length - 1) } catch {}
+    members.push({ pubkey, length, tipHeld, tipAt: _seederTipAt.get(circleId + ':' + pubkey) ?? null })
+  }
+  const writers = []
+  if (entry.core) writers.push({ length: entry.core.length, contiguousLength: entry.core.contiguousLength })
+  for (const core of entry.writerCores?.values() ?? []) writers.push({ length: core.length, contiguousLength: core.contiguousLength })
+  return summarizeSeederCoverage({ members, writers })
+}
+
 async function refreshSeederLastknownTip (core, circleId, pubkey) {
   await core.ready()
   try { await core.update({ wait: false }) } catch {}
@@ -5300,6 +5324,7 @@ async function refreshSeederLastknownTip (core, circleId, pubkey) {
   try {
     tipBlock = await core.get(core.length - 1, { wait: true, timeout: PEER_TIP_FETCH_TIMEOUT_MS })
   } catch { return } // tip not served yet; the 'append'/next push retries
+  if (tipBlock) _seederTipAt.set(circleId + ':' + pubkey, Date.now())
   // One-shot observability: the seeder replicated a member's (encrypted) tip,
   // so it can now serve offline last-known (proposal 2026-06-04 slice 2b).
   const coreKeyHex = b4a.toString(core.key, 'hex')
@@ -7232,6 +7257,7 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
       // Operator nickname (proposal 2026-07-15-seeder-nickname). get returns the
       // current value; set persists it, updates the in-memory copy, and
       // re-announces to every live member so a rename propagates immediately.
+      getCoverage: seederCoverage,
       getNickname: () => _seederNickname,
       setNickname: async (nickname) => {
         _seederNickname = typeof nickname === 'string' && nickname.length > 0 ? nickname : null
