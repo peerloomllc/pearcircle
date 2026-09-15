@@ -71,7 +71,8 @@ container directly on the Umbrel host:
 ssh umbrel@umbrel.local \
   'docker run -d --name pcseeder -p 8730:8730 -v ~/pcseeder-data:/data \
      ghcr.io/peerloomllc/pearcircle-seeder:0.1.0'
-# dashboard at http://umbrel.local:8730
+# dashboard at http://umbrel.local:8730/?t=<token from ~/pcseeder-data/auth.token>
+# (images up to 1.1.1 skip the token and are open to the whole LAN; stop it when done)
 ```
 
 ## Install as an Umbrel app
@@ -101,7 +102,11 @@ via `gh`. `release.sh` exposes this as `UMBREL_OFFICIAL_DIR` / `UMBREL_OFFICIAL_
 
 ## Networking note
 
-Hyperswarm/HyperDHT uses UDP with NAT hole-punching, which normally traverses
-Docker's bridge NAT fine. If replication never connects from inside the
-container, the fallback is host networking - but that bypasses `app_proxy`, so
-prefer confirming bridge works first.
+Hyperswarm/HyperDHT uses UDP with NAT hole-punching. Umbrel's rootful Docker
+bridge carries it, so the app runs on the bridge behind `app_proxy`. User-mode
+container networking does not: under rootless Podman (slirp4netns or pasta)
+connections form but no hole-punched traffic flows, and the seeder churns forever
+without replicating. Outside Umbrel, run the image with host networking - see
+"Run the Docker image yourself" in [../README.md](../README.md), which also covers
+the dashboard token (images up to 1.1.1 default to `SEEDER_NO_AUTH=1`; the app's
+`docker-compose.yml` sets it explicitly, because `app_proxy` already gates access).

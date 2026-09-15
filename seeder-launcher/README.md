@@ -44,6 +44,36 @@ Installer guides live alongside each platform's packaging files under `installer
 - macOS: [installer/macos/README.md](installer/macos/README.md)
 - Windows: [installer/windows/README.md](installer/windows/README.md)
 - Linux: [installer/linux/README.md](installer/linux/README.md)
+- Umbrel: [umbrel/README.md](umbrel/README.md)
+- Start9: [start9/README.md](start9/README.md)
+
+### Run the Docker image yourself
+
+The image is `ghcr.io/peerloomllc/pearcircle-seeder`, tagged by release (for
+example `1.1.0`). Outside Umbrel, run it with **host networking** and **turn the
+dashboard token back on**:
+
+```bash
+docker run -d --name pearcircle-seeder --restart unless-stopped --network host -e SEEDER_NO_AUTH=0 -v ~/pearcircle-seeder-data:/data ghcr.io/peerloomllc/pearcircle-seeder:1.1.0
+```
+
+- **Host networking.** Under rootless Podman (slirp4netns or pasta) the
+  container's connections form but hole-punched traffic never flows, so the
+  seeder drops and re-dials every connection and never replicates, while the
+  dashboard still works through the port map and hides the problem. Umbrel's
+  rootful Docker bridge does carry it, which is why the Umbrel app does not use
+  host networking. Anywhere else, use `--network host` rather than `-p`.
+- **The token.** Images up to 1.1.1 turn the dashboard token off by default
+  (built for Umbrel, where the Umbrel login guards the dashboard) and bind
+  `0.0.0.0`, so with host networking they put an unauthenticated dashboard on your
+  LAN. Later images require the token by default; `-e SEEDER_NO_AUTH=0` makes
+  either one require it. The token is in `auth.token` in the data
+  folder (`sudo cat ~/pearcircle-seeder-data/auth.token`, or `podman unshare cat`
+  for rootless Podman), and you open the dashboard at `http://<host>:8730/?t=<token>`.
+- **Local only.** Add `-e SEEDER_HOST=127.0.0.1` to keep the dashboard off the
+  LAN entirely.
+- **SELinux** (Fedora, RHEL): append `:Z` to the volume, e.g.
+  `-v ~/pearcircle-seeder-data:/data:Z`.
 
 ## Design
 
