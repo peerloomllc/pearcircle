@@ -156,6 +156,70 @@ _confirm() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: background builds
+#
+# The seeder builds are slow and do not depend on each other, so they run as
+# background jobs instead of one after another. The desktop installers start
+# after the verify gate (step 1) and build alongside the Android build and the
+# release-notes review. The Umbrel image, then Start9, starts once step 5 has
+# written the notes into the store manifests. Each job writes only to its own
+# log, with stdin closed so it never reads from the terminal. Steps 5b-5d wait
+# for them and report in the usual order. Any exit (a declined confirm, a
+# failed build, Ctrl-C) kills whatever is still running.
+# ---------------------------------------------------------------------------
+_BG_DIR=$(mktemp -d)
+_BG_PIDS=()
+declare -A _BG_PID=()
+
+_bg_kill_tree() {
+  local _c
+  for _c in $(pgrep -P "$1" 2>/dev/null); do _bg_kill_tree "$_c"; done
+  kill "$1" 2>/dev/null || true
+}
+
+_bg_cleanup() {
+  local _p
+  for _p in "${_BG_PIDS[@]}"; do
+    if kill -0 "$_p" 2>/dev/null; then _bg_kill_tree "$_p"; fi
+  done
+  rm -rf "$_BG_DIR"
+}
+trap _bg_cleanup EXIT
+
+# Usage: _bg_start <name> <command...>
+_bg_start() {
+  local _name="$1"; shift
+  "$@" < /dev/null &
+  _BG_PID[$_name]=$!
+  _BG_PIDS+=("$!")
+}
+
+# Usage: _bg_wait <name>  - returns the job's exit status (127 if never started)
+_bg_wait() {
+  local _pid="${_BG_PID[$1]:-}"
+  [ -n "$_pid" ] || return 127
+  wait "$_pid"
+}
+
+# Usage: _bg_follow <name> <log> <regex>
+# Prints the log's matching lines, indented, until the job ends, then returns
+# its exit status. Lines the job logged before this call are shown too.
+_bg_follow() {
+  local _pid="${_BG_PID[$1]:-}"
+  [ -n "$_pid" ] || return 127
+  tail --pid="$_pid" -n +1 -F "$2" 2>/dev/null \
+    | grep --line-buffered -E "$3" \
+    | awk '{ print "      " $0; fflush() }' || true
+  wait "$_pid"
+}
+
+# Usage: _bg_after <pid>  - blocks until that job has ended (no-op for "")
+_bg_after() {
+  [ -n "${1:-}" ] || return 0
+  while kill -0 "$1" 2>/dev/null; do sleep 2; done
+}
+
+# ---------------------------------------------------------------------------
 # Helper: fetch latest version from GitHub releases (returns bare X.Y.Z or "")
 # ---------------------------------------------------------------------------
 _github_latest_version() {
@@ -1333,6 +1397,45 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> Native project: android/ is checked in, no prebuild needed."
 
+# Start the desktop seeder-launcher installers in the background (see "Helper:
+# background builds"). Step 5b collects them.
+#
+# Linux runs now. Windows waits for Linux, because both run `npm install` in
+# seeder-launcher, and for the Android build in step 3, because its
+# `npm install --force` in the repo root rewrites node_modules that Gradle
+# reads. macOS builds on the Mac mini and waits for nothing.
+_SLV="${RELEASE_TAG#v}"
+_SL="$REPO_ROOT/seeder-launcher"
+
+_desktop_linux() {
+  ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error ) \
+    > /tmp/pearcircle-build-linux.log 2>&1 || true
+  bash "$_SL/scripts/build-linux.sh" "$_SLV" >> /tmp/pearcircle-build-linux.log 2>&1
+}
+
+_desktop_windows() {
+  : > /tmp/pearcircle-build-windows.log
+  _bg_after "${1:-}"
+  while [ ! -e "$_BG_DIR/android.done" ]; do sleep 2; done
+  ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error
+    cd "$REPO_ROOT" && npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 \
+      --force --no-save --no-audit --no-fund --loglevel=error ) \
+    >> /tmp/pearcircle-build-windows.log 2>&1 || true
+  bash "$_SL/scripts/build-windows-local.sh" "$_SLV" >> /tmp/pearcircle-build-windows.log 2>&1
+}
+
+_desktop_macos() {
+  APP_SIGN_ID="${MACOS_APP_SIGN_ID:-}" PKG_SIGN_ID="${MACOS_PKG_SIGN_ID:-}" \
+    bash "$_SL/scripts/build-macos-remote.sh" "$_SLV" > /tmp/pearcircle-build-macos.log 2>&1
+}
+
+if ! $SKIP_DESKTOP; then
+  echo "==> Starting desktop seeder-launcher builds in the background (collected at step 5b)..."
+  $SKIP_LINUX   || _bg_start linux _desktop_linux
+  $SKIP_WINDOWS || _bg_start windows _desktop_windows "${_BG_PID[linux]:-}"
+  $SKIP_MACOS   || _bg_start macos _desktop_macos
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Build signed release APK (and AAB if publishing to Google Play)
 # ---------------------------------------------------------------------------
@@ -1386,6 +1489,8 @@ else
     echo "==> Built AAB: $AAB_NAME  ($AAB_SIZE)"
   fi
 fi
+# Lets the background Windows build start (see the note above step 3).
+touch "$_BG_DIR/android.done"
 
 # ---------------------------------------------------------------------------
 # 4e. Generate .sha256 sidecars for the mobile artifacts
@@ -1601,12 +1706,42 @@ if ! node "$REPO_ROOT/seeder-launcher/scripts/write-store-release-notes.js" rele
   exit 1
 fi
 
+# Start the Umbrel image and the Start9 package in the background now that the
+# notes are in their manifests (see "Helper: background builds"). Start9 waits
+# for Umbrel, because it pins the image Umbrel pushes. Steps 5c and 5d collect
+# them. The Start9 log is emptied up front so step 5d never shows the previous
+# release's lines while it waits.
+_umbrel_build() {
+  STORE_DIR="${UMBREL_STORE_DIR:-}" \
+  OFFICIAL_STORE_DIR="${UMBREL_OFFICIAL_DIR:-}" \
+  OFFICIAL_STORE_PR="${UMBREL_OFFICIAL_PR:-}" \
+    bash "$REPO_ROOT/seeder-launcher/scripts/build-umbrel-image.sh" "${RELEASE_TAG#v}" \
+    > /tmp/pearcircle-build-umbrel.log 2>&1
+}
+
+_start9_build() {
+  _bg_after "${1:-}"
+  bash "$REPO_ROOT/seeder-launcher/scripts/build-start9-s9pk.sh" "${RELEASE_TAG#v}" \
+    >> /tmp/pearcircle-build-start9.log 2>&1
+}
+
+if ! $SKIP_UMBREL; then
+  : > /tmp/pearcircle-build-umbrel.log
+  _bg_start umbrel _umbrel_build
+fi
+if ! $SKIP_START9 && command -v start-sdk >/dev/null && command -v deno >/dev/null && command -v yq >/dev/null; then
+  : > /tmp/pearcircle-build-start9.log
+  _bg_start start9 _start9_build "${_BG_PID[umbrel]:-}"
+fi
+[ -n "${_BG_PID[umbrel]:-}${_BG_PID[start9]:-}" ] && echo "==> Started the Umbrel/Start9 seeder builds in the background (collected at steps 5c-5d)."
+
 # ---------------------------------------------------------------------------
 # 5b. Build the desktop seeder-launcher installers
 #
-# Moved to run after release-notes editing: the slow, best-effort desktop
-# builds now run unattended once the notes are finalized. Still gated on
-# NEEDS_BUILD (no desktop build for a Zapstore-only republish) and SKIP_DESKTOP.
+# The builds themselves started in the background before step 3 and have been
+# running unattended through the Android build and the release-notes review;
+# this step waits for them. Still gated on NEEDS_BUILD (no desktop build for a
+# Zapstore-only republish) and SKIP_DESKTOP.
 # Best-effort: each platform builds independently and a failure (Mac mini
 # unreachable, missing signing certs, build script not yet on this branch) is
 # logged and skipped, never blocking the mobile release.
@@ -1618,17 +1753,13 @@ if $SKIP_DESKTOP; then
   echo "==> Skipping desktop seeder-launcher builds (--skip-desktop)."
 else
   echo ""
-  echo "==> Building desktop seeder-launcher installers..."
-  _SLV="${RELEASE_TAG#v}"
-  _SL="$REPO_ROOT/seeder-launcher"
+  echo "==> Waiting for the desktop seeder-launcher installers (building in the background)..."
 
   if $SKIP_LINUX; then
     echo "--> Linux    (skipped via --skip-linux)"
   else
     echo "--> Linux    (.deb + .AppImage, built locally)"
-    ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error ) \
-      > /tmp/pearcircle-build-linux.log 2>&1 || true
-    if bash "$_SL/scripts/build-linux.sh" "$_SLV" >> /tmp/pearcircle-build-linux.log 2>&1; then
+    if _bg_wait linux; then
       for _f in "$_SL/dist/linux/pearcircle-seeder_${_SLV}_amd64.deb" \
                 "$_SL/dist/linux/pearcircle-seeder_${_SLV}_arm64.deb" \
                 "$_SL/dist/linux/PearCircleSeeder-x86_64.AppImage" \
@@ -1645,16 +1776,7 @@ else
     echo "--> Windows  (skipped via --skip-windows)"
   else
     echo "--> Windows  (.exe, cross-built locally - no VM)"
-    # The Windows installer is a cross-build: makensis runs on Linux/macOS and
-    # every payload binary is prebuilt. Ensure the seeder-launcher deps
-    # (esbuild) are present - the Linux stage's install above is skippable via
-    # --skip-linux - and force in the win32 bare runtime, an optional npm dep
-    # gated to os=win32 that a normal install on a non-Windows host skips.
-    ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error
-      cd "$REPO_ROOT" && npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 \
-        --force --no-save --no-audit --no-fund --loglevel=error ) \
-      > /tmp/pearcircle-build-windows.log 2>&1 || true
-    if bash "$_SL/scripts/build-windows-local.sh" "$_SLV" >> /tmp/pearcircle-build-windows.log 2>&1; then
+    if _bg_wait windows; then
       _f="$_SL/dist/windows/PearCircleSeeder-Setup-${_SLV}.exe"
       if [ -f "$_f" ]; then DESKTOP_ARTIFACTS+=("$_f"); fi
       echo "    Windows build OK."
@@ -1667,8 +1789,7 @@ else
     echo "--> macOS    (skipped via --skip-macos)"
   else
     echo "--> macOS    (.pkg, built on the Mac mini)"
-    if APP_SIGN_ID="${MACOS_APP_SIGN_ID:-}" PKG_SIGN_ID="${MACOS_PKG_SIGN_ID:-}" \
-         bash "$_SL/scripts/build-macos-remote.sh" "$_SLV" > /tmp/pearcircle-build-macos.log 2>&1; then
+    if _bg_wait macos; then
       _f="$_SL/dist/macos/PearCircleSeeder-${_SLV}.pkg"
       if [ -f "$_f" ]; then DESKTOP_ARTIFACTS+=("$_f"); fi
       echo "    macOS build OK."
@@ -1677,7 +1798,6 @@ else
     fi
   fi
 
-  # .sha256 sidecars, matching the mobile artifacts from step 4c.
   for _f in "${DESKTOP_ARTIFACTS[@]}"; do
     ( cd "$(dirname "$_f")" && sha256sum "$(basename "$_f")" > "$(basename "$_f").sha256" )
   done
@@ -1720,22 +1840,17 @@ if $SKIP_UMBREL; then
   echo "==> Skipping Umbrel/Docker image build."
 else
   echo ""
-  echo "==> Building + pushing the multi-arch Umbrel/Docker seeder image (amd64 + arm64)..."
+  echo "==> Building + pushing the multi-arch Umbrel/Docker seeder image (amd64 + arm64, in the background)..."
   echo "    Live milestones below — 'STEP N/M' = building, 'Copying blob' = pushing to ghcr."
   echo "    Full log: /tmp/pearcircle-build-umbrel.log"
-  # Stream milestone lines so this isn't a silent multi-minute spinner, while
-  # tee keeps the full log. PIPESTATUS[0] is the builder's real exit (grep/awk
-  # after it never mask a build failure); set +e so the pipeline can't abort us.
-  set +e
-  STORE_DIR="${UMBREL_STORE_DIR:-}" \
-  OFFICIAL_STORE_DIR="${UMBREL_OFFICIAL_DIR:-}" \
-  OFFICIAL_STORE_PR="${UMBREL_OFFICIAL_PR:-}" \
-    bash "$REPO_ROOT/seeder-launcher/scripts/build-umbrel-image.sh" "${RELEASE_TAG#v}" 2>&1 \
-    | tee /tmp/pearcircle-build-umbrel.log \
-    | grep --line-buffered -E '^==>|STEP [0-9]+/|Copying (blob|config)|Writing manifest|bumped |official store|refreshed |nothing to commit|WARNING|[Ee]rror' \
-    | awk '{ print "      " $0; fflush() }'
-  _umbrel_status=${PIPESTATUS[0]}
-  set -e
+  # Show milestone lines from the background build's log so this isn't a silent
+  # multi-minute wait. The job's own exit status is the build result.
+  if _bg_follow umbrel /tmp/pearcircle-build-umbrel.log \
+       '^==>|STEP [0-9]+/|Copying (blob|config)|Writing manifest|bumped |official store|refreshed |nothing to commit|WARNING|[Ee]rror'; then
+    _umbrel_status=0
+  else
+    _umbrel_status=$?
+  fi
   if [ "$_umbrel_status" -eq 0 ]; then
     echo "    Umbrel image OK ($(grep -oE 'digest=sha256:[0-9a-f]+' /tmp/pearcircle-build-umbrel.log | tail -1)). Log: /tmp/pearcircle-build-umbrel.log"
     echo "    In-repo umbrel manifest bumped — review + commit it with the release."
@@ -1773,15 +1888,14 @@ elif ! command -v start-sdk >/dev/null || ! command -v deno >/dev/null || ! comm
   echo "==> Skipping StartOS s9pk build (StartOS SDK toolchain not found: needs start-sdk + deno + yq)."
 else
   echo ""
-  echo "==> Building StartOS (Start9) universal s9pk (x86_64 + aarch64)..."
+  echo "==> Building StartOS (Start9) universal s9pk (x86_64 + aarch64, in the background)..."
   echo "    Full log: /tmp/pearcircle-build-start9.log"
-  set +e
-  bash "$REPO_ROOT/seeder-launcher/scripts/build-start9-s9pk.sh" "${RELEASE_TAG#v}" 2>&1 \
-    | tee /tmp/pearcircle-build-start9.log \
-    | grep --line-buffered -E '^==>|^\s*!!|STEP [0-9]+/|Copying (blob|config)|save \+ normalize|packing |verify|s9pk ready|WARNING|[Ee]rror' \
-    | awk '{ print "      " $0; fflush() }'
-  _start9_status=${PIPESTATUS[0]}
-  set -e
+  if _bg_follow start9 /tmp/pearcircle-build-start9.log \
+       '^==>|^\s*!!|STEP [0-9]+/|Copying (blob|config)|save \+ normalize|packing |verify|s9pk ready|WARNING|[Ee]rror'; then
+    _start9_status=0
+  else
+    _start9_status=$?
+  fi
   if [ "$_start9_status" -eq 0 ]; then
     START9_S9PK="$REPO_ROOT/seeder-launcher/start9/pearcircle-seeder.s9pk"
     echo "    Start9 s9pk OK ($(du -h "$START9_S9PK" | cut -f1)). Log: /tmp/pearcircle-build-start9.log"
@@ -2073,52 +2187,91 @@ d = json.load(sys.stdin)
 print(json.dumps({a['name']: a['id'] for a in d.get('assets', []) or []}))
 " 2>/dev/null || echo "{}")
 
-  # --- Upload each asset in order ---
-  for _asset in "${RELEASE_ASSETS[@]}"; do
+  # --- Upload the assets, UPLOAD_JOBS (default 4) at a time ---
+  # Usage: _upload_asset <path> <existing-asset-id> <result-prefix>
+  # Writes <result-prefix>.ok on success, or the API response to
+  # <result-prefix>.err on failure.
+  _upload_asset() {
+    local _asset="$1" _existing_id="$2" _out="$3"
+    local _ctype _basename _err
     _ctype=$(_asset_content_type "$_asset")
     _basename=$(basename "$_asset")
     # If an asset with this name already exists on the release, delete it
     # first so the upload-by-name below doesn't 422 with already_exists.
-    _existing_id=$(printf '%s' "$EXISTING_ASSETS_JSON" \
-      | python3 -c "
-import sys, json
-m = json.load(sys.stdin)
-print(m.get('$_basename', ''))" 2>/dev/null || echo "")
     if [ -n "$_existing_id" ]; then
       echo "==> Replacing existing $_basename (asset id $_existing_id)..."
       curl -s -X DELETE \
         -H "Authorization: Bearer $GH_TOKEN" \
         -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${REPO_SLUG}/releases/assets/${_existing_id}" \
-        > /dev/null
+        > /dev/null || true
     fi
     echo "==> Uploading $_basename ($_ctype)..."
-    UPLOAD_RESP_FILE=$(mktemp)
-    curl \
+    if ! curl -sS \
       -X POST \
       -H "Authorization: Bearer $GH_TOKEN" \
       -H "Accept: application/vnd.github+json" \
       -H "Content-Type: $_ctype" \
       "${UPLOAD_URL}?name=${_basename}" \
       --data-binary "@${_asset}" \
-      --progress-bar \
-      -o "$UPLOAD_RESP_FILE" 2>&1
-    UPLOAD_RESP=$(cat "$UPLOAD_RESP_FILE"); rm -f "$UPLOAD_RESP_FILE"
-
-    UPLOAD_ERROR=$(printf '%s' "$UPLOAD_RESP" \
-      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" \
-      2>/dev/null || echo "")
-    if [ -n "$UPLOAD_ERROR" ]; then
-      echo ""
-      echo "ERROR: Upload of $_basename failed:"
-      printf '%s\n' "$UPLOAD_RESP" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$UPLOAD_RESP"
-      echo ""
-      echo "The GitHub release was created but $_basename was not attached."
-      echo "You can upload it manually at: https://github.com/${REPO_SLUG}/releases/tag/${RELEASE_TAG}"
-      exit 1
+      -o "$_out.resp" 2> "$_out.curl"; then
+      { echo "curl failed:"; cat "$_out.curl"; } > "$_out.err"
+      echo "    FAILED: $_basename"
+      return 1
     fi
-    echo "    Uploaded successfully."
+    _err=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" \
+      < "$_out.resp" 2>/dev/null || echo "")
+    if [ -n "$_err" ]; then
+      python3 -m json.tool < "$_out.resp" > "$_out.err" 2>/dev/null || cp "$_out.resp" "$_out.err"
+      echo "    FAILED: $_basename"
+      return 1
+    fi
+    touch "$_out.ok"
+    echo "    Uploaded $_basename."
+  }
+
+  _UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
+  _UP_DIR="$_BG_DIR/uploads"
+  mkdir -p "$_UP_DIR"
+  _up_pids=()
+  echo "==> Uploading ${#RELEASE_ASSETS[@]} assets, up to $_UPLOAD_JOBS at a time..."
+  for _i in "${!RELEASE_ASSETS[@]}"; do
+    # Wait for a free slot.
+    while true; do
+      _running=0
+      for _p in "${_up_pids[@]}"; do
+        if kill -0 "$_p" 2>/dev/null; then _running=$((_running + 1)); fi
+      done
+      [ "$_running" -lt "$_UPLOAD_JOBS" ] && break
+      sleep 1
+    done
+    _existing_id=$(printf '%s' "$EXISTING_ASSETS_JSON" \
+      | python3 -c "
+import sys, json
+m = json.load(sys.stdin)
+print(m.get(sys.argv[1], ''))" "$(basename "${RELEASE_ASSETS[$_i]}")" 2>/dev/null || echo "")
+    _upload_asset "${RELEASE_ASSETS[$_i]}" "$_existing_id" "$_UP_DIR/$_i" < /dev/null &
+    _up_pids+=("$!")
+    _BG_PIDS+=("$!")
   done
+  for _p in "${_up_pids[@]}"; do wait "$_p" || true; done
+
+  _up_failed=()
+  for _i in "${!RELEASE_ASSETS[@]}"; do
+    [ -e "$_UP_DIR/$_i.ok" ] || _up_failed+=("$_i")
+  done
+  if [ ${#_up_failed[@]} -gt 0 ]; then
+    for _i in "${_up_failed[@]}"; do
+      echo ""
+      echo "ERROR: Upload of $(basename "${RELEASE_ASSETS[$_i]}") failed:"
+      cat "$_UP_DIR/$_i.err" 2>/dev/null || echo "(no response recorded)"
+    done
+    echo ""
+    echo "The GitHub release was created but ${#_up_failed[@]} asset(s) were not attached."
+    echo "You can upload them manually at: https://github.com/${REPO_SLUG}/releases/tag/${RELEASE_TAG}"
+    exit 1
+  fi
+  echo "==> All ${#RELEASE_ASSETS[@]} assets uploaded."
 
 else
   # Fallback: gh CLI (requires working auth). gh accepts multiple positional
