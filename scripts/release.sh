@@ -15,7 +15,8 @@
 #   --skip-umbrel      Skip building + pushing the multi-arch Umbrel/Docker image
 #   --skip-start9      Skip building the StartOS (Start9) .s9pk (auto-skips if the
 #                      StartOS SDK toolchain is absent)
-#   --skip-android     Skip Android APK/AAB build (auto-disables Play + Zapstore)
+#   --skip-android     Skip Android APK/AAB build (auto-disables Play + Zapstore;
+#                      the GitHub release re-attaches the previous APK)
 #   --skip-ios         Skip iOS App Store build
 #   --skip-mobile      Skip both Android and iOS builds (shorthand)
 #
@@ -163,6 +164,71 @@ _github_latest_version() {
     2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name','').lstrip('v'))" \
     2>/dev/null || echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Helper: does the latest GitHub release carry an APK built for its own version?
+# False for a seeder-only release, whose APK is carried forward from an older one.
+# A failed query answers true, which keeps the pre-flight's old behavior.
+# Usage: _github_latest_has_own_apk <token> <slug> <X.Y.Z>
+# ---------------------------------------------------------------------------
+_github_latest_has_own_apk() {
+  local token="$1" slug="$2" version="$3"
+  local api="${GITHUB_API:-https://api.github.com}"
+  local names
+  names=$(curl -sL \
+    ${token:+-H "Authorization: Bearer $token"} \
+    -H "Accept: application/vnd.github+json" \
+    "${api}/repos/${slug}/releases/latest" 2>/dev/null \
+    | python3 -c "
+import sys, json
+for a in json.load(sys.stdin).get('assets', []): print(a.get('name', ''))
+" 2>/dev/null) || return 0
+  [ -z "$names" ] && return 0
+  printf '%s\n' "$names" | grep -qxF "${ARTIFACT_PREFIX:-pearcircle}-v${version}.apk"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: carry the previous release's APK into a seeder-only release
+#
+# A release run with --skip-android (or --skip-mobile) builds no APK, but the
+# website sends people to releases/latest for the Android app, so a release
+# without one leaves nothing to download. This fetches the APK and its .sha256
+# sidecar from the current latest release into <dest-dir>, checks the hash and
+# prints both paths. The file keeps its original name (pearcircle-v1.1.2.apk),
+# so it never passes for a new build. Prints nothing when there is no APK to
+# carry or the hash is wrong.
+#
+# GITHUB_API overrides the API base, for the test.
+# Usage: _carry_forward_apk <token> <slug> <dest-dir>
+# ---------------------------------------------------------------------------
+_carry_forward_apk() {
+  local token="$1" slug="$2" dest="$3"
+  local api="${GITHUB_API:-https://api.github.com}"
+  [ -z "$slug" ] && return 0
+  local urls
+  urls=$(curl -sL \
+    ${token:+-H "Authorization: Bearer $token"} \
+    -H "Accept: application/vnd.github+json" \
+    "${api}/repos/${slug}/releases/latest" 2>/dev/null \
+    | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+names = {a.get('name'): a.get('browser_download_url') for a in d.get('assets', [])}
+apks = [n for n in names if n and n.endswith('.apk')]
+if len(apks) == 1 and names.get(apks[0] + '.sha256'):
+    print(names[apks[0]]); print(names[apks[0] + '.sha256'])
+" 2>/dev/null) || return 0
+  [ -z "$urls" ] && return 0
+  local apk_url sum_url name
+  apk_url=$(printf '%s\n' "$urls" | sed -n 1p)
+  sum_url=$(printf '%s\n' "$urls" | sed -n 2p)
+  name=$(basename "$apk_url")
+  mkdir -p "$dest"
+  curl -sfL -o "$dest/$name" "$apk_url" || return 0
+  curl -sfL -o "$dest/$name.sha256" "$sum_url" || return 0
+  ( cd "$dest" && sha256sum -c --status "$name.sha256" ) || return 0
+  printf '%s\n%s\n' "$dest/$name" "$dest/$name.sha256"
 }
 
 # ---------------------------------------------------------------------------
@@ -838,11 +904,19 @@ else
       gt)
         echo ""
         echo "==> GitHub ($GH_VERSION) is ahead of Zapstore ($ZSP_VERSION_CURRENT)."
-        echo "    Skipping build — will publish existing GitHub release to Zapstore only."
-        RELEASE_TAG="v${GH_VERSION}"
-        APP_VERSION="$GH_VERSION"
-        echo "    Using release tag: $RELEASE_TAG"
-        ZAPSTORE_ONLY=true
+        # A seeder-only release (--skip-android) is ahead of Zapstore on purpose: its
+        # APK was carried forward from an older version, so there is nothing new to
+        # publish there. Build the next version instead of the Zapstore shortcut,
+        # which would stop at the artifact/version mismatch check.
+        if ! _github_latest_has_own_apk "$GH_TOKEN" "$REPO_SLUG" "$GH_VERSION"; then
+          echo "    v$GH_VERSION has no APK of its own (a seeder-only release) - proceeding with full build for next version."
+        else
+          echo "    Skipping build — will publish existing GitHub release to Zapstore only."
+          RELEASE_TAG="v${GH_VERSION}"
+          APP_VERSION="$GH_VERSION"
+          echo "    Using release tag: $RELEASE_TAG"
+          ZAPSTORE_ONLY=true
+        fi
         ;;
       lt)
         echo ""
@@ -1837,6 +1911,17 @@ fi
 if $PUBLISH_PLAY && [ -n "$AAB_NAME" ] && [ -f "$AAB_NAME" ]; then
   RELEASE_ASSETS+=("$AAB_NAME")
   [ -f "${AAB_NAME}.sha256" ] && RELEASE_ASSETS+=("${AAB_NAME}.sha256")
+fi
+# A seeder-only release (--skip-android) carries the previous APK forward, so the
+# releases/latest page the website links to still has the Android app on it.
+if $SKIP_ANDROID; then
+  _CARRIED=$(_carry_forward_apk "$GH_TOKEN" "$REPO_SLUG" "$(mktemp -d)")
+  if [ -n "$_CARRIED" ]; then
+    while IFS= read -r _c; do RELEASE_ASSETS+=("$_c"); done <<< "$_CARRIED"
+    echo "==> Carrying forward $(basename "$(printf '%s\n' "$_CARRIED" | head -1)") from the previous release."
+  else
+    echo "==> WARNING: no APK carried forward - this release will have no Android download."
+  fi
 fi
 # Desktop seeder-launcher installers from step 4d (best-effort; empty when
 # --skip-desktop was passed or every platform failed to build).
