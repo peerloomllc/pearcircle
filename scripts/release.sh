@@ -15,6 +15,10 @@
 #   --skip-umbrel      Skip building + pushing the multi-arch Umbrel/Docker image
 #   --skip-start9      Skip building the StartOS (Start9) .s9pk (auto-skips if the
 #                      StartOS SDK toolchain is absent)
+#   --skip-start9-legacy
+#                      Do not publish the legacy StartOS 0.3.5 .s9pk (it is still
+#                      built, since the 0.4 package is converted from it). The
+#                      pre-flight asks, and defaults to skipping it.
 #   --skip-android     Skip Android APK/AAB build (auto-disables Play + Zapstore;
 #                      the GitHub release re-attaches the previous APK)
 #   --skip-ios         Skip iOS App Store build
@@ -640,6 +644,9 @@ SKIP_ANDROID=false
 SKIP_IOS=false
 SKIP_UMBREL=false
 SKIP_START9=false
+# The legacy 0.3.5 package is being phased out: publishing it is opt-in.
+SKIP_START9_LEGACY=true
+_START9_LEGACY_FLAG=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -653,6 +660,7 @@ for arg in "$@"; do
     --skip-macos) SKIP_MACOS=true ;;
     --skip-umbrel) SKIP_UMBREL=true ;;
     --skip-start9) SKIP_START9=true ;;
+    --skip-start9-legacy) _START9_LEGACY_FLAG=true ;;
     --skip-android) SKIP_ANDROID=true ;;
     --skip-ios) SKIP_IOS=true ;;
     --skip-mobile) SKIP_ANDROID=true; SKIP_IOS=true ;;
@@ -772,7 +780,7 @@ else
   echo "    App Store    : ${ASC_VERSION_CURRENT:-unknown} (live only; iTunes lookup)"
 fi
 echo "    Umbrel (ghcr): ${UMBREL_VERSION_CURRENT:-unknown} (${UMBREL_IMAGE})"
-echo "    Start9 (reg) : ${START9_VERSION_CURRENT:-unknown} (registry: what StartOS users install)"
+echo "    Start9 (reg) : ${START9_VERSION_CURRENT:-unknown} (0.3.5 registry, lags when the legacy s9pk is skipped)"
 
 # --check-versions: print diagnostic info and exit without doing anything else
 if $CHECK_VERSIONS_ONLY; then
@@ -1161,6 +1169,25 @@ if ! $CHECK_VERSIONS_ONLY; then
       case "${_r:-y}" in
         [Yy]) SKIP_START9=false; echo "    ✓ StartOS (Start9) s9pk"; break ;;
         [Nn]) SKIP_START9=true;  echo "    ✗ StartOS (Start9) s9pk (skipped)"; break ;;
+        *) echo "    Please enter y or n." ;;
+      esac
+    done
+  fi
+
+  # Legacy StartOS 0.3.5 .s9pk. It is always built when Start9 is, because the
+  # 0.4 package is converted from it, but it is ~3x the size and being phased
+  # out, so uploading it and refreshing the 0.3.5 registry is opt-in. Skipping
+  # leaves 0.3.5 boxes on the last legacy version already published.
+  if $SKIP_START9; then
+    :
+  elif $_START9_LEGACY_FLAG; then
+    echo "    - StartOS 0.3.5 legacy s9pk (skipped via --skip-start9-legacy)"
+  else
+    while true; do
+      read -rp "    Also publish the legacy StartOS 0.3.5 s9pk (large, being phased out)? [y/N] " _r
+      case "${_r:-n}" in
+        [Yy]) SKIP_START9_LEGACY=false; echo "    ✓ StartOS 0.3.5 legacy s9pk"; break ;;
+        [Nn]) SKIP_START9_LEGACY=true;  echo "    ✗ StartOS 0.3.5 legacy s9pk (skipped)"; break ;;
         *) echo "    Please enter y or n." ;;
       esac
     done
@@ -1932,8 +1959,11 @@ done
 # StartOS .s9pk from step 5d (best-effort). Uploaded under the tag so the
 # website registry's /package/v0/pearcircle-seeder.s9pk redirect resolves.
 if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ]; then
-  RELEASE_ASSETS+=("$START9_S9PK")
-  [ -f "${START9_S9PK}.sha256" ] && RELEASE_ASSETS+=("${START9_S9PK}.sha256")
+  # The legacy 0.3.5 package only when the pre-flight opted in.
+  if ! $SKIP_START9_LEGACY; then
+    RELEASE_ASSETS+=("$START9_S9PK")
+    [ -f "${START9_S9PK}.sha256" ] && RELEASE_ASSETS+=("${START9_S9PK}.sha256")
+  fi
   # The v2 package for StartOS 0.4.0+, converted from the v1 above by the same
   # build script. 0.4.0's web UI refuses a v1 s9pk on a magic-byte check, so
   # without this asset a 0.4.0 user has to fall back to the CLI to sideload.
@@ -1943,6 +1973,8 @@ if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ]; then
   if [ -f "$_s9pk_v2" ]; then
     RELEASE_ASSETS+=("$_s9pk_v2")
     [ -f "${_s9pk_v2}.sha256" ] && RELEASE_ASSETS+=("${_s9pk_v2}.sha256")
+  elif $SKIP_START9_LEGACY; then
+    echo "==> WARNING: no v2 s9pk and the legacy one was skipped - this release has no StartOS package."
   fi
 fi
 echo ""
@@ -2112,7 +2144,7 @@ fi
 if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ] && [ -n "${WEBSITE_DIR:-}" ]; then
   echo ""
   echo "==> Refreshing StartOS community registry on the website..."
-  if S9PK="$START9_S9PK" WEBSITE_DIR="$WEBSITE_DIR" \
+  if S9PK="$START9_S9PK" WEBSITE_DIR="$WEBSITE_DIR" SKIP_LEGACY="$SKIP_START9_LEGACY" \
      WEBSITE_REGISTRY_PR="${WEBSITE_REGISTRY_PR:-}" \
        bash "$REPO_ROOT/seeder-launcher/scripts/publish-start9-registry.sh" "${RELEASE_TAG#v}"; then
     :
