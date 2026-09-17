@@ -60,6 +60,16 @@ trap 'echo; echo "Interrupted (SIGINT) - aborting release."; exit 130' INT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Shared release helpers, one copy for every PeerLoom app, in the sibling repo
+# peerloomllc/peerloom-release (proposals/2026-09-17-shared-release-library.md).
+RELEASE_LIB="$REPO_ROOT/../peerloom-release/release-lib.sh"
+if [ ! -f "$RELEASE_LIB" ]; then
+  echo "error: $RELEASE_LIB not found - clone peerloomllc/peerloom-release beside this repo" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$RELEASE_LIB"
+
 # Pin JDK 21 for the Android build. RN 0.81's Gradle plugin doesn't support
 # JDK 25 (system default on Fedora 44), and Fedora's repos don't ship 21.
 # Override by exporting JAVA_HOME before invoking this script.
@@ -90,70 +100,6 @@ for _k in APP_NAME ARTIFACT_PREFIX XCODE_PROJECT; do
     exit 1
   fi
 done
-
-# ---------------------------------------------------------------------------
-# Helper: derive "owner/repo" from the git remote URL without gh CLI
-# ---------------------------------------------------------------------------
-_remote_slug() {
-  local remote_url
-  remote_url=$(git remote get-url "${GITHUB_REMOTE:-}" 2>/dev/null \
-    || git remote get-url github 2>/dev/null \
-    || git remote get-url origin 2>/dev/null \
-    || echo "")
-  if [ -z "$remote_url" ]; then
-    echo ""
-    return
-  fi
-  # Handle both SSH (git@github.com:owner/repo.git) and HTTPS forms
-  local slug
-  slug=$(printf '%s' "$remote_url" \
-    | sed -E 's|.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$|\1|' \
-    | sed 's/\.git$//')
-  printf '%s' "$slug"
-}
-
-# ---------------------------------------------------------------------------
-# Helper: resolve GITHUB_TOKEN without requiring `gh auth token` to work
-# ---------------------------------------------------------------------------
-_github_token() {
-  # 1. Already set in environment / .env
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    printf '%s' "$GITHUB_TOKEN"
-    return
-  fi
-  # 2. Try gh CLI (may fail when account is limited — that's fine)
-  local tok
-  tok=$(gh auth token 2>/dev/null || echo "")
-  if [ -n "$tok" ]; then
-    printf '%s' "$tok"
-    return
-  fi
-  echo ""
-}
-
-# ---------------------------------------------------------------------------
-# Helper: confirmation prompt — loops until y or n is entered
-# Usage: _confirm "Question to ask"
-# ---------------------------------------------------------------------------
-_confirm() {
-  local prompt="${1:-Continue?}"
-  local _reply
-  while true; do
-    echo ""
-    read -rp "    ${prompt} [y/N] " _reply
-    echo ""
-    case "$_reply" in
-      [Yy]) return 0 ;;
-      [Nn]|"")
-        echo "Aborted."
-        exit 0
-        ;;
-      *)
-        echo "    Please enter y or n."
-        ;;
-    esac
-  done
-}
 
 # ---------------------------------------------------------------------------
 # Helper: background builds
@@ -220,21 +166,6 @@ _bg_after() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: fetch latest version from GitHub releases (returns bare X.Y.Z or "")
-# ---------------------------------------------------------------------------
-_github_latest_version() {
-  local token="$1" slug="$2"
-  [ -z "$token" ] || [ -z "$slug" ] && echo "" && return
-  curl -s \
-    -H "Authorization: Bearer $token" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${slug}/releases/latest" \
-    2>/dev/null \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name','').lstrip('v'))" \
-    2>/dev/null || echo ""
-}
-
-# ---------------------------------------------------------------------------
 # Helper: does the latest GitHub release carry an APK built for its own version?
 # False for a seeder-only release, whose APK is carried forward from an older one.
 # A failed query answers true, which keeps the pre-flight's old behavior.
@@ -257,254 +188,6 @@ for a in json.load(sys.stdin).get('assets', []): print(a.get('name', ''))
 }
 
 # ---------------------------------------------------------------------------
-# Helper: carry the previous release's APK into a seeder-only release
-#
-# A release run with --skip-android (or --skip-mobile) builds no APK, but the
-# website sends people to releases/latest for the Android app, so a release
-# without one leaves nothing to download. This fetches the APK and its .sha256
-# sidecar from the current latest release into <dest-dir>, checks the hash and
-# prints both paths. The file keeps its original name (pearcircle-v1.1.2.apk),
-# so it never passes for a new build. Prints nothing when there is no APK to
-# carry or the hash is wrong.
-#
-# GITHUB_API overrides the API base, for the test.
-# Usage: _carry_forward_apk <token> <slug> <dest-dir>
-# ---------------------------------------------------------------------------
-_carry_forward_apk() {
-  local token="$1" slug="$2" dest="$3"
-  local api="${GITHUB_API:-https://api.github.com}"
-  [ -z "$slug" ] && return 0
-  local urls
-  urls=$(curl -sL \
-    ${token:+-H "Authorization: Bearer $token"} \
-    -H "Accept: application/vnd.github+json" \
-    "${api}/repos/${slug}/releases/latest" 2>/dev/null \
-    | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-names = {a.get('name'): a.get('browser_download_url') for a in d.get('assets', [])}
-apks = [n for n in names if n and n.endswith('.apk')]
-if len(apks) == 1 and names.get(apks[0] + '.sha256'):
-    print(names[apks[0]]); print(names[apks[0] + '.sha256'])
-" 2>/dev/null) || return 0
-  [ -z "$urls" ] && return 0
-  local apk_url sum_url name
-  apk_url=$(printf '%s\n' "$urls" | sed -n 1p)
-  sum_url=$(printf '%s\n' "$urls" | sed -n 2p)
-  name=$(basename "$apk_url")
-  mkdir -p "$dest"
-  curl -sfL -o "$dest/$name" "$apk_url" || return 0
-  curl -sfL -o "$dest/$name.sha256" "$sum_url" || return 0
-  ( cd "$dest" && sha256sum -c --status "$name.sha256" ) || return 0
-  printf '%s\n%s\n' "$dest/$name" "$dest/$name.sha256"
-}
-
-# ---------------------------------------------------------------------------
-# Helper: fetch latest version published on Zapstore for this app.
-# Queries the Nostr relay at wss://relay.zapstore.dev for kind 30063 events
-# whose "i" tag matches the app's Android package name (identifier).
-# Returns bare X.Y.Z or "".
-# ---------------------------------------------------------------------------
-_zapstore_latest_version() {
-  local identifier="${1:-}"
-  [ -z "$identifier" ] && echo "" && return
-
-  # Build a NIP-01 REQ filter for kind 30063 events tagged with this app id
-  local filter
-  filter=$(python3 -c "
-import json
-req = ['REQ', 'sub1', {'kinds': [30063], '#i': ['${identifier}'], 'limit': 5}]
-print(json.dumps(req))
-")
-
-  local version=""
-
-  # --- Try websocat first (fastest) ---
-  if command -v websocat &>/dev/null; then
-    version=$(printf '%s\n' "$filter" \
-      | timeout 10 websocat --no-close wss://relay.zapstore.dev 2>/dev/null \
-      | python3 -c "
-import sys, json
-best = ()
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        msg = json.loads(line)
-        if isinstance(msg, list) and msg[0] == 'EOSE':
-            break
-        if isinstance(msg, list) and msg[0] == 'EVENT':
-            ev = msg[2]
-            tags = {t[0]: t[1] for t in ev.get('tags',[]) if len(t)>=2}
-            ver = tags.get('version','')
-            if ver:
-                parts = tuple(int(x) for x in ver.lstrip('v').split('.') if x.isdigit())
-                if parts > best:
-                    best = parts
-    except:
-        pass
-if best: print('.'.join(str(x) for x in best))
-" 2>/dev/null || echo "")
-
-  # --- Fallback: python3 websockets ---
-  elif python3 -c "import websockets" 2>/dev/null; then
-    version=$(python3 - "$identifier" <<'PYEOF' 2>/dev/null
-import asyncio, json, sys
-import websockets
-
-async def query(identifier):
-    uri = "wss://relay.zapstore.dev"
-    req = json.dumps(["REQ", "sub1", {"kinds": [30063], "#i": [identifier], "limit": 5}])
-    best = ()
-    try:
-        async with websockets.connect(uri, open_timeout=6, close_timeout=2) as ws:
-            await ws.send(req)
-            for _ in range(10):
-                try:
-                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-                    if isinstance(msg, list) and msg[0] == "EOSE":
-                        break
-                    if isinstance(msg, list) and msg[0] == "EVENT":
-                        tags = {t[0]: t[1] for t in msg[2].get("tags", []) if len(t) >= 2}
-                        ver = tags.get("version", "")
-                        if ver:
-                            parts = tuple(int(x) for x in ver.lstrip("v").split(".") if x.isdigit())
-                            if parts > best:
-                                best = parts
-                except asyncio.TimeoutError:
-                    break
-    except Exception:
-        pass
-    if best:
-        print(".".join(str(x) for x in best))
-
-asyncio.run(query(sys.argv[1]))
-PYEOF
-    )
-  else
-    # No WebSocket tool available — emit a diagnostic on stderr, return empty
-    echo "    (Note: install 'websocat' or 'pip install websockets' to enable Zapstore version lookup)" >&2
-    echo ""
-    return
-  fi
-
-  printf '%s' "${version:-}"
-}
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Helper: obtain a Google Play API OAuth2 token.
-# Tries gcloud application-default credentials first (no key file needed),
-# then falls back to service account JSON if PLAY_SERVICE_ACCOUNT_JSON is set.
-# Returns the token string or "" on failure.
-# ---------------------------------------------------------------------------
-_play_token() {
-  local sa_json="${1:-}"
-
-  # --- Path 1: service account JSON (preferred — no quota project needed) ---
-  if [ -n "$sa_json" ] && [ -f "$sa_json" ]; then
-    python3 - "$sa_json" <<'PYEOF' 2>/dev/null || echo ""
-import sys, json, time, base64
-from urllib.request import urlopen, Request
-from urllib.parse import urlencode
-
-svc = json.load(open(sys.argv[1]))
-now = int(time.time())
-header  = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b'=')
-payload = base64.urlsafe_b64encode(json.dumps({
-    "iss": svc["client_email"],
-    "scope": "https://www.googleapis.com/auth/androidpublisher",
-    "aud": "https://oauth2.googleapis.com/token",
-    "iat": now, "exp": now + 3600
-}).encode()).rstrip(b'=')
-
-try:
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
-    key = serialization.load_pem_private_key(svc["private_key"].encode(), password=None)
-    sig_input = header + b'.' + payload
-    sig = base64.urlsafe_b64encode(key.sign(sig_input, padding.PKCS1v15(), hashes.SHA256())).rstrip(b'=')
-    jwt = (sig_input + b'.' + sig).decode()
-except ImportError:
-    import subprocess, tempfile, os
-    sig_input = (header + b'.' + payload).decode()
-    with tempfile.NamedTemporaryFile(suffix='.pem', delete=False) as f:
-        f.write(svc["private_key"].encode()); kp = f.name
-    try:
-        sig_bytes = subprocess.check_output(['openssl','dgst','-sha256','-sign',kp], input=sig_input.encode())
-        sig = base64.urlsafe_b64encode(sig_bytes).rstrip(b'=').decode()
-        jwt = sig_input + '.' + sig
-    finally:
-        os.unlink(kp)
-
-data = urlencode({"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":jwt}).encode()
-resp = json.loads(urlopen(Request("https://oauth2.googleapis.com/token", data=data)).read())
-print(resp.get("access_token",""))
-PYEOF
-    return
-  fi
-
-  # --- Path 2: gcloud application-default credentials ---
-  # The androidpublisher API requires x-goog-user-project on every request when
-  # using ADC user credentials. Resolve project from PLAY_QUOTA_PROJECT or gcloud.
-  if command -v gcloud > /dev/null 2>&1; then
-    local proj
-    proj="${PLAY_QUOTA_PROJECT:-$(gcloud config get-value project 2>/dev/null || echo "")}"
-    if [ -z "$proj" ]; then
-      echo "ERROR: Cannot determine GCP quota project for Android Publisher API." >&2
-      echo "  Set PLAY_QUOTA_PROJECT=<your-gcp-project-id> in scripts/.env" >&2
-      echo "  or use PLAY_SERVICE_ACCOUNT_JSON instead of ADC." >&2
-      echo ""
-      return
-    fi
-    local tok
-    tok=$(gcloud auth application-default print-access-token 2>/dev/null || echo "")
-    if [ -n "$tok" ]; then
-      printf '%s' "$tok"
-      return
-    fi
-  fi
-
-  echo ""
-}
-
-# ---------------------------------------------------------------------------
-# Helper: fetch latest version published on Google Play for this app.
-# Queries the configured PLAY_TRACK (default: production).
-# Returns bare X.Y.Z or "".
-# ---------------------------------------------------------------------------
-_play_latest_version() {
-  local package="${1:-}" sa_json="${2:-}" track="${3:-production}"
-  [ -z "$package" ] && echo "" && return
-
-  local token
-  token=$(_play_token "$sa_json")
-  [ -z "$token" ] && echo "" && return
-
-  python3 - "$package" "$track" "$token" <<'PYEOF' 2>/dev/null || echo ""
-import sys, json
-from urllib.request import urlopen, Request
-
-package = sys.argv[1]
-track   = sys.argv[2]
-token   = sys.argv[3]
-
-url = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{package}/tracks/{track}"
-req = Request(url, headers={"Authorization": f"Bearer {token}"})
-try:
-    track_data = json.loads(urlopen(req).read())
-    releases = track_data.get("releases", [])
-    for status in ("completed", "inProgress", "halted", "draft"):
-        for r in releases:
-            if r.get("status") == status:
-                print(r.get("name", ""))
-                sys.exit(0)
-except Exception:
-    pass
-PYEOF
-}
-
 
 # ---------------------------------------------------------------------------
 # Helper: fetch the current live version from the Apple App Store.
@@ -627,70 +310,6 @@ _asc_auth_linux() {
 
 # Uses $REPO_ROOT so this works regardless of invocation directory.
 # ---------------------------------------------------------------------------
-_android_package_name() {
-  local gradle_file="$REPO_ROOT/android/app/build.gradle"
-
-  # 1. Try aapt on the most recently built APK (most authoritative)
-  local apk="$REPO_ROOT/android/app/build/outputs/apk/release/app-release.apk"
-  if [ -f "$apk" ] && command -v aapt &>/dev/null; then
-    aapt dump badging "$apk" 2>/dev/null \
-      | grep "^package:" \
-      | sed -E "s/.*name='([^']+)'.*/\1/"
-    return
-  fi
-
-  # 2. Parse applicationId from build.gradle
-  if [ ! -f "$gradle_file" ]; then
-    echo "    Warning: $gradle_file not found" >&2
-    echo ""
-    return
-  fi
-
-  grep -E 'applicationId' "$gradle_file" \
-    | head -1 \
-    | sed -E "s/.*applicationId[[:space:]]+['\"]([^'\"]+)['\"].*/\1/"
-}
-
-# ---------------------------------------------------------------------------
-# Helper: the versionName baked into an APK, or "" if it cannot be read.
-#
-# Exists so a publish can assert the artifact really is the version being
-# announced. Prefers aapt (same tool _android_package_name already relies on),
-# falls back to the newest aapt2 in the Android SDK, and gives up quietly
-# rather than guessing — callers treat "" as "unknown", not as a mismatch.
-# ---------------------------------------------------------------------------
-_apk_version_name() {
-  local apk="$1"
-  [ -f "$apk" ] || return 0
-
-  local badging=""
-  if command -v aapt &>/dev/null; then
-    badging=$(aapt dump badging "$apk" 2>/dev/null || true)
-  fi
-  if [ -z "$badging" ]; then
-    local aapt2
-    aapt2=$(ls -1 "${ANDROID_HOME:-$HOME/Android/Sdk}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
-    [ -n "$aapt2" ] && badging=$("$aapt2" dump badging "$apk" 2>/dev/null || true)
-  fi
-  [ -z "$badging" ] && return 0
-
-  printf '%s' "$badging" \
-    | grep -m1 "^package:" \
-    | sed -E "s/.*versionName='([^']*)'.*/\1/"
-}
-
-# ---------------------------------------------------------------------------
-# Helper: compare two X.Y.Z version strings.
-# Prints "gt" / "lt" / "eq"
-# ---------------------------------------------------------------------------
-_ver_cmp() {
-  python3 - "$1" "$2" <<'EOF'
-import sys
-a = tuple(int(x) for x in sys.argv[1].split("."))
-b = tuple(int(x) for x in sys.argv[2].split("."))
-print("gt" if a > b else ("lt" if a < b else "eq"))
-EOF
-}
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -739,6 +358,9 @@ for arg in "$@"; do
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
+
+# A real release must run the reviewed, current shared library (release-lib.sh).
+if ! $CHECK_VERSIONS_ONLY; then release_lib_require_current; fi
 
 # ---------------------------------------------------------------------------
 # Determine release tag — entirely local via git tags
@@ -1094,27 +716,8 @@ NEEDS_BUILD=false
 # asset loop stays safe even when the build block is skipped (e.g. --retag).
 DESKTOP_ARTIFACTS=()
 
-# Play is available if either gcloud is authenticated or a SA JSON is present
-_play_configured() {
-  command -v gcloud > /dev/null 2>&1 \
-    && gcloud auth application-default print-access-token > /dev/null 2>&1 \
-    && return 0
-  [ -n "${PLAY_SERVICE_ACCOUNT_JSON:-}" ] && [ -f "${PLAY_SERVICE_ACCOUNT_JSON:-}" ] \
-    && return 0
-  return 1
-}
 _play_configured && PUBLISH_PLAY=true
 
-_appstore_configured() {
-  # Mac Mini must be reachable for the xcodebuild archive+export step
-  ssh -o ConnectTimeout=5 -o BatchMode=yes "${MAC_MINI_HOST:-Tims-Mac-mini.local}" exit 2>/dev/null || return 1
-  # Prefer API key auth, fall back to legacy app-specific password
-  if [ -n "${ASC_KEY_ID:-}" ] && [ -n "${ASC_ISSUER_ID:-}" ] && [ -n "${ASC_APP_ID:-}" ]; then
-    return 0
-  fi
-  [ -n "${ASC_APPLE_ID:-}" ] && [ -n "${ASC_APP_PASSWORD:-}" ] && return 0
-  return 1
-}
 _appstore_configured && PUBLISH_APP_STORE=true
 
 # Force-disable destinations whose source platform was skipped. Play and
@@ -1563,44 +1166,6 @@ fi
 FEAT_LINES=""
 FIX_LINES=""
 OTHER_LINES=""
-
-# Helper: strip conventional commit prefix (feat:, fix:, etc.) from a title,
-# returning just the description. Handles optional scope e.g. feat(ui): ...
-_strip_prefix() {
-  printf '%s' "$1" | sed -E 's/^[a-z]+(\([^)]*\))?!?:[[:space:]]*//'
-}
-
-# Helper: categorise a title into feat / fix / other
-_category() {
-  if [[ "$1" =~ ^feat(\([^\)]*\))?!?: ]]; then
-    echo "feat"
-  elif [[ "$1" =~ ^fix(\([^\)]*\))?!?: ]]; then
-    echo "fix"
-  else
-    echo "other"
-  fi
-}
-
-# Helper: append an entry to the right bucket.
-# Usage: _add_entry "<raw title>" "<optional summary>"
-_add_entry() {
-  local raw_title="$1"
-  local summary="$2"
-  local cat
-  cat=$(_category "$raw_title")
-  local clean_title
-  clean_title=$(_strip_prefix "$raw_title")
-
-  local entry="- **${clean_title}**"
-  [ -n "$summary" ] && entry="${entry}: ${summary}"
-  entry="${entry}\n"
-
-  case "$cat" in
-    feat)  FEAT_LINES="${FEAT_LINES}${entry}" ;;
-    fix)   FIX_LINES="${FIX_LINES}${entry}" ;;
-    *)     OTHER_LINES="${OTHER_LINES}${entry}" ;;
-  esac
-}
 
 # Process merge commits (treated as PRs) oldest-first
 while IFS= read -r sha; do
@@ -2316,15 +1881,7 @@ fi # end PUBLISH_GITHUB
 # ---------------------------------------------------------------------------
 # 8. Install zsp if needed
 # ---------------------------------------------------------------------------
-if $PUBLISH_ZAPSTORE && ! command -v zsp &>/dev/null; then
-  echo "==> Installing zsp..."
-  ZSP_URL=$(curl -s https://api.github.com/repos/zapstore/zsp/releases/latest \
-    | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)
-  mkdir -p "$HOME/.local/bin"
-  curl -sL "$ZSP_URL" -o "$HOME/.local/bin/zsp"
-  chmod +x "$HOME/.local/bin/zsp"
-  export PATH="$HOME/.local/bin:$PATH"
-fi
+release_install_zsp
 
 # ---------------------------------------------------------------------------
 # 9. Publish to Zapstore
@@ -3230,7 +2787,6 @@ fi # end PUBLISH_NOSTR
 # ---------------------------------------------------------------------------
 echo ""
 echo "==> $APP_NAME $RELEASE_TAG"
-_report() { printf '    %-14s %s\n' "$1" "$2"; }
 $PUBLISH_GITHUB    && _report "GitHub"    "published" || _report "GitHub"    "skipped"
 $PUBLISH_ZAPSTORE  && _report "Zapstore"  "published" || _report "Zapstore"  "skipped"
 $PUBLISH_PLAY      && _report "Google Play" "published" || _report "Google Play" "skipped"
