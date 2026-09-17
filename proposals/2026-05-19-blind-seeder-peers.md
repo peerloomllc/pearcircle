@@ -1,6 +1,6 @@
 # Blind seeder peers - always-on replication without trust
 
-**Status**: Draft 2026-05-19. Open questions resolved 2026-05-19 (see end of doc): Q1 always-on encryption with no user toggle, Q2 one identity per device, Q3 mode fixed at launch, Q4 per-circle list only, Q5 v: 1 on seeder rows, Q6 document anonymity concern only, Q7 any-member admission with transparency, Q8 ship TTL config knob in v1. Awaiting approval.
+**Status**: Draft 2026-05-19. Open questions resolved 2026-05-19 (see end of doc): Q1 always-on encryption with no user toggle, Q2 one identity per device, Q3 mode fixed at launch, Q4 per-circle list only, Q5 v: 1 on seeder rows, Q6 document anonymity concern only, Q7 any-member admission with transparency, Q8 ship TTL config knob in v1. **Approved 2026-09-17** (Tim), recording what already shipped: admission, retention, revocation, QR pairing and the operator nickname are all in the tree, and this is the canonical seeder design the suite-wide shared-seeder proposal treats as the donor.
 
 **Goal**: Let a circle enroll an always-on "blind seeder" device (a Raspberry Pi, a spare phone, eventually a community-run mesh) that replicates encrypted Autobase blocks for the circle but never holds the encryption key, so circle members can sync asynchronously without both being online at the same instant. Closes the structural co-presence gap that today's pure-P2P design has against server-mediated apps like Life360.
 
