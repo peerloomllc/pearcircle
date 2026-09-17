@@ -65,9 +65,13 @@ mac() { ssh "$MAC_MINI" 'bash -l -s' <<< "$1"; }
 # Same trap as ios-dev-install.sh: Xcode packages whatever is in assets/, it
 # never rebuilds the JS. Stale bundles here mean testing yesterday's worklet.
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  step "build bundles locally (bare:ios + ui)"
+  step "build bundles locally (bare:ios-sim + ui)"
   cd "$REPO_ROOT"
-  npm run build:bare:ios
+  # build:bare:ios is the release's device command (--host ios-arm64). The
+  # Simulator variant asks for the simulator hosts too. With --linked addons the
+  # two bundles were byte-identical when measured (2026-09-17), because addons
+  # resolve by framework name, but the Simulator build should not depend on that.
+  npm run build:bare:ios-sim
   npm run build:ui
 fi
 

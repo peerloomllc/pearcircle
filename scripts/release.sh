@@ -1363,11 +1363,11 @@ _confirm "app.json version looks correct — proceed with bundle builds?"
 # Constitution §5 gate: the unit tests run first and a red suite aborts the
 # release via set -e, then every bundle the release ships is rebuilt.
 #
-# The bundle commands are inlined rather than delegated to `npm run verify`
-# because package.json's build:bare passes `--defer fs --defer path` and its
-# build:bare:ios uses `--preset ios` where the release uses `--host ios-arm64
-# --linked`. Those produce different bundles, so calling verify here would
-# change what ships. Reconciling package.json is tracked separately.
+# The bundle commands are inlined rather than delegated to `npm run verify`,
+# but package.json's build:bare and build:bare:ios run exactly these commands
+# (reconciled 2026-09-17, byte-identical output), so verify checks the bundles
+# that ship. build:bare:ios-sim is the Simulator variant (ios preset) and is
+# never used here.
 # ---------------------------------------------------------------------------
 echo "==> Running unit tests..."
 npm test
