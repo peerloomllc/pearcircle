@@ -213,6 +213,12 @@ async function ensureNotifications() {
       lightColor: '#0E413A',
     })
   }
+  // iOS: ask only once the page and the worklet have loaded. Expo runs its
+  // native async calls one at a time on a shared queue, and on iOS
+  // getPermissionsAsync blocks that queue until iOS answers. On a freshly
+  // booted iOS 27 Simulator the answer never came, so the asset and file reads
+  // behind it never ran and the first launch sat on the splash (2026-09-28).
+  if (Platform.OS === 'ios') await _iosStartupLoaded
   const settings = await Notifications.getPermissionsAsync()
   if (settings.status !== 'granted') {
     await Notifications.requestPermissionsAsync()
@@ -489,6 +495,14 @@ let _webViewRef: { current: WebView | null } | null = null
 // headless path can kick it off and the `ready` FGS-start flow can await it
 // before startUpdates, exactly as the Activity path did via a component ref.
 let _notifSetupReady: Promise<void> = Promise.resolve()
+// Settle (success or failure) when the UI HTML and the worklet have loaded.
+// ensureNotifications waits on both before its iOS permission check.
+let _uiHtmlSettled: () => void = () => {}
+let _workletSettled: () => void = () => {}
+const _iosStartupLoaded = Promise.all([
+  new Promise<void>((r) => { _uiHtmlSettled = r }),
+  new Promise<void>((r) => { _workletSettled = r }),
+])
 
 // iOS first-run location priming gate (Activity path only; iOS never runs
 // headless). Module-scoped because the `ready` native handler sets it and the
@@ -818,7 +832,7 @@ export const ensureBackendStarted = makeStartLock(async () => {
   AsyncStorage.getItem(DISTANCE_UNIT_KEY).then((raw) => {
     _distanceUnitPref = raw === 'miles' ? 'miles' : 'km'
   }).catch(() => {})
-  await startWorklet()
+  try { await startWorklet() } finally { _workletSettled() }
 })
 
 function buildHtml(jsBundle: string) {
@@ -913,7 +927,7 @@ export default function Index() {
     // worklet handlers and starts the worklet; safe if the headless boot
     // task already started it (the start lock returns the same promise).
     ensureBackendStarted().catch((e: any) => console.warn('backend start failed', e))
-    loadUiHtml().then((h) => { shellMark('ui:html-ready'); setHtml(h) }).catch((e) => console.warn('UI bundle load failed', e))
+    loadUiHtml().then((h) => { shellMark('ui:html-ready'); setHtml(h) }).catch((e) => console.warn('UI bundle load failed', e)).finally(() => _uiHtmlSettled())
 
     const sub = AppState.addEventListener('change', (s) => {
       // WebView-freeze recovery (Android/GrapheneOS): stamp when we background,
