@@ -105,6 +105,8 @@ security set-key-partition-list \
 XCODE_PATH=$(printf '%s' "$PATH" | sed 's|/opt/homebrew/bin:||g; s|:/opt/homebrew/bin||g')
 
 # ── Archive ─────────────────────────────────────────────────────────────────
+# $HOME, not ~: inside the quotes ~ is never expanded, and codesign then fails with
+# "no identity found" (it did on Xcode 27, 2026-09-28).
 rm -rf "$ARCHIVE_PATH"
 echo "Archiving..."
 PATH="$XCODE_PATH" xcodebuild \
@@ -114,7 +116,7 @@ PATH="$XCODE_PATH" xcodebuild \
   -destination "generic/platform=iOS" \
   -archivePath "$ARCHIVE_PATH" \
   DEVELOPMENT_TEAM="$TEAM_ID" \
-  OTHER_CODE_SIGN_FLAGS="--keychain ~/Library/Keychains/buildkey.keychain" \
+  OTHER_CODE_SIGN_FLAGS="--keychain $HOME/Library/Keychains/buildkey.keychain" \
   archive 2>&1 | tee /tmp/${APP_NAME}-archive.log | grep -E "^(error:|warning:|note:|.*ARCHIVE)|: error:" || true
 # The pipe above hides xcodebuild's exit status (grep decides it, and `|| true`
 # swallows grep finding nothing), so check for the archive itself. Without this a
@@ -155,7 +157,8 @@ if $USE_ASC; then
     --issuer-id "$ASC_ISSUER_ID" \
     --private-key "$ASC_KEY_FILE"
 
-  asc builds upload --app "$ASC_APP_ID" --ipa "$IPA_PATH"
+  # The default timeout cut a ~190 MB PearCinema upload off partway on 2026-09-28.
+  ASC_UPLOAD_TIMEOUT="${ASC_UPLOAD_TIMEOUT:-1200s}" asc builds upload --app "$ASC_APP_ID" --ipa "$IPA_PATH"
 else
   xcrun altool \
     --upload-app \
