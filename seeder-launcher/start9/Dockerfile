@@ -6,7 +6,7 @@
 # `bare` child the host spawns) and the StartOS entrypoint. `docker buildx`
 # selects the right arch layer from the base image's manifest; the s9pk
 # packer expects the built tar tagged start9/<id>/main:<version>.
-FROM ghcr.io/peerloomllc/pearcircle-seeder:1.1.2@sha256:ea16a9a8d7564189d2b3ee5191c146d6785ef8d764d4d059bd56ba07f5681e95
+FROM ghcr.io/peerloomllc/pearcircle-seeder:1.1.4@sha256:ad80eaa9156c19f13c02c19f0d70602724ec2bec8002dfb25cb580e18f35f400
 
 # The published image is node:20-bookworm-slim (Debian), which has no init.
 RUN apt-get update \
