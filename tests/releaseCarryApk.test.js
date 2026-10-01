@@ -13,7 +13,10 @@ const crypto = require('crypto')
 const { spawnSync } = require('child_process')
 
 const SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'release.sh'), 'utf8')
-const helper = SCRIPT.match(/^_carry_forward_apk\(\) \{[\s\S]*?^\}$/m)[0]
+// The helper moved into the shared release library (PR #218), which release.sh
+// sources from a peerloom-release checkout beside this repo.
+const LIB = fs.readFileSync(path.join(__dirname, '..', '..', 'peerloom-release', 'release-lib.sh'), 'utf8')
+const helper = LIB.match(/^_carry_forward_apk\(\) \{[\s\S]*?^\}$/m)[0]
 
 function fakeRelease ({ apk = 'pearcircle-v1.0.8.apk', goodSum = true, withSum = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'carry-'))
