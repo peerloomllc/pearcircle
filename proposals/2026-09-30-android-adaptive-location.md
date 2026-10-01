@@ -1,6 +1,6 @@
 # Android adaptive location (low-power while idle, GPS only while moving)
 
-**Status**: Draft 2026-09-30. Awaiting approval.
+**Status**: Approved 2026-09-30 by Tim, with the open questions resolved below.
 
 **Goal**: Stop the GPS from running all day on Android. Use a low-power location request while the phone is still, and turn on high-accuracy GPS only while the app is open, the phone is moving or a trip is in progress. iOS has done this since PR #57.
 
@@ -77,9 +77,9 @@ Mixed fleets are fine; this is a local energy change.
 
 `ADAPTIVE_LOCATION_MODE_ENABLED` already pins `tracking` everywhere. An Android-only flag beside it pins `tracking` on Android alone. With either set, behavior is today's. No peer coordination needed.
 
-## Open questions
+## Resolved questions
 
-- Q1: Significant-motion sensor or Activity Recognition? Activity Recognition gives explicit still/moving transitions but needs the `ACTIVITY_RECOGNITION` permission, an onboarding prompt and Play services, so it does nothing on de-Googled phones. Lean: significant motion only.
-- Q2: Idle cadence. 5 min balanced-power with a 50m minimum distance is the default. Shorter keeps idle positions fresher at some cost.
-- Q3: Should idle mode keep the foreground notification? The service must stay in the foreground to receive location while backgrounded, so yes. Only the request inside it changes.
-- Q4: Battery bar. What result on the Pixel counts as fixed? Default: PearCircle under 5% of a normal day's drain.
+- Q1: Significant-motion sensor only. No Activity Recognition, no new permission.
+- Q2: Idle cadence 5 min, balanced power, 50m minimum distance.
+- Q3: The foreground service and its notification stay in idle mode. Only the request inside it changes.
+- Q4: Battery bar: PearCircle under 10% of a normal day's drain on the Pixel 9 Pro.
