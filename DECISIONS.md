@@ -2,6 +2,18 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-09-30 - Android adaptive location: low power while idle, GPS while moving
+
+Tier: T1. Proposal `proposals/2026-09-30-android-adaptive-location.md` (PR #225).
+
+Context: PearCircle was the top battery app on a GrapheneOS Pixel 9 Pro (21% of a 9h window, GPS on for 9h 5m) and a GrapheneOS Pixel 7 user reported half their battery. Android streamed `PRIORITY_HIGH_ACCURACY` every 10s around the clock and ignored the worklet's `location:mode:set`.
+
+Choice: Implement `setMode` on Android. Idle uses balanced power (fused) or the network or passive provider (no GMS) at 5 min and 50m. Motion comes from `TYPE_SIGNIFICANT_MOTION`. Idle arrive/leave alerts come from OS geofences (`GeofencingClient`, or `addProximityAlert` without GMS) through the existing `region:enter` / `region:exit` path. Success bar: under 10% of a normal day on the Pixel.
+
+Alternatives considered: Activity Recognition (rejected: new permission prompt and needs Play services, so nothing on de-Googled phones); keeping JS geofencing on sparse idle fixes (rejected: late or missed alerts).
+
+Consequences: An idle Android member's position refreshes every 5 min at about 100m, and idle alerts may lag by up to about 2 min. No wire change. Rollback: an Android-only flag pins `tracking`.
+
 ## 2026-08-28 - the seeder heals a copied data folder instead of staying down; member mode keeps the guard
 Tier: T1. Local storage logic only, no wire change, no Hyperbee key change. Ported from PearCal PR #325 (its DECISIONS.md, same date).
 Context: hypercore-storage opens the corestore through `device-file`, whose CORESTORE marker records the file's own inode and a created stamp and refuses to open ("Invalid device file, was modified") when either changes. The guard exists so two live copies of a core never both write. StartOS 0.4.0.1's first boot clones each package volume into a btrfs subvolume and deletes the original, so every file gets a new inode and birth time while exactly one copy remains. pearcircle-seeder on the Start9 crash-looped from 16:08 on 2026-08-28 until the marker was rewritten by hand.
