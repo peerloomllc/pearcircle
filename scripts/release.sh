@@ -625,6 +625,68 @@ _asc_auth_linux() {
     --private-key "$key_file" >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------------------
+# _asc_wait_for_build <marketingVersion> [buildNumber]
+#
+# Waits for App Store Connect to finish processing the build this run uploaded,
+# then prints "<uuid> <processingState>". Prints the last state seen (or nothing)
+# if ASC_PROCESS_WAIT seconds pass first (default 1800).
+#
+# Matches the marketing version as well as the build number. Build numbers repeat
+# across versions: PearPetal 1.0.7 and 1.0.8 were both build 19, so a lookup by
+# number alone attached the old build and the 2026-09-30 submission failed.
+# A new upload takes 5-15 minutes to appear and process, and submitting before
+# then leaves an empty review submission behind.
+# ---------------------------------------------------------------------------
+_asc_wait_for_build() {
+  local _ver="$1" _num="${2:-}" _info="" _state=""
+  local _deadline=$(( $(date +%s) + ${ASC_PROCESS_WAIT:-1800} ))
+  while :; do
+    _info=$(asc builds list --app "$ASC_APP_ID" --version "$_ver" --processing-state all \
+      --output json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+want = '$_num'.strip()
+for x in d.get('data', []):
+    a = x.get('attributes', {})
+    if not want or str(a.get('version', '')).strip() == want:
+        print('%s %s' % (x.get('id', ''), a.get('processingState', 'UNKNOWN')))
+        break
+" 2>/dev/null)
+    _state="${_info##* }"
+    case "$_state" in VALID|FAILED|INVALID) break ;; esac
+    [ "$(date +%s)" -ge "$_deadline" ] && break
+    echo "    Build ${_num:-for $_ver} is ${_state:-not registered yet} on App Store Connect, checking again in 30s..." >&2
+    sleep 30
+  done
+  printf '%s\n' "$_info"
+}
+
+# ---------------------------------------------------------------------------
+# _asc_attach_build <versionId> <buildId>
+#
+# Attaches the build to the App Store version. Succeeds if it attached or was
+# already attached; otherwise prints why and fails, so the caller does not go on
+# to submit a version with no build (Apple then reports "The build associated
+# with appStoreVersions ... was not found", which points nowhere near the cause).
+# ---------------------------------------------------------------------------
+_asc_attach_build() {
+  local _vid="$1" _bid="$2" _err
+  echo "    Attaching build ${_bid}..."
+  _err=$(asc versions attach-build --version-id "$_vid" --build "$_bid" 2>&1 >/dev/null) && return 0
+  if asc versions view --version-id "$_vid" --include-build --output json 2>/dev/null | grep -q "$_bid"; then
+    echo "    Build is already attached."
+    return 0
+  fi
+  echo "    ERROR: could not attach build ${_bid}: ${_err}" >&2
+  echo "    NOT submitting. Attach it in App Store Connect (version page -> Build -> +)" >&2
+  echo "    and submit from there." >&2
+  return 1
+}
+
 # Uses $REPO_ROOT so this works regardless of invocation directory.
 # ---------------------------------------------------------------------------
 _android_package_name() {
@@ -2959,17 +3021,15 @@ except Exception:
         fi
       fi
 
-      BUILD_ID=$(asc builds info --app "$ASC_APP_ID" --version "$APP_VERSION" --latest --output json 2>/dev/null \
-        | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    item = d.get('data', d) if isinstance(d, dict) else d
-    if isinstance(item, list):
-        item = item[0] if item else {}
-    print(item.get('id', ''))
-except Exception:
-    print('')" 2>/dev/null || echo "")
+      # Wait for Apple to finish processing the upload: attaching or submitting
+      # before then fails and leaves an empty review submission behind. Matches
+      # the build number too, since build numbers repeat across versions.
+      _BUILD_INFO=$(_asc_wait_for_build "$APP_VERSION" "${_ios_build_number:-}")
+      BUILD_ID="${_BUILD_INFO%% *}"
+      if [ -n "$BUILD_ID" ] && [ "${_BUILD_INFO##* }" != "VALID" ]; then
+        echo "    Build is ${_BUILD_INFO##* } on App Store Connect, not VALID."
+        BUILD_ID=""
+      fi
 
       if [ -z "$VERSION_ID" ] || [ -z "$BUILD_ID" ]; then
         echo "    NOTE: could not find version-id ($VERSION_ID) or build-id ($BUILD_ID)."
@@ -2987,16 +3047,16 @@ except Exception:
         echo "    Version : $VERSION_ID"
         echo "    Build   : $BUILD_ID"
 
-        # Step 4a: attach build to version (idempotent — re-attaching the
-        # same build is a no-op).
-        echo "    Attaching build to version..."
-        asc versions attach-build --version-id "$VERSION_ID" --build "$BUILD_ID" >/dev/null 2>&1 || \
-          echo "    (attach may have already been done — continuing)"
+        # Step 4a: attach build to version (already-attached counts as success).
+        _ATTACHED=true
+        _asc_attach_build "$VERSION_ID" "$BUILD_ID" || { _ATTACHED=false; PUBLISH_FAILED=true; }
 
-        # Step 4b: create a review submission
-        echo "    Creating review submission..."
-        SUBMISSION_ID=$(asc review submissions-create --app "$ASC_APP_ID" --platform IOS --output json 2>/dev/null \
-          | python3 -c "
+        # Step 4b: create a review submission, only with a build attached
+        SUBMISSION_ID=""
+        if $_ATTACHED; then
+          echo "    Creating review submission..."
+          SUBMISSION_ID=$(asc review submissions-create --app "$ASC_APP_ID" --platform IOS --output json 2>/dev/null \
+            | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -3004,8 +3064,11 @@ try:
     print(item.get('id', ''))
 except Exception:
     print('')" 2>/dev/null || echo "")
+        fi
 
-        if [ -z "$SUBMISSION_ID" ]; then
+        if ! $_ATTACHED; then
+          echo "    Skipping submission (see the attach error above)."
+        elif [ -z "$SUBMISSION_ID" ]; then
           echo "    WARNING: could not create review submission (maybe one already exists)."
           echo "    List in-progress submissions: asc review submissions-list --app $ASC_APP_ID"
           PUBLISH_FAILED=true
