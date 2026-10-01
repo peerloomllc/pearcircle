@@ -1,6 +1,7 @@
 package com.pearcircle
 
 import android.Manifest
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -24,6 +25,7 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.facebook.react.modules.core.PermissionAwareActivity
@@ -31,6 +33,8 @@ import com.facebook.react.modules.core.PermissionListener
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.location.CurrentLocationRequest
+import com.google.android.gms.location.Geofence
+import com.google.android.gms.location.GeofencingRequest
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
@@ -40,6 +44,9 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
 
     init {
         instance = this
+        // A new module means a new JS context that has not attached its
+        // region listeners yet, so queue region events until it does.
+        regionListenersAttached.clear()
         registerNetworkCallback()
     }
 
@@ -143,8 +150,128 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         }
     }
 
-    // Required by RN even when we deliver via DeviceEventManagerModule.
-    @ReactMethod fun addListener(eventName: String) { /* no-op */ }
+    // Adaptive location mode from the worklet's driver (proposal 2026-09-30,
+    // the Android side of 2026-05-16 / 2026-05-21). "idle" drops to a
+    // low-power request; "tracking" is the full GPS stream.
+    @ReactMethod
+    fun setMode(mode: String, promise: Promise) {
+        PearCircleLocationService.setMode(mode)
+        promise.resolve(true)
+    }
+
+    // OS geofences for the nearest Places, so arrive/leave alerts still fire
+    // while idle mode has the GPS off. Same region shape as iOS
+    // ({ id: "circleId|placeId", lat, lon, radius }); events come back through
+    // PearCircleGeofenceReceiver as PearCircleLocation:region:enter / :exit.
+    // Fused GeofencingClient with Play services, LocationManager proximity
+    // alerts without. A failed registration keeps the service in tracking.
+    @ReactMethod
+    fun setMonitoredRegions(regions: ReadableArray, promise: Promise) {
+        val list = (0 until regions.size()).mapNotNull { i ->
+            val r = regions.getMap(i) ?: return@mapNotNull null
+            val id = r.getString("id") ?: return@mapNotNull null
+            if (!r.hasKey("lat") || !r.hasKey("lon") || !r.hasKey("radius")) return@mapNotNull null
+            Region(id, r.getDouble("lat"), r.getDouble("lon"), r.getDouble("radius").toFloat())
+        }
+        if (!hasFineLocation()) {
+            PearCircleLocationService.setGeofencesHealthy(list.isEmpty())
+            promise.resolve(false)
+            return
+        }
+        if (gmsAvailable(ctx)) setFusedGeofences(list, promise) else setProximityAlerts(list, promise)
+    }
+
+    private fun setFusedGeofences(list: List<Region>, promise: Promise) {
+        val client = LocationServices.getGeofencingClient(ctx)
+        val pi = PearCircleGeofenceReceiver.fusedPendingIntent(ctx)
+        client.removeGeofences(pi).addOnCompleteListener {
+            if (list.isEmpty()) {
+                PearCircleLocationService.setGeofencesHealthy(true)
+                promise.resolve(true)
+                return@addOnCompleteListener
+            }
+            val req = GeofencingRequest.Builder()
+                // No initial trigger: iOS regions do not report the state at
+                // registration either, and the worklet's classifier already
+                // knows whether we are inside.
+                .setInitialTrigger(0)
+                .addGeofences(list.map { r ->
+                    Geofence.Builder()
+                        .setRequestId(r.id)
+                        .setCircularRegion(r.lat, r.lon, r.radius)
+                        .setExpirationDuration(Geofence.NEVER_EXPIRE)
+                        .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER or Geofence.GEOFENCE_TRANSITION_EXIT)
+                        .build()
+                })
+                .build()
+            try {
+                client.addGeofences(req, pi)
+                    .addOnSuccessListener {
+                        PearCircleLocationService.setGeofencesHealthy(true)
+                        promise.resolve(true)
+                    }
+                    .addOnFailureListener { e ->
+                        Log.w(TAG, "addGeofences failed: ${e.message}")
+                        PearCircleLocationService.setGeofencesHealthy(false)
+                        promise.resolve(false)
+                    }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "addGeofences refused: ${e.message}")
+                PearCircleLocationService.setGeofencesHealthy(false)
+                promise.resolve(false)
+            }
+        }
+    }
+
+    private fun setProximityAlerts(list: List<Region>, promise: Promise) {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (lm == null) {
+            PearCircleLocationService.setGeofencesHealthy(list.isEmpty())
+            promise.resolve(false)
+            return
+        }
+        synchronized(proximityIntents) {
+            for (pi in proximityIntents.values) {
+                try { lm.removeProximityAlert(pi) } catch (_: Throwable) {}
+                pi.cancel()
+            }
+            proximityIntents.clear()
+            try {
+                for (r in list) {
+                    val pi = PearCircleGeofenceReceiver.proximityPendingIntent(ctx, r.id)
+                    lm.addProximityAlert(r.lat, r.lon, r.radius, -1L, pi)
+                    proximityIntents[r.id] = pi
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "addProximityAlert refused: ${e.message}")
+                PearCircleLocationService.setGeofencesHealthy(false)
+                promise.resolve(false)
+                return
+            }
+        }
+        PearCircleLocationService.setGeofencesHealthy(true)
+        promise.resolve(true)
+    }
+
+    fun emitMotion(moving: Boolean) {
+        val payload: WritableMap = Arguments.createMap().apply { putBoolean("moving", moving) }
+        try {
+            ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit("PearCircleLocation:motion:changed", payload)
+        } catch (_: Throwable) {
+            // React context torn down; the next trigger re-reports motion.
+        }
+    }
+
+    // Required by RN even when we deliver via DeviceEventManagerModule. The
+    // region listener attaching is the cue to replay crossings that arrived
+    // before JS was listening (a geofence can start the process cold).
+    @ReactMethod fun addListener(eventName: String) {
+        if (eventName == REGION_ENTER_EVENT || eventName == REGION_EXIT_EVENT) {
+            regionListenersAttached.add(eventName)
+            flushPendingRegionEvents()
+        }
+    }
     @ReactMethod fun removeListeners(count: Int) { /* no-op */ }
 
     // Cross-platform parity with the iOS PearCircleLocationModule.swift
@@ -609,6 +736,34 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         }
     }
 
+    private fun flushPendingRegionEvents() {
+        val ready = synchronized(pendingRegionEvents) {
+            val (now, later) = pendingRegionEvents.partition { regionListenersAttached.contains(it.event) }
+            pendingRegionEvents.clear()
+            pendingRegionEvents.addAll(later)
+            now
+        }
+        for (e in ready) {
+            if (!emitRegionNow(e)) synchronized(pendingRegionEvents) { pendingRegionEvents.add(e) }
+        }
+    }
+
+    private fun emitRegionNow(e: RegionEvent): Boolean {
+        val payload: WritableMap = Arguments.createMap().apply {
+            putString("id", e.id)
+            putDouble("ts", e.ts.toDouble())
+        }
+        return try {
+            ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(e.event, payload)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    data class Region(val id: String, val lat: Double, val lon: Double, val radius: Float)
+    data class RegionEvent(val event: String, val id: String, val ts: Long)
+
     companion object {
         private const val TAG = "PearCircleLocation"
         private const val REQ_FINE = 4711
@@ -619,6 +774,23 @@ class PearCircleLocationModule(private val ctx: ReactApplicationContext)
         // The fused provider can hang indefinitely on de-Googled ROMs.
         private const val GET_FIX_TIMEOUT_MS = 8000L
         @JvmStatic var instance: PearCircleLocationModule? = null
+
+        const val REGION_ENTER_EVENT = "PearCircleLocation:region:enter"
+        const val REGION_EXIT_EVENT = "PearCircleLocation:region:exit"
+        private val proximityIntents = mutableMapOf<String, PendingIntent>()
+        private val pendingRegionEvents = mutableListOf<RegionEvent>()
+        private val regionListenersAttached = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+        // Called by PearCircleGeofenceReceiver. Emits straight away when JS is
+        // listening, otherwise queues until addListener replays it. The shell
+        // buffers again until the worklet is up, as it does for iOS.
+        @JvmStatic
+        fun dispatchRegionEvent(enter: Boolean, id: String, ts: Long) {
+            val e = RegionEvent(if (enter) REGION_ENTER_EVENT else REGION_EXIT_EVENT, id, ts)
+            val mod = instance
+            if (mod != null && regionListenersAttached.contains(e.event) && mod.emitRegionNow(e)) return
+            synchronized(pendingRegionEvents) { pendingRegionEvents.add(e) }
+        }
 
         // Autostart gate, shared with BootReceiver. Proposal 2026-06-09.
         const val PREFS = "pearcircle_autostart"

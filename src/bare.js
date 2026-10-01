@@ -459,6 +459,7 @@ let _locationUpdateSeen = false
 // a step-down, so a brief stop (red light, gas station, the user
 // briefly backgrounding the app mid-walk) doesn't flap the radio.
 const MOTION_GRACE_MS = 2 * 60 * 1000
+const TRIP_SETTLE_TICK_MS = 60 * 1000
 
 // Suppress duplicate `transition:applied` IPC emits when autobase
 // re-applies the same op (indexer reorganization on writer-add or
@@ -747,6 +748,7 @@ function motionIsRecent () {
 // motion grace timer. The shell ignores the event on non-iOS platforms,
 // so it is safe to run unconditionally.
 function runLocationModeDriver () {
+  armTripSettleTimer()
   const nextMode = nextEmittedMode(
     _lastAdaptiveMode,
     {
@@ -765,6 +767,32 @@ function runLocationModeDriver () {
     // fixes only flow in 'tracking', so a trip that never escalates never arms.
     traceTrip('mode', { to: nextMode, phase: _tripState.phase, fg: _appForeground, motion: motionIsRecent() }, true)
   }
+}
+
+// While a trip is open, close it on a timer once it has gone a full cooldown
+// window without activity (proposal 2026-09-30). stepTrip only settles a trip
+// when a fix arrives, and a phone parked at the end of a drive may send none
+// (Android filters fixes under 10m), which would leave the trip open and the
+// mode pinned to "tracking" with the GPS on. iOS settles on its next wake via
+// drainTripFixes; this covers a process that stays alive. Idempotent: at most
+// one timer, and none while idle.
+let _tripSettleTimer = null
+function armTripSettleTimer () {
+  if (_tripSettleTimer || _tripState.phase === 'idle') return
+  _tripSettleTimer = setTimeout(async () => {
+    _tripSettleTimer = null
+    try {
+      const prevPhase = _tripState.phase
+      const settled = settleStaleTrip(_tripState, Date.now())
+      if (settled.state !== _tripState) {
+        _tripState = settled.state
+        traceTrip('settle-timer', { from: prevPhase, completed: !!settled.completed }, true)
+        if (settled.completed) await finalizeCompletedTrip(settled.completed)
+        await persistTripCheckpoint()
+      }
+    } catch (e) { console.warn('[bare] trip settle timer failed', e?.message) }
+    runLocationModeDriver()
+  }, TRIP_SETTLE_TICK_MS)
 }
 
 const handlers = {

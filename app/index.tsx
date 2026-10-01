@@ -510,6 +510,14 @@ const _iosStartupLoaded = Promise.all([
 // component's closure.
 let _pendingLocationStart = false
 
+// Rollback switch for Android adaptive location (proposal 2026-09-30). false
+// leaves Android on the full GPS stream with no OS geofences, exactly as before.
+const ANDROID_ADAPTIVE_LOCATION = true
+
+function adaptiveLocationOnThisPlatform() {
+  return Platform.OS === 'ios' || (Platform.OS === 'android' && ANDROID_ADAPTIVE_LOCATION)
+}
+
 function emitEvent(event: string, data: any) {
   // Optional-chains through a possibly-null ref/current so a headless backend
   // (no WebView) is a safe no-op rather than a crash.
@@ -554,8 +562,8 @@ function ensureLocationListener() {
   // CoreMotion activity transitions from the iOS native side (proposal
   // 2026-05-21). A stationary -> moving change escalates the worklet's
   // adaptive location mode out of SLC-only "idle" without waiting on
-  // the trip detector, closing the idle-trap. Android emits no
-  // equivalent, so the listener simply never fires there.
+  // the trip detector, closing the idle-trap. Android sends the same event
+  // from its significant-motion sensor (proposal 2026-09-30).
   emitter.addListener('PearCircleLocation:motion:changed', (data: any) => {
     sendToWorklet({ method: 'motion:changed', args: data })
   })
@@ -783,21 +791,21 @@ function registerNativeActionHandlers() {
     if (data && typeof data.enabled === 'boolean') _tripNotificationsEnabled = data.enabled
   })
 
-  // Worklet asks the shell to reconcile the iOS CLCircularRegion set with its
-  // current places (iOS-only; Android no-ops here). Capped to <=20 by the
-  // worklet (Apple's limit). Non-fatal: the JS classifier still covers the
-  // foreground / backgrounded case via location:update.
+  // Worklet asks the shell to reconcile the OS region set with its current
+  // places: CLCircularRegion on iOS, geofences or proximity alerts on Android
+  // (proposal 2026-09-30). Capped to <=20 by the worklet (Apple's limit).
+  // Non-fatal: the JS classifier still covers crossings via location:update.
   onEvent('regions:set', async (data) => {
-    if (Platform.OS !== 'ios' || !PearCircleLocation?.setMonitoredRegions) return
+    if (!adaptiveLocationOnThisPlatform() || !PearCircleLocation?.setMonitoredRegions) return
     const regions = Array.isArray(data?.regions) ? data.regions : []
     try { await PearCircleLocation.setMonitoredRegions(regions) }
     catch (e: any) { console.warn('setMonitoredRegions failed', e?.message ?? String(e)) }
   })
-  // Adaptive location mode (proposal 2026-05-16): worklet flips the native
-  // CLLocationManager between SLC-only ("idle") and SLC+continuous
-  // ("tracking"). iOS only; Android has its own knobs.
+  // Adaptive location mode (proposals 2026-05-16, 2026-09-30): the worklet
+  // flips native location between low power ("idle") and continuous GPS
+  // ("tracking"). On iOS idle is SLC-only; on Android a balanced-power request.
   onEvent('location:mode:set', async (data) => {
-    if (Platform.OS !== 'ios' || !PearCircleLocation?.setMode) return
+    if (!adaptiveLocationOnThisPlatform() || !PearCircleLocation?.setMode) return
     const mode = data?.mode
     if (mode !== 'idle' && mode !== 'tracking') return
     try { await PearCircleLocation.setMode(mode) }
