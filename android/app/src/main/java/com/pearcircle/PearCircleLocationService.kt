@@ -81,7 +81,9 @@ class PearCircleLocationService : Service() {
         // refused. Idempotent: the JS start lock no-ops if the Activity
         // already started the backend, so the normal app-open path (no
         // EXTRA_FROM_BOOT) skips this and avoids spinning a redundant task.
-        if (intent?.getBooleanExtra(EXTRA_FROM_BOOT, false) == true) {
+        // A null intent is a START_STICKY restart after the OS killed the
+        // process: the worklet died with it, so bring it back the same way.
+        if (intent == null || intent.getBooleanExtra(EXTRA_FROM_BOOT, false)) {
             BackendHeadlessTaskService.ensureStarted(applicationContext)
         }
         // START_STICKY: if the OS kills us under memory pressure, retry
