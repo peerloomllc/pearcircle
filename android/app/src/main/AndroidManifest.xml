@@ -77,5 +77,11 @@
         <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
       </intent-filter>
     </receiver>
+    <!-- OS geofence crossings for Places while the adaptive location mode is
+         idle (GPS off). Only the system fires it through our own
+         PendingIntents, so it is not exported. Proposal 2026-09-30. -->
+    <receiver
+      android:name=".PearCircleGeofenceReceiver"
+      android:exported="false"/>
   </application>
 </manifest>
