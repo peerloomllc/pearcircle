@@ -5073,7 +5073,7 @@ function CirclesSection ({ active = true, onChanged }) {
   return (
     <>
       <p style={s.muted}>
-        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy. If you own a circle, its row also has icons to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places) or export its name, Places and settings to a file you can re-import later.
+        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy. Any circle can be exported: its name, Places and settings go to a file you can re-import later as a new circle that you own. If you own a circle, its row also has an icon to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places).
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
         {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
@@ -5199,16 +5199,17 @@ function CirclesSection ({ active = true, onChanged }) {
                   <ArrowsClockwise size={18} weight="regular" />
                 </button>
               )}
-              {c.isOwner && (
-                <button
-                  onClick={() => { setError(null); setExportingFor(c) }}
-                  disabled={isPending}
-                  title="Export circle to file"
-                  aria-label="Export circle to file"
-                  style={iconBtnStyle({ disabled: isPending })}>
-                  <ExportIcon size={18} weight="regular" />
-                </button>
-              )}
+              {/* Any member can export: the file holds only the name, Places
+                  and toggles every member already sees, and it lets someone
+                  who lost the owner identity rebuild the circle by import. */}
+              <button
+                onClick={() => { setError(null); setExportingFor(c) }}
+                disabled={isPending}
+                title="Export circle to file"
+                aria-label="Export circle to file"
+                style={iconBtnStyle({ disabled: isPending })}>
+                <ExportIcon size={18} weight="regular" />
+              </button>
               <button
                 onClick={() => setConfirmingFor(c)}
                 disabled={isPending}
