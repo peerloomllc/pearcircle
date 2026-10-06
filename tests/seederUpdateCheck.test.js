@@ -1,5 +1,5 @@
 const {
-  parseVersion, compareVersions, isNewer, selectAsset, selectSha256For, evaluateRelease,
+  parseVersion, compareVersions, isNewer, selectAsset, selectSha256For, evaluateRelease, assetVersion, latestSeederVersion,
 } = require('../src/lib/seederUpdateCheck')
 
 // Proposal 2026-06-05-seeder-update slice 2: version compare + asset selection.
@@ -112,5 +112,39 @@ describe('evaluateRelease', () => {
     expect(r.updateAvailable).toBe(false)
     expect(r.latestVersion).toBeNull()
     expect(r.assetUrl).toBeNull()
+  })
+})
+
+describe('installer versions (releases that carry older seeders forward)', () => {
+  test('assetVersion reads every installer naming scheme', () => {
+    expect(assetVersion('PearCircleSeeder-1.1.2.pkg')).toBe('1.1.2')
+    expect(assetVersion('PearCircleSeeder-Setup-1.1.1.exe')).toBe('1.1.1')
+    expect(assetVersion('pearcircle-seeder_1.1.0_amd64.deb')).toBe('1.1.0')
+    expect(assetVersion('PearCircleSeeder-1.1.5-x86_64.AppImage')).toBe('1.1.5')
+    expect(assetVersion('pearcircle-seeder-v1.0.11.pkg')).toBe('1.0.11')
+    expect(assetVersion('PearCircleSeeder-x86_64.AppImage')).toBeNull()
+  })
+  const carried = {
+    tag_name: 'v1.1.5',
+    assets: [
+      { name: 'PearCircleSeeder-1.1.2.pkg', browser_download_url: 'u/pkg' },
+      { name: 'pearcircle-seeder_1.1.0_amd64.deb', browser_download_url: 'u/deb' },
+      { name: 'pearcircle-v1.1.5.apk', browser_download_url: 'u/apk' },
+    ],
+  }
+  test('a carried installer is not offered to a seeder already on it', () => {
+    const r = evaluateRelease(carried, { currentVersion: '1.1.2', platform: 'darwin' })
+    expect(r.latestVersion).toBe('1.1.2')
+    expect(r.updateAvailable).toBe(false)
+  })
+  test('a carried installer is still offered to an older seeder', () => {
+    expect(evaluateRelease(carried, { currentVersion: '1.1.0', platform: 'darwin' }).updateAvailable).toBe(true)
+  })
+  test('no installer for this platform means no update', () => {
+    expect(evaluateRelease(carried, { currentVersion: '1.0.0', platform: 'win32' }).updateAvailable).toBe(false)
+  })
+  test('latestSeederVersion is the newest installer, not the tag', () => {
+    expect(latestSeederVersion(carried)).toBe('1.1.2')
+    expect(latestSeederVersion({ tag_name: 'v1.1.5', assets: [{ name: 'pearcircle-v1.1.5.apk' }] })).toBe('1.1.5')
   })
 })
