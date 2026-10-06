@@ -19,6 +19,7 @@ import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
 import { supersedeFailureMessage } from '../lib/supersedeApply.js'
 import { summarizeSeederCircles } from '../lib/seederContact.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
+import { BackupSection, useBackupStatus, lastBackupAt, BACKUP_REMINDER_MS } from './components/BackupSection.jsx'
 import { Tour } from './components/Tour.jsx'
 import { RepairBanner, RepairingBanner, RepairConfirmModal, REPAIR_ESCALATE_MS } from './components/RepairBanners.jsx'
 import appConfig from '../../app.json'
@@ -1173,6 +1174,51 @@ const SYNC_FAIL_BANNER_THRESHOLD = 5
 // location has actually gone stale. Network location is a deliberate privacy
 // choice on these ROMs, so the copy is informational and honest about the
 // tradeoff rather than prescriptive, and the banner is dismissible.
+function BackupReminderBanner ({ neverBackedUp, onOpen, onDismiss }) {
+  return (
+    <div style={{
+      position: 'absolute', top: 0, left: 0, right: 0, zIndex: 50,
+      padding: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px) ${spacing.base}px ${spacing.sm}px`,
+      background: 'rgba(26,26,26,0.92)',
+      borderBottom: `1px solid ${colors.border}`,
+    }}>
+      <button
+        onClick={onDismiss}
+        aria-label='Dismiss'
+        style={{
+          position: 'absolute',
+          top: `calc(env(safe-area-inset-top, 24px) + ${spacing.sm}px)`,
+          right: spacing.sm,
+          background: 'transparent', border: 'none', color: colors.text.secondary,
+          fontSize: 20, cursor: 'pointer', padding: '4px 8px', lineHeight: 1,
+        }}
+      >×</button>
+      <div style={{ textAlign: 'center', padding: `0 ${spacing.lg}px` }}>
+        <div style={{ ...typography.body, color: colors.text.primary, fontWeight: 400 }}>
+          {neverBackedUp ? 'Back up your circles' : 'Your backup is out of date'}
+        </div>
+        <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: 2, lineHeight: 1.4 }}>
+          If you lose this phone or reinstall the app, a backup brings back your account and circles.
+        </div>
+        <button
+          onClick={onOpen}
+          style={{
+            display: 'inline-block',
+            marginTop: spacing.sm,
+            padding: '6px 14px',
+            background: colors.primary, color: colors.text.onPrimary,
+            border: 'none', borderRadius: radius.sm,
+            fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+            cursor: 'pointer',
+          }}
+        >
+          Back up now
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function NetworkLocationBanner ({ onOpenSettings, onDismiss }) {
   return (
     <div style={{
@@ -2123,6 +2169,21 @@ function mergeCircleSnapshots (circles) {
 
 function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
+  // Backup reminder (proposal 2026-10-06-owner-continuity): no backup, or
+  // none in 14 days. Dismissing snoozes it for 14 days on this phone.
+  const [backupStatus, refreshBackupStatus] = useBackupStatus(true)
+  const [backupBannerSnoozed, setBackupBannerSnoozed] = useState(() => {
+    try { return Date.now() < Number(localStorage.getItem('pc:backupBannerSnoozeUntil') || 0) } catch { return false }
+  })
+  const snoozeBackupBanner = () => {
+    try { localStorage.setItem('pc:backupBannerSnoozeUntil', String(Date.now() + BACKUP_REMINDER_MS)) } catch {}
+    setBackupBannerSnoozed(true)
+  }
+  useEffect(() => {
+    const id = setInterval(refreshBackupStatus, 5 * 60 * 1000)
+    window.addEventListener('pc:backup-changed', refreshBackupStatus)
+    return () => { clearInterval(id); window.removeEventListener('pc:backup-changed', refreshBackupStatus) }
+  }, [refreshBackupStatus])
   const [selfSeen, setSelfSeen] = useState(null)
   // Circle-repair banner state. repairConfirmOpen gates the explainer modal;
   // repairBannerDismissed hides the needs-repair nudge for the session (it
@@ -2465,6 +2526,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const repairingBannerEligible = repairTargets.length > 0 && !(repairIsEscalated && repairEscalatedDismissed)
   const repairBannerEligible = !repairBannerDismissed && needRepairCircles.length > 0
   const syncBannerEligible = syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed
+  const backupBannerEligible = backupStatus != null && circles.length > 0 && !backupBannerSnoozed &&
+    (!lastBackupAt(backupStatus) || Date.now() - lastBackupAt(backupStatus) > BACKUP_REMINDER_MS)
   const topBanner = tourActive ? null
     : permissionBannerEligible ? 'permission'
     : batteryBannerEligible ? 'battery'
@@ -2472,6 +2535,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
     : repairingBannerEligible ? 'repairing'
     : repairBannerEligible ? 'repair'
     : syncBannerEligible ? 'sync'
+    : backupBannerEligible ? 'backup'
     : null
 
   // Where to write per-place / per-circle actions. With "All" selected
@@ -2827,6 +2891,13 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           not just "network off": a de-Googled user who is mobile or near a
           window is fine, so we only surface it when their own location has
           actually gone stale (or never arrived). */}
+      {topBanner === 'backup' && (
+        <BackupReminderBanner
+          neverBackedUp={!lastBackupAt(backupStatus)}
+          onOpen={() => setSheet({ name: 'settings', expand: 'backup' })}
+          onDismiss={snoozeBackupBanner}
+        />
+      )}
       {topBanner === 'network' && (
         <NetworkLocationBanner
           onOpenSettings={() => { pear.call('shell:location:openSettings').catch(() => {}) }}
@@ -4878,6 +4949,10 @@ function CirclesSection ({ active = true, onChanged }) {
   const [exportingFor, setExportingFor] = useState(null)     // circle object
   const [exportBusy, setExportBusy] = useState(false)
   const [importBusy, setImportBusy] = useState(false)
+  // Optional password on circle export files (proposal 2026-10-06-owner-continuity).
+  const [exportPw, setExportPw] = useState('')
+  const [pendingImport, setPendingImport] = useState(null) // sealed payload waiting for its password
+  const [importPw, setImportPw] = useState('')
   // Manual re-post of a migration nudge that never landed (proposal
   // 2026-07-24). Holds the circleId being notified so only that row's button
   // shows a busy label.
@@ -5039,7 +5114,8 @@ function CirclesSection ({ active = true, onChanged }) {
     setError(null)
     setNotice(null)
     try {
-      const exportObj = await pear.call('circle:export', { circleId: c.circleId })
+      const exportObj = await pear.call('circle:export', { circleId: c.circleId, password: exportPw || undefined })
+      if (exportObj?.ok === false && exportObj.error) throw new Error(exportObj.error)
       const filename = (c.name || 'circle').replace(/\s+/g, '-').toLowerCase() + '.pearcircle.json'
       const r = await pear.call('shell:exportFile', {
         filename,
@@ -5048,6 +5124,7 @@ function CirclesSection ({ active = true, onChanged }) {
       })
       if (r && r.ok === false && r.error) throw new Error(r.error)
       setExportingFor(null)
+      setExportPw('')
       // r.canceled (no folder picked) leaves no note; a real save confirms it.
       if (r?.ok) setNotice(r.savedToFolder ? `Saved ${filename} to your chosen folder.` : `Exported ${filename}.`)
     } catch (e) {
@@ -5072,22 +5149,38 @@ function CirclesSection ({ active = true, onChanged }) {
       let payload
       try { payload = JSON.parse(picked.contents) }
       catch { throw new Error('That file is not valid JSON') }
-      const r = await pear.call('circle:import', { payload })
-      if (r?.ok === false && r.error) throw new Error(r.error)
-      if (!r?.invite) throw new Error('Import did not return an invite')
-      setRecreateResult({
-        name: r.name,
-        invite: r.invite,
-        imported: true,
-        placesSkipped: Array.isArray(r.placesSkipped) ? r.placesSkipped.length : 0,
-      })
-      onChanged?.()
-      refresh()
+      await finishImport(payload)
     } catch (e) {
       setError(String(e?.message ?? e))
     } finally {
       setImportBusy(false)
     }
+  }
+
+  // A password-protected export asks for its password first.
+  const finishImport = async (payload, password) => {
+    const r = await pear.call('circle:import', { payload, password })
+    if (r?.needsPassword) { setPendingImport(payload); setImportPw(''); return }
+    if (r?.ok === false && r.error) throw new Error(r.error)
+    setPendingImport(null)
+    setImportPw('')
+    if (!r?.invite) throw new Error('Import did not return an invite')
+    setRecreateResult({
+      name: r.name,
+      invite: r.invite,
+      imported: true,
+      placesSkipped: Array.isArray(r.placesSkipped) ? r.placesSkipped.length : 0,
+    })
+    onChanged?.()
+    refresh()
+  }
+
+  const submitImportPassword = async () => {
+    setImportBusy(true)
+    setError(null)
+    try { await finishImport(pendingImport, importPw) }
+    catch (e) { setError(String(e?.message ?? e)) }
+    finally { setImportBusy(false) }
   }
 
   if (loading) return null
@@ -5109,6 +5202,20 @@ function CirclesSection ({ active = true, onChanged }) {
         <DownloadSimple size={16} weight="regular" />
         {importBusy ? 'Importing...' : 'Import circle from file'}
       </button>
+      {pendingImport && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm, marginTop: spacing.sm, textAlign: 'left' }}>
+          <p style={s.muted}>This file is password-protected.</p>
+          <input
+            type='password' autoComplete='current-password' placeholder='File password'
+            value={importPw} onChange={(e) => setImportPw(e.target.value)}
+            style={{ ...s.input, width: '100%', boxSizing: 'border-box' }}
+          />
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            <button style={{ ...s.secondaryBtn, flex: 1, marginTop: 0 }} disabled={importBusy} onClick={() => { setPendingImport(null); setImportPw('') }}>Cancel</button>
+            <button style={{ ...s.primaryBtn, flex: 1 }} disabled={importBusy || !importPw} onClick={submitImportPassword}>Import</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 
@@ -5312,14 +5419,22 @@ function CirclesSection ({ active = true, onChanged }) {
           message={<>
             Save <strong>{exportingFor.name}</strong>'s name, Places and sharing toggles to a file you can re-import later. No keys, members or history are included. You'll pick where it goes (like Downloads) the first time.
             <span style={{ display: 'block', marginTop: spacing.sm, color: colors.error }}>
-              This file contains your Place coordinates (like home and work). Only save it somewhere you trust.
+              This file contains your Place coordinates (like home and work). Only save it somewhere you trust, or add a password.
             </span>
+            <input
+              type='password' autoComplete='new-password' placeholder='Password (optional)'
+              value={exportPw} onChange={(e) => setExportPw(e.target.value)}
+              style={{ ...s.input, width: '100%', boxSizing: 'border-box', marginTop: spacing.sm }}
+            />
+            {exportPw.length > 0 && exportPw.length < 8 && (
+              <span style={{ display: 'block', marginTop: spacing.xs, color: colors.error }}>Use at least 8 characters.</span>
+            )}
           </>}
           confirmLabel="Export"
           destructive={false}
           busy={exportBusy}
-          onConfirm={() => performExport(exportingFor)}
-          onClose={() => { if (!exportBusy) setExportingFor(null) }}
+          onConfirm={() => { if (exportPw.length === 0 || exportPw.length >= 8) performExport(exportingFor) }}
+          onClose={() => { if (!exportBusy) { setExportingFor(null); setExportPw('') } }}
         />
       )}
       {confirmingFor && (() => {
@@ -5510,6 +5625,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
     // 'circles' (repair-escalation banner) -> Circles, where leave/recreate live.
     const target = initialExpand === 'battery' ? 'stayingSync'
       : initialExpand === 'circles' ? 'circles'
+      : initialExpand === 'backup' ? 'backup'
       : null
     if (!target) return
     handledInitialExpandRef.current = initialExpand
@@ -5709,6 +5825,10 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
 
       <Collapsible title='Circles' icon={UsersThree} open={openSection === 'circles'} onToggle={() => toggleSection('circles')} maxHeight='1200px'>
         <CirclesSection active={active && openSection === 'circles'} onChanged={onSaved} />
+      </Collapsible>
+
+      <Collapsible title='Backup' icon={DownloadSimple} open={openSection === 'backup'} onToggle={() => toggleSection('backup')} maxHeight='1400px'>
+        <BackupSection active={active && openSection === 'backup'} />
       </Collapsible>
 
       <Collapsible title='Location sharing' icon={Broadcast} open={openSection === 'locationSharing'} onToggle={() => toggleSection('locationSharing')} maxHeight='1200px'>
