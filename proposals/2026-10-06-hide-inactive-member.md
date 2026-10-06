@@ -1,6 +1,6 @@
 # Hide an inactive member for the whole circle
 
-**Status**: Draft 2026-10-06.
+**Status**: Approved 2026-10-06 by Tim, with the open questions resolved as proposed: 30 days, no unhiding of others, no notification.
 
 **Goal**: Let any member hide a member who has not been seen for 30 days, for everyone in the circle, so the old entry left behind by someone who lost their app data stops showing. A member who is still around comes back by themselves.
 
