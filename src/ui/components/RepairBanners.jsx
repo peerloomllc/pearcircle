@@ -172,7 +172,7 @@ export function RepairConfirmModal ({ circles, onConfirm, onCancel }) {
         background: colors.surface.card, borderRadius: radius.lg,
         padding: spacing.lg, boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
       }}>
-        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary }}>
+        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary, textAlign: 'center' }}>
           Repair {name}?
         </h2>
         <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
