@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -1212,7 +1212,7 @@ function BackupReminderBanner ({ neverBackedUp, onOpen, onDismiss }) {
             cursor: 'pointer',
           }}
         >
-          Back up now
+          {neverBackedUp ? 'Set up backup' : 'Update backup'}
         </button>
       </div>
     </div>
@@ -4944,15 +4944,6 @@ function CirclesSection ({ active = true, onChanged }) {
   const [recreatingFor, setRecreatingFor] = useState(null)   // source circle object
   const [recreateBusy, setRecreateBusy] = useState(false)
   const [recreateResult, setRecreateResult] = useState(null) // { name, invite, sourceName }
-  // File export/import (proposal 2026-06-17 slice 4). exportingFor opens the
-  // coordinate-privacy confirm; busy flags gate double-taps.
-  const [exportingFor, setExportingFor] = useState(null)     // circle object
-  const [exportBusy, setExportBusy] = useState(false)
-  const [importBusy, setImportBusy] = useState(false)
-  // Optional password on circle export files (proposal 2026-10-06-owner-continuity).
-  const [exportPw, setExportPw] = useState('')
-  const [pendingImport, setPendingImport] = useState(null) // sealed payload waiting for its password
-  const [importPw, setImportPw] = useState('')
   // Manual re-post of a migration nudge that never landed (proposal
   // 2026-07-24). Holds the circleId being notified so only that row's button
   // shows a busy label.
@@ -5106,126 +5097,13 @@ function CirclesSection ({ active = true, onChanged }) {
     }
   }
 
-  // Export this circle's curated config (name + Places + toggles) to a JSON
-  // file via the OS share sheet. The confirm modal carries the coordinate-
-  // privacy note before we hand any Place coordinates to a share target.
-  const performExport = async (c) => {
-    setExportBusy(true)
-    setError(null)
-    setNotice(null)
-    try {
-      const exportObj = await pear.call('circle:export', { circleId: c.circleId, password: exportPw || undefined })
-      if (exportObj?.ok === false && exportObj.error) throw new Error(exportObj.error)
-      const filename = (c.name || 'circle').replace(/\s+/g, '-').toLowerCase() + '.pearcircle.json'
-      const r = await pear.call('shell:exportFile', {
-        filename,
-        contents: JSON.stringify(exportObj, null, 2),
-        title: 'Export ' + (c.name || 'circle'),
-      })
-      if (r && r.ok === false && r.error) throw new Error(r.error)
-      setExportingFor(null)
-      setExportPw('')
-      // r.canceled (no folder picked) leaves no note; a real save confirms it.
-      if (r?.ok) setNotice(r.savedToFolder ? `Saved ${filename} to your chosen folder.` : `Exported ${filename}.`)
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setExportBusy(false)
-    }
-  }
-
-  // Import a circle config from a file: pick it, parse, hand the payload to the
-  // worklet (which validates + mints a brand-new circle), then surface the new
-  // invite via the same success modal recreate uses.
-  const performImport = async () => {
-    setImportBusy(true)
-    setError(null)
-    try {
-      const picked = await pear.call('shell:importFile')
-      if (!picked?.ok) {
-        if (picked?.canceled) return
-        throw new Error(picked?.error || 'Could not read the file')
-      }
-      let payload
-      try { payload = JSON.parse(picked.contents) }
-      catch { throw new Error('That file is not valid JSON') }
-      await finishImport(payload)
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setImportBusy(false)
-    }
-  }
-
-  // A password-protected export asks for its password first.
-  const finishImport = async (payload, password) => {
-    const r = await pear.call('circle:import', { payload, password })
-    if (r?.needsPassword) { setPendingImport(payload); setImportPw(''); return }
-    if (r?.ok === false && r.error) throw new Error(r.error)
-    setPendingImport(null)
-    setImportPw('')
-    if (!r?.invite) throw new Error('Import did not return an invite')
-    setRecreateResult({
-      name: r.name,
-      invite: r.invite,
-      imported: true,
-      placesSkipped: Array.isArray(r.placesSkipped) ? r.placesSkipped.length : 0,
-    })
-    onChanged?.()
-    refresh()
-  }
-
-  const submitImportPassword = async () => {
-    setImportBusy(true)
-    setError(null)
-    try { await finishImport(pendingImport, importPw) }
-    catch (e) { setError(String(e?.message ?? e)) }
-    finally { setImportBusy(false) }
-  }
-
   if (loading) return null
-  // "Import from file" footer button, shown whether or not the user has any
-  // circles (importing always mints a brand-new one).
-  const importButton = (
-    <div style={{ textAlign: 'center' }}>
-      <button
-        onClick={performImport}
-        disabled={importBusy}
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
-          marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
-          background: 'transparent', color: colors.text.secondary,
-          border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
-          fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
-          opacity: importBusy ? 0.6 : 1,
-        }}>
-        <DownloadSimple size={16} weight="regular" />
-        {importBusy ? 'Importing...' : 'Import circle from file'}
-      </button>
-      {pendingImport && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm, marginTop: spacing.sm, textAlign: 'left' }}>
-          <p style={s.muted}>This file is password-protected.</p>
-          <input
-            type='password' autoComplete='current-password' placeholder='File password'
-            value={importPw} onChange={(e) => setImportPw(e.target.value)}
-            style={{ ...s.input, width: '100%', boxSizing: 'border-box' }}
-          />
-          <div style={{ display: 'flex', gap: spacing.sm }}>
-            <button style={{ ...s.secondaryBtn, flex: 1, marginTop: 0 }} disabled={importBusy} onClick={() => { setPendingImport(null); setImportPw('') }}>Cancel</button>
-            <button style={{ ...s.primaryBtn, flex: 1 }} disabled={importBusy || !importPw} onClick={submitImportPassword}>Import</button>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-
   if (list.length === 0) {
     return (
       <>
         <p style={s.muted}>
           You're not in any circles yet. Create or join one from the circle menu on the map.
         </p>
-        {importButton}
         {error && <p style={s.error}>{error}</p>}
         {recreateResult && (
           <RecreatedInviteModal result={recreateResult} onClose={() => setRecreateResult(null)} />
@@ -5242,7 +5120,7 @@ function CirclesSection ({ active = true, onChanged }) {
   return (
     <>
       <p style={s.muted}>
-        Delete a circle you own or co-own to remove it for everyone. Leave a circle to remove only your copy. Any circle can be exported: its name, Places and settings go to a file you can re-import later as a new circle that you own. If you own or co-own a circle, its row also has an icon to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places). To make someone a co-owner, open the circle, tap them in Members and choose Make co-owner.
+        Delete a circle you own or co-own to remove it for everyone. Leave a circle to remove only your copy. If you own or co-own a circle, its row also has an icon to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places). To make someone a co-owner, open the circle, tap them in Members and choose Make co-owner. To save a circle to a file, use Backup.
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
         {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
@@ -5373,17 +5251,6 @@ function CirclesSection ({ active = true, onChanged }) {
                   <ArrowsClockwise size={18} weight="regular" />
                 </button>
               )}
-              {/* Any member can export: the file holds only the name, Places
-                  and toggles every member already sees, and it lets someone
-                  who lost the owner identity rebuild the circle by import. */}
-              <button
-                onClick={() => { setError(null); setExportingFor(c) }}
-                disabled={isPending}
-                title="Export circle to file"
-                aria-label="Export circle to file"
-                style={iconBtnStyle({ disabled: isPending })}>
-                <ExportIcon size={18} weight="regular" />
-              </button>
               {/* The owner deletes (leaving would abandon the circle). A
                   co-owner can delete or leave; a member can only leave. */}
               {(c.isOwner || (c.isCoowner && c.canManage)) && (
@@ -5410,33 +5277,8 @@ function CirclesSection ({ active = true, onChanged }) {
           )
         })}
       </ul>
-      {importButton}
       {error && <p style={s.error}>{error}</p>}
       {notice && <p style={{ ...typography.caption, color: colors.success, marginTop: spacing.sm }}>{notice}</p>}
-      {exportingFor && (
-        <ConfirmSheet
-          title="Export circle to file"
-          message={<>
-            Save <strong>{exportingFor.name}</strong>'s name, Places and sharing toggles to a file you can re-import later. No keys, members or history are included. You'll pick where it goes (like Downloads) the first time.
-            <span style={{ display: 'block', marginTop: spacing.sm, color: colors.error }}>
-              This file contains your Place coordinates (like home and work). Only save it somewhere you trust, or add a password.
-            </span>
-            <input
-              type='password' autoComplete='new-password' placeholder='Password (optional)'
-              value={exportPw} onChange={(e) => setExportPw(e.target.value)}
-              style={{ ...s.input, width: '100%', boxSizing: 'border-box', marginTop: spacing.sm }}
-            />
-            {exportPw.length > 0 && exportPw.length < 8 && (
-              <span style={{ display: 'block', marginTop: spacing.xs, color: colors.error }}>Use at least 8 characters.</span>
-            )}
-          </>}
-          confirmLabel="Export"
-          destructive={false}
-          busy={exportBusy}
-          onConfirm={() => { if (exportPw.length === 0 || exportPw.length >= 8) performExport(exportingFor) }}
-          onClose={() => { if (!exportBusy) { setExportingFor(null); setExportPw('') } }}
-        />
-      )}
       {confirmingFor && (() => {
         // Delete-confirmation guard (proposal 2026-06-17): if the owner is
         // about to delete the NEWER half of a recreated pair (the replacement,
@@ -5492,6 +5334,202 @@ function CirclesSection ({ active = true, onChanged }) {
         />
       )}
     </>
+  )
+}
+
+// Circle files (moved from the Circles list into Settings > Backup, 2026-10-06).
+// Export saves one circle's name, Places and toggles to a file, optionally
+// password-protected; import makes a brand-new circle you own from such a
+// file. Different from the account backup: it carries no keys, members or
+// history, so it is how someone rebuilds a circle nobody can manage any more.
+function CircleFilesSection ({ active, onChanged }) {
+  const [list, setList] = useState([])
+  const [error, setError] = useState(null)
+  const [notice, setNotice] = useState(null)
+  const [recreateResult, setRecreateResult] = useState(null)
+  const [exportingFor, setExportingFor] = useState(null)     // circle object
+  const [exportBusy, setExportBusy] = useState(false)
+  const [importBusy, setImportBusy] = useState(false)
+  const [exportPw, setExportPw] = useState('')
+  const [pendingImport, setPendingImport] = useState(null) // sealed payload waiting for its password
+  const [importPw, setImportPw] = useState('')
+
+  const refresh = useCallback(async () => {
+    try {
+      const snap = await pear.call('circles:getAll')
+      setList((snap?.circles ?? [])
+        .filter((c) => !c.error && !c.circle?.deleted)
+        .map((c) => ({ circleId: c.circleId, name: c.circle?.name || CIRCLE_NAME_PENDING })))
+    } catch {}
+  }, [])
+  useEffect(() => { if (active) refresh() }, [active, refresh])
+
+  // Export this circle's curated config (name + Places + toggles) to a JSON
+  // file via the OS share sheet. The confirm modal carries the coordinate-
+  // privacy note before we hand any Place coordinates to a share target.
+  const performExport = async (c) => {
+    setExportBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const exportObj = await pear.call('circle:export', { circleId: c.circleId, password: exportPw || undefined })
+      if (exportObj?.ok === false && exportObj.error) throw new Error(exportObj.error)
+      const filename = (c.name || 'circle').replace(/\s+/g, '-').toLowerCase() + '.pearcircle.json'
+      const r = await pear.call('shell:exportFile', {
+        filename,
+        contents: JSON.stringify(exportObj, null, 2),
+        title: 'Export ' + (c.name || 'circle'),
+      })
+      if (r && r.ok === false && r.error) throw new Error(r.error)
+      setExportingFor(null)
+      setExportPw('')
+      // r.canceled (no folder picked) leaves no note; a real save confirms it.
+      if (r?.ok) setNotice(r.savedToFolder ? `Saved ${filename} to your chosen folder.` : `Exported ${filename}.`)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setExportBusy(false)
+    }
+  }
+
+  // Import a circle config from a file: pick it, parse, hand the payload to the
+  // worklet (which validates + mints a brand-new circle), then surface the new
+  // invite via the same success modal recreate uses.
+  const performImport = async () => {
+    setImportBusy(true)
+    setError(null)
+    try {
+      const picked = await pear.call('shell:importFile')
+      if (!picked?.ok) {
+        if (picked?.canceled) return
+        throw new Error(picked?.error || 'Could not read the file')
+      }
+      let payload
+      try { payload = JSON.parse(picked.contents) }
+      catch { throw new Error('That file is not valid JSON') }
+      await finishImport(payload)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setImportBusy(false)
+    }
+  }
+
+  // A password-protected export asks for its password first.
+  const finishImport = async (payload, password) => {
+    const r = await pear.call('circle:import', { payload, password })
+    if (r?.needsPassword) { setPendingImport(payload); setImportPw(''); return }
+    if (r?.ok === false && r.error) throw new Error(r.error)
+    setPendingImport(null)
+    setImportPw('')
+    if (!r?.invite) throw new Error('Import did not return an invite')
+    setRecreateResult({
+      name: r.name,
+      invite: r.invite,
+      imported: true,
+      placesSkipped: Array.isArray(r.placesSkipped) ? r.placesSkipped.length : 0,
+    })
+    onChanged?.()
+    refresh()
+  }
+
+  const submitImportPassword = async () => {
+    setImportBusy(true)
+    setError(null)
+    try { await finishImport(pendingImport, importPw) }
+    catch (e) { setError(String(e?.message ?? e)) }
+    finally { setImportBusy(false) }
+  }
+
+  // "Import from file" footer button, shown whether or not the user has any
+  // circles (importing always mints a brand-new one).
+  const importButton = (
+    <div style={{ textAlign: 'center' }}>
+      <button
+        onClick={performImport}
+        disabled={importBusy}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: spacing.xs,
+          marginTop: spacing.md, padding: '10px 14px', borderRadius: radius.md,
+          background: 'transparent', color: colors.text.secondary,
+          border: `1px solid ${colors.border}`, cursor: importBusy ? 'default' : 'pointer',
+          fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+          opacity: importBusy ? 0.6 : 1,
+        }}>
+        <DownloadSimple size={16} weight="regular" />
+        {importBusy ? 'Importing...' : 'Import a circle from a file'}
+      </button>
+      {pendingImport && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm, marginTop: spacing.sm, textAlign: 'left' }}>
+          <p style={s.muted}>This file is password-protected.</p>
+          <input
+            type='password' autoComplete='current-password' placeholder='File password'
+            value={importPw} onChange={(e) => setImportPw(e.target.value)}
+            style={{ ...s.input, width: '100%', boxSizing: 'border-box' }}
+          />
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            <button style={{ ...s.secondaryBtn, flex: 1, marginTop: 0 }} disabled={importBusy} onClick={() => { setPendingImport(null); setImportPw('') }}>Cancel</button>
+            <button style={{ ...s.primaryBtn, flex: 1 }} disabled={importBusy || !importPw} onClick={submitImportPassword}>Import</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+
+  return (
+    <div style={{ marginTop: spacing.xl }}>
+      <p style={{ ...typography.caption, color: colors.text.secondary, marginBottom: spacing.sm, fontWeight: 400, textAlign: 'center' }}>Circle files</p>
+      <p style={{ ...s.muted, marginTop: 0 }}>
+        Export saves one circle's name and Places to a file. Importing it makes a new circle that you own, which you can use to start a circle over when nobody can manage the old one. No members or history are included.
+      </p>
+      {[...list].sort((a, b) => byName(a.name, b.name)).map((c) => (
+        <div key={c.circleId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.sm, padding: `${spacing.sm}px 0`, borderBottom: `1px solid ${colors.divider}` }}>
+          <span style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</span>
+          <button
+            onClick={() => { setError(null); setNotice(null); setExportingFor(c) }}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: spacing.xs, flexShrink: 0,
+              padding: '8px 14px', borderRadius: radius.sm,
+              background: 'transparent', color: colors.text.primary,
+              border: `1px solid ${colors.border}`, cursor: 'pointer',
+              fontFamily: typography.fontFamily, fontSize: 13, fontWeight: 400,
+            }}>
+            <ExportIcon size={16} weight="regular" />
+            Export
+          </button>
+        </div>
+      ))}
+      {importButton}
+      {error && <p style={s.error}>{error}</p>}
+      {notice && <p style={{ ...typography.caption, color: colors.success, marginTop: spacing.sm }}>{notice}</p>}
+      {exportingFor && (
+        <ConfirmSheet
+          title="Export circle to file"
+          message={<>
+            Save <strong>{exportingFor.name}</strong>'s name, Places and sharing toggles to a file you can re-import later. No keys, members or history are included. You'll pick where it goes (like Downloads) the first time.
+            <span style={{ display: 'block', marginTop: spacing.sm, color: colors.error }}>
+              This file contains your Place coordinates (like home and work). Only save it somewhere you trust, or add a password.
+            </span>
+            <input
+              type='password' autoComplete='new-password' placeholder='Password (optional)'
+              value={exportPw} onChange={(e) => setExportPw(e.target.value)}
+              style={{ ...s.input, width: '100%', boxSizing: 'border-box', marginTop: spacing.sm }}
+            />
+            {exportPw.length > 0 && exportPw.length < 8 && (
+              <span style={{ display: 'block', marginTop: spacing.xs, color: colors.error }}>Use at least 8 characters.</span>
+            )}
+          </>}
+          confirmLabel="Export"
+          destructive={false}
+          busy={exportBusy}
+          onConfirm={() => { if (exportPw.length === 0 || exportPw.length >= 8) performExport(exportingFor) }}
+          onClose={() => { if (!exportBusy) { setExportingFor(null); setExportPw('') } }}
+        />
+      )}
+      {recreateResult && (
+        <RecreatedInviteModal result={recreateResult} onClose={() => setRecreateResult(null)} />
+      )}
+    </div>
   )
 }
 
@@ -5827,74 +5865,75 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <CirclesSection active={active && openSection === 'circles'} onChanged={onSaved} />
       </Collapsible>
 
-      <Collapsible title='Backup' icon={DownloadSimple} open={openSection === 'backup'} onToggle={() => toggleSection('backup')} maxHeight='1400px'>
-        <BackupSection active={active && openSection === 'backup'} />
+      {/* Sharing: per circle, live location (pause / resume) and, on Android,
+          trips. Trip SHARING is hidden on iOS: iOS suspends the app within
+          ~30s of each background wake, so a drive never accumulates as one
+          continuous fix stream (the trip machine needs >=60s of sustained
+          motion). See the background-trip investigation, 2026-07. */}
+      <Collapsible title='Sharing' icon={Broadcast} open={openSection === 'sharing'} onToggle={() => toggleSection('sharing')} maxHeight='2400px'>
+        <LocationSharingSection active={active && openSection === 'sharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
       </Collapsible>
 
-      <Collapsible title='Location sharing' icon={Broadcast} open={openSection === 'locationSharing'} onToggle={() => toggleSection('locationSharing')} maxHeight='1200px'>
-        <LocationSharingSection active={active && openSection === 'locationSharing'} sharing={sharing} setSharingForCircle={setSharingForCircle} s={s} />
-      </Collapsible>
-
-      {/* Trips: sharing + notifications for trips together. Trip SHARING is
-          hidden on iOS: this device can't reliably create trips to share,
-          because iOS suspends the app within ~30s of each background wake, so
-          a drive never accumulates as one continuous fix stream (the trip
-          machine needs >=60s of sustained motion). See the background-trip
-          investigation, 2026-07. Trip NOTIFICATIONS stay: an iPhone can still
-          receive and be notified about trips shared by Android peers. */}
-      <Collapsible title='Trips' icon={MapTrifold} open={openSection === 'trips'} onToggle={() => toggleSection('trips')} maxHeight='1800px'>
-        {!IS_IOS && (
-          <>
-            <p style={{ ...subLabel, marginTop: 0 }}>Trip sharing</p>
-            <TripsSharingSection active={active && openSection === 'trips'} />
-          </>
-        )}
-        <p style={{ ...subLabel, marginTop: IS_IOS ? 0 : spacing.xl }}>Trip notifications</p>
+      {/* Notifications: trip-finished alerts (iPhones still receive trips
+          shared by Android peers), low battery alerts about OTHER members'
+          phones, and the daily open-the-app reminder. */}
+      <Collapsible title='Notifications' icon={BellSimple} open={openSection === 'notifications'} onToggle={() => toggleSection('notifications')} maxHeight='1600px'>
         <TripNotificationsSection />
+        <div style={{ borderTop: `1px solid ${colors.divider}`, marginTop: spacing.base, paddingTop: spacing.base }}>
+          <BatteryAlertsSection />
+        </div>
+        <div style={{ borderTop: `1px solid ${colors.divider}`, marginTop: spacing.base, paddingTop: spacing.base }}>
+          <SyncReminderSection />
+        </div>
       </Collapsible>
 
-      {/* Deliberately its own section rather than a row under "Staying in
-          sync": that section's battery block is Android's Doze exemption, which
-          is about THIS phone staying awake. This is about OTHER people's phones
-          dying, and filing them together reads as one setting. */}
-      <Collapsible title='Low battery alerts' icon={BatteryWarning} open={openSection === 'batteryAlerts'} onToggle={() => toggleSection('batteryAlerts')} maxHeight='1200px'>
-        <BatteryAlertsSection />
+      <Collapsible title='Backup' icon={DownloadSimple} open={openSection === 'backup'} onToggle={() => toggleSection('backup')} maxHeight='2400px'>
+        <BackupSection active={active && openSection === 'backup'} />
+        <CircleFilesSection active={active && openSection === 'backup'} onChanged={onSaved} />
       </Collapsible>
 
-      {/* Staying in sync: everything that keeps the no-server P2P backend
-          running -- the daily open reminder, boot autostart (Android), and
-          the battery exemption. The 'battery' deep-link lands here. */}
+      {/* Staying in sync: keeping THIS phone's backend running on Android
+          (boot autostart and the battery exemption). Nothing in it applies to
+          iOS, so it is hidden there. The 'battery' deep-link lands here. */}
       <div ref={stayingSyncRef} />
-      <Collapsible title='Staying in sync' icon={ArrowsClockwise} open={openSection === 'stayingSync'} onToggle={() => toggleSection('stayingSync')} maxHeight='3400px'>
-        <p style={{ ...subLabel, marginTop: 0 }}>Daily reminder</p>
-        <SyncReminderSection />
-        <AutostartStatus />
-        {battery.supported && (
-          <div style={{ marginTop: spacing.lg }}>
-            <p style={{ ...subLabel, marginTop: 0 }}>Battery optimization</p>
-            {battery.exempt ? (
-              <p style={s.muted}>
-                Battery optimization is off for PearCircle. Location sharing
-                should keep working through extended idle.
-              </p>
-            ) : (
-              <>
+      {!IS_IOS && (
+        <Collapsible title='Staying in sync' icon={ArrowsClockwise} open={openSection === 'stayingSync'} onToggle={() => toggleSection('stayingSync')} maxHeight='3400px'>
+          <AutostartStatus />
+          {battery.supported && (
+            <div style={{ marginTop: spacing.lg }}>
+              <p style={{ ...subLabel, marginTop: 0 }}>Battery optimization</p>
+              {battery.exempt ? (
                 <p style={s.muted}>
-                  Battery optimization is on. Android may pause location sharing
-                  during long idle periods, so peers won't see your updates until
-                  your phone wakes. Disabling this for PearCircle keeps sharing
-                  reliable but uses slightly more battery.
+                  Battery optimization is off for PearCircle. Location sharing
+                  should keep working through extended idle.
                 </p>
-                <button style={{ ...s.primaryBtn, marginTop: spacing.sm }} onClick={requestBatteryExempt}>
-                  Disable battery optimization
-                </button>
-              </>
-            )}
-            {batteryError && <p style={s.error}>{batteryError}</p>}
-          </div>
-        )}
+              ) : (
+                <>
+                  <p style={s.muted}>
+                    Battery optimization is on. Android may pause location sharing
+                    during long idle periods, so peers won't see your updates until
+                    your phone wakes. Disabling this for PearCircle keeps sharing
+                    reliable but uses slightly more battery.
+                  </p>
+                  <button style={{ ...s.primaryBtn, marginTop: spacing.sm }} onClick={requestBatteryExempt}>
+                    Disable battery optimization
+                  </button>
+                </>
+              )}
+              {batteryError && <p style={s.error}>{batteryError}</p>}
+            </div>
+          )}
+        </Collapsible>
+      )}
+
+      {/* Seeders & relay: the two optional ways phones reach each other
+          besides a direct connection. */}
+      <Collapsible title='Seeders & relay' icon={HardDrives} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='2000px'>
+        <SeedersSection active={active && openSection === 'seeders'} />
         {/* Renders nothing (heading included) on a build with no relay key. */}
-        <RelaySection subLabel={subLabel} />
+        <div style={{ marginTop: spacing.xl }}>
+          <RelaySection subLabel={subLabel} />
+        </div>
       </Collapsible>
 
       <Collapsible title='Display & map' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')} maxHeight='1600px'>
@@ -5905,10 +5944,6 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <p style={{ ...subLabel, marginTop: spacing.lg }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
         <TileCacheSection />
-      </Collapsible>
-
-      <Collapsible title='Seeders' icon={Broadcast} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='1600px'>
-        <SeedersSection active={active && openSection === 'seeders'} />
       </Collapsible>
 
       {/* Advanced is debug-only now (battery moved to Staying in sync, map
@@ -5965,6 +6000,11 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
   const [pendingCircleId, setPendingCircleId] = useState(null)
   const [expandedCircleId, setExpandedCircleId] = useState(null)
   const [errorByCircle, setErrorByCircle] = useState({})
+  // Per-circle trip sharing (proposal 2026-05-10), Android only. Opt-in:
+  // default off, and turning it on only shares future trips.
+  const [tripSharing, setTripSharing] = useState({})
+  const [tripPendingId, setTripPendingId] = useState(null)
+  const [tripConfirming, setTripConfirming] = useState(null) // { circleId, name, value }
 
   // Drive a one-second tick so the "Paused, resumes in 1h 23m" line
   // counts down live. Only spins while at least one circle is paused
@@ -5984,11 +6024,15 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
 
   const refresh = useCallback(async () => {
     try {
-      const snap = await pear.call('circles:getAll')
+      const [snap, tripsR] = await Promise.all([
+        pear.call('circles:getAll'),
+        IS_IOS ? Promise.resolve(null) : pear.call('trips:sharing:get'),
+      ])
       const next = (snap?.circles ?? [])
         .filter((c) => !c.error && !c.circle?.deleted)
         .map((c) => ({ circleId: c.circleId, name: c.circle?.name || CIRCLE_NAME_PENDING }))
       setList(next)
+      if (tripsR?.sharing) setTripSharing(tripsR.sharing)
     } catch {
       // Empty list keeps the section in its "no circles yet" copy.
     } finally {
@@ -5996,6 +6040,21 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
     }
   }, [])
   useEffect(() => { if (active) refresh() }, [active, refresh])
+
+  const commitTripSharing = async () => {
+    if (!tripConfirming) return
+    const { circleId, value } = tripConfirming
+    setTripPendingId(circleId)
+    try {
+      await pear.call('trips:sharing:set', { circleId, enabled: value })
+      setTripSharing((prev) => ({ ...prev, [circleId]: value }))
+    } catch {
+      // Leave the switch where it was; the user can retry.
+    } finally {
+      setTripPendingId(null)
+      setTripConfirming(null)
+    }
+  }
 
   const apply = async (circleId, enabled, expiresAt = null) => {
     setPendingCircleId(circleId)
@@ -6022,7 +6081,13 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
           Join or create a circle to start sharing your location.
         </p>
       ) : (
-        [...list].sort((a, b) => byName(a.name, b.name)).map((c, idx, sorted) => {
+        <>
+        <p style={{ ...s.muted, marginTop: 0 }}>
+          {IS_IOS
+            ? 'Choose what each circle sees. Pause your location for a while, or stop it until you resume.'
+            : 'Choose what each circle sees. Pause your location for a while, or stop it until you resume. Trip sharing is off until you turn it on, and then only shares trips you take from that point.'}
+        </p>
+        {[...list].sort((a, b) => byName(a.name, b.name)).map((c, idx, sorted) => {
           const st = getCircleSharing(sharing, c.circleId)
           const isPending = pendingCircleId === c.circleId
           const expanded = expandedCircleId === c.circleId
@@ -6040,9 +6105,28 @@ function LocationSharingSection ({ active = true, sharing, setSharingForCircle, 
               onExpand={() => setExpandedCircleId(expanded ? null : c.circleId)}
               onPause={(ms) => apply(c.circleId, false, ms ? Date.now() + ms : null)}
               onResume={() => apply(c.circleId, true, null)}
+              tripOn={IS_IOS ? null : tripSharing[c.circleId] === true}
+              tripBusy={tripPendingId === c.circleId}
+              onTripToggle={() => setTripConfirming({ circleId: c.circleId, name: c.name, value: tripSharing[c.circleId] !== true })}
             />
           )
-        })
+        })}
+        </>
+      )}
+      {tripConfirming && (
+        <ConfirmSheet
+          title={tripConfirming.value
+            ? `Share trips with "${tripConfirming.name}"?`
+            : `Stop sharing trips with "${tripConfirming.name}"?`}
+          message={tripConfirming.value
+            ? <>Members of <strong>{tripConfirming.name}</strong> will see trips you take from now on. Past trips stay private. You can turn this off any time.</>
+            : <>Future trips won't be shared with <strong>{tripConfirming.name}</strong>. Trips you've already shared remain visible to members until you delete them from the trip detail view.</>}
+          confirmLabel={tripConfirming.value ? 'Share' : 'Stop sharing'}
+          destructive={!tripConfirming.value}
+          busy={tripPendingId === tripConfirming.circleId}
+          onConfirm={commitTripSharing}
+          onClose={() => { if (tripPendingId !== tripConfirming.circleId) setTripConfirming(null) }}
+        />
       )}
     </>
   )
@@ -6055,7 +6139,7 @@ const PAUSE_DURATIONS = [
   { label: '24 hours', ms: 24 * 60 * 60_000 },
 ]
 
-function CircleSharingRow ({ circle, state, isPending, expanded, error, isLast, onExpand, onPause, onResume }) {
+function CircleSharingRow ({ circle, state, isPending, expanded, error, isLast, onExpand, onPause, onResume, tripOn = null, tripBusy = false, onTripToggle }) {
   const paused = !state.enabled
   const remainingMs = paused && typeof state.expiresAt === 'number' ? state.expiresAt - Date.now() : null
   const subText = paused
@@ -6157,114 +6241,15 @@ function CircleSharingRow ({ circle, state, isPending, expanded, error, isLast, 
           </button>
         </div>
       )}
+      {/* null on iOS, where trip sharing is hidden. */}
+      {tripOn !== null && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: spacing.sm }}>
+          <span style={{ ...typography.caption, color: colors.text.secondary }}>Share trips</span>
+          <ToggleSwitch on={tripOn} disabled={tripBusy} onChange={onTripToggle} />
+        </div>
+      )}
       {error && (
         <p style={{ ...typography.caption, color: colors.error, marginTop: spacing.xs, marginBottom: 0 }}>{error}</p>
-      )}
-    </div>
-  )
-}
-
-// Per-circle trip-sharing toggle list (proposal 2026-05-10). Default
-// OFF everywhere (opt-in) — privacy is the load-bearing constraint
-// per the proposal: a user upgrading to this build ships zero trips
-// until they explicitly turn sharing on for at least one circle.
-// Toggling on is non-destructive (only future trips replicate; past
-// trips stay private). Toggling off shows a confirmation surfacing
-// the implications.
-function TripsSharingSection ({ active = true }) {
-  const [list, setList] = useState([])
-  const [sharing, setSharing] = useState({})
-  const [loading, setLoading] = useState(true)
-  const [pendingCircleId, setPendingCircleId] = useState(null)
-  const [confirming, setConfirming] = useState(null) // { circleId, name, value }
-
-  const refresh = useCallback(async () => {
-    try {
-      const [snap, sharingR] = await Promise.all([
-        pear.call('circles:getAll'),
-        pear.call('trips:sharing:get'),
-      ])
-      const next = (snap?.circles ?? [])
-        .filter((c) => !c.error && !c.circle?.deleted)
-        .map((c) => ({ circleId: c.circleId, name: c.circle?.name || CIRCLE_NAME_PENDING }))
-      setList(next)
-      setSharing(sharingR?.sharing ?? {})
-    } catch {
-      // Surface nothing here; the Collapsible just stays empty.
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => { if (active) refresh() }, [active, refresh])
-
-  const onCommit = async () => {
-    if (!confirming) return
-    const { circleId, value } = confirming
-    setPendingCircleId(circleId)
-    try {
-      await pear.call('trips:sharing:set', { circleId, enabled: value })
-      setSharing((prev) => ({ ...prev, [circleId]: value }))
-    } catch {
-      // Leave UI in last-known state; user can retry.
-    } finally {
-      setPendingCircleId(null)
-      setConfirming(null)
-    }
-  }
-
-  if (loading) {
-    return <p style={{ ...typography.caption, color: colors.text.muted }}>Loading…</p>
-  }
-  if (list.length === 0) {
-    return (
-      <p style={{ ...typography.caption, color: colors.text.muted }}>
-        No circles yet. Trip sharing applies once you join or create one.
-      </p>
-    )
-  }
-
-  return (
-    <div>
-      <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, fontWeight: 400 }}>
-        When on, future trips you take are shared with members of that circle. Past trips remain private until you turn this on. Off any time.
-      </p>
-      {[...list].sort((a, b) => byName(a.name, b.name)).map((c) => {
-        const on = sharing[c.circleId] === true
-        const busy = pendingCircleId === c.circleId
-        return (
-          <div
-            key={c.circleId}
-            style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              padding: `${spacing.sm}px 0`, borderBottom: `1px solid ${colors.divider}`,
-            }}
-          >
-            <div style={{ ...typography.body, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: spacing.md }}>
-              {c.name}
-            </div>
-            <ToggleSwitch
-              on={on}
-              disabled={busy}
-              onChange={() => setConfirming({ circleId: c.circleId, name: c.name, value: !on })}
-            />
-          </div>
-        )
-      })}
-      {confirming && (
-        <ConfirmSheet
-          title={confirming.value
-            ? `Share trips with "${confirming.name}"?`
-            : `Stop sharing trips with "${confirming.name}"?`}
-          message={confirming.value
-            ? <>Members of <strong>{confirming.name}</strong> will see trips you take from now on. Past trips stay private. You can turn this off any time.</>
-            : <>Future trips won't be shared with <strong>{confirming.name}</strong>. Trips you've already shared remain visible to members until you delete them from the trip detail view.</>}
-          confirmLabel={confirming.value ? 'Share' : 'Stop sharing'}
-          destructive={!confirming.value}
-          busy={pendingCircleId === confirming.circleId}
-          onConfirm={onCommit}
-          onClose={() => { if (pendingCircleId !== confirming.circleId) setConfirming(null) }}
-        />
       )}
     </div>
   )
@@ -6479,7 +6464,7 @@ function SyncReminderSection () {
   return (
     <>
       <p style={{ ...typography.caption, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base }}>
-        Nothing stores your circles for you — they sync directly between members' phones, only while the app is running. A daily reminder at the time you pick nudges you to open PearCircle so your latest location goes out and you catch up on everyone else.
+        Nothing stores your circles for you. They sync directly between members' phones, only while the app is running. A daily reminder at the time you pick nudges you to open PearCircle so your latest location goes out and you catch up on everyone else.
       </p>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
         <span style={{ ...typography.caption, color: colors.text.primary, flex: 1 }}>Daily reminder</span>
