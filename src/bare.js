@@ -50,6 +50,7 @@ const { planSeederLeavePurge } = require('./lib/seederLeavePurge')
 const { summarizeSeederCoverage } = require('./lib/seederCoverage')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
+const { memberHiddenByHide, memberLastActiveAt, canHideMember, shouldAcceptHiddenRow } = require('./lib/memberHide')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
@@ -1965,6 +1966,50 @@ const handlers = {
       key: 'removed:' + pubkey,
       value: { pubkey, removedBy: ourKeyHex, ts: Date.now(), v: 1 },
     })
+    return { ok: true, pubkey }
+  },
+
+  // Hide a member who hasn't been seen in 30 days, for the whole circle
+  // (proposal 2026-10-06-hide-inactive-member). Any member can do it; it only
+  // hides them from the list. `inactiveMs` is a shorter threshold debug builds
+  // pass for testing, clamped by hideThresholdMs.
+  'member:hide': async ({ circleId, pubkey, inactiveMs } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const circleRow = await base.view.get('circle')
+    if (circleRow?.value?.deleted) throw new Error('this circle has been deleted')
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const memberRow = typeof pubkey === 'string' ? (await base.view.get('member:' + pubkey))?.value : null
+    const seenTs = []
+    if (typeof pubkey === 'string') {
+      seenTs.push((await base.view.get('lastSeen:' + pubkey))?.value?.ts)
+      seenTs.push(_lastKnownCache.get(circleId)?.get(pubkey)?.ts)
+      seenTs.push(_liveLastSeen.get(circleId)?.get(pubkey)?.ts)
+    }
+    const verdict = canHideMember({
+      pubkey,
+      ourKey: ourKeyHex,
+      hasMemberRow: !!memberRow,
+      lastActiveAt: memberLastActiveAt({ joinedAt: memberRow?.joinedAt, seenTs }),
+      inactiveMs,
+    })
+    if (!verdict.ok) {
+      const why = {
+        bad_pubkey: 'pubkey must be a 64-char hex string',
+        self: 'you cannot hide yourself',
+        not_member: 'not a member of this circle',
+        recently_seen: 'this member was seen recently',
+      }[verdict.reason] || verdict.reason
+      throw new Error(why)
+    }
+    const value = signValue({ pubkey, hiddenBy: ourKeyHex, ts: Date.now(), v: 1 }, _identity.secretKey)
+    if (!(await safeAppend(base, { type: 'put', key: 'hidden:' + pubkey, value }, 'hidden'))) {
+      throw new Error('could not save the change, try again')
+    }
+    mark('member:hide', { cid: circleId.slice(0, 8), pk: pubkey.slice(0, 8) })
     return { ok: true, pubkey }
   },
 
@@ -4044,30 +4089,40 @@ async function readCircleView (circleId, base) {
     const pubkey = key.slice('removed:'.length)
     if (typeof value?.ts === 'number') removedAtByPubkey.set(pubkey, value.ts)
   }
+  // Members hidden as inactive (proposal 2026-10-06), same newer-than-
+  // joinedAt rule.
+  const hiddenAtByPubkey = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'hidden:', lt: 'hidden:~' })) {
+    const pubkey = key.slice('hidden:'.length)
+    if (typeof value?.ts === 'number') hiddenAtByPubkey.set(pubkey, value.ts)
+  }
   const members = []
   for await (const { key, value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
     if (memberHiddenByRemoved(removedAtByPubkey.get(value?.pubkey), value?.joinedAt)) continue
     const leftAt = leftAtByPubkey.get(value?.pubkey)
     if (memberHiddenByLeft(leftAt, value?.joinedAt)) continue
+    if (memberHiddenByHide(hiddenAtByPubkey.get(value?.pubkey), value?.joinedAt)) continue
     members.push({ key, value })
   }
   const lastSeen = {}
   for await (const { key, value } of view.createReadStream({ gt: 'lastSeen:', lt: 'lastSeen:~' })) {
     const pubkey = key.slice('lastSeen:'.length)
-    if (removedAtByPubkey.has(pubkey) || leftAtByPubkey.has(pubkey)) {
+    if (removedAtByPubkey.has(pubkey) || leftAtByPubkey.has(pubkey) || hiddenAtByPubkey.has(pubkey)) {
       const memberRow = await view.get('member:' + pubkey)
       if (memberHiddenByRemoved(removedAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
       if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
+      if (memberHiddenByHide(hiddenAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
     }
     lastSeen[pubkey] = value
   }
   const presence = {}
   for await (const { key, value } of view.createReadStream({ gt: 'presence:', lt: 'presence:~' })) {
     const pubkey = key.slice('presence:'.length)
-    if (removedAtByPubkey.has(pubkey) || leftAtByPubkey.has(pubkey)) {
+    if (removedAtByPubkey.has(pubkey) || leftAtByPubkey.has(pubkey) || hiddenAtByPubkey.has(pubkey)) {
       const memberRow = await view.get('member:' + pubkey)
       if (memberHiddenByRemoved(removedAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
       if (memberHiddenByLeft(leftAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
+      if (memberHiddenByHide(hiddenAtByPubkey.get(pubkey), memberRow?.value?.joinedAt)) continue
     }
     presence[pubkey] = value
   }
@@ -4341,6 +4396,9 @@ async function emitMemberJoined (view, circleId, memberValue, priorValue) {
     const pubkey = memberValue && memberValue.pubkey
     if (!circleId || typeof joinedAt !== 'number' || typeof pubkey !== 'string') return
     if (Date.now() - joinedAt > MEMBER_NOTIF_FRESHNESS_MS) return
+    // A hidden member showing themselves again never left (proposal
+    // 2026-10-06), so it is not a join.
+    if (memberValue.rejoin === 'unhide') return
     // Only a genuinely new member row notifies. If we already held a row
     // for this pubkey with the same-or-newer joinedAt, this is an autobase
     // re-apply (indexer reorg) or a profile edit (joinedAt preserved) --
@@ -4501,6 +4559,19 @@ async function applyCircleNodes (nodes, view, base, circleId) {
             } catch (e) { console.warn('[bare] circle:removed-self emit failed', e?.message) }
           }
         }
+        continue
+      }
+      // `hidden:{pubkey}` (proposal 2026-10-06-hide-inactive-member): any
+      // member hides an inactive member from the list for everyone. Signed by
+      // `hiddenBy`, LWW on `ts`, silent. Hides only while ts beats the member
+      // row's joinedAt, and a live member rewrites that row to show again.
+      if (op.key.startsWith('hidden:')) {
+        const incoming = op.value
+        const keyPubkey = op.key.slice('hidden:'.length)
+        if (!shouldAcceptHiddenRow({ keyPubkey, value: incoming, futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: (v) => verifyValueWithSigner(v, 'hiddenBy') })) continue
+        const existingHidden = (await view.get(op.key))?.value
+        if (existingHidden && typeof existingHidden.ts === 'number' && incoming.ts <= existingHidden.ts) continue
+        await view.put(op.key, incoming)
         continue
       }
       // `member:*`: any current writer. A removed member's rejoin is a
@@ -4827,6 +4898,7 @@ async function autoAppendMemberRow (circleId) {
   if (!base || !base.writable) return
   const ourKey = b4a.toString(_identity.publicKey, 'hex')
   const existing = await base.view.get('member:' + ourKey)
+  let unhide = false
   if (existing && existing.value) {
     // A member row already exists, so joinedAt normally stays stable --
     // a left: / removed: tombstone hides us only while its ts beats
@@ -4838,14 +4910,20 @@ async function autoAppendMemberRow (circleId) {
     // every other device (their own still shows them via self-inject).
     const leftRow = await base.view.get('left:' + ourKey)
     const removedRow = await base.view.get('removed:' + ourKey)
+    const hiddenRow = await base.view.get('hidden:' + ourKey)
     const hidden =
       memberHiddenByLeft(leftRow?.value?.leftAt, existing.value.joinedAt) ||
       memberHiddenByRemoved(removedRow?.value?.ts, existing.value.joinedAt)
-    if (!hidden) return
+    // Another member hid us as inactive (proposal 2026-10-06), but we are
+    // running, so show ourselves again. Tagged so peers skip the "joined"
+    // notice: we never left.
+    unhide = !hidden && memberHiddenByHide(hiddenRow?.value?.ts, existing.value.joinedAt)
+    if (!hidden && !unhide) return
   }
   const profile = await readProfileForMemberRow(ourKey)
   const memberValue = { pubkey: ourKey, displayName: profile.displayName, joinedAt: Date.now(), v: 1 }
   if (profile.avatar) memberValue.avatar = profile.avatar
+  if (unhide) memberValue.rejoin = 'unhide'
   if (await safeAppend(base, { type: 'put', key: 'member:' + ourKey, value: memberValue }, 'member')) {
     if (!_firstWriterMarked.has(circleId)) {
       _firstWriterMarked.add(circleId)
@@ -6063,7 +6141,7 @@ function pushWriterCoresToSeeder (circleId, conn) {
   if (cores.length > 0) entry.sendWriterCores(cores)
 }
 
-// Currently-visible member identity pubkeys for a circle (left/removed filtered
+// Currently-visible member identity pubkeys for a circle (left/removed/hidden filtered
 // out, same rule as snapshotCircle). Lean — only the pubkeys, for the cutover
 // check. Proposal 2026-06-04 slice 3.
 async function circleVisibleMemberPubkeys (view) {
@@ -6075,12 +6153,20 @@ async function circleVisibleMemberPubkeys (view) {
   for await (const { key, value } of view.createReadStream({ gt: 'removed:', lt: 'removed:~' })) {
     if (typeof value?.ts === 'number') removedAt.set(key.slice('removed:'.length), value.ts)
   }
+  // A member hidden as inactive (proposal 2026-10-06) is usually a dead
+  // identity that will never announce a core, so it must not hold back the
+  // cutover either.
+  const hiddenAt = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'hidden:', lt: 'hidden:~' })) {
+    if (typeof value?.ts === 'number') hiddenAt.set(key.slice('hidden:'.length), value.ts)
+  }
   const out = []
   for await (const { value } of view.createReadStream({ gt: 'member:', lt: 'member:~' })) {
     const pubkey = value?.pubkey
     if (typeof pubkey !== 'string') continue
     if (memberHiddenByRemoved(removedAt.get(pubkey), value?.joinedAt)) continue
     if (memberHiddenByLeft(leftAt.get(pubkey), value?.joinedAt)) continue
+    if (memberHiddenByHide(hiddenAt.get(pubkey), value?.joinedAt)) continue
     out.push(pubkey)
   }
   return out

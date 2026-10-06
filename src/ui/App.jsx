@@ -8,6 +8,7 @@ import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork,
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
+import { canHideMember, memberLastActiveAt } from '../lib/memberHide.js'
 import { formatDistance, formatDuration, formatSpeed, formatTripDate, polylineSvgPath, polylineGeoJson } from '../lib/tripFormat.js'
 import {
   computeClusters,
@@ -2717,6 +2718,25 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       ? activeCircles[0]
       : null
 
+  // Any member can hide someone unseen for 30 days (proposal 2026-10-06),
+  // e.g. the old entry left when a member lost their app data. Same
+  // single-circle gate as removal; the owner gets Remove instead. Debug
+  // builds use a 1-minute threshold so the flow can be tested.
+  const hideInactiveMs = (typeof window !== 'undefined' && window.__pearDebug) ? 60 * 1000 : undefined
+  const circleForHide = (() => {
+    if (!isSingleCircle || ownedCircleForRemoval || !selectedPubkey) return null
+    const c = activeCircles[0]
+    const row = c?.members?.find((m) => m.value?.pubkey === selectedPubkey)?.value
+    const verdict = canHideMember({
+      pubkey: selectedPubkey,
+      ourKey: myPubkey,
+      hasMemberRow: !!row,
+      lastActiveAt: memberLastActiveAt({ joinedAt: row?.joinedAt, seenTs: [c?.lastSeen?.[selectedPubkey]?.ts] }),
+      inactiveMs: hideInactiveMs,
+    })
+    return verdict.ok ? c : null
+  })()
+
   // Title is the current filter label. A selectedCircleId can outlive its
   // circle (e.g. right after leaving the last circle), so resolve the name
   // from the live snapshot and fall through to the no-/multi-circle labels
@@ -3139,7 +3159,18 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           isSelf={selectedPubkey === myPubkey}
           connected={connectedPubkeys.has(selectedPubkey)}
           canRemove={!!ownedCircleForRemoval && selectedPubkey !== myPubkey}
-          circleNameForRemoval={ownedCircleForRemoval?.circle?.name ?? 'this circle'}
+          circleNameForRemoval={ownedCircleForRemoval?.circle?.name ?? circleForHide?.circle?.name ?? 'this circle'}
+          canHide={!!circleForHide}
+          onHide={async () => {
+            const r = await pear.call('member:hide', {
+              circleId: circleForHide.circleId,
+              pubkey: selectedPubkey,
+              inactiveMs: hideInactiveMs,
+            })
+            if (!r?.ok) throw new Error('Could not hide member')
+            setMemberSheetVisible(false)
+            setSelectedPubkey(null)
+          }}
           needsRepair={isSingleCircle && !!activeCircles[0]?.needsRepair}
           onRepair={async () => {
             if (!actionTargetCircleId) return
@@ -7430,7 +7461,7 @@ function initialsFor (label) {
 // places list. Closing only hides the sheet; the focus state lives on
 // the parent so the user can re-open via tap-on-focus-bar without
 // re-flying the map.
-function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', needsRepair = false, onRepair, onRemove, onOpenTrips, onClose }) {
+function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', canHide = false, onHide, needsRepair = false, onRepair, onRemove, onOpenTrips, onClose }) {
   const [repairing, setRepairing] = useState(false)
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
@@ -7444,6 +7475,9 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
   const [confirmingRemove, setConfirmingRemove] = useState(false)
   const [removing, setRemoving] = useState(false)
   const [removeError, setRemoveError] = useState(null)
+  const [confirmingHide, setConfirmingHide] = useState(false)
+  const [hiding, setHiding] = useState(false)
+  const [hideError, setHideError] = useState(null)
   useEffect(() => {
     if (!member?.pubkey) return
     let cancelled = false
@@ -7625,9 +7659,48 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
               Remove from circle
             </button>
           )}
+          {canHide && (
+            <button
+              onClick={() => { setHideError(null); setConfirmingHide(true) }}
+              style={{
+                width: '100%', padding: '12px', borderRadius: radius.md,
+                background: 'transparent', color: colors.text.primary,
+                border: `1px solid ${colors.border}`, cursor: 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              }}
+            >
+              Hide from circle
+            </button>
+          )}
         </div>
       )}
     </BottomSheet>
+    {confirmingHide && (
+      <ConfirmSheet
+        title='Hide from circle?'
+        message={<>
+          Hide <strong>{member.displayName}</strong> in <strong>{circleNameForRemoval}</strong> for everyone? Use this for an old entry, like one left behind when someone reinstalled the app. Nobody is removed, and if they open PearCircle again they show up again by themselves.
+          {hideError && <div style={{ color: colors.error, marginTop: spacing.sm }}>{hideError}</div>}
+        </>}
+        confirmLabel='Hide'
+        destructive={false}
+        busy={hiding}
+        onConfirm={async () => {
+          setHiding(true)
+          setHideError(null)
+          try {
+            await onHide?.()
+          } catch (e) {
+            setHideError(e?.message || 'Could not hide member')
+            setHiding(false)
+            return
+          }
+          setHiding(false)
+          setConfirmingHide(false)
+        }}
+        onClose={() => { if (!hiding) { setConfirmingHide(false); setHideError(null) } }}
+      />
+    )}
     {confirmingRemove && (
       <ConfirmSheet
         title='Remove from circle?'
