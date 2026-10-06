@@ -11,6 +11,7 @@
       "bundleIdentifier": "com.pearcircle",
       "buildNumber": "41",
       "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
         "LSApplicationQueriesSchemes": [
           "lightning"
         ],
