@@ -1021,7 +1021,11 @@ _desktop_windows() {
   _bg_after "${1:-}"
   while [ ! -e "$_BG_DIR/android.done" ]; do sleep 2; done
   ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error
-    cd "$REPO_ROOT" && npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 \
+    # The version package-lock pins: build-windows-local.sh refuses any other
+    # (fb97b4b), and an unpinned install pulled the newest and failed every
+    # Windows build from 1.1.2 to 1.1.5.
+    _WIN_BARE=$(node -p "require('$REPO_ROOT/package-lock.json').packages['node_modules/bare-runtime-win32-x64'].version" 2>/dev/null)
+    cd "$REPO_ROOT" && npm install "bare-runtime-win32-x64@${_WIN_BARE:-latest}" --os=win32 --cpu=x64 \
       --force --no-save --no-audit --no-fund --loglevel=error ) \
     >> /tmp/pearcircle-build-windows.log 2>&1 || true
   bash "$_SL/scripts/build-windows-local.sh" "$_SLV" >> /tmp/pearcircle-build-windows.log 2>&1
@@ -1325,10 +1329,19 @@ else
   else
     echo "--> Linux    (.deb + .AppImage, built locally)"
     if _bg_wait linux; then
+      # Put the version in the AppImage names (the .deb, .pkg and .exe already
+      # carry it). The seeder update check reads an installer's version from
+      # its name, because a later release that skips the seeder builds carries
+      # these files forward under a newer tag.
+      for _arch in x86_64 aarch64; do
+        if [ -f "$_SL/dist/linux/PearCircleSeeder-${_arch}.AppImage" ]; then
+          mv -f "$_SL/dist/linux/PearCircleSeeder-${_arch}.AppImage" "$_SL/dist/linux/PearCircleSeeder-${_SLV}-${_arch}.AppImage"
+        fi
+      done
       for _f in "$_SL/dist/linux/pearcircle-seeder_${_SLV}_amd64.deb" \
                 "$_SL/dist/linux/pearcircle-seeder_${_SLV}_arm64.deb" \
-                "$_SL/dist/linux/PearCircleSeeder-x86_64.AppImage" \
-                "$_SL/dist/linux/PearCircleSeeder-aarch64.AppImage"; do
+                "$_SL/dist/linux/PearCircleSeeder-${_SLV}-x86_64.AppImage" \
+                "$_SL/dist/linux/PearCircleSeeder-${_SLV}-aarch64.AppImage"; do
         if [ -f "$_f" ]; then DESKTOP_ARTIFACTS+=("$_f"); fi
       done
       echo "    Linux build OK."
@@ -1601,6 +1614,64 @@ git push "$GIT_REMOTE" "$RELEASE_TAG" \
   || echo "    Tag already on remote"
 
 # ---------------------------------------------------------------------------
+# Helper: carry the newest seeder files into a release that did not build them
+#
+# A release that skips some or all seeder builds would otherwise leave
+# releases/latest without those downloads, and the desktop seeders' update
+# check and the website both read releases/latest. For each seeder file kind
+# (macOS .pkg, Windows .exe, Linux .deb and .AppImage per arch, StartOS .s9pk
+# legacy and v2) that is not in <have-name...>, this finds the newest earlier
+# release with that file and a .sha256 sidecar, downloads both into
+# <dest-dir>, checks the hash and prints both paths. Files keep their original
+# names, so a carried 1.1.2 installer still says 1.1.2.
+#
+# GITHUB_API overrides the API base, for the test.
+# Usage: _carry_forward_seeders <token> <slug> <dest-dir> <this-tag> [have-name...]
+# ---------------------------------------------------------------------------
+_carry_forward_seeders() {
+  local token="$1" slug="$2" dest="$3" this_tag="$4"
+  shift 4
+  local api="${GITHUB_API:-https://api.github.com}"
+  [ -z "$slug" ] && return 0
+  local plan
+  plan=$(curl -sL \
+    ${token:+-H "Authorization: Bearer $token"} \
+    -H "Accept: application/vnd.github+json" \
+    "${api}/repos/${slug}/releases" 2>/dev/null \
+    | HAVE="$*" THIS_TAG="$this_tag" python3 -c '
+import json, os, re, sys
+kinds = [r"\.pkg$", r"\.exe$", r"_amd64\.deb$", r"_arm64\.deb$", r"x86_64\.AppImage$",
+         r"aarch64\.AppImage$", r"^pearcircle-seeder\.s9pk$", r"^pearcircle-seeder-v2\.s9pk$"]
+have = os.environ.get("HAVE", "").split()
+try:
+    rels = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for kind in kinds:
+    if any(re.search(kind, h) for h in have):
+        continue
+    for rel in rels:
+        if rel.get("draft") or rel.get("tag_name") == os.environ.get("THIS_TAG"):
+            continue
+        urls = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", [])}
+        hits = [n for n in urls if n and re.search(kind, n) and urls.get(n + ".sha256")]
+        if hits:
+            print(urls[hits[0]]); print(urls[hits[0] + ".sha256"])
+            break
+' 2>/dev/null) || return 0
+  [ -z "$plan" ] && return 0
+  mkdir -p "$dest"
+  local file_url sum_url name
+  while IFS= read -r file_url && IFS= read -r sum_url; do
+    name=$(basename "$file_url")
+    curl -sfL -o "$dest/$name" "$file_url" || continue
+    curl -sfL -o "$dest/$name.sha256" "$sum_url" || continue
+    ( cd "$dest" && sha256sum -c --status "$name.sha256" ) || continue
+    printf '%s\n%s\n' "$dest/$name" "$dest/$name.sha256"
+  done <<< "$plan"
+}
+
+# ---------------------------------------------------------------------------
 # 7. Create GitHub release and upload assets
 # ---------------------------------------------------------------------------
 echo "==> Creating GitHub release $RELEASE_TAG..."
@@ -1655,6 +1726,17 @@ if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ]; then
   elif $SKIP_START9_LEGACY; then
     echo "==> WARNING: no v2 s9pk and the legacy one was skipped - this release has no StartOS package."
   fi
+fi
+# Seeder files this run didn't build come forward from the newest earlier
+# release that has each one, so releases/latest always offers every seeder
+# download. They keep their names, and with them their versions.
+_HAVE=()
+for _a in "${RELEASE_ASSETS[@]}"; do _HAVE+=("$(basename "$_a")"); done
+_SEEDERS=$(_carry_forward_seeders "$GH_TOKEN" "$REPO_SLUG" "$(mktemp -d)" "$RELEASE_TAG" "${_HAVE[@]}")
+if [ -n "$_SEEDERS" ]; then
+  while IFS= read -r _c; do RELEASE_ASSETS+=("$_c"); done <<< "$_SEEDERS"
+  echo "==> Carrying forward seeder files this release did not build:"
+  printf '%s\n' "$_SEEDERS" | grep -v '\.sha256$' | while IFS= read -r _c; do echo "    - $(basename "$_c")"; done
 fi
 echo ""
 echo "    Repo   : ${REPO_SLUG:-unknown}"

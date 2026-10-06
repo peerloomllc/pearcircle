@@ -87,16 +87,45 @@ function selectSha256For (assets, assetName) {
 
 // Evaluate a GitHub `/releases/latest` JSON against the running version for a
 // platform. Returns a stable shape the host route + UI consume.
+// The version an installer was built as, read from its filename
+// (PearCircleSeeder-1.1.5.pkg, pearcircle-seeder_1.1.5_amd64.deb,
+// PearCircleSeeder-1.1.5-x86_64.AppImage). A release that didn't rebuild the
+// seeders carries the previous installers forward, so the release tag is not
+// the seeder's version. Null for an unversioned name (AppImages before 1.1.5).
+function assetVersion (name) {
+  if (typeof name !== 'string') return null
+  const m = name.match(/(?:^|[-_])v?(\d+\.\d+\.\d+)(?=[-_.])/)
+  return m ? m[1] : null
+}
+
+// Newest desktop seeder version attached to a release, for the phone's
+// "update available" line. Falls back to the tag when no installer names a
+// version.
+function latestSeederVersion (release) {
+  const tag = typeof release?.tag_name === 'string' ? release.tag_name.replace(/^v/i, '') : null
+  let best = null
+  for (const a of Array.isArray(release?.assets) ? release.assets : []) {
+    const name = typeof a?.name === 'string' ? a.name.toLowerCase() : ''
+    if (name.endsWith('.sha256') || !/\.(pkg|exe|deb|appimage)$/.test(name)) continue
+    const v = assetVersion(a.name)
+    if (v && (!best || isNewer(v, best))) best = v
+  }
+  return best || tag
+}
+
 function evaluateRelease (release, { currentVersion, platform, arch, installKind } = {}) {
-  const latestVersion = typeof release?.tag_name === 'string'
+  const tagVersion = typeof release?.tag_name === 'string'
     ? release.tag_name.replace(/^v/i, '')
     : null
   const asset = selectAsset(release?.assets, platform, arch, installKind)
   const sha = asset ? selectSha256For(release?.assets, asset.name) : null
+  // The installer's own version, not the tag; no installer for this platform
+  // means nothing to update to.
+  const latestVersion = asset ? (assetVersion(asset.name) || tagVersion) : tagVersion
   return {
     currentVersion: currentVersion ?? null,
     latestVersion,
-    updateAvailable: latestVersion ? isNewer(latestVersion, currentVersion) : false,
+    updateAvailable: asset && latestVersion ? isNewer(latestVersion, currentVersion) : false,
     releaseUrl: typeof release?.html_url === 'string' ? release.html_url : null,
     assetName: asset?.name ?? null,
     assetUrl: asset?.browser_download_url ?? null,
@@ -104,4 +133,4 @@ function evaluateRelease (release, { currentVersion, platform, arch, installKind
   }
 }
 
-module.exports = { parseVersion, compareVersions, isNewer, selectAsset, selectSha256For, evaluateRelease }
+module.exports = { parseVersion, compareVersions, isNewer, selectAsset, selectSha256For, evaluateRelease, assetVersion, latestSeederVersion }

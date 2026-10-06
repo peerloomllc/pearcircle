@@ -29,8 +29,8 @@ service for the user who ran the install. The service starts immediately.
 ## Install - other distributions (.AppImage)
 
 ```bash
-chmod +x PearCircleSeeder-x86_64.AppImage              # or -aarch64
-./PearCircleSeeder-x86_64.AppImage --install-service
+chmod +x PearCircleSeeder-1.1.5-x86_64.AppImage        # your version; or -aarch64
+./PearCircleSeeder-1.1.5-x86_64.AppImage --install-service
 ```
 
 `--install-service` registers the systemd user service (its `ExecStart`

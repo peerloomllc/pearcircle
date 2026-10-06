@@ -15,7 +15,7 @@ import {
   clusterKey,
   computeRingOffsets,
 } from '../lib/fanOut.js'
-import { isNewer as isSeederVersionNewer } from '../lib/seederUpdateCheck.js'
+import { isNewer as isSeederVersionNewer, latestSeederVersion } from '../lib/seederUpdateCheck.js'
 import { supersedeFailureMessage } from '../lib/supersedeApply.js'
 import { summarizeSeederCircles } from '../lib/seederContact.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
@@ -1648,7 +1648,9 @@ function SeedersSection ({ active = true }) {
       .then((r) => (r.ok ? r.json() : null))
       .then((rel) => {
         if (cancelled || !rel?.tag_name) return
-        setLatestVersion(String(rel.tag_name).replace(/^v/i, ''))
+        // The newest attached installer, since a release can carry older
+        // seeder builds forward.
+        setLatestVersion(latestSeederVersion(rel))
       })
       .catch(() => {})
     return () => { cancelled = true }
