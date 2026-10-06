@@ -14,7 +14,7 @@
 // (the current view value) and passes a `verifySig` closure, so the rule set
 // is unit-testable without an Autobase. Mirrors shouldAcceptSeederRow.
 
-function shouldAcceptSupersede ({ keyNew, incoming, ownerKey, existing, now, futureToleranceMs = 0, verifySig }) {
+function shouldAcceptSupersede ({ keyNew, incoming, ownerKey, existing, now, futureToleranceMs = 0, verifySig, coowners }) {
   if (!incoming || typeof incoming !== 'object') return false
   if (typeof incoming.newCircleId !== 'string') return false
   if (typeof incoming.invite !== 'string') return false
@@ -23,6 +23,9 @@ function shouldAcceptSupersede ({ keyNew, incoming, ownerKey, existing, now, fut
   if (typeof now === 'number' && incoming.postedAt > now + futureToleranceMs) return false
   if (keyNew !== incoming.newCircleId) return false
   if (typeof ownerKey !== 'string' || incoming.ownerKey !== ownerKey) return false
+  // A co-owner posts with `by` set to their identity (proposal
+  // 2026-10-06-owner-continuity); the caller's verifySig then checks `by`.
+  if (typeof incoming.by === 'string' && incoming.by !== ownerKey && !(coowners && coowners.has(incoming.by))) return false
   if (typeof verifySig === 'function' && !verifySig(incoming)) return false
   if (existing && typeof existing.postedAt === 'number' && incoming.postedAt <= existing.postedAt) return false
   return true

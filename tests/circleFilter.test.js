@@ -121,3 +121,22 @@ describe('shouldAcceptRemovedRow', () => {
     })).toBe(false)
   })
 })
+
+describe('shouldRecoverFromTombstone', () => {
+  const { shouldRecoverFromTombstone } = require('../src/lib/circleFilter')
+  test('no tombstone, nothing to recover', () => {
+    expect(shouldRecoverFromTombstone(undefined, 100, 200)).toBe(false)
+  })
+  test('tombstone older than the member row does not hide us', () => {
+    expect(shouldRecoverFromTombstone(100, 200, 300)).toBe(false)
+  })
+  test('a removal newer than our local join sticks', () => {
+    expect(shouldRecoverFromTombstone(500, 100, 100)).toBe(false)
+  })
+  test('we rejoined after the removal, so recover', () => {
+    expect(shouldRecoverFromTombstone(500, 100, 600)).toBe(true)
+  })
+  test('unknown local join never recovers', () => {
+    expect(shouldRecoverFromTombstone(500, 100, undefined)).toBe(false)
+  })
+})

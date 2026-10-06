@@ -49,8 +49,9 @@ const { recordBlockReceived, removeBlockTracking, runSeederRetentionSweep, range
 const { planSeederLeavePurge } = require('./lib/seederLeavePurge')
 const { summarizeSeederCoverage } = require('./lib/seederCoverage')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
-const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow } = require('./lib/circleFilter')
+const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow, shouldRecoverFromTombstone } = require('./lib/circleFilter')
 const { memberHiddenByHide, memberLastActiveAt, canHideMember, shouldAcceptHiddenRow } = require('./lib/memberHide')
+const { OWNER_V2_CAP, activeCoowners, isAuthorized, hasOwnerV2Cap, circleOwnerV2Ready, shouldAcceptCircleRow, shouldAcceptSignedRemovedRow, shouldAcceptCoownerRow } = require('./lib/ownerAuth')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
 const { shouldAppendLastSeen } = require('./lib/lastSeenGate')
@@ -974,7 +975,7 @@ const handlers = {
       try {
         const existing = await base.view.get('member:' + ourKey)
         const joinedAt = existing?.value?.joinedAt ?? updatedAt
-        const memberValue = { pubkey: ourKey, displayName: trimmed, joinedAt, v: 1 }
+        const memberValue = { pubkey: ourKey, displayName: trimmed, joinedAt, caps: [OWNER_V2_CAP], v: 1 }
         if (avatarValue) memberValue.avatar = avatarValue
         await base.append({
           type: 'put',
@@ -1026,9 +1027,9 @@ const handlers = {
     await base.append({
       type: 'put',
       key: 'circle',
-      value: { id: circleId, name, ownerKey: ownerPublicKey, createdAt, encrypted: true, v: 1 },
+      value: signCircleRow({ id: circleId, name, ownerKey: ownerPublicKey, createdAt, encrypted: true, v: 1 }),
     })
-    const ownerMember = { pubkey: ownerPublicKey, displayName: profile.displayName, joinedAt: createdAt, v: 1 }
+    const ownerMember = { pubkey: ownerPublicKey, displayName: profile.displayName, joinedAt: createdAt, caps: [OWNER_V2_CAP], v: 1 }
     if (profile.avatar) ownerMember.avatar = profile.avatar
     await base.append({
       type: 'put',
@@ -1102,7 +1103,9 @@ const handlers = {
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const sourceRec = await _localDb.get('circles:joined:' + circleId)
     if (!sourceRec) throw new Error('unknown circle: ' + circleId)
-    if (sourceRec.value.role !== 'owner') throw new Error('only the circle owner can recreate it')
+    const sourceBase = _circleBases.get(circleId)
+    if (!sourceBase) throw new Error('unknown circle: ' + circleId)
+    assertCanManage(await ownerStanding(circleId, sourceBase), 'recreate')
 
     const sourceConfig = await readCircleConfigForExport(circleId)
     const created = await createCircleFromConfig(sourceConfig)
@@ -1194,7 +1197,23 @@ const handlers = {
     // unchanged. The owner re-scanning their own invite must not be demoted
     // to 'member', and a member re-scanning the same invite is a no-op.
     const existing = await _localDb.get('circles:joined:' + circleId)
-    if (existing) return { ...existing.value, alreadyJoined: true }
+    if (existing) {
+      // Rejoining with a fresh invite after being removed or leaving, before
+      // the old record was cleaned up: count this as a new join so
+      // autoAppendMemberRow out-dates the tombstone (shouldRecoverFromTombstone).
+      const base = _circleBases.get(circleId)
+      const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+      const row = base && (await base.view.get('member:' + ourKeyHex).catch(() => null))?.value
+      const removedTs = base && (await base.view.get('removed:' + ourKeyHex).catch(() => null))?.value?.ts
+      const leftTs = base && (await base.view.get('left:' + ourKeyHex).catch(() => null))?.value?.leftAt
+      if (memberHiddenByRemoved(removedTs, row?.joinedAt) || memberHiddenByLeft(leftTs, row?.joinedAt)) {
+        const record = { ...existing.value, joinedAt: Date.now() }
+        await _localDb.put('circles:joined:' + circleId, record)
+        _leavingCircles.delete(circleId)
+        return { ...record, alreadyJoined: true }
+      }
+      return { ...existing.value, alreadyJoined: true }
+    }
 
     // Open the per-circle Autobase as a reader. Replication populates the
     // view once a writer connects. addWriter (slice 6E) flips writable=true.
@@ -1346,6 +1365,8 @@ const handlers = {
           // The migration nudge this circle still owes its members (proposal
           // 2026-07-24). In-memory read, so it costs the poll nothing.
           supersedePending: _supersedePending.has(circleId),
+          // Owner / co-owner standing (proposal 2026-10-06-owner-continuity).
+          owner: await readOwnerStandingForUi(circleId, base),
         })
         // A repairing circle is "done enough" once its rebuilt base is
         // writable again (re-admitted as a writer == functional). Historical
@@ -1381,7 +1402,7 @@ const handlers = {
       : profile.displayName
     const joinedAt = Date.now()
 
-    const memberValue = { pubkey: ourKey, displayName: dn, joinedAt, v: 1 }
+    const memberValue = { pubkey: ourKey, displayName: dn, joinedAt, caps: [OWNER_V2_CAP], v: 1 }
     if (profile.avatar) memberValue.avatar = profile.avatar
     await base.append({
       type: 'put',
@@ -1832,16 +1853,13 @@ const handlers = {
     if (trimmed.length === 0) throw new Error('name must be non-empty')
     const base = _circleBases.get(circleId)
     if (!base) throw new Error('unknown circle: ' + circleId)
-    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
-    const circleRow = await base.view.get('circle')
-    if (!circleRow?.value) throw new Error('circle metadata missing')
-    if (circleRow.value.ownerKey !== ourKeyHex) {
-      throw new Error('only the owner can rename this circle')
-    }
-    if (circleRow.value.deleted) throw new Error('this circle has been deleted')
+    const standing = await ownerStanding(circleId, base)
+    if (!standing.circle) throw new Error('circle metadata missing')
+    assertCanManage(standing, 'rename')
+    if (standing.circle.deleted) throw new Error('this circle has been deleted')
     if (!base.writable) throw new Error('not yet a writer for this circle')
-    if (circleRow.value.name === trimmed) return { ok: true, name: trimmed }
-    const updated = { ...circleRow.value, name: trimmed }
+    if (standing.circle.name === trimmed) return { ok: true, name: trimmed }
+    const updated = signCircleRow({ ...standing.circle, name: trimmed })
     await base.append({ type: 'put', key: 'circle', value: updated })
     // Mirror the new name to the local circles:joined record so the
     // dropdown / sheets reflect the rename even before circles:getAll
@@ -1866,12 +1884,10 @@ const handlers = {
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const base = _circleBases.get(circleId)
     if (!base) throw new Error('unknown circle: ' + circleId)
-    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
-    const circleRow = await base.view.get('circle')
+    const standing = await ownerStanding(circleId, base)
+    const circleRow = standing.circle ? { value: standing.circle } : null
     if (!circleRow?.value) throw new Error('circle metadata missing')
-    if (circleRow.value.ownerKey !== ourKeyHex) {
-      throw new Error('only the owner can delete this circle')
-    }
+    assertCanManage(standing, 'delete')
     if (circleRow.value.deleted) {
       // Idempotent: already deleted on the wire; just ensure local state
       // is gone too.
@@ -1879,11 +1895,11 @@ const handlers = {
       return { ok: true, alreadyDeleted: true }
     }
     if (!base.writable) throw new Error('not yet a writer for this circle')
-    const tombstone = {
+    const tombstone = signCircleRow({
       ...circleRow.value,
       deleted: true,
       deletedAt: Date.now(),
-    }
+    })
     await base.append({ type: 'put', key: 'circle', value: tombstone })
     // Brief replication window. Peers connected via Hyperswarm pull our
     // hypercore over the duplex stream; 2s is a best-effort upper bound
@@ -1953,20 +1969,48 @@ const handlers = {
     const base = _circleBases.get(circleId)
     if (!base) throw new Error('unknown circle: ' + circleId)
     const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
-    if (pubkey === ourKeyHex) throw new Error('the owner cannot remove themselves')
-    const circleRow = await base.view.get('circle')
-    if (!circleRow?.value) throw new Error('circle metadata missing')
-    if (circleRow.value.ownerKey !== ourKeyHex) {
-      throw new Error('only the owner can remove members')
-    }
-    if (circleRow.value.deleted) throw new Error('this circle has been deleted')
+    if (pubkey === ourKeyHex) throw new Error('you cannot remove yourself')
+    const standing = await ownerStanding(circleId, base)
+    if (!standing.circle) throw new Error('circle metadata missing')
+    assertCanManage(standing, 'remove members from')
+    if (pubkey === standing.circle.ownerKey) throw new Error('the owner cannot be removed')
+    if (standing.circle.deleted) throw new Error('this circle has been deleted')
     if (!base.writable) throw new Error('not yet a writer for this circle')
+    // Signed by our identity so receivers accept it from any writer core
+    // (proposal 2026-10-06-owner-continuity). Old peers ignore the signature.
     await base.append({
       type: 'put',
       key: 'removed:' + pubkey,
-      value: { pubkey, removedBy: ourKeyHex, ts: Date.now(), v: 1 },
+      value: signValue({ pubkey, removedBy: ourKeyHex, ts: Date.now(), v: 1 }, _identity.secretKey),
     })
     return { ok: true, pubkey }
+  },
+
+  // Appoint or revoke a co-owner (proposal 2026-10-06-owner-continuity).
+  // The owner or any co-owner can do either, except to the owner identity.
+  // Identity-signed, so it waits until the whole circle can apply it.
+  'coowner:set': async ({ circleId, pubkey, coowner } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string' || pubkey.length !== 64) throw new Error('pubkey must be a 64-char hex string')
+    if (typeof coowner !== 'boolean') throw new Error('coowner must be a boolean')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const standing = await ownerStanding(circleId, base)
+    if (!standing.circle) throw new Error('circle metadata missing')
+    if (standing.circle.deleted) throw new Error('this circle has been deleted')
+    if (!standing.isOwner && !standing.isCoowner) throw new Error('only the owner or a co-owner can change co-owners')
+    if (!standing.ready) throw new Error('everyone in this circle needs the latest PearCircle first (waiting on ' + standing.waitingOn.join(', ') + ')')
+    if (pubkey === standing.circle.ownerKey) throw new Error('the owner is already in charge of this circle')
+    if (!(await base.view.get('member:' + pubkey))?.value) throw new Error('not a member of this circle')
+    if (standing.coowners.has(pubkey) === coowner) return { ok: true, pubkey, coowner }
+    const value = signValue({ pubkey, by: standing.ourKey, revoked: !coowner, ts: Date.now(), v: 1 }, _identity.secretKey)
+    if (!(await safeAppend(base, { type: 'put', key: 'coowner:' + pubkey, value }, 'coowner'))) {
+      throw new Error('could not save the change, try again')
+    }
+    mark('coowner:set', { cid: circleId.slice(0, 8), pk: pubkey.slice(0, 8), coowner })
+    return { ok: true, pubkey, coowner }
   },
 
   // Hide a member who hasn't been seen in 30 days, for the whole circle
@@ -4454,6 +4498,74 @@ async function emitMemberLeft (view, circleId, pubkey, leftTs) {
   } catch (e) { console.warn('[bare] member:left emit failed', e?.message) }
 }
 
+// Current co-owners of a circle, read from its view (proposal
+// 2026-10-06-owner-continuity). Read at apply time, so authority follows the
+// linearized order.
+async function readCoowners (view) {
+  const rows = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'coowner:', lt: 'coowner:~' })) {
+    rows.set(key.slice('coowner:'.length), value)
+  }
+  return activeCoowners(rows)
+}
+
+// Our standing in a circle for owner actions (proposal
+// 2026-10-06-owner-continuity). viaBootstrap is the phone that created the
+// circle, which old peers still trust. Anyone else authorized (the owner
+// identity elsewhere, or a co-owner) may act only once every visible member
+// can apply identity-signed owner rows (`ready`).
+async function ownerStanding (circleId, base) {
+  const ourKey = b4a.toString(_identity.publicKey, 'hex')
+  const circle = (await base.view.get('circle'))?.value || null
+  const coowners = await readCoowners(base.view)
+  const viaBootstrap = !!(base.local && b4a.equals(base.local.key, base.key))
+  const authorized = isAuthorized(ourKey, { ownerKey: circle?.ownerKey, coowners })
+  const { members } = await readCircleView(circleId, base)
+  const { ready, waitingOn } = circleOwnerV2Ready(members)
+  return {
+    circle,
+    ourKey,
+    coowners,
+    viaBootstrap,
+    isOwner: !!circle && circle.ownerKey === ourKey,
+    isCoowner: coowners.has(ourKey),
+    ready,
+    waitingOn,
+    canManage: viaBootstrap || (authorized && ready),
+  }
+}
+
+// Bounded, UI-shaped standing for circles:getAll. A degraded circle's view
+// reads stall, so skip it rather than hang the poll.
+async function readOwnerStandingForUi (circleId, base) {
+  if (_degradedCircles.has(circleId)) return null
+  const { value: st, timedOut } = await withTimeout(ownerStanding(circleId, base), READ_TIMEOUT_MS)
+  if (timedOut || !st) return null
+  return {
+    isOwner: st.isOwner,
+    isCoowner: st.isCoowner,
+    canManage: st.canManage,
+    ready: st.ready,
+    waitingOn: st.waitingOn,
+    coowners: Array.from(st.coowners),
+  }
+}
+
+// Throws the user-facing reason when we may not act as an owner here.
+function assertCanManage (standing, verb) {
+  if (standing.canManage) return
+  if (!standing.isOwner && !standing.isCoowner) throw new Error('only the owner or a co-owner can ' + verb + ' this circle')
+  throw new Error('everyone in this circle needs the latest PearCircle first (waiting on ' + standing.waitingOn.join(', ') + ')')
+}
+
+// A `circle` row written by this version: signed by our identity with a fresh
+// updatedAt, so receivers can check who wrote it and ignore an older copy
+// replayed later. Old peers ignore the extra fields.
+function signCircleRow (value) {
+  const { sig: _s, by: _b, updatedAt: _u, ...rest } = value
+  return signValue({ ...rest, by: b4a.toString(_identity.publicKey, 'hex'), updatedAt: Date.now() }, _identity.secretKey)
+}
+
 async function applyCircleNodes (nodes, view, base, circleId) {
   const bootstrapHex = b4a.toString(base.key, 'hex')
   let weJustBecameWritable = false
@@ -4481,8 +4593,19 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       // clean up local state.
       if (op.key === 'circle') {
         const fromHex = b4a.toString(node.from.key, 'hex')
-        if (fromHex !== bootstrapHex) continue
-        const wasDeleted = !!(await view.get('circle'))?.value?.deleted
+        // Bootstrap-authored, or signed by the owner identity or a co-owner
+        // (proposal 2026-10-06-owner-continuity).
+        const existingCircle = (await view.get('circle'))?.value
+        if (fromHex !== bootstrapHex) {
+          const accepted = shouldAcceptCircleRow({
+            fromHex, bootstrapHex, incoming: op.value, existing: existingCircle,
+            coowners: await readCoowners(view), now: Date.now(),
+            futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: verifyValueWithSigner,
+          })
+          mark('owner:circle-row', { accepted, by: String(op.value?.by || '').slice(0, 8) })
+          if (!accepted) continue
+        }
+        const wasDeleted = !!existingCircle?.deleted
         await view.put('circle', op.value)
         // Suppress the event when this device originated the write — the
         // owner's own `circle:delete` IPC already runs the teardown, so
@@ -4534,7 +4657,17 @@ async function applyCircleNodes (nodes, view, base, circleId) {
       if (op.key.startsWith('removed:')) {
         const fromHex = b4a.toString(node.from.key, 'hex')
         const keyPubkey = op.key.slice('removed:'.length)
-        if (!shouldAcceptRemovedRow({ fromHex, bootstrapHex, keyPubkey, value: op.value })) continue
+        if (fromHex !== bootstrapHex) {
+          // Signed by the owner identity or a co-owner (proposal 2026-10-06-owner-continuity).
+          const accepted = shouldAcceptSignedRemovedRow({
+            fromHex, bootstrapHex, keyPubkey, value: op.value,
+            ownerKey: (await view.get('circle'))?.value?.ownerKey,
+            coowners: await readCoowners(view), now: Date.now(),
+            futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: verifyValueWithSigner,
+          })
+          mark('owner:removed-row', { accepted, by: String(op.value?.removedBy || '').slice(0, 8) })
+          if (!accepted) continue
+        } else if (!shouldAcceptRemovedRow({ fromHex, bootstrapHex, keyPubkey, value: op.value })) continue
         const existingRemoved = (await view.get(op.key))?.value
         if (existingRemoved && typeof existingRemoved.ts === 'number' &&
             typeof op.value?.ts === 'number' && op.value.ts <= existingRemoved.ts) continue
@@ -4857,9 +4990,26 @@ async function applyCircleNodes (nodes, view, base, circleId) {
           existing,
           now: Date.now(),
           futureToleranceMs: FUTURE_TS_TOLERANCE_MS,
-          verifySig: (val) => verifyValueWithSigner(val, 'ownerKey'),
+          coowners: await readCoowners(view),
+          verifySig: (val) => verifyValueWithSigner(val, typeof val?.by === 'string' ? 'by' : 'ownerKey'),
         })
         if (accept) await view.put(op.key, incoming)
+        continue
+      }
+      // `coowner:{pubkey}` (proposal 2026-10-06-owner-continuity): the owner
+      // or a co-owner appoints or revokes a co-owner. Signed by `by`, LWW.
+      if (op.key.startsWith('coowner:')) {
+        const incoming = op.value
+        const keyPubkey = op.key.slice('coowner:'.length)
+        const accepted = shouldAcceptCoownerRow({
+          keyPubkey, incoming,
+          existing: (await view.get(op.key))?.value,
+          ownerKey: (await view.get('circle'))?.value?.ownerKey,
+          coowners: await readCoowners(view), now: Date.now(),
+          futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: verifyValueWithSigner,
+        })
+        mark('owner:coowner-row', { accepted, pk: keyPubkey.slice(0, 8), revoked: incoming?.revoked === true })
+        if (accepted) await view.put(op.key, incoming)
         continue
       }
       // Other prefixes not yet wired — silently dropped.
@@ -4911,17 +5061,34 @@ async function autoAppendMemberRow (circleId) {
     const leftRow = await base.view.get('left:' + ourKey)
     const removedRow = await base.view.get('removed:' + ourKey)
     const hiddenRow = await base.view.get('hidden:' + ourKey)
+    // Only out-date a tombstone we rejoined after; a newer one is a real
+    // leave or removal and must stick.
+    const localJoinedAt = (await _localDb.get('circles:joined:' + circleId).catch(() => null))?.value?.joinedAt
     const hidden =
-      memberHiddenByLeft(leftRow?.value?.leftAt, existing.value.joinedAt) ||
-      memberHiddenByRemoved(removedRow?.value?.ts, existing.value.joinedAt)
+      shouldRecoverFromTombstone(leftRow?.value?.leftAt, existing.value.joinedAt, localJoinedAt) ||
+      shouldRecoverFromTombstone(removedRow?.value?.ts, existing.value.joinedAt, localJoinedAt)
     // Another member hid us as inactive (proposal 2026-10-06), but we are
     // running, so show ourselves again. Tagged so peers skip the "joined"
     // notice: we never left.
-    unhide = !hidden && memberHiddenByHide(hiddenRow?.value?.ts, existing.value.joinedAt)
-    if (!hidden && !unhide) return
+    const tombstoned =
+      memberHiddenByLeft(leftRow?.value?.leftAt, existing.value.joinedAt) ||
+      memberHiddenByRemoved(removedRow?.value?.ts, existing.value.joinedAt)
+    unhide = !hidden && !tombstoned && memberHiddenByHide(hiddenRow?.value?.ts, existing.value.joinedAt)
+    if (!hidden && !unhide) {
+      // A real leave or removal is in force: write nothing.
+      if (tombstoned) return
+      // Upgraded from a version without the owner-v2 cap: advertise it once,
+      // keeping joinedAt so nobody gets a "joined" notice (proposal
+      // 2026-10-06-owner-continuity).
+      if (!hasOwnerV2Cap(existing.value)) {
+        const caps = Array.isArray(existing.value.caps) ? existing.value.caps : []
+        await safeAppend(base, { type: 'put', key: 'member:' + ourKey, value: { ...existing.value, caps: [...caps, OWNER_V2_CAP] } }, 'member')
+      }
+      return
+    }
   }
   const profile = await readProfileForMemberRow(ourKey)
-  const memberValue = { pubkey: ourKey, displayName: profile.displayName, joinedAt: Date.now(), v: 1 }
+  const memberValue = { pubkey: ourKey, displayName: profile.displayName, joinedAt: Date.now(), caps: [OWNER_V2_CAP], v: 1 }
   if (profile.avatar) memberValue.avatar = profile.avatar
   if (unhide) memberValue.rejoin = 'unhide'
   if (await safeAppend(base, { type: 'put', key: 'member:' + ourKey, value: memberValue }, 'member')) {
@@ -6961,9 +7128,16 @@ async function postSupersede (oldCircleId, newCircleId) {
   // whether we bother appending.
   const oldRec = await _localDb.get('circles:joined:' + oldCircleId)
   const ownerKey = circleRow?.value?.ownerKey ?? (oldRec?.value?.role === 'owner' ? ourKeyHex : null)
-  // Non-owner of the old circle: nothing to post (only the owner's signature is
-  // accepted on the wire). A benign no-op rather than an error.
-  if (ownerKey !== ourKeyHex) return { ok: false, reason: rowTimedOut ? 'circle_unreadable' : 'not_owner' }
+  // A co-owner posts with `by` (proposal 2026-10-06-owner-continuity), once
+  // the whole circle can apply it.
+  let coownerPost = false
+  if (ownerKey !== ourKeyHex && circleRow?.value) {
+    const standing = await ownerStanding(oldCircleId, base).catch(() => null)
+    coownerPost = !!(standing && standing.isCoowner && standing.ready)
+  }
+  // Neither owner nor an eligible co-owner: nothing to post. A benign no-op
+  // rather than an error.
+  if (ownerKey !== ourKeyHex && !coownerPost) return { ok: false, reason: rowTimedOut ? 'circle_unreadable' : 'not_owner' }
   if (!base.writable) return { ok: false, reason: 'not_writable' }
 
   // Build the new circle's invite from its persisted joined record (same fields
@@ -6979,7 +7153,8 @@ async function postSupersede (oldCircleId, newCircleId) {
     newCircleId,
     name,
     invite,
-    ownerKey: ourKeyHex,
+    ownerKey,
+    ...(coownerPost ? { by: ourKeyHex } : {}),
     postedAt: Date.now(),
     v: 1,
   }, _identity.secretKey)
