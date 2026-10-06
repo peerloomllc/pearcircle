@@ -1014,7 +1014,7 @@ function PermissionPrimingModal ({ onContinue }) {
         padding: spacing.lg,
         boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
       }}>
-        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary }}>
+        <h2 style={{ ...typography.heading, margin: `0 0 ${spacing.base}px`, color: colors.text.primary, textAlign: 'center' }}>
           Location access
         </h2>
         <p style={{ ...typography.body, color: colors.text.secondary, marginTop: 0, marginBottom: spacing.base, lineHeight: 1.5 }}>
@@ -1273,13 +1273,13 @@ function CircleDeletedNotice ({ circleName, kind = 'deleted', onDismiss }) {
         maxWidth: 400, width: '100%',
         border: `1px solid ${colors.border}`,
       }}>
-        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm, textAlign: 'center' }}>
           {kind === 'removed' ? 'Removed from circle' : 'Circle deleted'}
         </div>
         <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
           {kind === 'removed'
             ? <>You were removed from the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles. You can rejoin if you still have an invite link.</>
-            : <>The owner deleted the circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong>. It's been removed from your circles.</>}
+            : <>The circle <strong style={{ color: colors.text.primary, fontWeight: 400 }}>{circleName}</strong> was deleted. It's been removed from your circles.</>}
         </div>
         <button
           onClick={onDismiss}
@@ -1312,7 +1312,7 @@ function MigrationNudgeModal ({ nudge, busy = false, onJoin, onLater }) {
         padding: spacing.lg, maxWidth: 400, width: '100%',
         border: `1px solid ${colors.border}`,
       }}>
-        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm, textAlign: 'center' }}>
           Your group moved
         </div>
         <div style={{ ...typography.body, color: colors.text.secondary, marginBottom: spacing.lg }}>
@@ -6813,7 +6813,7 @@ function RegionDownloadModal ({ onClose }) {
   return (
     <BottomSheet onClose={onClose} zIndex={420}>
       <div style={{ padding: `${spacing.lg}px ${spacing.lg}px ${spacing.base}px` }}>
-        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm }}>
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: spacing.sm, textAlign: 'center' }}>
           Download tiles
         </div>
         {!viewport?.bbox ? (
