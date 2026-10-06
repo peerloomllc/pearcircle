@@ -974,6 +974,9 @@ function isInviteUrl(url: string) {
 export default function Index() {
   const webViewRef = useRef<WebView>(null)
   const [html, setHtml] = useState<string | null>(null)
+  // Bumped to remount the WebView after an account restore. reload() does
+  // nothing on iOS for a page loaded from an HTML string.
+  const [webViewKey, setWebViewKey] = useState(0)
   const webViewLoaded = useRef(false)
   const pendingDeeplink = useRef<string | null>(null)
   const pendingNotificationFocus = useRef<{ circleId: string; pubkey: string } | null>(null)
@@ -1374,7 +1377,8 @@ export default function Index() {
       try {
         respond(msg.id, { ok: true })
         await restartWorklet()
-        webViewRef.current?.reload()
+        webViewLoaded.current = false
+        setWebViewKey((k) => k + 1)
       } catch (err: any) {
         console.warn('worklet restart failed', err?.message ?? String(err))
       }
@@ -1955,6 +1959,7 @@ export default function Index() {
     <>
       <StatusBar barStyle={statusBarStyle} translucent backgroundColor='transparent' />
       <WebView
+        key={webViewKey}
         ref={webViewRef}
         // baseUrl https://localhost/ rather than about:blank: the
         // WebView treats about:blank as a non-secure null-origin

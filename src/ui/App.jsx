@@ -2181,7 +2181,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   }
   useEffect(() => {
     const id = setInterval(refreshBackupStatus, 5 * 60 * 1000)
-    return () => clearInterval(id)
+    window.addEventListener('pc:backup-changed', refreshBackupStatus)
+    return () => { clearInterval(id); window.removeEventListener('pc:backup-changed', refreshBackupStatus) }
   }, [refreshBackupStatus])
   const [selfSeen, setSelfSeen] = useState(null)
   // Circle-repair banner state. repairConfirmOpen gates the explainer modal;

@@ -145,6 +145,7 @@ export function BackupSection ({ active }) {
       const r = await call('shell:exportFile', { filename: 'pearcircle-backup-' + date + '.json', contents: built.contents, title: 'Save PearCircle backup' })
       if (r?.canceled) { setBusy(false); return }
       await pear.call('shell:backup:manual-done')
+      window.dispatchEvent(new Event('pc:backup-changed'))
       setNotice('Backup saved. Keep the file and your password somewhere safe.')
       setMode(null)
       refresh()
@@ -159,6 +160,7 @@ export function BackupSection ({ active }) {
       const keyed = await call('account:backup:key', { password })
       const r = await call('shell:backup:auto:enable', keyed)
       if (r?.canceled) { setBusy(false); return }
+      window.dispatchEvent(new Event('pc:backup-changed'))
       setNotice('Automatic backup is on.')
       setMode(null)
       refresh()
