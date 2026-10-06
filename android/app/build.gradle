@@ -63,6 +63,16 @@ react {
     autolinkLibrariesWithApp()
 }
 
+// The JS bundle task only watches .js/.ts/.tsx sources, so rebuilding the
+// worklet or UI bundle in assets/ (bare-universal.bundle, app-ui.bundle) on
+// its own left it UP-TO-DATE and the APK shipped the old copy. Declare the
+// prebuilt bundles as inputs so any change to them repacks. Covers debug and
+// release.
+tasks.matching { it.name ==~ /createBundle.*JsAndAssets/ }.configureEach {
+    inputs.files(fileTree("${rootDir}/../assets") { include "*.bundle" })
+        .withPropertyName("prebuiltBundles")
+}
+
 /**
  * Set this to true in release builds to optimize the app using [R8](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization).
  */
