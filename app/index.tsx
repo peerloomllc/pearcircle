@@ -17,7 +17,7 @@ import * as SecureStore from 'expo-secure-store'
 import { makeStartLock, autostartGateValue } from '@/src/lib/backendBootstrap'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
-const { PearCircleLocation, WebViewRecovery } = NativeModules
+const { PearCircleLocation, WebViewRecovery, PearCircleFiles } = NativeModules
 
 // GrapheneOS/Vanadium WebView resume-freeze recovery (2026-07-21). Proven from
 // live logcat: Android's cached-app freezer cgroup-freezes the WebView's Vanadium
@@ -640,21 +640,23 @@ async function restartWorklet() {
 }
 
 // --- Account auto-backup (proposal 2026-10-06-owner-continuity, part 3) ------
-// Android only: the user picks a folder once (Storage Access Framework) and
-// the shell rewrites pearcircle-backup.json there when the backup's contents
-// change, and at least daily. The password-derived key lives in the secure
-// store, never the password.
+// The user picks a folder once and the shell rewrites pearcircle-backup.json
+// there when the backup's contents change, and at least daily. Android keeps a
+// Storage Access Framework grant (dirUri); iOS keeps a security-scoped
+// bookmark through the PearCircleFiles native module. The password-derived
+// key lives in the secure store, never the password.
 const AUTO_BACKUP_CFG_KEY = 'pc:autoBackup'
 const BACKUP_KEY_SECURE = 'pc.backup.key'
 const AUTO_BACKUP_FILE = 'pearcircle-backup'
 const AUTO_BACKUP_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const AUTO_BACKUP_CHECK_MS = 30 * 60 * 1000
-type AutoBackupCfg = { enabled: boolean, dirUri: string | null, lastAt: number | null, lastFingerprint: string | null, lastError: string | null, manualAt: number | null }
+type AutoBackupCfg = { enabled: boolean, dirUri: string | null, bookmark: string | null, lastAt: number | null, lastFingerprint: string | null, lastError: string | null, manualAt: number | null }
+const autoBackupSupported = () => Platform.OS === 'android' || !!PearCircleFiles?.writeToFolder
 let _autoBackupRunning = false
 let _autoBackupTimer: any = null
 
 async function loadAutoBackupCfg(): Promise<AutoBackupCfg> {
-  const base: AutoBackupCfg = { enabled: false, dirUri: null, lastAt: null, lastFingerprint: null, lastError: null, manualAt: null }
+  const base: AutoBackupCfg = { enabled: false, dirUri: null, bookmark: null, lastAt: null, lastFingerprint: null, lastError: null, manualAt: null }
   try {
     const raw = await AsyncStorage.getItem(AUTO_BACKUP_CFG_KEY)
     return raw ? { ...base, ...JSON.parse(raw) } : base
@@ -674,11 +676,11 @@ async function writeBackupToDir(dirUri: string, contents: string) {
 }
 
 async function runAutoBackup(force = false) {
-  if (Platform.OS !== 'android' || _autoBackupRunning || !_worklet) return
+  if (!autoBackupSupported() || _autoBackupRunning || !_worklet) return
   _autoBackupRunning = true
   try {
     const cfg = await loadAutoBackupCfg()
-    if (!cfg.enabled || !cfg.dirUri) return
+    if (!cfg.enabled || !(cfg.dirUri || cfg.bookmark)) return
     const keyJson = await SecureStore.getItemAsync(BACKUP_KEY_SECURE)
     if (!keyJson) return
     const fp = await call('account:backup:fingerprint')
@@ -687,8 +689,14 @@ async function runAutoBackup(force = false) {
     if (!force && !stale && fp.fingerprint === cfg.lastFingerprint) return
     const built = await call('account:backup:build', JSON.parse(keyJson))
     if (!built?.contents) throw new Error(built?.error || 'could not build the backup')
-    await writeBackupToDir(cfg.dirUri, built.contents)
-    await saveAutoBackupCfg({ ...cfg, lastAt: Date.now(), lastFingerprint: built.fingerprint, lastError: null })
+    let bookmark = cfg.bookmark
+    if (Platform.OS === 'ios') {
+      const w = await PearCircleFiles.writeToFolder(cfg.bookmark, AUTO_BACKUP_FILE + '.json', built.contents)
+      if (typeof w?.bookmark === 'string') bookmark = w.bookmark
+    } else {
+      await writeBackupToDir(cfg.dirUri!, built.contents)
+    }
+    await saveAutoBackupCfg({ ...cfg, bookmark, lastAt: Date.now(), lastFingerprint: built.fingerprint, lastError: null })
     shellMark('backup:auto:written', { circles: built.circles })
   } catch (e: any) {
     const cfg = await loadAutoBackupCfg()
@@ -700,7 +708,7 @@ async function runAutoBackup(force = false) {
 }
 
 function startAutoBackupTimer() {
-  if (Platform.OS !== 'android' || _autoBackupTimer) return
+  if (!autoBackupSupported() || _autoBackupTimer) return
   _autoBackupTimer = setInterval(() => { runAutoBackup().catch(() => {}) }, AUTO_BACKUP_CHECK_MS)
 }
 
@@ -1356,6 +1364,13 @@ export default function Index() {
         }
         const uri = (FileSystem.cacheDirectory ?? FileSystem.documentDirectory!) + filename
         await FileSystem.writeAsStringAsync(uri, contents, { encoding: FileSystem.EncodingType.UTF8 })
+        // Backups go through the export-to-Files picker, which reports a
+        // cancel; the share sheet resolves the same either way.
+        if (msg.args?.saveToFiles && PearCircleFiles?.exportFile) {
+          const r = await PearCircleFiles.exportFile(uri.replace(/^file:\/\//, ''))
+          respond(msg.id, r?.saved ? { ok: true, savedToFolder: true } : { ok: false, canceled: true })
+          return
+        }
         if (!(await Sharing.isAvailableAsync())) {
           respond(msg.id, { ok: false, error: 'sharing not available' })
           return
@@ -1388,8 +1403,8 @@ export default function Index() {
       const cfg = await loadAutoBackupCfg()
       const hasKey = !!(await SecureStore.getItemAsync(BACKUP_KEY_SECURE).catch(() => null))
       respond(msg.id, {
-        autoSupported: Platform.OS === 'android',
-        enabled: cfg.enabled && hasKey && !!cfg.dirUri,
+        autoSupported: autoBackupSupported(),
+        enabled: cfg.enabled && hasKey && !!(cfg.dirUri || cfg.bookmark),
         lastAt: cfg.lastAt,
         manualAt: cfg.manualAt,
         lastError: cfg.lastError,
@@ -1405,16 +1420,31 @@ export default function Index() {
     if (msg.method === 'shell:backup:auto:enable') {
       // Pick the folder, keep the derived key, write the first backup now.
       try {
-        if (Platform.OS !== 'android') { respond(msg.id, { ok: false, error: 'automatic backup is Android-only for now' }); return }
+        if (!autoBackupSupported()) { respond(msg.id, { ok: false, error: 'automatic backup needs an app update' }); return }
         const key = msg.args?.key
         const kdf = msg.args?.kdf
         if (typeof key !== 'string' || !kdf) { respond(msg.id, { ok: false, error: 'backup key missing' }); return }
-        const SAF = (FileSystem as any).StorageAccessFramework
-        const perm = await SAF.requestDirectoryPermissionsAsync()
-        if (!perm.granted) { respond(msg.id, { ok: false, canceled: true }); return }
-        await SecureStore.setItemAsync(BACKUP_KEY_SECURE, JSON.stringify({ key, kdf }))
+        let dirUri: string | null = null
+        let bookmark: string | null = null
+        if (Platform.OS === 'ios') {
+          const picked = await PearCircleFiles.pickFolder()
+          if (!picked?.bookmark) { respond(msg.id, picked?.error ? { ok: false, error: picked.error } : { ok: false, canceled: true }); return }
+          bookmark = picked.bookmark
+        } else {
+          const SAF = (FileSystem as any).StorageAccessFramework
+          const perm = await SAF.requestDirectoryPermissionsAsync()
+          if (!perm.granted) { respond(msg.id, { ok: false, canceled: true }); return }
+          dirUri = perm.directoryUri
+        }
+        try {
+          await SecureStore.setItemAsync(BACKUP_KEY_SECURE, JSON.stringify({ key, kdf }))
+        } catch (e: any) {
+          shellMark('backup:auto:key-store-failed', { err: e?.message ?? String(e) })
+          respond(msg.id, { ok: false, error: 'could not save the backup key on this phone' })
+          return
+        }
         const cfg = await loadAutoBackupCfg()
-        await saveAutoBackupCfg({ ...cfg, enabled: true, dirUri: perm.directoryUri, lastFingerprint: null, lastError: null })
+        await saveAutoBackupCfg({ ...cfg, enabled: true, dirUri, bookmark, lastFingerprint: null, lastError: null })
         await runAutoBackup(true)
         const after = await loadAutoBackupCfg()
         respond(msg.id, after.lastError ? { ok: false, error: after.lastError } : { ok: true, lastAt: after.lastAt })
@@ -1426,7 +1456,7 @@ export default function Index() {
     if (msg.method === 'shell:backup:auto:disable') {
       await SecureStore.deleteItemAsync(BACKUP_KEY_SECURE).catch(() => {})
       const cfg = await loadAutoBackupCfg()
-      await saveAutoBackupCfg({ ...cfg, enabled: false, dirUri: null, lastFingerprint: null, lastError: null })
+      await saveAutoBackupCfg({ ...cfg, enabled: false, dirUri: null, bookmark: null, lastFingerprint: null, lastError: null })
       respond(msg.id, { ok: true })
       return
     }

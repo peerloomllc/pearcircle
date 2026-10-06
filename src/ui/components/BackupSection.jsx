@@ -142,7 +142,7 @@ export function BackupSection ({ active }) {
       const keyed = await call('account:backup:key', { password })
       const built = await call('account:backup:build', keyed)
       const date = new Date().toISOString().slice(0, 10)
-      const r = await call('shell:exportFile', { filename: 'pearcircle-backup-' + date + '.json', contents: built.contents, title: 'Save PearCircle backup' })
+      const r = await call('shell:exportFile', { filename: 'pearcircle-backup-' + date + '.json', contents: built.contents, title: 'Save PearCircle backup', saveToFiles: true })
       if (r?.canceled) { setBusy(false); return }
       await pear.call('shell:backup:manual-done')
       window.dispatchEvent(new Event('pc:backup-changed'))
