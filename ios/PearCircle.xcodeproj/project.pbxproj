@@ -13,6 +13,8 @@
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 		AAAA00000000000000000A02 /* PearCircleLocationModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000A01 /* PearCircleLocationModule.swift */; };
 		AAAA00000000000000000B02 /* PearCircleLocationModule.m in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000B01 /* PearCircleLocationModule.m */; };
+		AAAA00000000000000000F02 /* PearCircleFilesModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000F01 /* PearCircleFilesModule.swift */; };
+		AAAA00000000000000000F12 /* PearCircleFilesModule.m in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000F11 /* PearCircleFilesModule.m */; };
 		AAAA00000000000000000C02 /* arrive.wav in Resources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000C01 /* arrive.wav */; };
 		AAAA00000000000000000D02 /* leave.wav in Resources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000D01 /* leave.wav */; };
 /* End PBXBuildFile section */
@@ -28,6 +30,8 @@
 		F11748442D0722820044C1D9 /* PearCircle-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "PearCircle-Bridging-Header.h"; path = "PearCircle/PearCircle-Bridging-Header.h"; sourceTree = "<group>"; };
 		AAAA00000000000000000A01 /* PearCircleLocationModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PearCircleLocationModule.swift; path = PearCircle/PearCircleLocationModule.swift; sourceTree = "<group>"; };
 		AAAA00000000000000000B01 /* PearCircleLocationModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = PearCircleLocationModule.m; path = PearCircle/PearCircleLocationModule.m; sourceTree = "<group>"; };
+		AAAA00000000000000000F01 /* PearCircleFilesModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PearCircleFilesModule.swift; path = PearCircle/PearCircleFilesModule.swift; sourceTree = "<group>"; };
+		AAAA00000000000000000F11 /* PearCircleFilesModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = PearCircleFilesModule.m; path = PearCircle/PearCircleFilesModule.m; sourceTree = "<group>"; };
 		AAAA00000000000000000C01 /* arrive.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = arrive.wav; path = PearCircle/arrive.wav; sourceTree = "<group>"; };
 		AAAA00000000000000000D01 /* leave.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = leave.wav; path = PearCircle/leave.wav; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -50,6 +54,8 @@
 				F11748442D0722820044C1D9 /* PearCircle-Bridging-Header.h */,
 				AAAA00000000000000000A01 /* PearCircleLocationModule.swift */,
 				AAAA00000000000000000B01 /* PearCircleLocationModule.m */,
+				AAAA00000000000000000F01 /* PearCircleFilesModule.swift */,
+				AAAA00000000000000000F11 /* PearCircleFilesModule.m */,
 				BB2F792B24A3F905000567C9 /* Supporting */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -246,6 +252,8 @@
 				F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */,
 				AAAA00000000000000000A02 /* PearCircleLocationModule.swift in Sources */,
 				AAAA00000000000000000B02 /* PearCircleLocationModule.m in Sources */,
+				AAAA00000000000000000F02 /* PearCircleFilesModule.swift in Sources */,
+				AAAA00000000000000000F12 /* PearCircleFilesModule.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
