@@ -11,7 +11,26 @@ title: "PearCircle Seeder"
 # emver: up to four dot-separated numbers; the fourth (if present) is the
 # StartOS packaging revision. Kept in lockstep with the seeder image tag.
 version: 1.1.4
-release-notes: "Improvements\n                                                                                                                                                       \n  - PearCircle uses much less battery on Android. GPS now turns on only while you're moving, while the app is open or while a trip is being recorded. The rest of the time the app uses wifi and cell towers to find you.\n  - Arrive and leave alerts for your Places keep working while GPS is off.\n\nBug Fixes\n\n  - Fixed a bug on Android that stopped your phone from going to sleep after it restarted, which drained the battery.\n"
+release-notes: |
+  New Features
+
+    - **Back up your account.** Save your name, account and circles to one password-protected file. If you lose your phone or reinstall the app, restore it and everything comes back, including your place in each circle.
+    - **Automatic backup.** Pick a folder once and PearCircle keeps your backup up to date there. Choose a folder that syncs to another device or the cloud and your circles are safe even if your phone is lost.
+    - **Restore from the welcome screen.** Starting fresh on a new phone? Tap "Restore from a backup" and pick up where you left off.
+    - **Co-owners.** A circle's owner can make other members co-owners. Co-owners can rename, recreate or delete the circle and remove members, so the circle keeps running even if the owner loses their phone.
+    - **Hide old entries.** If someone reinstalled the app and now shows up twice, any member can hide the old entry once it hasn't been seen for 30 days. If that person turns out to still be around, they reappear on their own.
+    - **Any member can export a circle.** Save a circle's name and Places to a file, optionally with a password, and import it later to start a fresh copy that you own.
+
+  Improvements
+
+    - **Simpler Settings.** Settings is now seven sections instead of nine. Pausing your location and sharing trips are together under Sharing, all your
+    alerts are under Notifications, and saving circles to a file has moved to Backup.
+    - **Backup reminder.** If you haven't backed up in a while, a gentle reminder shows on the map.
+    - **Tidier pop-ups.** Pop-up titles are now centered.
+
+  Bug Fixes
+
+    - Removing someone from a circle now sticks. Before, it could quietly undo itself if they had the app open.
 license: MIT
 wrapper-repo: "https://github.com/peerloomllc/pearcircle"
 upstream-repo: "https://github.com/peerloomllc/pearcircle"
