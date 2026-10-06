@@ -13,6 +13,7 @@ import * as Notifications from 'expo-notifications'
 import * as Haptics from 'expo-haptics'
 import * as Clipboard from 'expo-clipboard'
 import AsyncStorage from '@react-native-async-storage/async-storage'
+import * as SecureStore from 'expo-secure-store'
 import { makeStartLock, autostartGateValue } from '@/src/lib/backendBootstrap'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
@@ -623,6 +624,86 @@ function call(method: string, args: any = {}): Promise<any> {
   })
 }
 
+// Restart the worklet in place. Restoring an account backup rewrites the
+// identity that the swarm and every circle are keyed by, so the worklet has
+// to come up again as the restored account (proposal
+// 2026-10-06-owner-continuity, part 3). init already retries the corestore
+// lock a terminated instance may still hold.
+async function restartWorklet() {
+  const old = _worklet
+  _worklet = null
+  _workletStarted = false
+  for (const resolve of _pending.values()) resolve({ error: 'worklet restarting' })
+  _pending.clear()
+  try { old?.terminate?.() } catch {}
+  await startWorklet()
+}
+
+// --- Account auto-backup (proposal 2026-10-06-owner-continuity, part 3) ------
+// Android only: the user picks a folder once (Storage Access Framework) and
+// the shell rewrites pearcircle-backup.json there when the backup's contents
+// change, and at least daily. The password-derived key lives in the secure
+// store, never the password.
+const AUTO_BACKUP_CFG_KEY = 'pc:autoBackup'
+const BACKUP_KEY_SECURE = 'pc.backup.key'
+const AUTO_BACKUP_FILE = 'pearcircle-backup'
+const AUTO_BACKUP_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const AUTO_BACKUP_CHECK_MS = 30 * 60 * 1000
+type AutoBackupCfg = { enabled: boolean, dirUri: string | null, lastAt: number | null, lastFingerprint: string | null, lastError: string | null, manualAt: number | null }
+let _autoBackupRunning = false
+let _autoBackupTimer: any = null
+
+async function loadAutoBackupCfg(): Promise<AutoBackupCfg> {
+  const base: AutoBackupCfg = { enabled: false, dirUri: null, lastAt: null, lastFingerprint: null, lastError: null, manualAt: null }
+  try {
+    const raw = await AsyncStorage.getItem(AUTO_BACKUP_CFG_KEY)
+    return raw ? { ...base, ...JSON.parse(raw) } : base
+  } catch { return base }
+}
+async function saveAutoBackupCfg(cfg: AutoBackupCfg) {
+  await AsyncStorage.setItem(AUTO_BACKUP_CFG_KEY, JSON.stringify(cfg))
+}
+
+// Overwrite pearcircle-backup.json in the granted folder, creating it once.
+async function writeBackupToDir(dirUri: string, contents: string) {
+  const SAF = (FileSystem as any).StorageAccessFramework
+  const entries: string[] = await SAF.readDirectoryAsync(dirUri)
+  const existing = entries.find((u) => decodeURIComponent(u).endsWith('/' + AUTO_BACKUP_FILE + '.json'))
+  const fileUri = existing ?? await SAF.createFileAsync(dirUri, AUTO_BACKUP_FILE, 'application/json')
+  await FileSystem.writeAsStringAsync(fileUri, contents, { encoding: FileSystem.EncodingType.UTF8 })
+}
+
+async function runAutoBackup(force = false) {
+  if (Platform.OS !== 'android' || _autoBackupRunning || !_worklet) return
+  _autoBackupRunning = true
+  try {
+    const cfg = await loadAutoBackupCfg()
+    if (!cfg.enabled || !cfg.dirUri) return
+    const keyJson = await SecureStore.getItemAsync(BACKUP_KEY_SECURE)
+    if (!keyJson) return
+    const fp = await call('account:backup:fingerprint')
+    if (!fp?.fingerprint) return
+    const stale = !cfg.lastAt || Date.now() - cfg.lastAt > AUTO_BACKUP_MAX_AGE_MS
+    if (!force && !stale && fp.fingerprint === cfg.lastFingerprint) return
+    const built = await call('account:backup:build', JSON.parse(keyJson))
+    if (!built?.contents) throw new Error(built?.error || 'could not build the backup')
+    await writeBackupToDir(cfg.dirUri, built.contents)
+    await saveAutoBackupCfg({ ...cfg, lastAt: Date.now(), lastFingerprint: built.fingerprint, lastError: null })
+    shellMark('backup:auto:written', { circles: built.circles })
+  } catch (e: any) {
+    const cfg = await loadAutoBackupCfg()
+    await saveAutoBackupCfg({ ...cfg, lastError: e?.message ?? String(e) }).catch(() => {})
+    shellMark('backup:auto:failed', { err: e?.message ?? String(e) })
+  } finally {
+    _autoBackupRunning = false
+  }
+}
+
+function startAutoBackupTimer() {
+  if (Platform.OS !== 'android' || _autoBackupTimer) return
+  _autoBackupTimer = setInterval(() => { runAutoBackup().catch(() => {}) }, AUTO_BACKUP_CHECK_MS)
+}
+
 async function startWorklet() {
   if (_workletStarted) return
   _workletStarted = true
@@ -688,6 +769,8 @@ async function startWorklet() {
   // worklet was detached, so a background drive publishes its trip on this wake
   // without the app ever being opened (proposal 2026-07-18, Part B/C).
   drainNativeFixBuffer().catch(() => {})
+  startAutoBackupTimer()
+  runAutoBackup().catch(() => {})
 }
 
 // The one-time FGS / location-permission bring-up, fired off the worklet's
@@ -938,6 +1021,7 @@ export default function Index() {
     loadUiHtml().then((h) => { shellMark('ui:html-ready'); setHtml(h) }).catch((e) => console.warn('UI bundle load failed', e)).finally(() => _uiHtmlSettled())
 
     const sub = AppState.addEventListener('change', (s) => {
+      if (s === 'active') runAutoBackup().catch(() => {})
       // WebView-freeze recovery (Android/GrapheneOS): stamp when we background,
       // and on resume-after-a-while terminate this app's WebView render process
       // so it reloads a fresh renderer bound to the new surface instead of
@@ -1282,6 +1366,64 @@ export default function Index() {
       } catch (err: any) {
         respond(msg.id, { ok: false, error: err?.message ?? String(err) })
       }
+      return
+    }
+    if (msg.method === 'shell:worklet:restart') {
+      // After an account restore (proposal 2026-10-06-owner-continuity):
+      // bring the worklet up as the restored account, then reload the UI.
+      try {
+        respond(msg.id, { ok: true })
+        await restartWorklet()
+        webViewRef.current?.reload()
+      } catch (err: any) {
+        console.warn('worklet restart failed', err?.message ?? String(err))
+      }
+      return
+    }
+    if (msg.method === 'shell:backup:status') {
+      const cfg = await loadAutoBackupCfg()
+      const hasKey = !!(await SecureStore.getItemAsync(BACKUP_KEY_SECURE).catch(() => null))
+      respond(msg.id, {
+        autoSupported: Platform.OS === 'android',
+        enabled: cfg.enabled && hasKey && !!cfg.dirUri,
+        lastAt: cfg.lastAt,
+        manualAt: cfg.manualAt,
+        lastError: cfg.lastError,
+      })
+      return
+    }
+    if (msg.method === 'shell:backup:manual-done') {
+      const cfg = await loadAutoBackupCfg()
+      await saveAutoBackupCfg({ ...cfg, manualAt: Date.now() })
+      respond(msg.id, { ok: true })
+      return
+    }
+    if (msg.method === 'shell:backup:auto:enable') {
+      // Pick the folder, keep the derived key, write the first backup now.
+      try {
+        if (Platform.OS !== 'android') { respond(msg.id, { ok: false, error: 'automatic backup is Android-only for now' }); return }
+        const key = msg.args?.key
+        const kdf = msg.args?.kdf
+        if (typeof key !== 'string' || !kdf) { respond(msg.id, { ok: false, error: 'backup key missing' }); return }
+        const SAF = (FileSystem as any).StorageAccessFramework
+        const perm = await SAF.requestDirectoryPermissionsAsync()
+        if (!perm.granted) { respond(msg.id, { ok: false, canceled: true }); return }
+        await SecureStore.setItemAsync(BACKUP_KEY_SECURE, JSON.stringify({ key, kdf }))
+        const cfg = await loadAutoBackupCfg()
+        await saveAutoBackupCfg({ ...cfg, enabled: true, dirUri: perm.directoryUri, lastFingerprint: null, lastError: null })
+        await runAutoBackup(true)
+        const after = await loadAutoBackupCfg()
+        respond(msg.id, after.lastError ? { ok: false, error: after.lastError } : { ok: true, lastAt: after.lastAt })
+      } catch (err: any) {
+        respond(msg.id, { ok: false, error: err?.message ?? String(err) })
+      }
+      return
+    }
+    if (msg.method === 'shell:backup:auto:disable') {
+      await SecureStore.deleteItemAsync(BACKUP_KEY_SECURE).catch(() => {})
+      const cfg = await loadAutoBackupCfg()
+      await saveAutoBackupCfg({ ...cfg, enabled: false, dirUri: null, lastFingerprint: null, lastError: null })
+      respond(msg.id, { ok: true })
       return
     }
     if (msg.method === 'shell:importFile') {

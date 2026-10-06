@@ -15,6 +15,7 @@
 
 import { useEffect, useState } from 'react'
 import { colors, typography, spacing, radius } from '../theme.js'
+import { RestoreBackupFlow } from './BackupSection.jsx'
 
 // main.jsx assigns window.pear after this module is imported, so we
 // must resolve through window at call time. Mirrors App.jsx's proxy.
@@ -83,7 +84,17 @@ export function OnboardingFlow ({ profile, battery = { supported: null, exempt: 
               Private location sharing with the people you trust. No accounts, no tracking, no subscriptions - your location lives only on the devices in your circles.
             </div>
             <button style={primaryBtn} onClick={() => setStep(1)}>Get started</button>
+            <button style={textBtn} onClick={() => setStep('restore')}>Restore from a backup</button>
             <button style={textBtn} onClick={handleSkip}>Skip setup</button>
+          </>
+        )}
+
+        {step === 'restore' && (
+          <>
+            <div style={{ ...typography.heading, color: colors.text.primary, textAlign: 'center' }}>
+              Restore from a backup
+            </div>
+            <RestoreBackupFlow onCancel={() => setStep(0)} />
           </>
         )}
 

@@ -51,6 +51,7 @@ const { summarizeSeederCoverage } = require('./lib/seederCoverage')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow, shouldRecoverFromTombstone } = require('./lib/circleFilter')
 const { memberHiddenByHide, memberLastActiveAt, canHideMember, shouldAcceptHiddenRow } = require('./lib/memberHide')
+const accountBackup = require('./lib/accountBackup')
 const { OWNER_V2_CAP, activeCoowners, isAuthorized, hasOwnerV2Cap, circleOwnerV2Ready, shouldAcceptCircleRow, shouldAcceptSignedRemovedRow, shouldAcceptCoownerRow } = require('./lib/ownerAuth')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
 const geofencePersist = require('./lib/geofencePersist')
@@ -921,6 +922,55 @@ const handlers = {
     return { publicKey: b4a.toString(_identity.publicKey, 'hex'), ready: true }
   },
 
+  // Account backup (proposal 2026-10-06-owner-continuity, part 3). The key
+  // is derived once from the password; the shell keeps it in its secure
+  // store so auto-backup can seal without asking again.
+  'account:backup:key': async ({ password } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    return accountBackup.newBackupKey(password)
+  },
+
+  // Seal the current account into a backup file. Returns the file text and
+  // a fingerprint that only changes when the backup's contents would.
+  'account:backup:build': async ({ key, kdf } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof key !== 'string' || key.length !== 64 || !kdf) throw new Error('backup key missing')
+    const source = await readAccountForBackup()
+    const plain = accountBackup.buildPlain(source)
+    const file = accountBackup.sealBackup(plain, { key, kdf })
+    mark('account:backup:built', { circles: plain.circles.length })
+    return { contents: JSON.stringify(file), fingerprint: accountBackup.backupFingerprint(source), circles: plain.circles.length }
+  },
+
+  'account:backup:fingerprint': async () => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    return { fingerprint: accountBackup.backupFingerprint(await readAccountForBackup()) }
+  },
+
+  // Restore an account backup on a fresh install. Writes the identity,
+  // profile and circle records, then closes the store: the swarm and every
+  // circle are keyed by the identity, so the shell restarts the worklet to
+  // come up as the restored account (shell:worklet:restart).
+  'account:restore': async ({ contents, password } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    for await (const _ of _localDb.createReadStream({ gt: 'circles:joined:', lt: 'circles:joined:~', limit: 1 })) {
+      throw new Error('this phone already has circles. Restore only works on a fresh install')
+    }
+    const plain = accountBackup.openBackup(contents, password)
+    await _localDb.put('identity', { publicKey: plain.identity.publicKey, secretKey: plain.identity.secretKey, createdAt: Date.now(), restoredAt: Date.now() })
+    if (plain.profile && typeof plain.profile.displayName === 'string') {
+      const profile = { displayName: plain.profile.displayName, updatedAt: Date.now() }
+      if (typeof plain.profile.avatar === 'string') profile.avatar = plain.profile.avatar
+      await _localDb.put('profile', profile)
+    }
+    for (const c of plain.circles) await _localDb.put('circles:joined:' + c.circleId, c)
+    mark('account:restored', { circles: plain.circles.length, pk: plain.identity.publicKey.slice(0, 8) })
+    _initialized = false
+    try { await _swarm?.destroy() } catch {}
+    try { await _store?.close() } catch {}
+    return { ok: true, circles: plain.circles.length, displayName: plain.profile?.displayName ?? null }
+  },
+
   'profile:get': async () => {
     if (!_initialized) throw new Error('worklet not initialized')
     const row = await _localDb.get('profile')
@@ -1068,21 +1118,27 @@ const handlers = {
 
   // Export a circle's curated config (name + Places + per-circle toggles) as a
   // versioned, keyless JSON envelope (proposal 2026-06-17). Read-only.
-  'circle:export': async ({ circleId } = {}) => {
+  'circle:export': async ({ circleId, password } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const config = await readCircleConfigForExport(circleId)
     // Refuse rather than hand back a file that looks complete but has lost
     // every Place because the circle's data is stuck.
     if (config.placesUnavailable) throw new Error("Could not read this circle's Places - its data is stuck. Repair the circle and try again.")
-    return buildExport(config)
+    const exported = buildExport(config)
+    // Optional password (proposal 2026-10-06-owner-continuity).
+    return (typeof password === 'string' && password.length > 0) ? accountBackup.sealCircleExport(exported, password) : exported
   },
 
   // Create a brand-new circle from a previously-exported config envelope.
   // Always mints a fresh circle (the envelope carries no keys/ids); returns the
   // new circle's invite for the owner to share.
-  'circle:import': async ({ payload } = {}) => {
+  'circle:import': async ({ payload, password } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
+    if (accountBackup.isSealedCircleExport(payload)) {
+      if (typeof password !== 'string' || password.length === 0) return { ok: false, needsPassword: true }
+      payload = accountBackup.openCircleExport(payload, password)
+    }
     const result = validateImport(payload)
     if (!result.ok) throw new Error('invalid import: ' + result.error)
     const created = await createCircleFromConfig(result.value)
@@ -4496,6 +4552,20 @@ async function emitMemberLeft (view, circleId, pubkey, leftTs) {
       circleName: circleRow?.value?.name || 'Circle',
     }})
   } catch (e) { console.warn('[bare] member:left emit failed', e?.message) }
+}
+
+// What goes in an account backup: identity, profile and every joined circle.
+async function readAccountForBackup () {
+  const circles = []
+  for await (const { value } of _localDb.createReadStream({ gt: 'circles:joined:', lt: 'circles:joined:~' })) {
+    if (value && value.circleId) circles.push(value)
+  }
+  const profile = (await _localDb.get('profile'))?.value || null
+  return {
+    identity: { publicKey: b4a.toString(_identity.publicKey, 'hex'), secretKey: b4a.toString(_identity.secretKey, 'hex') },
+    profile,
+    circles,
+  }
 }
 
 // Current co-owners of a circle, read from its view (proposal
