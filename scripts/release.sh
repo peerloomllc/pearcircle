@@ -1021,7 +1021,11 @@ _desktop_windows() {
   _bg_after "${1:-}"
   while [ ! -e "$_BG_DIR/android.done" ]; do sleep 2; done
   ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error
-    cd "$REPO_ROOT" && npm install bare-runtime-win32-x64 --os=win32 --cpu=x64 \
+    # The version package-lock pins: build-windows-local.sh refuses any other
+    # (fb97b4b), and an unpinned install pulled the newest and failed every
+    # Windows build from 1.1.2 to 1.1.5.
+    _WIN_BARE=$(node -p "require('$REPO_ROOT/package-lock.json').packages['node_modules/bare-runtime-win32-x64'].version" 2>/dev/null)
+    cd "$REPO_ROOT" && npm install "bare-runtime-win32-x64@${_WIN_BARE:-latest}" --os=win32 --cpu=x64 \
       --force --no-save --no-audit --no-fund --loglevel=error ) \
     >> /tmp/pearcircle-build-windows.log 2>&1 || true
   bash "$_SL/scripts/build-windows-local.sh" "$_SLV" >> /tmp/pearcircle-build-windows.log 2>&1
