@@ -1,6 +1,6 @@
 # Owner continuity: co-owners and account backup
 
-**Status**: Draft 2026-10-06.
+**Status**: Approved 2026-10-06 by Tim, with every open question resolved as proposed: co-owners can delete, the owner or any co-owner can revoke a co-owner, a password is required on account backups (optional on circle exports), auto-backup runs on change plus at most daily with a 14-day reminder, and two-phone detection waits (the restore screen warns instead).
 
 **Goal**: A circle keeps a working owner when the owner loses their app data, and anyone who saved a backup gets their whole account back after a reinstall.
 
