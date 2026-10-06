@@ -58,4 +58,21 @@ function shouldAcceptRemovedRow ({ fromHex, bootstrapHex, keyPubkey, value }) {
   return true
 }
 
-module.exports = { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow }
+// Whether our own device should out-date a left:/removed: tombstone that hides
+// us by rewriting our member row. Only when we joined again after it: a
+// tombstone newer than our local join is a real leave or removal, and
+// rewriting would undo it (a removed member's poll used to un-remove them
+// within seconds, before they dismissed the notice).
+//
+//   tombstone does not hide us        - nothing to recover
+//   localJoinedAt unknown             - don't recover (can't tell)
+//   tombstone older than our join     - we rejoined, recover
+//   tombstone newer than our join     - real removal/leave, keep it
+function shouldRecoverFromTombstone (tombstoneTs, memberJoinedAt, localJoinedAt) {
+  if (typeof tombstoneTs !== 'number') return false
+  if (typeof memberJoinedAt === 'number' && tombstoneTs <= memberJoinedAt) return false
+  if (typeof localJoinedAt !== 'number') return false
+  return tombstoneTs < localJoinedAt
+}
+
+module.exports = { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow, shouldRecoverFromTombstone }

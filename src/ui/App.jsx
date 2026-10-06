@@ -2713,10 +2713,26 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   // context where "Remove from circle" is unambiguous. Hidden in the
   // merged "All circles" view, same single-circle gate as rename /
   // delete.
-  const ownedCircleForRemoval =
-    isSingleCircle && activeCircles[0]?.circle?.ownerKey === myPubkey
-      ? activeCircles[0]
-      : null
+  // Owner tools follow the account (proposal 2026-10-06-owner-continuity):
+  // the owner or a co-owner, once the circle's standing allows it. Falls back
+  // to the plain ownerKey check if the worklet couldn't report standing.
+  const ownedCircleForRemoval = (() => {
+    if (!isSingleCircle) return null
+    const c = activeCircles[0]
+    const canManage = c?.owner ? c.owner.canManage : c?.circle?.ownerKey === myPubkey
+    return canManage ? c : null
+  })()
+  const singleCircleOwnerKey = isSingleCircle ? activeCircles[0]?.circle?.ownerKey : null
+  const singleCircleCoowners = new Set(isSingleCircle ? (activeCircles[0]?.owner?.coowners ?? []) : [])
+  // The owner or a co-owner can appoint and revoke co-owners once everyone in
+  // the circle can apply it. Never for ourselves or the owner.
+  const coownerToggle = (() => {
+    if (!isSingleCircle || !selectedPubkey || selectedPubkey === myPubkey) return null
+    const st = activeCircles[0]?.owner
+    if (!st || !(st.isOwner || st.isCoowner) || !st.ready) return null
+    if (selectedPubkey === singleCircleOwnerKey) return null
+    return { circleId: activeCircles[0].circleId, isCoowner: singleCircleCoowners.has(selectedPubkey) }
+  })()
 
   // Any member can hide someone unseen for 30 days (proposal 2026-10-06),
   // e.g. the old entry left when a member lost their app data. Same
@@ -3158,7 +3174,17 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           placesById={placesById}
           isSelf={selectedPubkey === myPubkey}
           connected={connectedPubkeys.has(selectedPubkey)}
-          canRemove={!!ownedCircleForRemoval && selectedPubkey !== myPubkey}
+          canRemove={!!ownedCircleForRemoval && selectedPubkey !== myPubkey && selectedPubkey !== singleCircleOwnerKey}
+          role={selectedPubkey === singleCircleOwnerKey ? 'Owner' : singleCircleCoowners.has(selectedPubkey) ? 'Co-owner' : null}
+          coownerToggle={coownerToggle ? (coownerToggle.isCoowner ? 'revoke' : 'appoint') : null}
+          onCoownerToggle={async () => {
+            const r = await pear.call('coowner:set', {
+              circleId: coownerToggle.circleId,
+              pubkey: selectedPubkey,
+              coowner: !coownerToggle.isCoowner,
+            })
+            if (!r?.ok) throw new Error(r?.error || 'Could not change co-owner')
+          }}
           circleNameForRemoval={ownedCircleForRemoval?.circle?.name ?? circleForHide?.circle?.name ?? 'this circle'}
           canHide={!!circleForHide}
           onHide={async () => {
@@ -3167,7 +3193,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               pubkey: selectedPubkey,
               inactiveMs: hideInactiveMs,
             })
-            if (!r?.ok) throw new Error('Could not hide member')
+            if (!r?.ok) throw new Error(r?.error || 'Could not hide member')
             setMemberSheetVisible(false)
             setSelectedPubkey(null)
           }}
@@ -3225,6 +3251,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                     currentPlaceName={curPlaceName}
                     connected={connectedPubkeys.has(pubkey)}
                     isSelf={pubkey === myPubkey}
+                    role={pubkey === singleCircleOwnerKey ? 'Owner' : singleCircleCoowners.has(pubkey) ? 'Co-owner' : null}
                     onFocus={focusMember}
                   />
                 )
@@ -4870,6 +4897,10 @@ function CirclesSection ({ active = true, onChanged }) {
           circleId: c.circleId,
           name: c.circle?.name || CIRCLE_NAME_PENDING,
           isOwner: c.circle?.ownerKey === ourKey,
+          // Owner tools follow the account (proposal 2026-10-06-owner-continuity).
+          isCoowner: c.owner?.isCoowner === true,
+          canManage: c.owner ? c.owner.canManage : c.circle?.ownerKey === ourKey,
+          waitingOn: c.owner && !c.owner.canManage && (c.owner.isOwner || c.owner.isCoowner) ? (c.owner.waitingOn ?? []) : [],
           memberCount: (c.members ?? []).length,
           // Local recreate links + created date (proposal 2026-06-17 slice 3/4).
           createdAt: typeof c.createdAt === 'number' ? c.createdAt : null,
@@ -4903,9 +4934,9 @@ function CirclesSection ({ active = true, onChanged }) {
     setPending(c.circleId)
     setError(null)
     try {
-      const ipc = c.isOwner ? 'circle:delete' : 'circle:leave'
-      const r = await pear.call(ipc, { circleId: c.circleId })
-      if (!r?.ok) throw new Error('Could not ' + (c.isOwner ? 'delete' : 'leave') + ' circle')
+      const deleting = c.action === 'delete'
+      const r = await pear.call(deleting ? 'circle:delete' : 'circle:leave', { circleId: c.circleId })
+      if (!r?.ok) throw new Error(r?.error || ('Could not ' + (deleting ? 'delete' : 'leave') + ' circle'))
       setList(prev => prev.filter(x => x.circleId !== c.circleId))
       setConfirmingFor(null)
       onChanged?.()
@@ -5104,7 +5135,7 @@ function CirclesSection ({ active = true, onChanged }) {
   return (
     <>
       <p style={s.muted}>
-        Delete a circle you own to remove it for everyone. Leave a circle to remove only your copy. Any circle can be exported: its name, Places and settings go to a file you can re-import later as a new circle that you own. If you own a circle, its row also has an icon to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places).
+        Delete a circle you own or co-own to remove it for everyone. Leave a circle to remove only your copy. Any circle can be exported: its name, Places and settings go to a file you can re-import later as a new circle that you own. If you own or co-own a circle, its row also has an icon to recreate it on a fresh copy (when it gets slow or cluttered, keeping the name and Places). To make someone a co-owner, open the circle, tap them in Members and choose Make co-owner.
       </p>
       <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
         {[...list].sort((a, b) => byName(a.name, b.name)).map(c => {
@@ -5183,8 +5214,13 @@ function CirclesSection ({ active = true, onChanged }) {
                   {isReplacement && <RecreateBadge label="New" tone="primary" />}
                 </div>
                 <div style={{ ...typography.caption, color: colors.text.secondary }}>
-                  {c.createdAt ? `Created ${formatCreatedDate(c.createdAt)} · ` : ''}{c.isOwner ? 'You own this · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
+                  {c.createdAt ? `Created ${formatCreatedDate(c.createdAt)} · ` : ''}{c.isOwner ? 'You own this · ' : c.isCoowner ? 'Co-owner · ' : ''}{c.memberCount} {c.memberCount === 1 ? 'member' : 'members'}
                 </div>
+                {c.waitingOn.length > 0 && (
+                  <div style={{ ...typography.caption, color: colors.text.secondary }}>
+                    Owner tools unlock once everyone has the latest PearCircle. Waiting on {c.waitingOn.join(', ')}.
+                  </div>
+                )}
                 {/* The move notice never landed in this circle, so its members
                     have no idea the group moved. The app keeps retrying, but
                     say so plainly and give the owner a lever - a wedged circle
@@ -5210,7 +5246,7 @@ function CirclesSection ({ active = true, onChanged }) {
                   </div>
                 )}
               </div>
-              {c.isOwner && (
+              {c.canManage && (
                 <button
                   onClick={() => startRename(c)}
                   disabled={isPending}
@@ -5220,7 +5256,7 @@ function CirclesSection ({ active = true, onChanged }) {
                   <PencilSimple size={18} weight="regular" />
                 </button>
               )}
-              {c.isOwner && (
+              {c.canManage && (
                 <button
                   onClick={() => { setError(null); setRecreatingFor(c) }}
                   disabled={isPending}
@@ -5241,16 +5277,28 @@ function CirclesSection ({ active = true, onChanged }) {
                 style={iconBtnStyle({ disabled: isPending })}>
                 <ExportIcon size={18} weight="regular" />
               </button>
-              <button
-                onClick={() => setConfirmingFor(c)}
-                disabled={isPending}
-                title={c.isOwner ? 'Delete circle' : 'Leave circle'}
-                aria-label={c.isOwner ? 'Delete circle' : 'Leave circle'}
-                style={iconBtnStyle({ disabled: isPending, destructive: true })}>
-                {c.isOwner
-                  ? <Trash size={18} weight="regular" />
-                  : <SignOut size={18} weight="regular" />}
-              </button>
+              {/* The owner deletes (leaving would abandon the circle). A
+                  co-owner can delete or leave; a member can only leave. */}
+              {(c.isOwner || (c.isCoowner && c.canManage)) && (
+                <button
+                  onClick={() => setConfirmingFor({ ...c, action: 'delete' })}
+                  disabled={isPending}
+                  title='Delete circle'
+                  aria-label='Delete circle'
+                  style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                  <Trash size={18} weight="regular" />
+                </button>
+              )}
+              {!c.isOwner && (
+                <button
+                  onClick={() => setConfirmingFor({ ...c, action: 'leave' })}
+                  disabled={isPending}
+                  title='Leave circle'
+                  aria-label='Leave circle'
+                  style={iconBtnStyle({ disabled: isPending, destructive: true })}>
+                  <SignOut size={18} weight="regular" />
+                </button>
+              )}
             </li>
           )
         })}
@@ -5279,15 +5327,16 @@ function CirclesSection ({ active = true, onChanged }) {
         // about to delete the NEWER half of a recreated pair (the replacement,
         // whose partner old circle still exists), call that out loudly — the
         // two share a name and deleting the new one undoes the recreate.
-        const deletingNewer = confirmingFor.isOwner &&
+        const isDelete = confirmingFor.action === 'delete'
+        const deletingNewer = isDelete &&
           !!(confirmingFor.recreatedFrom && presentIds.has(confirmingFor.recreatedFrom))
         const created = confirmingFor.createdAt ? `created ${formatCreatedDate(confirmingFor.createdAt)}` : null
         const detail = [created, `${confirmingFor.memberCount} ${confirmingFor.memberCount === 1 ? 'member' : 'members'}`]
           .filter(Boolean).join(' · ')
         return (
           <ConfirmSheet
-            title={confirmingFor.isOwner ? 'Delete circle?' : 'Leave circle?'}
-            message={confirmingFor.isOwner
+            title={isDelete ? 'Delete circle?' : 'Leave circle?'}
+            message={isDelete
               ? <>
                   Delete <strong>{confirmingFor.name}</strong>{detail ? <> ({detail})</> : null}? This removes the circle for everyone in it. This cannot be undone.
                   {deletingNewer && (
@@ -5297,7 +5346,7 @@ function CirclesSection ({ active = true, onChanged }) {
                   )}
                 </>
               : <>Leave <strong>{confirmingFor.name}</strong>? You will stop sharing with this circle. You can rejoin later if someone shares the invite again.</>}
-            confirmLabel={confirmingFor.isOwner ? 'Delete' : 'Leave'}
+            confirmLabel={isDelete ? 'Delete' : 'Leave'}
             destructive
             busy={pending === confirmingFor.circleId}
             onConfirm={() => performAction(confirmingFor)}
@@ -7461,7 +7510,7 @@ function initialsFor (label) {
 // places list. Closing only hides the sheet; the focus state lives on
 // the parent so the user can re-open via tap-on-focus-bar without
 // re-flying the map.
-function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', canHide = false, onHide, needsRepair = false, onRepair, onRemove, onOpenTrips, onClose }) {
+function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf = false, connected = false, canRemove = false, circleNameForRemoval = 'this circle', canHide = false, onHide, role = null, coownerToggle = null, onCoownerToggle, needsRepair = false, onRepair, onRemove, onOpenTrips, onClose }) {
   const [repairing, setRepairing] = useState(false)
   const seen = member?.seen
   const isPaused = effectivePresenceMuted(presence)
@@ -7475,6 +7524,9 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
   const [confirmingRemove, setConfirmingRemove] = useState(false)
   const [removing, setRemoving] = useState(false)
   const [removeError, setRemoveError] = useState(null)
+  const [confirmingCoowner, setConfirmingCoowner] = useState(false)
+  const [coownerBusy, setCoownerBusy] = useState(false)
+  const [coownerError, setCoownerError] = useState(null)
   const [confirmingHide, setConfirmingHide] = useState(false)
   const [hiding, setHiding] = useState(false)
   const [hideError, setHideError] = useState(null)
@@ -7524,6 +7576,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.sm, paddingTop: spacing.sm, paddingBottom: spacing.base }}>
         <Avatar base64={member.avatar} label={member.displayName} size={80} />
         <h2 style={{ ...typography.heading, margin: 0, color: colors.text.primary }}>{member.displayName}</h2>
+        {role && <div style={{ ...typography.caption, color: colors.text.secondary }}>{role}</div>}
         {isPaused && (
           <div style={{ ...typography.caption, color: colors.text.secondary }}>Sharing paused</div>
         )}
@@ -7659,6 +7712,19 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
               Remove from circle
             </button>
           )}
+          {coownerToggle && (
+            <button
+              onClick={() => { setCoownerError(null); setConfirmingCoowner(true) }}
+              style={{
+                width: '100%', padding: '12px', borderRadius: radius.md,
+                background: 'transparent', color: colors.text.primary,
+                border: `1px solid ${colors.border}`, cursor: 'pointer',
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              }}
+            >
+              {coownerToggle === 'appoint' ? 'Make co-owner' : 'Remove co-owner'}
+            </button>
+          )}
           {canHide && (
             <button
               onClick={() => { setHideError(null); setConfirmingHide(true) }}
@@ -7675,6 +7741,34 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
         </div>
       )}
     </BottomSheet>
+    {confirmingCoowner && (
+      <ConfirmSheet
+        title={coownerToggle === 'appoint' ? 'Make co-owner?' : 'Remove co-owner?'}
+        message={<>
+          {coownerToggle === 'appoint'
+            ? <>Make <strong>{member.displayName}</strong> a co-owner of <strong>{circleNameForRemoval}</strong>? Co-owners can rename, recreate and delete the circle, remove members and choose other co-owners. If the owner loses their phone, a co-owner keeps the circle running.</>
+            : <><strong>{member.displayName}</strong> stops being a co-owner of <strong>{circleNameForRemoval}</strong> and stays a member.</>}
+          {coownerError && <div style={{ color: colors.error, marginTop: spacing.sm }}>{coownerError}</div>}
+        </>}
+        confirmLabel={coownerToggle === 'appoint' ? 'Make co-owner' : 'Remove co-owner'}
+        destructive={coownerToggle !== 'appoint'}
+        busy={coownerBusy}
+        onConfirm={async () => {
+          setCoownerBusy(true)
+          setCoownerError(null)
+          try {
+            await onCoownerToggle?.()
+          } catch (e) {
+            setCoownerError(e?.message || 'Could not change co-owner')
+            setCoownerBusy(false)
+            return
+          }
+          setCoownerBusy(false)
+          setConfirmingCoowner(false)
+        }}
+        onClose={() => { if (!coownerBusy) { setConfirmingCoowner(false); setCoownerError(null) } }}
+      />
+    )}
     {confirmingHide && (
       <ConfirmSheet
         title='Hide from circle?'
@@ -8393,7 +8487,7 @@ function ConfirmSheet ({ title, message, confirmLabel = 'Confirm', destructive =
 // Single member row in the bottom sheet's roster. Pulled out as its
 // own component so the useReverseGeocode hook has a stable call site
 // per row (otherwise hook ordering would shift with the members list).
-function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, currentPlaceName, connected, isSelf, onFocus }) {
+function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, currentPlaceName, connected, isSelf, role = null, onFocus }) {
   const pubkey = member.value?.pubkey ?? ''
   const displayName = member.value?.displayName ?? short(pubkey)
   // Every row opens the member-detail sheet on tap, even one with no
@@ -8423,6 +8517,7 @@ function MemberRow ({ member, seen, isPaused, transition, transitionPlaceName, c
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
               <div style={{ ...s.memberName, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
+              {role && <span style={{ ...typography.caption, color: colors.text.secondary, flexShrink: 0 }}>{role}</span>}
               {!isSelf && <ConnectionDot connected={connected} />}
               {!isPaused && <MotionGlyph speed={seen?.speed} size={14} />}
             </div>
