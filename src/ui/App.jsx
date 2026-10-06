@@ -7476,6 +7476,7 @@ function GeofenceDiagModal ({ diag, onClose }) {
               {(diag.circles || []).map((c) => (
                 <div key={c.circleId} style={mono}>
                   {c.circleId} · writer {c.writable ? 'writable' : 'NOT writable'} · sharing {c.sharing ? 'on' : 'off'}
+                  {typeof c.indexers === 'number' && <> · indexers {c.indexers}{c.weIndex ? ' (incl. us)' : ''} · unconfirmed {c.unconfirmed ?? '?'} of {c.length ?? '?'}</>}
                 </div>
               ))}
               {(diag.circles || []).length === 0 && <div style={mono}>none</div>}

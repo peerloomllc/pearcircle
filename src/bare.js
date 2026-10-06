@@ -2633,6 +2633,7 @@ const handlers = {
         circleId: circleId.slice(0, 8),
         writable: !!(base && base.writable),
         sharing: getCircleSharing(circleId).enabled,
+        ...indexerHealth(base),
       })
     }
     const places = [..._circlePlaces.values()]
@@ -4552,6 +4553,28 @@ async function emitMemberLeft (view, circleId, pubkey, leftTs) {
       circleName: circleRow?.value?.name || 'Circle',
     }})
   } catch (e) { console.warn('[bare] member:left emit failed', e?.message) }
+}
+
+// Indexer health for a circle (TODO "Dead phones stay Autobase indexers",
+// 2026-10-06). Autobase confirms a node only once a majority of indexers has
+// seen it, every PearCircle writer is an indexer, and a wiped or repaired
+// phone stays one forever. A large `unconfirmed` means the circle has lost
+// its majority and nothing will confirm again.
+function indexerHealth (base) {
+  try {
+    const indexers = base?.linearizer?.indexers?.length ?? base?.system?.indexers?.length ?? null
+    const length = typeof base?.length === 'number' ? base.length : null
+    const indexed = typeof base?.indexedLength === 'number' ? base.indexedLength : null
+    return {
+      indexers,
+      weIndex: !!base?.ackable,
+      length,
+      indexed,
+      unconfirmed: length !== null && indexed !== null ? length - indexed : null,
+    }
+  } catch {
+    return {}
+  }
 }
 
 // What goes in an account backup: identity, profile and every joined circle.
@@ -7822,6 +7845,11 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
     if (value.circleKey) joinCircleTopic(value.circleId, value.circleKey)
   }
   mark('init:circles-mounted', { count: _circleBases.size })
+  // Indexer health once the bases have had a minute to sync (TODO "Dead
+  // phones stay Autobase indexers", 2026-10-06).
+  setTimeout(() => {
+    for (const [cid, base] of _circleBases) mark('circle:indexer-health', { cid: cid.slice(0, 8), ...indexerHealth(base) })
+  }, 60_000)
 
   // Heal any last-known tip this device published in the clear before the
   // join-time race was closed (2026-07-24). Fire-and-forget per circle: a local
