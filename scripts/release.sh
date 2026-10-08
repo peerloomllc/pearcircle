@@ -2389,6 +2389,8 @@ else
   echo "    Syncing repo to $MAC_MINI (including freshly built bundles)..."
   rsync -az --rsync-path=/opt/homebrew/bin/rsync \
     --exclude='.git' --exclude='node_modules' --exclude='android' \
+    --exclude='/*.apk' --exclude='/*.aab' --exclude='/*.AppImage' --exclude='/*.deb' --exclude='/*.exe' \
+    --exclude='/*.dmg' --exclude='/*.ipa' --exclude='/*.sha256' --exclude='/*.blockmap' --exclude='/latest*.yml' \
     "$REPO_ROOT/" "${MAC_MINI}:${MAC_MINI_REPO_PATH}/"
   echo "    Sync complete."
   echo ""
