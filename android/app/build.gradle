@@ -215,3 +215,14 @@ dependencies {
         implementation jscFlavor
     }
 }
+
+// No Firebase. expo-notifications depends on firebase-messaging for remote
+// push, which PearCircle does not use (no FCM, no google-services.json, no push
+// token). Firebase never started, but its classes and manifest entries still
+// shipped and tracker scanners (Exodus, App Manager) listed them; raised on
+// Nostr 2026-10-30. expo-notifications still compiles against it; the Firebase
+// classes it names are only reached for a remote message, which never arrives.
+configurations.matching { it.name.toLowerCase().endsWith('runtimeclasspath') }.all {
+    exclude group: 'com.google.firebase'
+    exclude group: 'com.google.android.datatransport'
+}
