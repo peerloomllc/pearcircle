@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, Modal, TouchableOpacity, BackHandler, StatusBar } from 'react-native'
+import { View, Text, StyleSheet, NativeModules, NativeEventEmitter, Platform, AppState, Share, BackHandler, StatusBar, PermissionsAndroid } from 'react-native'
 import { WebView } from 'react-native-webview'
 import { Worklet } from 'react-native-bare-kit'
 import b4a from 'b4a'
@@ -8,7 +8,6 @@ import * as FileSystem from 'expo-file-system/legacy'
 import * as Sharing from 'expo-sharing'
 import * as DocumentPicker from 'expo-document-picker'
 import * as Linking from 'expo-linking'
-import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Notifications from 'expo-notifications'
 import * as Haptics from 'expo-haptics'
 import * as Clipboard from 'expo-clipboard'
@@ -1017,10 +1016,6 @@ export default function Index() {
   const webViewLoaded = useRef(false)
   const pendingDeeplink = useRef<string | null>(null)
   const pendingNotificationFocus = useRef<{ circleId: string; pubkey: string } | null>(null)
-  // QR scanner is a JS-driven modal that resolves a pending shell:scanQr
-  // IPC call when the camera reads a code (or the user cancels).
-  const [scannerVisible, setScannerVisible] = useState(false)
-  const scanResolveRef = useRef<((value: string | null) => void) | null>(null)
   // Status bar icon tint. 'light-content' (white icons) is the default
   // because most of the app is dark-themed. The home view with the
   // light map tiles flips it to 'dark-content' via shell:statusBar:set
@@ -1331,14 +1326,16 @@ export default function Index() {
     let msg: any
     try { msg = JSON.parse(e.nativeEvent.data) } catch { return }
     if (!msg?.method) return
-    if (msg.method === 'shell:scanQr') {
-      // Open the native CameraView modal and resolve when a QR is read
-      // (or when the user cancels).
-      const text = await new Promise<string | null>((resolve) => {
-        scanResolveRef.current = resolve
-        setScannerVisible(true)
-      })
-      respond(msg.id, text)
+    if (msg.method === 'shell:cameraPermission') {
+      // The QR scanner runs in the page (src/ui/scanQr.js). Android's WebView
+      // gives it no camera without the app's CAMERA permission; iOS asks by
+      // itself when the page opens the camera.
+      let granted = true
+      if (Platform.OS === 'android') {
+        const perm = PermissionsAndroid.PERMISSIONS.CAMERA
+        granted = (await PermissionsAndroid.check(perm)) || (await PermissionsAndroid.request(perm)) === PermissionsAndroid.RESULTS.GRANTED
+      }
+      respond(msg.id, { granted })
       return
     }
     if (msg.method === 'shell:share') {
@@ -2007,13 +2004,6 @@ export default function Index() {
     )
   }
 
-  const onScannerResult = (text: string | null) => {
-    setScannerVisible(false)
-    const fn = scanResolveRef.current
-    scanResolveRef.current = null
-    if (fn) fn(text)
-  }
-
   return (
     <>
       <StatusBar barStyle={statusBarStyle} translucent backgroundColor='transparent' />
@@ -2043,78 +2033,17 @@ export default function Index() {
         originWhitelist={['*']}
         javaScriptEnabled
         domStorageEnabled
-      />
-      <QrScannerModal
-        visible={scannerVisible}
-        onScanned={(t) => onScannerResult(t)}
-        onCancel={() => onScannerResult(null)}
+        // The QR scanner's camera (src/ui/scanQr.js, getUserMedia on the
+        // https://localhost/ page).
+        allowsInlineMediaPlayback
+        mediaPlaybackRequiresUserAction={false}
+        mediaCapturePermissionGrantType='grant'
       />
     </>
-  )
-}
-
-function QrScannerModal({
-  visible,
-  onScanned,
-  onCancel,
-}: {
-  visible: boolean
-  onScanned: (text: string) => void
-  onCancel: () => void
-}) {
-  const [permission, requestPermission] = useCameraPermissions()
-  const scanned = useRef(false)
-
-  useEffect(() => {
-    if (!visible) { scanned.current = false; return }
-    if (!permission?.granted) {
-      requestPermission().then((res) => {
-        if (!res.granted) onCancel()
-      })
-    }
-  }, [visible, permission, requestPermission, onCancel])
-
-  const handleBarcode = (result: any) => {
-    if (scanned.current) return
-    scanned.current = true
-    onScanned(result.data)
-  }
-
-  return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onCancel}>
-      {permission?.granted ? (
-        <View style={{ flex: 1, backgroundColor: '#000' }}>
-          <CameraView
-            style={StyleSheet.absoluteFillObject}
-            facing="back"
-            onBarcodeScanned={handleBarcode}
-            barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
-          />
-          <View style={styles.scannerOverlay} pointerEvents="box-none">
-            <View style={styles.scannerHint}>
-              <Text style={styles.scannerHintText}>Point at the invite QR</Text>
-            </View>
-            <TouchableOpacity style={styles.scannerCancel} onPress={onCancel}>
-              <Text style={styles.scannerCancelText}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      ) : (
-        <View style={styles.scannerWaiting}>
-          <Text style={{ color: '#fff' }}>Requesting camera permission…</Text>
-        </View>
-      )}
-    </Modal>
   )
 }
 
 const styles = StyleSheet.create({
   splash: { flex: 1, backgroundColor: '#111', alignItems: 'center', justifyContent: 'center' },
   splashText: { color: '#eee', fontSize: 28, fontWeight: '600' },
-  scannerOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'space-between', padding: 32 },
-  scannerHint: { alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 8, marginTop: 60 },
-  scannerHintText: { color: '#fff', fontSize: 14, fontWeight: '500' },
-  scannerCancel: { backgroundColor: 'rgba(0,0,0,0.7)', padding: 16, borderRadius: 8, alignItems: 'center' },
-  scannerCancelText: { color: '#fff', fontSize: 16, fontWeight: '600' },
-  scannerWaiting: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#111' },
 })
