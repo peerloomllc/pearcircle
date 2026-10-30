@@ -225,4 +225,6 @@ dependencies {
 configurations.matching { it.name.toLowerCase().endsWith('runtimeclasspath') }.all {
     exclude group: 'com.google.firebase'
     exclude group: 'com.google.android.datatransport'
+    // Google Play's install referrer (expo-application), never called.
+    exclude group: 'com.android.installreferrer'
 }
