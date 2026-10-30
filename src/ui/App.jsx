@@ -21,6 +21,7 @@ import { summarizeSeederCircles } from '../lib/seederContact.js'
 import { OnboardingFlow } from './components/OnboardingFlow.jsx'
 import { BackupSection, useBackupStatus, lastBackupAt, BACKUP_REMINDER_MS } from './components/BackupSection.jsx'
 import { Tour } from './components/Tour.jsx'
+import { scanQr as scanQrInPage } from './scanQr.js'
 import { RepairBanner, RepairingBanner, RepairConfirmModal, REPAIR_ESCALATE_MS } from './components/RepairBanners.jsx'
 import appConfig from '../../app.json'
 
@@ -258,6 +259,16 @@ function haptic (kind) {
 // falls through to `shell:exitApp`. Mirrors React's render-order
 // nesting so an inner sheet/modal naturally dismisses first.
 const _backStack = []
+// For code outside React (the QR scanner): push a handler, get back a remover.
+function pushBackHandler (fn) {
+  _backStack.push(fn)
+  return () => {
+    const i = _backStack.lastIndexOf(fn)
+    if (i >= 0) _backStack.splice(i, 1)
+  }
+}
+const scanQr = () => scanQrInPage(pear.call, pushBackHandler)
+
 function useBackHandler (handler, active = true) {
   const handlerRef = useRef(handler)
   useEffect(() => { handlerRef.current = handler }, [handler])
@@ -1712,7 +1723,7 @@ function SeederSection ({ active = true }) {
 
   const scan = async () => {
     let text
-    try { text = await pear.call('shell:scanQr') } catch (e) { setMsg('Scan failed: ' + (e?.message ?? e)); return }
+    try { text = await scanQr() } catch (e) { setMsg('Scan failed: ' + (e?.message ?? e)); return }
     if (typeof text === 'string' && text.trim()) pairWith(text)
   }
 
@@ -2164,7 +2175,7 @@ function JoinView ({ onClose, onJoined, initialInvite }) {
   const onScan = async () => {
     setError(null)
     try {
-      const text = await pear.call('shell:scanQr')
+      const text = await scanQr()
       if (typeof text === 'string' && text.length > 0) setInvite(text)
     } catch (err) {
       setError('Scan failed: ' + (err?.message ?? err))
