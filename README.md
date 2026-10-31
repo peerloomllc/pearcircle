@@ -51,7 +51,7 @@ When devices in the same circle are online at the same time - whether on the sam
 All sync traffic is encrypted in transit. Each location update, place change, and trip is cryptographically signed by the writing device. Other circle members only apply updates they can verify came from a paired member.
 
 ### Geofences without a server
-Place transitions ("arrived at Home", "left School") are computed locally on each device against the Places defined in that circle. When you cross a geofence, your device writes a signed transition record that replicates to peers; their devices fire the local OS notification. The map tiles themselves come from a public tile provider (currently OpenFreeMap), but nothing about you or your locations is sent to them.
+Place transitions ("arrived at Home", "left School") are computed locally on each device against the Places defined in that circle. When you cross a geofence, your device writes a signed transition record that replicates to peers; their devices fire the local OS notification. The map tiles themselves come from a public tile provider (currently OpenFreeMap). Tile requests carry no names, circles or positions, but the provider sees your device's internet address and which area you are viewing, which is often where you or your circle are. Tiles you have viewed or downloaded in advance are cached on the device.
 
 ### Optional blind seeder
 Because nothing stores your circle's data but your own devices, a circle syncs only while two of them are
