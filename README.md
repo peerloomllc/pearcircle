@@ -62,15 +62,15 @@ It is blind by construction. It replicates the circle's encrypted blocks and can
 report only counts, never contents, and it holds no key that could decrypt a
 location. The circle admits a seeder explicitly and can revoke it.
 
-Packaging lives in [`seeder-launcher/`](seeder-launcher/), including an Umbrel
-app manifest and Start9 packaging. The image is published to
-`ghcr.io/peerloomllc/pearcircle-seeder`. Running one is entirely optional;
-PearCircle works without it.
+Install [PeerLoom Seeder](https://github.com/peerloomllc/peerloom-seeder) for
+this. It runs on Linux, macOS, Windows, Umbrel and Start9 and serves every
+PeerLoom app. Running one is entirely optional; PearCircle works without it.
+The older PearCircle-only seeder in [`seeder-launcher/`](seeder-launcher/) is
+retired.
 
-Note it needs host networking. Under a NAT'd container bridge the swarm cannot
-hole-punch, so run it with `--network=host` if you are running the image outside
-Umbrel, and turn the dashboard token back on with `-e SEEDER_NO_AUTH=0`. See
-[Run the Docker image yourself](seeder-launcher/README.md#run-the-docker-image-yourself).
+The `pearcircle-watch` and PearCircle Watcher downloads on the releases page
+are a separate app: a watch-only map for a computer. See
+[`watch-desktop/`](watch-desktop/README.md).
 
 ### Pairing
 You pair into a circle via a one-time invite link or QR code. The link encodes the cryptographic address of the circle - there's no server involved. After joining, every device in the circle remembers every other one and can sync directly.
