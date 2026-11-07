@@ -1,5 +1,9 @@
 # PearCircle Seeder Launcher
 
+> **Retired.** This seeder is no longer released (last build 1.1.5).
+> [PeerLoom Seeder](https://github.com/peerloomllc/peerloom-seeder) replaces it
+> for PearCircle and the other PeerLoom apps. This folder is kept for reference.
+
 A desktop app that keeps a PearCircle circle's data online when no member device is.
 
 PearCircle circles sync peer-to-peer, so a circle's history is only reachable while at least one member device is online. The seeder launcher runs the PearCircle blind-seeder worklet as a background service on an always-on machine: it replicates each enrolled circle's encrypted blocks so members stay in sync even when every phone is offline. It is a "blind" seeder because the blocks stay encrypted - it stores and serves a circle's data without ever being able to read it.
