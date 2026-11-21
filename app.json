@@ -9,7 +9,7 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "bundleIdentifier": "com.pearcircle",
-      "buildNumber": "48",
+      "buildNumber": "49",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "LSApplicationQueriesSchemes": [
@@ -82,7 +82,7 @@
           ]
         }
       ],
-      "versionCode": 1001008
+      "versionCode": 1001009
     },
     "plugins": [
       [
@@ -112,6 +112,6 @@
       "./assets/bare-universal.bundle",
       "./assets/bare-ios.bundle"
     ],
-    "version": "1.1.8"
+    "version": "1.1.9"
   }
 }
