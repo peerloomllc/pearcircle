@@ -66,7 +66,34 @@ const TOUR_STEPS = [
     title: 'Keep your circle in sync',
     body: "A seeder is an always-on computer that keeps your circle's locations and history synced even when everyone's phone is off. It's optional but handy. Set one up any time from Settings.",
   },
+  {
+    anchor: 'settings-button',
+    title: 'Satellite view',
+    body: 'Want satellite pictures instead of the street map? Open Settings, then Display & map, and tap Satellite. It needs a free MapTiler key, which takes a minute to get.',
+    placement: 'top',
+  },
 ]
+
+// "What's new" tours for people who already finished onboarding before a
+// feature shipped. Each runs once, after the first launch of the release
+// that adds it. New installs see the same step at the end of TOUR_STEPS,
+// and finishing that tour marks every feature tour as seen.
+const FEATURE_TOURS = {
+  satellite: [
+    {
+      anchor: '__no-anchor__',
+      title: 'New: satellite view',
+      body: 'You can now switch the map to satellite pictures, so you can see houses, roads and trees around your circle.',
+    },
+    {
+      anchor: 'settings-button',
+      title: 'Turn it on in Settings',
+      body: 'Open Settings, then Display & map, and tap Satellite. It needs a free key from MapTiler, the map company that provides the pictures. After that, a button on the map switches between street and satellite.',
+      placement: 'top',
+    },
+  ],
+}
+const FEATURE_TOUR_IDS = Object.keys(FEATURE_TOURS)
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
 
@@ -480,6 +507,9 @@ export function App () {
   // over the live map UI, on tour done/skip the tour flag clears.
   const [onboardingComplete, setOnboardingComplete] = useState(true)
   const [tourPending, setTourPending] = useState(false)
+  // Feature tours already seen (or skipped). null until loaded, so an
+  // update never flashes a tour before AsyncStorage answers.
+  const [featureToursSeen, setFeatureToursSeen] = useState(null)
   const [onboardingLoaded, setOnboardingLoaded] = useState(false)
   // Status bar icon tint: light (white) icons on dark surfaces, dark
   // icons on the bare map view. The bare map area is the only place
@@ -510,6 +540,10 @@ export function App () {
     const style = overlayShowing ? 'light' : 'dark'
     pear.call('shell:statusBar:set', { style }).catch(() => {})
   }, [sheet, primingVisible, donateReminderVisible, onboardingLoaded, onboardingComplete, tourPending, permissionStatus, bannerDismissed, battery.supported, battery.exempt, batteryBannerDismissed])
+  // Next "what's new" tour to show, or null. See FEATURE_TOURS.
+  const featureTourId = (!WATCH_ONLY && onboardingLoaded && onboardingComplete && !tourPending && featureToursSeen)
+    ? (FEATURE_TOUR_IDS.find((t) => !featureToursSeen.includes(t)) ?? null)
+    : null
   const persistOnboarding = useCallback(async (patch) => {
     try { await pear.call('shell:onboarding:set', patch) } catch {}
   }, [])
@@ -543,8 +577,9 @@ export function App () {
     pear.call('shell:onboarding:get').then((r) => {
       setOnboardingComplete(!!r?.complete)
       setTourPending(!!r?.tourPending)
+      setFeatureToursSeen(Array.isArray(r?.featureToursSeen) ? r.featureToursSeen : [])
       setOnboardingLoaded(true)
-    }).catch(() => { setOnboardingLoaded(true) })
+    }).catch(() => { setFeatureToursSeen([]); setOnboardingLoaded(true) })
     pear.on('ready', refresh)
     pear.on('sharing:changed', ({ circleId, enabled, expiresAt, anyEnabled }) => {
       // Merge the per-circle update into the local map without losing
@@ -784,7 +819,7 @@ export function App () {
         networkLocationOff={networkLocationOff}
         networkBannerDismissed={networkBannerDismissed}
         onNetworkBannerDismiss={() => setNetworkBannerDismissed(true)}
-        tourActive={onboardingLoaded && onboardingComplete && tourPending && !sheet}
+        tourActive={(onboardingLoaded && onboardingComplete && tourPending && !sheet) || (!!featureTourId && !sheet)}
       />
       <SheetContainer open={sheet?.name === 'settings'}>
         <ProfileView
@@ -928,14 +963,28 @@ export function App () {
           steps={TOUR_STEPS}
           onDone={() => {
             setTourPending(false)
-            persistOnboarding({ tourPending: false })
+            setFeatureToursSeen(FEATURE_TOUR_IDS)
+            persistOnboarding({ tourPending: false, featureToursSeen: FEATURE_TOUR_IDS })
           }}
           onSkip={() => {
             setTourPending(false)
-            persistOnboarding({ tourPending: false })
+            setFeatureToursSeen(FEATURE_TOUR_IDS)
+            persistOnboarding({ tourPending: false, featureToursSeen: FEATURE_TOUR_IDS })
           }}
         />
       )}
+      {/* One "what's new" tour at a time, for people who finished
+          onboarding before the feature shipped. */}
+      {(() => {
+        const id = featureTourId
+        if (!id || sheet) return null
+        const finish = () => {
+          const next = [...featureToursSeen, id]
+          setFeatureToursSeen(next)
+          persistOnboarding({ featureToursSeen: next })
+        }
+        return <Tour key={id} steps={FEATURE_TOURS[id]} onDone={finish} onSkip={finish} />
+      })()}
     </>
   )
 }
@@ -3280,6 +3329,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setTileStyleUr
         type='button'
         onClick={() => setSheet({ name: 'settings' })}
         aria-label='Settings'
+        data-tour='settings-button'
         style={s.overlayIconBtn}
       >
         <GearSix size={22} weight='thin' />
