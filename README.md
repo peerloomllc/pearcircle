@@ -19,6 +19,7 @@ Part of the [PeerLoom](https://peerloomllc.com) suite of account-free, peer-to-p
 - **Motion at a glance** - pins surface walking / driving / flying / stationary state from the device's sensors, with battery and last-seen time
 - **Sharing pause** - one tap silences your location for the rest of the day or until you flip it back on; peers see "Sharing paused" instead of stale dots
 - **Offline map tiles** - tiles you've viewed stay cached so the map keeps working without a network connection; download an area in advance for trips into dead zones
+- **Optional satellite view** - switch the map to satellite pictures from MapTiler using your own free MapTiler key. A button on the map flips between street and satellite once the key is in
 - **No accounts** - your identity is a cryptographic key pair generated on your device; nothing is tied to an email or phone number
 - **Optional self-hosted seeder** - run a blind seeder on your own hardware so a circle stays reachable when phones are asleep. It cannot read your locations
 - **No data collection** - PeerLoom, Google, Apple and no third party ever sees your circle's location data
@@ -51,7 +52,7 @@ When devices in the same circle are online at the same time - whether on the sam
 All sync traffic is encrypted in transit. Each location update, place change, and trip is cryptographically signed by the writing device. Other circle members only apply updates they can verify came from a paired member.
 
 ### Geofences without a server
-Place transitions ("arrived at Home", "left School") are computed locally on each device against the Places defined in that circle. When you cross a geofence, your device writes a signed transition record that replicates to peers; their devices fire the local OS notification. The map tiles themselves come from a public tile provider (currently OpenFreeMap). Tile requests carry no names, circles or positions, but the provider sees your device's internet address and which area you are viewing, which is often where you or your circle are. Tiles you have viewed or downloaded in advance are cached on the device.
+Place transitions ("arrived at Home", "left School") are computed locally on each device against the Places defined in that circle. When you cross a geofence, your device writes a signed transition record that replicates to peers; their devices fire the local OS notification. The map tiles themselves come from a public tile provider (currently OpenFreeMap). Tile requests carry no names, circles or positions, but the provider sees your device's internet address and which area you are viewing, which is often where you or your circle are. Tiles you have viewed or downloaded in advance are cached on the device. If you turn on satellite view, the pictures come from MapTiler instead, using your own MapTiler key, so MapTiler sees the same things plus that key. Satellite pictures are not cached for offline use.
 
 ### Optional blind seeder
 Because nothing stores your circle's data but your own devices, a circle syncs only while two of them are
@@ -85,6 +86,7 @@ You pair into a circle via a one-time invite link or QR code. The link encodes t
 - All sync traffic is encrypted end-to-end
 - Location data stays on the devices in your circles - never uploaded anywhere
 - Map tiles fetched from public providers (e.g. OpenFreeMap) are stateless requests for `(z, x, y)` coordinates; they don't identify you or your circle
+- Satellite view is off by default. When you turn it on, map requests go to MapTiler with your own MapTiler key, which is tied to your MapTiler account
 - Trip history is local-only by default; per-circle sharing is opt-in
 
 ---
