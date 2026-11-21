@@ -72,6 +72,12 @@ const TOUR_STEPS = [
     body: 'Want satellite pictures instead of the street map? Open Settings, then Display & map, and tap Satellite. It needs a free MapTiler key, which takes a minute to get.',
     placement: 'top',
   },
+  {
+    anchor: 'map-style-button',
+    title: 'Switch right from the map',
+    body: 'Once your key is in, this button appears on the map. Tap it to flip between street and satellite.',
+    placement: 'left',
+  },
 ]
 
 // "What's new" tours for people who already finished onboarding before a
@@ -88,8 +94,14 @@ const FEATURE_TOURS = {
     {
       anchor: 'settings-button',
       title: 'Turn it on in Settings',
-      body: 'Open Settings, then Display & map, and tap Satellite. It needs a free key from MapTiler, the map company that provides the pictures. After that, a button on the map switches between street and satellite.',
+      body: 'Open Settings, then Display & map, and tap Satellite. It needs a free key from MapTiler, the map company that provides the pictures.',
       placement: 'top',
+    },
+    {
+      anchor: 'map-style-button',
+      title: 'Switch right from the map',
+      body: 'Once your key is in, this button appears on the map. Tap it to flip between street and satellite.',
+      placement: 'left',
     },
   ],
 }
@@ -510,6 +522,9 @@ export function App () {
   // Feature tours already seen (or skipped). null until loaded, so an
   // update never flashes a tour before AsyncStorage answers.
   const [featureToursSeen, setFeatureToursSeen] = useState(null)
+  // Anchor of the tour step on screen, so the map can show the
+  // Street / Satellite button while the tour points at it.
+  const [tourAnchor, setTourAnchor] = useState(null)
   const [onboardingLoaded, setOnboardingLoaded] = useState(false)
   // Status bar icon tint: light (white) icons on dark surfaces, dark
   // icons on the bare map view. The bare map area is the only place
@@ -805,6 +820,7 @@ export function App () {
         sharing={!sharing.anyPaused}
         tileStyleUrl={tileStyleUrl}
         setTileStyleUrl={setTileStyleUrlAndPersist}
+        showStyleButtonForTour={tourAnchor === 'map-style-button'}
         setView={setView}
         setSheet={setSheet}
         initialSelectedCircleId={view.selectCircle ?? null}
@@ -961,6 +977,7 @@ export function App () {
       {onboardingLoaded && onboardingComplete && tourPending && !sheet && (
         <Tour
           steps={TOUR_STEPS}
+          onStep={setTourAnchor}
           onDone={() => {
             setTourPending(false)
             setFeatureToursSeen(FEATURE_TOUR_IDS)
@@ -983,7 +1000,7 @@ export function App () {
           setFeatureToursSeen(next)
           persistOnboarding({ featureToursSeen: next })
         }
-        return <Tour key={id} steps={FEATURE_TOURS[id]} onDone={finish} onSkip={finish} />
+        return <Tour key={id} steps={FEATURE_TOURS[id]} onDone={finish} onSkip={finish} onStep={setTourAnchor} />
       })()}
     </>
   )
@@ -2339,7 +2356,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setTileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setTileStyleUrl, showStyleButtonForTour = false, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   // Backup reminder (proposal 2026-10-06-owner-continuity): no backup, or
   // none in 14 days. Dismissing snoozes it for 14 days on this phone.
@@ -3415,14 +3432,17 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setTileStyleUr
       {(() => {
         const mode = styleMode(tileStyleUrl)
         const key = keyFromSatelliteStyle(tileStyleUrl) || loadSavedKey()
-        if (!key || mode === 'custom' || !setTileStyleUrl) return null
-        const toSatellite = mode === 'street'
+        // The tour shows the button briefly even without a key, so it can
+        // point at it. Taps are a no-op until a key exists.
+        if (!showStyleButtonForTour && (!key || mode === 'custom' || !setTileStyleUrl)) return null
+        const toSatellite = mode !== 'satellite'
         const label = toSatellite ? 'Show satellite map' : 'Show street map'
         return (
           <button
             type='button'
-            onClick={() => setTileStyleUrl(toSatellite ? satelliteStyleUrl(key) : null)}
+            onClick={() => { if (key && mode !== 'custom') setTileStyleUrl(toSatellite ? satelliteStyleUrl(key) : null) }}
             aria-label={label}
+            data-tour='map-style-button'
             title={label}
             style={{
               position: 'absolute',
