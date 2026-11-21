@@ -8,6 +8,7 @@ import {
   loadSavedKey,
   saveKey,
   checkSatelliteKey,
+  mapCredit,
 } from './mapStyles.js'
 
 describe('mapStyles', () => {
@@ -48,5 +49,10 @@ describe('mapStyles', () => {
     expect(await checkSatelliteKey('abcdefgh', async () => ({ ok: false, status: 403 }))).toMatch(/did not accept/)
     expect(await checkSatelliteKey('abcdefgh', async () => ({ ok: false, status: 500 }))).toMatch(/500/)
     expect(await checkSatelliteKey('abcdefgh', async () => { throw new Error('offline') })).toMatch(/connection/)
+  })
+
+  test('mapCredit adds MapTiler for satellite', () => {
+    expect(mapCredit(null)).toBe('\u00a9 OpenStreetMap contributors')
+    expect(mapCredit(satelliteStyleUrl('abcdefgh'))).toBe('\u00a9 MapTiler \u00a9 OpenStreetMap contributors')
   })
 })

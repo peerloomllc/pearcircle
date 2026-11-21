@@ -27,7 +27,7 @@ import appConfig from '../../app.json'
 
 const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
 import { downloadRegion, estimateTilesInBbox } from './lib/regionDownload.js'
-import { STREET_STYLE_URL, MAPTILER_SIGNUP_URL, satelliteStyleUrl, isSatelliteStyle, keyFromSatelliteStyle, styleMode, validateMaptilerKey, loadSavedKey, saveKey, checkSatelliteKey } from './lib/mapStyles.js'
+import { STREET_STYLE_URL, MAPTILER_SIGNUP_URL, satelliteStyleUrl, isSatelliteStyle, keyFromSatelliteStyle, styleMode, validateMaptilerKey, loadSavedKey, saveKey, checkSatelliteKey, mapCredit } from './lib/mapStyles.js'
 
 // The shell injects window.__pearPlatform ('ios' | 'android') before this
 // bundle loads (app/index.tsx head script). Read once at module load: it never
@@ -4305,7 +4305,7 @@ const CircleMap = React.forwardRef(function CircleMap (
         selectedPubkey={selectedPubkey}
         onSelect={onMemberClick}
       />
-      <div style={s.mapAttribution}>© OpenStreetMap contributors</div>
+      <div style={s.mapAttribution}>{mapCredit(tileStyleUrl)}</div>
     </div>
   )
 })

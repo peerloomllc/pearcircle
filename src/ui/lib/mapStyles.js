@@ -73,3 +73,11 @@ export async function checkSatelliteKey (key, fetchImpl) {
   if (!res.ok) return `MapTiler returned an error (${res.status})`
   return null
 }
+
+// Credit line under the map. MapTiler's terms require crediting MapTiler
+// as well as OpenStreetMap when its tiles are shown.
+export function mapCredit (url) {
+  return isSatelliteStyle(url)
+    ? '© MapTiler © OpenStreetMap contributors'
+    : '© OpenStreetMap contributors'
+}
