@@ -27,6 +27,7 @@ import appConfig from '../../app.json'
 
 const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
 import { downloadRegion, estimateTilesInBbox } from './lib/regionDownload.js'
+import { STREET_STYLE_URL, MAPTILER_SIGNUP_URL, satelliteStyleUrl, isSatelliteStyle, keyFromSatelliteStyle, styleMode, validateMaptilerKey, loadSavedKey, saveKey, checkSatelliteKey } from './lib/mapStyles.js'
 
 // The shell injects window.__pearPlatform ('ios' | 'android') before this
 // bundle loads (app/index.tsx head script). Read once at module load: it never
@@ -300,7 +301,7 @@ function ensureMapLibreCss () {
 // fallback when there's no override in AsyncStorage. The user can swap
 // to Protomaps or any other MapLibre-style URL via Settings -> Map tiles
 // without rebuilding the app.
-const DEFAULT_TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
+const DEFAULT_TILE_STYLE_URL = STREET_STYLE_URL
 // Shown in place of a circle name before its `circle` row has replicated
 // (the joined record exists a beat before the name syncs). Beats a bare
 // "..." in the pill, the circle switcher, and the Settings list.
@@ -6047,7 +6048,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
         <p style={{ ...subLabel, marginTop: spacing.lg }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
-        <TileCacheSection />
+        <TileCacheSection satellite={isSatelliteStyle(tileStyleUrl)} />
       </Collapsible>
 
       {/* Advanced is debug-only now (battery moved to Staying in sync, map
@@ -6705,115 +6706,186 @@ function AutostartStatus () {
 // or self-hosted server) and the map hot-swaps without a relaunch.
 // Reset clears the override so we fall back to DEFAULT_TILE_STYLE_URL.
 function TileStyleSection ({ url, onChange }) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(url ?? '')
+  // 'key' = asking for a MapTiler key, 'url' = editing a custom style URL
+  const [editing, setEditing] = useState(null)
+  const [draft, setDraft] = useState('')
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
-  const isCustom = !!url && url !== DEFAULT_TILE_STYLE_URL
+  const mode = styleMode(url)
 
-  const startEdit = () => {
-    setDraft(url ?? DEFAULT_TILE_STYLE_URL)
+  const run = async (fn) => {
+    setBusy(true)
     setError(null)
-    setEditing(true)
+    try {
+      await fn()
+      setEditing(null)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setBusy(false)
+    }
   }
-  const cancelEdit = () => {
-    setEditing(false)
+
+  const pickStreet = () => { if (mode !== 'street') run(() => onChange(null)) }
+  const pickSatellite = () => {
+    if (mode === 'satellite') return
+    const key = loadSavedKey()
+    if (key) { run(() => onChange(satelliteStyleUrl(key))); return }
+    startKeyEdit()
+  }
+  const startKeyEdit = () => {
+    setDraft(keyFromSatelliteStyle(url) || loadSavedKey() || '')
     setError(null)
+    setEditing('key')
   }
-  const validate = (s) => {
-    const t = (s ?? '').trim()
-    if (!t) return 'URL is required'
-    if (!/^https?:\/\//i.test(t)) return 'URL must start with http:// or https://'
-    return null
+  const startUrlEdit = () => {
+    setDraft(mode === 'custom' ? url : STREET_STYLE_URL)
+    setError(null)
+    setEditing('url')
   }
-  const save = async () => {
-    const err = validate(draft)
+  const cancelEdit = () => { setEditing(null); setError(null) }
+
+  const saveKeyDraft = async () => {
+    const err = validateMaptilerKey(draft)
     if (err) { setError(err); return }
-    setBusy(true)
-    try {
-      await onChange(draft.trim())
-      setEditing(false)
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const reset = async () => {
+    const key = draft.trim()
     setBusy(true)
     setError(null)
-    try {
-      await onChange(null)
-      setEditing(false)
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setBusy(false)
-    }
+    const checkErr = await checkSatelliteKey(key)
+    setBusy(false)
+    if (checkErr) { setError(checkErr); return }
+    saveKey(key)
+    run(() => onChange(satelliteStyleUrl(key)))
   }
+  const saveUrlDraft = () => {
+    const t = (draft ?? '').trim()
+    if (!t) { setError('URL is required'); return }
+    if (!/^https?:\/\//i.test(t)) { setError('URL must start with http:// or https://'); return }
+    run(() => onChange(t))
+  }
+
+  const btn = (label, active, onClick) => (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      style={{
+        flex: 1, padding: '10px', borderRadius: radius.sm,
+        background: active ? colors.primary : 'transparent',
+        color: active ? colors.text.onPrimary : colors.text.primary,
+        border: `1px solid ${active ? colors.primary : colors.border}`,
+        cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+      }}
+    >
+      {label}
+    </button>
+  )
+  const inputStyle = {
+    width: '100%', boxSizing: 'border-box',
+    padding: `${spacing.sm}px ${spacing.md}px`,
+    background: colors.surface.input,
+    color: colors.text.primary,
+    border: `1px solid ${colors.border}`,
+    borderRadius: radius.md,
+    fontFamily: typography.monoFamily, fontSize: 13,
+    outline: 'none',
+    marginBottom: spacing.sm,
+  }
+  const smallBtn = { ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }
+  const openSignup = () => { try { pear.call('shell:openUrl', { url: MAPTILER_SIGNUP_URL }) } catch {} }
 
   return (
     <>
-      <p style={s.muted}>
-        The map fetches tile imagery from this MapLibre style URL.
-        Default is OpenFreeMap. Change if the default is unavailable
-        or you want to point at your own provider.
-      </p>
-      {!editing && (
+      <div style={{ display: 'flex', gap: spacing.sm, marginBottom: spacing.sm }}>
+        {btn('Street', mode === 'street' && editing !== 'key', pickStreet)}
+        {btn('Satellite', mode === 'satellite' || editing === 'key', pickSatellite)}
+      </div>
+
+      {editing === 'key' && (
         <>
-          <div style={{
-            ...typography.caption, color: colors.text.secondary,
-            background: colors.surface.input,
-            border: `1px solid ${colors.border}`,
-            borderRadius: radius.md,
-            padding: `${spacing.sm}px ${spacing.md}px`,
-            wordBreak: 'break-all',
-            marginBottom: spacing.sm,
-            fontFamily: typography.monoFamily,
-          }}>
-            {url || DEFAULT_TILE_STYLE_URL}
-            {!isCustom && (
-              <span style={{ color: colors.text.muted, marginLeft: spacing.xs }}>(default)</span>
-            )}
-          </div>
+          <p style={s.muted}>
+            Satellite view comes from MapTiler. Make a free MapTiler account,
+            copy your API key and paste it here. The key stays on this phone.
+            MapTiler sees which parts of the map you look at, the same way the
+            street map provider does.
+          </p>
+          <button style={{ ...smallBtn, marginBottom: spacing.sm }} onClick={openSignup}>
+            Get a free key
+          </button>
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder='MapTiler API key'
+            spellCheck={false}
+            autoCapitalize='off'
+            autoCorrect='off'
+            style={inputStyle}
+          />
           <div style={{ display: 'flex', gap: spacing.sm }}>
-            <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={startEdit}>
-              Edit URL
+            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={saveKeyDraft} disabled={busy}>
+              {busy ? 'Checking...' : 'Use satellite'}
             </button>
-            {isCustom && (
-              <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={reset} disabled={busy}>
-                Reset to default
-              </button>
-            )}
+            <button style={smallBtn} onClick={cancelEdit} disabled={busy}>
+              Cancel
+            </button>
           </div>
         </>
       )}
-      {editing && (
+
+      {editing === 'url' && (
         <>
+          <p style={s.muted}>
+            Point the map at any MapLibre style URL, for example your own
+            tile server.
+          </p>
           <input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder='https://...'
             spellCheck={false}
             autoCapitalize='off'
-            style={{
-              width: '100%', boxSizing: 'border-box',
-              padding: `${spacing.sm}px ${spacing.md}px`,
-              background: colors.surface.input,
-              color: colors.text.primary,
-              border: `1px solid ${colors.border}`,
-              borderRadius: radius.md,
-              fontFamily: typography.monoFamily, fontSize: 13,
-              outline: 'none',
-              marginBottom: spacing.sm,
-            }}
+            style={inputStyle}
           />
           <div style={{ display: 'flex', gap: spacing.sm }}>
-            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={save} disabled={busy}>
+            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={saveUrlDraft} disabled={busy}>
               {busy ? 'Saving...' : 'Save'}
             </button>
-            <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={cancelEdit} disabled={busy}>
+            <button style={smallBtn} onClick={cancelEdit} disabled={busy}>
               Cancel
+            </button>
+          </div>
+        </>
+      )}
+
+      {!editing && (
+        <>
+          {mode === 'street' && (
+            <p style={s.muted}>Street map from OpenFreeMap. Free, no account.</p>
+          )}
+          {mode === 'satellite' && (
+            <p style={s.muted}>Satellite imagery from MapTiler, using your key.</p>
+          )}
+          {mode === 'custom' && (
+            <div style={{
+              ...typography.caption, color: colors.text.secondary,
+              background: colors.surface.input,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.md,
+              padding: `${spacing.sm}px ${spacing.md}px`,
+              wordBreak: 'break-all',
+              marginBottom: spacing.sm,
+              fontFamily: typography.monoFamily,
+            }}>
+              {url}
+              <span style={{ color: colors.text.muted, marginLeft: spacing.xs }}>(custom)</span>
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            {mode === 'satellite' && (
+              <button style={smallBtn} onClick={startKeyEdit} disabled={busy}>Change key</button>
+            )}
+            <button style={smallBtn} onClick={startUrlEdit} disabled={busy}>
+              {mode === 'custom' ? 'Edit URL' : 'Custom URL'}
             </button>
           </div>
         </>
@@ -6828,7 +6900,7 @@ function TileStyleSection ({ url, onChange }) {
 // the cache, so size grows naturally as the user explores; this UI
 // surfaces what's cached, lets them clear LRU entries, and opens the
 // region-download manager for explicit offline coverage.
-function TileCacheSection () {
+function TileCacheSection ({ satellite = false }) {
   const [stats, setStats] = useState(null)
   const [busy, setBusy] = useState(false)
   const [regions, setRegions] = useState([])
@@ -6901,8 +6973,11 @@ function TileCacheSection () {
           </div>
         </div>
       </div>
+      {satellite && (
+        <p style={{ ...s.muted, marginTop: 0 }}>Switch to Street to download map areas for offline use. Satellite pictures are not saved offline.</p>
+      )}
       <div style={{ display: 'flex', gap: spacing.sm, marginBottom: regions.length > 0 ? spacing.base : 0 }}>
-        <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1 }} onClick={() => setDownloadOpen(true)}>
+        <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1, opacity: satellite ? 0.5 : 1 }} onClick={() => setDownloadOpen(true)} disabled={satellite}>
           Download tiles
         </button>
         <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1 }} onClick={clear} disabled={busy}>
