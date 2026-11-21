@@ -68,6 +68,8 @@ const THEME_KEY = 'pc:theme'
 // the rest of AsyncStorage.
 const ONBOARDING_COMPLETE_KEY = 'pc:onboardingComplete'
 const TOUR_PENDING_KEY = 'pc:tourPending'
+// Comma-separated ids of "what's new" feature tours already shown.
+const FEATURE_TOURS_SEEN_KEY = 'pc:featureToursSeen'
 // Two-week donation-reminder modal (mirrors PearCal/PearGuard). The
 // firstLaunch key is auto-seeded with Date.now() on the very first
 // shell:donateReminder:get call so we have a reference point for the
@@ -1687,13 +1689,15 @@ export default function Index() {
     }
     if (msg.method === 'shell:onboarding:get') {
       try {
-        const [complete, tourPending] = await Promise.all([
+        const [complete, tourPending, featureToursSeen] = await Promise.all([
           AsyncStorage.getItem(ONBOARDING_COMPLETE_KEY),
           AsyncStorage.getItem(TOUR_PENDING_KEY),
+          AsyncStorage.getItem(FEATURE_TOURS_SEEN_KEY),
         ])
         respond(msg.id, {
           complete: complete === 'true',
           tourPending: tourPending === 'true',
+          featureToursSeen: featureToursSeen ? featureToursSeen.split(',').filter(Boolean) : [],
         })
       } catch (err: any) {
         respond(msg.id, { complete: false, tourPending: false, error: err?.message ?? String(err) })
@@ -1710,8 +1714,11 @@ export default function Index() {
       return
     }
     if (msg.method === 'shell:onboarding:set') {
-      const { complete, tourPending } = msg.args ?? {}
+      const { complete, tourPending, featureToursSeen } = msg.args ?? {}
       try {
+        if (Array.isArray(featureToursSeen)) {
+          await AsyncStorage.setItem(FEATURE_TOURS_SEEN_KEY, featureToursSeen.filter((t: unknown) => typeof t === 'string').join(','))
+        }
         if (typeof complete === 'boolean') {
           await AsyncStorage.setItem(ONBOARDING_COMPLETE_KEY, complete ? 'true' : 'false')
         }

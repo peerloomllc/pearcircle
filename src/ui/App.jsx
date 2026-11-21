@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives, Desktop } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives, Desktop, GlobeHemisphereWest } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -27,6 +27,7 @@ import appConfig from '../../app.json'
 
 const APP_VERSION = appConfig?.expo?.version ?? '0.0.0'
 import { downloadRegion, estimateTilesInBbox } from './lib/regionDownload.js'
+import { STREET_STYLE_URL, MAPTILER_SIGNUP_URL, satelliteStyleUrl, isSatelliteStyle, keyFromSatelliteStyle, styleMode, validateMaptilerKey, loadSavedKey, saveKey, checkSatelliteKey, mapCredit } from './lib/mapStyles.js'
 
 // The shell injects window.__pearPlatform ('ios' | 'android') before this
 // bundle loads (app/index.tsx head script). Read once at module load: it never
@@ -65,7 +66,46 @@ const TOUR_STEPS = [
     title: 'Keep your circle in sync',
     body: "A seeder is an always-on computer that keeps your circle's locations and history synced even when everyone's phone is off. It's optional but handy. Set one up any time from Settings.",
   },
+  {
+    anchor: 'settings-button',
+    title: 'Satellite view',
+    body: 'Want satellite pictures instead of the street map? Open Settings, then Display & map, and tap Satellite. It needs a free MapTiler key, which takes a minute to get.',
+    placement: 'top',
+  },
+  {
+    anchor: 'map-style-button',
+    title: 'Switch right from the map',
+    body: 'Once your key is in, this button appears on the map. Tap it to flip between street and satellite.',
+    placement: 'left',
+  },
 ]
+
+// "What's new" tours for people who already finished onboarding before a
+// feature shipped. Each runs once, after the first launch of the release
+// that adds it. New installs see the same step at the end of TOUR_STEPS,
+// and finishing that tour marks every feature tour as seen.
+const FEATURE_TOURS = {
+  satellite: [
+    {
+      anchor: '__no-anchor__',
+      title: 'New: satellite view',
+      body: 'You can now switch the map to satellite pictures, so you can see houses, roads and trees around your circle.',
+    },
+    {
+      anchor: 'settings-button',
+      title: 'Turn it on in Settings',
+      body: 'Open Settings, then Display & map, and tap Satellite. It needs a free key from MapTiler, the map company that provides the pictures.',
+      placement: 'top',
+    },
+    {
+      anchor: 'map-style-button',
+      title: 'Switch right from the map',
+      body: 'Once your key is in, this button appears on the map. Tap it to flip between street and satellite.',
+      placement: 'left',
+    },
+  ],
+}
+const FEATURE_TOUR_IDS = Object.keys(FEATURE_TOURS)
 import motionWalkingUrl from '../../assets/images/motion_walking.png'
 import motionDrivingUrl from '../../assets/images/motion_driving.png'
 
@@ -300,7 +340,7 @@ function ensureMapLibreCss () {
 // fallback when there's no override in AsyncStorage. The user can swap
 // to Protomaps or any other MapLibre-style URL via Settings -> Map tiles
 // without rebuilding the app.
-const DEFAULT_TILE_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty'
+const DEFAULT_TILE_STYLE_URL = STREET_STYLE_URL
 // Shown in place of a circle name before its `circle` row has replicated
 // (the joined record exists a beat before the name syncs). Beats a bare
 // "..." in the pill, the circle switcher, and the Settings list.
@@ -479,6 +519,12 @@ export function App () {
   // over the live map UI, on tour done/skip the tour flag clears.
   const [onboardingComplete, setOnboardingComplete] = useState(true)
   const [tourPending, setTourPending] = useState(false)
+  // Feature tours already seen (or skipped). null until loaded, so an
+  // update never flashes a tour before AsyncStorage answers.
+  const [featureToursSeen, setFeatureToursSeen] = useState(null)
+  // Anchor of the tour step on screen, so the map can show the
+  // Street / Satellite button while the tour points at it.
+  const [tourAnchor, setTourAnchor] = useState(null)
   const [onboardingLoaded, setOnboardingLoaded] = useState(false)
   // Status bar icon tint: light (white) icons on dark surfaces, dark
   // icons on the bare map view. The bare map area is the only place
@@ -509,6 +555,10 @@ export function App () {
     const style = overlayShowing ? 'light' : 'dark'
     pear.call('shell:statusBar:set', { style }).catch(() => {})
   }, [sheet, primingVisible, donateReminderVisible, onboardingLoaded, onboardingComplete, tourPending, permissionStatus, bannerDismissed, battery.supported, battery.exempt, batteryBannerDismissed])
+  // Next "what's new" tour to show, or null. See FEATURE_TOURS.
+  const featureTourId = (!WATCH_ONLY && onboardingLoaded && onboardingComplete && !tourPending && featureToursSeen)
+    ? (FEATURE_TOUR_IDS.find((t) => !featureToursSeen.includes(t)) ?? null)
+    : null
   const persistOnboarding = useCallback(async (patch) => {
     try { await pear.call('shell:onboarding:set', patch) } catch {}
   }, [])
@@ -542,8 +592,9 @@ export function App () {
     pear.call('shell:onboarding:get').then((r) => {
       setOnboardingComplete(!!r?.complete)
       setTourPending(!!r?.tourPending)
+      setFeatureToursSeen(Array.isArray(r?.featureToursSeen) ? r.featureToursSeen : [])
       setOnboardingLoaded(true)
-    }).catch(() => { setOnboardingLoaded(true) })
+    }).catch(() => { setFeatureToursSeen([]); setOnboardingLoaded(true) })
     pear.on('ready', refresh)
     pear.on('sharing:changed', ({ circleId, enabled, expiresAt, anyEnabled }) => {
       // Merge the per-circle update into the local map without losing
@@ -768,6 +819,8 @@ export function App () {
         profile={profile}
         sharing={!sharing.anyPaused}
         tileStyleUrl={tileStyleUrl}
+        setTileStyleUrl={setTileStyleUrlAndPersist}
+        showStyleButtonForTour={tourAnchor === 'map-style-button'}
         setView={setView}
         setSheet={setSheet}
         initialSelectedCircleId={view.selectCircle ?? null}
@@ -782,7 +835,7 @@ export function App () {
         networkLocationOff={networkLocationOff}
         networkBannerDismissed={networkBannerDismissed}
         onNetworkBannerDismiss={() => setNetworkBannerDismissed(true)}
-        tourActive={onboardingLoaded && onboardingComplete && tourPending && !sheet}
+        tourActive={(onboardingLoaded && onboardingComplete && tourPending && !sheet) || (!!featureTourId && !sheet)}
       />
       <SheetContainer open={sheet?.name === 'settings'}>
         <ProfileView
@@ -924,16 +977,31 @@ export function App () {
       {onboardingLoaded && onboardingComplete && tourPending && !sheet && (
         <Tour
           steps={TOUR_STEPS}
+          onStep={setTourAnchor}
           onDone={() => {
             setTourPending(false)
-            persistOnboarding({ tourPending: false })
+            setFeatureToursSeen(FEATURE_TOUR_IDS)
+            persistOnboarding({ tourPending: false, featureToursSeen: FEATURE_TOUR_IDS })
           }}
           onSkip={() => {
             setTourPending(false)
-            persistOnboarding({ tourPending: false })
+            setFeatureToursSeen(FEATURE_TOUR_IDS)
+            persistOnboarding({ tourPending: false, featureToursSeen: FEATURE_TOUR_IDS })
           }}
         />
       )}
+      {/* One "what's new" tour at a time, for people who finished
+          onboarding before the feature shipped. */}
+      {(() => {
+        const id = featureTourId
+        if (!id || sheet) return null
+        const finish = () => {
+          const next = [...featureToursSeen, id]
+          setFeatureToursSeen(next)
+          persistOnboarding({ featureToursSeen: next })
+        }
+        return <Tour key={id} steps={FEATURE_TOURS[id]} onDone={finish} onSkip={finish} onStep={setTourAnchor} />
+      })()}
     </>
   )
 }
@@ -2288,7 +2356,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setTileStyleUrl, showStyleButtonForTour = false, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   // Backup reminder (proposal 2026-10-06-owner-continuity): no backup, or
   // none in 14 days. Dismissing snoozes it for 14 days on this phone.
@@ -3278,6 +3346,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         type='button'
         onClick={() => setSheet({ name: 'settings' })}
         aria-label='Settings'
+        data-tour='settings-button'
         style={s.overlayIconBtn}
       >
         <GearSix size={22} weight='thin' />
@@ -3355,6 +3424,48 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       >
         <NavigationArrow size={22} weight='thin' />
       </button>}
+
+      {/* Street / Satellite switch, stacked above Find-me. Only shown once
+          a MapTiler key has been saved in Settings -> Map tiles, so the map
+          looks unchanged for everyone else. A custom style URL also hides
+          it: flipping would throw that URL away. */}
+      {(() => {
+        const mode = styleMode(tileStyleUrl)
+        const key = keyFromSatelliteStyle(tileStyleUrl) || loadSavedKey()
+        // The tour shows the button briefly even without a key, so it can
+        // point at it. Taps are a no-op until a key exists.
+        if (!showStyleButtonForTour && (!key || mode === 'custom' || !setTileStyleUrl)) return null
+        const toSatellite = mode !== 'satellite'
+        const label = toSatellite ? 'Show satellite map' : 'Show street map'
+        return (
+          <button
+            type='button'
+            onClick={() => { if (key && mode !== 'custom') setTileStyleUrl(toSatellite ? satelliteStyleUrl(key) : null) }}
+            aria-label={label}
+            data-tour='map-style-button'
+            title={label}
+            style={{
+              position: 'absolute',
+              right: 16,
+              bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 128px)`,
+              width: 44, height: 44, borderRadius: '50%',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: 'rgba(26,26,26,0.92)',
+              backdropFilter: 'blur(8px)',
+              WebkitBackdropFilter: 'blur(8px)',
+              border: `1px solid ${colorsRaw.border}`,
+              color: colorsRaw.text.primary,
+              cursor: 'pointer',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+              zIndex: 5,
+            }}
+          >
+            {toSatellite
+              ? <GlobeHemisphereWest size={22} weight='thin' />
+              : <MapTrifold size={22} weight='thin' />}
+          </button>
+        )
+      })()}
 
       {circles.length === 0 && (
         <div style={s.emptyHint}>
@@ -4304,7 +4415,7 @@ const CircleMap = React.forwardRef(function CircleMap (
         selectedPubkey={selectedPubkey}
         onSelect={onMemberClick}
       />
-      <div style={s.mapAttribution}>© OpenStreetMap contributors</div>
+      <div style={s.mapAttribution}>{mapCredit(tileStyleUrl)}</div>
     </div>
   )
 })
@@ -6047,7 +6158,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
         <DistanceUnitSection unit={distanceUnit} onChange={setDistanceUnit} />
         <p style={{ ...subLabel, marginTop: spacing.lg }}>Map tiles</p>
         <TileStyleSection url={tileStyleUrl} onChange={setTileStyleUrl} />
-        <TileCacheSection />
+        <TileCacheSection satellite={isSatelliteStyle(tileStyleUrl)} />
       </Collapsible>
 
       {/* Advanced is debug-only now (battery moved to Staying in sync, map
@@ -6705,115 +6816,186 @@ function AutostartStatus () {
 // or self-hosted server) and the map hot-swaps without a relaunch.
 // Reset clears the override so we fall back to DEFAULT_TILE_STYLE_URL.
 function TileStyleSection ({ url, onChange }) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(url ?? '')
+  // 'key' = asking for a MapTiler key, 'url' = editing a custom style URL
+  const [editing, setEditing] = useState(null)
+  const [draft, setDraft] = useState('')
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
-  const isCustom = !!url && url !== DEFAULT_TILE_STYLE_URL
+  const mode = styleMode(url)
 
-  const startEdit = () => {
-    setDraft(url ?? DEFAULT_TILE_STYLE_URL)
+  const run = async (fn) => {
+    setBusy(true)
     setError(null)
-    setEditing(true)
+    try {
+      await fn()
+      setEditing(null)
+    } catch (e) {
+      setError(String(e?.message ?? e))
+    } finally {
+      setBusy(false)
+    }
   }
-  const cancelEdit = () => {
-    setEditing(false)
+
+  const pickStreet = () => { if (mode !== 'street') run(() => onChange(null)) }
+  const pickSatellite = () => {
+    if (mode === 'satellite') return
+    const key = loadSavedKey()
+    if (key) { run(() => onChange(satelliteStyleUrl(key))); return }
+    startKeyEdit()
+  }
+  const startKeyEdit = () => {
+    setDraft(keyFromSatelliteStyle(url) || loadSavedKey() || '')
     setError(null)
+    setEditing('key')
   }
-  const validate = (s) => {
-    const t = (s ?? '').trim()
-    if (!t) return 'URL is required'
-    if (!/^https?:\/\//i.test(t)) return 'URL must start with http:// or https://'
-    return null
+  const startUrlEdit = () => {
+    setDraft(mode === 'custom' ? url : STREET_STYLE_URL)
+    setError(null)
+    setEditing('url')
   }
-  const save = async () => {
-    const err = validate(draft)
+  const cancelEdit = () => { setEditing(null); setError(null) }
+
+  const saveKeyDraft = async () => {
+    const err = validateMaptilerKey(draft)
     if (err) { setError(err); return }
-    setBusy(true)
-    try {
-      await onChange(draft.trim())
-      setEditing(false)
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const reset = async () => {
+    const key = draft.trim()
     setBusy(true)
     setError(null)
-    try {
-      await onChange(null)
-      setEditing(false)
-    } catch (e) {
-      setError(String(e?.message ?? e))
-    } finally {
-      setBusy(false)
-    }
+    const checkErr = await checkSatelliteKey(key)
+    setBusy(false)
+    if (checkErr) { setError(checkErr); return }
+    saveKey(key)
+    run(() => onChange(satelliteStyleUrl(key)))
   }
+  const saveUrlDraft = () => {
+    const t = (draft ?? '').trim()
+    if (!t) { setError('URL is required'); return }
+    if (!/^https?:\/\//i.test(t)) { setError('URL must start with http:// or https://'); return }
+    run(() => onChange(t))
+  }
+
+  const btn = (label, active, onClick) => (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      style={{
+        flex: 1, padding: '10px', borderRadius: radius.sm,
+        background: active ? colors.primary : 'transparent',
+        color: active ? colors.text.onPrimary : colors.text.primary,
+        border: `1px solid ${active ? colors.primary : colors.border}`,
+        cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+      }}
+    >
+      {label}
+    </button>
+  )
+  const inputStyle = {
+    width: '100%', boxSizing: 'border-box',
+    padding: `${spacing.sm}px ${spacing.md}px`,
+    background: colors.surface.input,
+    color: colors.text.primary,
+    border: `1px solid ${colors.border}`,
+    borderRadius: radius.md,
+    fontFamily: typography.monoFamily, fontSize: 13,
+    outline: 'none',
+    marginBottom: spacing.sm,
+  }
+  const smallBtn = { ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }
+  const openSignup = () => { try { pear.call('shell:openUrl', { url: MAPTILER_SIGNUP_URL }) } catch {} }
 
   return (
     <>
-      <p style={s.muted}>
-        The map fetches tile imagery from this MapLibre style URL.
-        Default is OpenFreeMap. Change if the default is unavailable
-        or you want to point at your own provider.
-      </p>
-      {!editing && (
+      <div style={{ display: 'flex', gap: spacing.sm, marginBottom: spacing.sm }}>
+        {btn('Street', mode === 'street' && editing !== 'key', pickStreet)}
+        {btn('Satellite', mode === 'satellite' || editing === 'key', pickSatellite)}
+      </div>
+
+      {editing === 'key' && (
         <>
-          <div style={{
-            ...typography.caption, color: colors.text.secondary,
-            background: colors.surface.input,
-            border: `1px solid ${colors.border}`,
-            borderRadius: radius.md,
-            padding: `${spacing.sm}px ${spacing.md}px`,
-            wordBreak: 'break-all',
-            marginBottom: spacing.sm,
-            fontFamily: typography.monoFamily,
-          }}>
-            {url || DEFAULT_TILE_STYLE_URL}
-            {!isCustom && (
-              <span style={{ color: colors.text.muted, marginLeft: spacing.xs }}>(default)</span>
-            )}
-          </div>
+          <p style={s.muted}>
+            Satellite view comes from MapTiler. Make a free MapTiler account,
+            copy your API key and paste it here. The key stays on this phone.
+            MapTiler sees which parts of the map you look at, the same way the
+            street map provider does.
+          </p>
+          <button style={{ ...smallBtn, marginBottom: spacing.sm }} onClick={openSignup}>
+            Get a free key
+          </button>
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder='MapTiler API key'
+            spellCheck={false}
+            autoCapitalize='off'
+            autoCorrect='off'
+            style={inputStyle}
+          />
           <div style={{ display: 'flex', gap: spacing.sm }}>
-            <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={startEdit}>
-              Edit URL
+            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={saveKeyDraft} disabled={busy}>
+              {busy ? 'Checking...' : 'Use satellite'}
             </button>
-            {isCustom && (
-              <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={reset} disabled={busy}>
-                Reset to default
-              </button>
-            )}
+            <button style={smallBtn} onClick={cancelEdit} disabled={busy}>
+              Cancel
+            </button>
           </div>
         </>
       )}
-      {editing && (
+
+      {editing === 'url' && (
         <>
+          <p style={s.muted}>
+            Point the map at any MapLibre style URL, for example your own
+            tile server.
+          </p>
           <input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder='https://...'
             spellCheck={false}
             autoCapitalize='off'
-            style={{
-              width: '100%', boxSizing: 'border-box',
-              padding: `${spacing.sm}px ${spacing.md}px`,
-              background: colors.surface.input,
-              color: colors.text.primary,
-              border: `1px solid ${colors.border}`,
-              borderRadius: radius.md,
-              fontFamily: typography.monoFamily, fontSize: 13,
-              outline: 'none',
-              marginBottom: spacing.sm,
-            }}
+            style={inputStyle}
           />
           <div style={{ display: 'flex', gap: spacing.sm }}>
-            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={save} disabled={busy}>
+            <button style={{ ...s.primaryBtn, boxSizing: 'border-box' }} onClick={saveUrlDraft} disabled={busy}>
               {busy ? 'Saving...' : 'Save'}
             </button>
-            <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box' }} onClick={cancelEdit} disabled={busy}>
+            <button style={smallBtn} onClick={cancelEdit} disabled={busy}>
               Cancel
+            </button>
+          </div>
+        </>
+      )}
+
+      {!editing && (
+        <>
+          {mode === 'street' && (
+            <p style={s.muted}>Street map from OpenFreeMap. Free, no account.</p>
+          )}
+          {mode === 'satellite' && (
+            <p style={s.muted}>Satellite imagery from MapTiler, using your key.</p>
+          )}
+          {mode === 'custom' && (
+            <div style={{
+              ...typography.caption, color: colors.text.secondary,
+              background: colors.surface.input,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.md,
+              padding: `${spacing.sm}px ${spacing.md}px`,
+              wordBreak: 'break-all',
+              marginBottom: spacing.sm,
+              fontFamily: typography.monoFamily,
+            }}>
+              {url}
+              <span style={{ color: colors.text.muted, marginLeft: spacing.xs }}>(custom)</span>
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: spacing.sm }}>
+            {mode === 'satellite' && (
+              <button style={smallBtn} onClick={startKeyEdit} disabled={busy}>Change key</button>
+            )}
+            <button style={smallBtn} onClick={startUrlEdit} disabled={busy}>
+              {mode === 'custom' ? 'Edit URL' : 'Custom URL'}
             </button>
           </div>
         </>
@@ -6828,7 +7010,7 @@ function TileStyleSection ({ url, onChange }) {
 // the cache, so size grows naturally as the user explores; this UI
 // surfaces what's cached, lets them clear LRU entries, and opens the
 // region-download manager for explicit offline coverage.
-function TileCacheSection () {
+function TileCacheSection ({ satellite = false }) {
   const [stats, setStats] = useState(null)
   const [busy, setBusy] = useState(false)
   const [regions, setRegions] = useState([])
@@ -6901,8 +7083,11 @@ function TileCacheSection () {
           </div>
         </div>
       </div>
+      {satellite && (
+        <p style={{ ...s.muted, marginTop: 0 }}>Switch to Street to download map areas for offline use. Satellite pictures are not saved offline.</p>
+      )}
       <div style={{ display: 'flex', gap: spacing.sm, marginBottom: regions.length > 0 ? spacing.base : 0 }}>
-        <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1 }} onClick={() => setDownloadOpen(true)}>
+        <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1, opacity: satellite ? 0.5 : 1 }} onClick={() => setDownloadOpen(true)} disabled={satellite}>
           Download tiles
         </button>
         <button style={{ ...s.secondaryBtn, marginTop: 0, boxSizing: 'border-box', flex: 1 }} onClick={clear} disabled={busy}>

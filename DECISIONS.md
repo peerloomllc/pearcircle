@@ -2,6 +2,18 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-11-21 - Satellite view through MapTiler with the user's own key
+
+Tier: T1. No proposal. New UI and local settings only; nothing replicates to peers.
+
+Context: issue #288 asked for a satellite map. Free imagery (EOX Sentinel-2 cloudless) is 10 m per pixel, too blurry to show houses. Sharp imagery (Esri, MapTiler, Stadia) needs an account or API key.
+
+Choice: Settings -> Map tiles gets Street / Satellite buttons. Satellite uses MapTiler's `hybrid` style with a key the user pastes in; we ship no key and pay nothing. The key is checked against MapTiler before saving, kept in WebView localStorage (`pc:maptilerKey`) and carried inside the saved style URL. Once a key is saved, a Street / Satellite button sits above find-me on the main map. The credit line reads "© MapTiler © OpenStreetMap contributors" while satellite is on, as MapTiler's terms require. Offline area download is disabled in satellite mode, and the tile cache never stored MapTiler hosts. A one-time "what's new" tour (`pc:featureToursSeen` in AsyncStorage, returned by `shell:onboarding:get`) shows existing users the feature and briefly shows the map button so it can be pointed at; new installs get the same steps at the end of the first-run tour.
+
+Alternatives considered: ship EOX Sentinel-2 as a free built-in option - rejected, too blurry for a location app and only the 2016 layer is clearly licensed for commercial use. A paid provider with our own key - rejected, a monthly cost and a key anyone could pull out of the app.
+
+Consequences: verified on the TCL (PR #289), including a real MapTiler key at street zoom and the no-key tour path. MapTiler sees map requests from people who turn satellite on; the privacy pages say so.
+
 ## 2026-10-13 - PeerLoom Seeder: signed `pseeder:` rows, its own dial key, a 90-day keep
 
 Tier: T3. Proposal `proposals/2026-10-13-peerloom-seeder.md` (approved, PR #242).

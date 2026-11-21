@@ -14,7 +14,7 @@ const TOOLTIP_W     = 280
 const TOOLTIP_GAP   = 12
 const VIEWPORT_PAD  = 12
 
-export function Tour ({ steps, onDone, onSkip, tokens }) {
+export function Tour ({ steps, onDone, onSkip, onStep, tokens }) {
   const [stepIdx, setStepIdx] = useState(0)
   const [bbox, setBbox]       = useState(null)
   const [vp, setVp]           = useState(() => viewport())
@@ -41,6 +41,10 @@ export function Tour ({ steps, onDone, onSkip, tokens }) {
 
   // Reset to step 0 if the steps array changes identity (e.g. replay).
   useEffect(() => { setStepIdx(0) }, [steps])
+  // Lets the parent mount UI that only exists for a step's spotlight
+  // (e.g. a button normally hidden). Cleared on unmount.
+  useEffect(() => { onStep?.(step?.anchor ?? null) }, [step?.anchor])
+  useEffect(() => () => { onStep?.(null) }, [])
 
   function next () {
     if (stepIdx + 1 >= steps.length) onDone?.()
