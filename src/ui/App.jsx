@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives, Desktop } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives, Desktop, GlobeHemisphereWest } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -769,6 +769,7 @@ export function App () {
         profile={profile}
         sharing={!sharing.anyPaused}
         tileStyleUrl={tileStyleUrl}
+        setTileStyleUrl={setTileStyleUrlAndPersist}
         setView={setView}
         setSheet={setSheet}
         initialSelectedCircleId={view.selectCircle ?? null}
@@ -2289,7 +2290,7 @@ function mergeCircleSnapshots (circles) {
   return { members: Array.from(memberMap.values()), lastSeen, presence, places, transitions }
 }
 
-function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
+function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setTileStyleUrl, setView, setSheet, initialSelectedCircleId = null, initialFocus = null, permissionStatus = 'always', bannerDismissed = false, onPermissionBannerDismiss = () => {}, battery = { supported: null, exempt: false }, batteryBannerDismissed = false, onBatteryBannerDismiss = () => {}, onOpenBatteryAdvanced = () => {}, networkLocationOff = false, networkBannerDismissed = false, onNetworkBannerDismiss = () => {}, tourActive = false }) {
   const [circles, setCircles] = useState([])
   // Backup reminder (proposal 2026-10-06-owner-continuity): no backup, or
   // none in 14 days. Dismissing snoozes it for 14 days on this phone.
@@ -3356,6 +3357,45 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       >
         <NavigationArrow size={22} weight='thin' />
       </button>}
+
+      {/* Street / Satellite switch, stacked above Find-me. Only shown once
+          a MapTiler key has been saved in Settings -> Map tiles, so the map
+          looks unchanged for everyone else. A custom style URL also hides
+          it: flipping would throw that URL away. */}
+      {(() => {
+        const mode = styleMode(tileStyleUrl)
+        const key = keyFromSatelliteStyle(tileStyleUrl) || loadSavedKey()
+        if (!key || mode === 'custom' || !setTileStyleUrl) return null
+        const toSatellite = mode === 'street'
+        const label = toSatellite ? 'Show satellite map' : 'Show street map'
+        return (
+          <button
+            type='button'
+            onClick={() => setTileStyleUrl(toSatellite ? satelliteStyleUrl(key) : null)}
+            aria-label={label}
+            title={label}
+            style={{
+              position: 'absolute',
+              right: 16,
+              bottom: `calc(max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px)) + 128px)`,
+              width: 44, height: 44, borderRadius: '50%',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: 'rgba(26,26,26,0.92)',
+              backdropFilter: 'blur(8px)',
+              WebkitBackdropFilter: 'blur(8px)',
+              border: `1px solid ${colorsRaw.border}`,
+              color: colorsRaw.text.primary,
+              cursor: 'pointer',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+              zIndex: 5,
+            }}
+          >
+            {toSatellite
+              ? <GlobeHemisphereWest size={22} weight='thin' />
+              : <MapTrifold size={22} weight='thin' />}
+          </button>
+        )
+      })()}
 
       {circles.length === 0 && (
         <div style={s.emptyHint}>
